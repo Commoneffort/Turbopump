@@ -2,10 +2,13 @@
 //! a target time fixed when the request landed. These tests try to trade at a known price in
 //! every way we could think of and assert each one fails.
 
+// These flows publish Pyth updates; an X1 build has its own tests (x1.rs).
+#![cfg(not(feature = "x1"))]
+
 mod common;
 use common::*;
 use percolator_prog::ix::Instruction as ProgIx;
-use percolator_router::{client as rclient, state as rstate, RouterError, BOND_LAMPORTS, DELAY_SECS, GRACE_SECS};
+use percolator_router::{client as rclient, state as rstate, RouterError, BOND_LAMPORTS, DELAY_SECS, GRACE_SECS, STALL_SECS};
 use percolator_vault::{error::VaultError, percolator as perc, processor};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
@@ -140,7 +143,7 @@ fn a_request_cannot_be_cancelled_or_withdrawn_from_and_expires_with_its_bond() {
     let book = rstate::book_address(&percolator_router::id(), &w.vault).0;
     let book_before = w.env.svm.get_balance(&book).unwrap();
     at(&mut w, target + GRACE_SECS);
-    let ix = rclient::expire(&kp.pubkey(), &w.vault, &t, id);
+    let ix = rclient::expire(&kp.pubkey(), &w.vault, &t);
     expect(w.send(vec![ix.clone()], &[&kp]), router_code(RouterError::TooEarly));
 
     // After the grace period it expires; the bond is forfeited to the book, never to the trader.
@@ -163,11 +166,10 @@ fn a_request_needs_margin_for_a_stressed_price_move() {
     let open = rclient::open_account(&t, &mint);
     let dep = rclient::deposit(&t, &u.collateral, &w.env.vault, 1_000_000); // 1 USDC
     w.send(vec![open, dep], &[&u.kp]).unwrap();
-    let id = w.book().next_id;
     // 10 units at 1.00 with 10% margin needs 1 USDC, plus the stress buffer: refused.
-    let ix = rclient::request(&t, &w.vault, id, 10 * UNIT as i128);
+    let ix = rclient::request(&t, &w.vault, 10 * UNIT as i128);
     expect(w.send(vec![ix], &[&u.kp]), router_code(RouterError::InsufficientMargin));
-    let ix = rclient::request(&t, &w.vault, id, 3 * UNIT as i128);
+    let ix = rclient::request(&t, &w.vault, 3 * UNIT as i128);
     w.send(vec![ix], &[&u.kp]).unwrap();
 }
 
@@ -346,7 +348,7 @@ fn a_market_with_a_queued_request_cannot_be_retired() {
     let target = w.request_target(id);
     at(&mut w, target + GRACE_SECS + 1);
     let (t, kp) = (w.traders[&0].1, w.trader_kp(0));
-    let ix = rclient::expire(&kp.pubkey(), &w.vault, &t, id);
+    let ix = rclient::expire(&kp.pubkey(), &w.vault, &t);
     w.send(vec![ix], &[&kp]).unwrap();
     w.send(vec![retire(&w)], &[]).unwrap();
 }
@@ -461,7 +463,7 @@ fn a_liquidation_does_nothing_if_the_trader_recovered_by_its_fill_price() {
     let t = w.trader(7);
     let id = w.book().next_id;
     let payer = w.payer.pubkey();
-    w.send(vec![rclient::request_close(&payer, &t, &w.vault, id)], &[]).unwrap();
+    w.send(vec![rclient::request_close(&payer, &t, &w.vault)], &[]).unwrap();
     // The first Pyth price after the target is back at 0.90: the account is above the level.
     w.price = 900_000;
     w.execute(7, id).unwrap();
@@ -499,4 +501,81 @@ fn percolators_own_liquidation_is_the_backstop() {
     assert_eq!((a.oi_eff_long_q, a.a_long, a.a_short), (0, percolator::ADL_ONE, percolator::ADL_ONE));
     w.refresh_matcher(); // the approval lapsed while the price walked down
     w.taker_trade(1, UNIT as i128).unwrap();
+}
+
+/// Two people who send a request to the same market at the same moment both get in: a request
+/// lives at its owner's address, not at one the whole market shares.
+#[test]
+fn two_traders_can_send_requests_at_the_same_moment() {
+    let mut w = live();
+    let (a, b) = (w.trader(0), w.trader(1));
+    let (ka, kb) = (w.trader_kp(0), w.trader_kp(1));
+    // Both transactions are built from the same view of the book.
+    let first = w.book().next_id;
+    let (ia, ib) = (rclient::request(&a, &w.vault, 2 * UNIT as i128), rclient::request(&b, &w.vault, -(UNIT as i128)));
+    w.send(vec![ia], &[&ka]).unwrap();
+    w.send(vec![ib], &[&kb]).unwrap();
+    assert_eq!({ w.book().len }, 2);
+    assert_eq!((w.request_account(first).1.wallet, w.request_account(first + 1).1.wallet), (a.wallet, b.wallet));
+    // They fill in turn, each at the first price at or after its own target.
+    w.execute(0, first).unwrap();
+    if w.request_target(first + 1) <= w.book().mark_publish_time { w.fill(1, first + 1).unwrap() } else { w.execute(1, first + 1).unwrap() };
+    assert_eq!((position(&w, 0), position(&w, 1)), (2 * UNIT as i128, -(UNIT as i128)));
+    assert_eq!({ w.book().len }, 0);
+}
+
+/// A request the account can no longer afford at the price it fills at ends there, having traded
+/// nothing, and the queue moves on. (It used to stay in the book, refused by Percolator on every
+/// attempt, until it expired 90 seconds later, with every request behind it waiting.)
+#[test]
+fn a_request_the_account_cannot_afford_at_its_price_ends_without_trading() {
+    let mut w = live();
+    leveraged_long(&mut w); // 20 long on 5 USDC
+    let id = w.request(7, 2 * UNIT as i128).unwrap(); // two more, while it still can
+    let behind = w.request(1, UNIT as i128).unwrap(); // someone else, queued behind it
+    // Its price turns out to be 0.84: 1.8 USDC of equity against 18.5 of positions with the
+    // two extra units is under the 10% Percolator asks for.
+    w.price = 840_000;
+    let executor = w.payer.pubkey();
+    let before = w.env.svm.get_balance(&executor).unwrap();
+    w.execute(7, id).unwrap();
+    assert_eq!(position(&w, 7), 20 * UNIT as i128, "nothing traded");
+    assert!(w.env.svm.get_balance(&executor).unwrap() > before, "whoever ended it earned the bond");
+    assert_eq!({ w.book().len }, 1);
+    // The trader is free again, and the request behind fills.
+    if w.request_target(behind) <= w.book().mark_publish_time { w.fill(1, behind).unwrap() } else { w.execute(1, behind).unwrap() };
+    assert_eq!(position(&w, 1), UNIT as i128);
+    w.taker_trade(7, -(UNIT as i128)).unwrap();
+}
+
+/// A request whose price the mark holds, and which nobody has filled `STALL_SECS` after the mark
+/// was moved there, can be expired: a request that cannot fill does not hold the market up for
+/// its whole grace period. Before its price has arrived, the grace period is the only way out.
+#[test]
+fn a_request_left_unfilled_at_its_price_can_be_expired_after_the_stall_time() {
+    let mut w = live();
+    let t = w.trader(0);
+    let kp = w.trader_kp(0);
+    let id = w.request(0, UNIT as i128).unwrap();
+    let target = w.request_target(id);
+    let expire = rclient::expire(&kp.pubkey(), &w.vault, &t);
+
+    // Its price has not arrived: no early way out, however long it has waited.
+    at(&mut w, target + STALL_SECS + 5);
+    expect(w.send(vec![expire.clone()], &[&kp]), router_code(RouterError::TooEarly));
+
+    // The mark moves to its price. Nobody fills it.
+    let prev = w.pyth_time;
+    w.pyth_time = target + 1;
+    let u = w.pyth_update(w.price, target + 1, prev);
+    w.advance_to(u).unwrap();
+    let set = w.clock_ts();
+    at(&mut w, set + STALL_SECS);
+    expect(w.send(vec![expire.clone()], &[&kp]), router_code(RouterError::TooEarly));
+    at(&mut w, set + STALL_SECS + 1);
+    assert!(set + STALL_SECS + 1 < target + GRACE_SECS);
+    w.send(vec![expire], &[&kp]).unwrap();
+    assert_eq!({ w.book().len }, 0);
+    // The mark is free to move on, and the trader to trade.
+    w.taker_trade(0, UNIT as i128).unwrap();
 }

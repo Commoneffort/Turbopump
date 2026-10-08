@@ -1,0 +1,26 @@
+{
+  "name": "percolator-vault-hedging",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "sim": "tsx src/cli/sim.ts",
+    "shadow": "tsx src/cli/hedger.ts --venue mock",
+    "status": "tsx src/cli/status.ts",
+    "measure": "tsx src/cli/measure.ts",
+    "switch": "tsx src/cli/switch.ts",
+    "testnet": "tsx src/cli/hedger.ts --venue hyperliquid-testnet",
+    "hl": "tsx src/cli/hl.ts",
+    "dashboard": "tsx src/cli/dashboard.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "5.6.3"
+  },
+  "dependencies": {
+    "@noble/curves": "^1.9.7",
+    "@noble/hashes": "^1.8.0"
+  }
+}

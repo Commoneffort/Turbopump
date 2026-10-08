@@ -31,8 +31,16 @@ use solana_sdk::{
 use spl_token::state::{Account as TokenAccount, AccountState};
 pub use v16_svm::{MarketConfig, V16Svm, INITIAL_PRICE};
 
+// An X1 build of the programs (`--features x1`) takes its prices from the reporter instead of
+// Pyth. Its tests (tests/x1.rs) run the same harness against those binaries.
+#[cfg(not(feature = "x1"))]
 const VAULT_SO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/target/deploy/percolator_vault.so");
+#[cfg(not(feature = "x1"))]
 const ROUTER_SO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/target/deploy/percolator_router.so");
+#[cfg(feature = "x1")]
+const VAULT_SO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/target/deploy-x1-test/percolator_vault.so");
+#[cfg(feature = "x1")]
+const ROUTER_SO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/target/deploy-x1-test/percolator_router.so");
 pub const EPOCH_LEN: u64 = 20;
 pub const SPREAD_BPS: u16 = 50;
 /// One unit of position size (Percolator's POS_SCALE).
@@ -94,7 +102,10 @@ impl World {
         let cu = self.send(vec![ix], &[&lister.kp])?;
         // Keep the harness's Pyth clock in step with the update the vault listed at, and open
         // the vault's router book (once).
+        #[cfg(not(feature = "x1"))]
         let u = percolator_vault::pyth::decode(&self.env.svm.get_account(&pyth).unwrap().data).unwrap();
+        #[cfg(feature = "x1")]
+        let u = percolator_vault::reporter::decode(&self.env.svm.get_account(&pyth).unwrap().data).unwrap();
         self.pyth_time = self.pyth_time.max(u.publish_time);
         self.price = u.price_e6().unwrap();
         let book = percolator_router::state::book_address(&percolator_router::id(), &self.vault).0;
@@ -141,8 +152,27 @@ impl World {
 }
 
 impl World {
-    /// Publishes a fully verified Pyth update for `FEED` (a new receiver-owned account).
+    /// The price source's next update for `FEED`. On Solana that is a fully verified Pyth update
+    /// (a new receiver-owned account); in an X1 build, the reporter posts it.
+    #[cfg(feature = "x1")]
     pub fn pyth_update(&mut self, price_e6: u64, publish_time: i64, prev_publish_time: i64) -> Pubkey {
+        let reporter = self.reporter();
+        self.post_report(&reporter, price_e6, publish_time, prev_publish_time).expect("post reported price")
+    }
+
+    /// A Pyth update account, whatever the build's price source is.
+    #[cfg(feature = "x1")]
+    pub fn pyth_account(&mut self, price_e6: u64, publish_time: i64, prev_publish_time: i64) -> Pubkey {
+        self.pyth_account_raw(price_e6, publish_time, prev_publish_time)
+    }
+
+    #[cfg(not(feature = "x1"))]
+    pub fn pyth_update(&mut self, price_e6: u64, publish_time: i64, prev_publish_time: i64) -> Pubkey {
+        self.pyth_account_raw(price_e6, publish_time, prev_publish_time)
+    }
+
+    /// Publishes a fully verified Pyth update for `FEED` (a new receiver-owned account).
+    fn pyth_account_raw(&mut self, price_e6: u64, publish_time: i64, prev_publish_time: i64) -> Pubkey {
         let mut d = vec![0u8; 134];
         d[..8].copy_from_slice(&[0x22, 0xf1, 0x23, 0x63, 0x9d, 0x7e, 0xf4, 0xcd]);
         d[40] = 1;
@@ -279,20 +309,38 @@ impl World {
     pub fn request(&mut self, taker: usize, size_q: i128) -> Result<u64, String> {
         let t = self.trader(taker);
         let id = self.book().next_id;
-        let ix = rclient::request(&t, &self.vault, id, size_q);
+        let ix = rclient::request(&t, &self.vault, size_q);
         let kp = self.trader_kp(taker);
         self.send(vec![ix], &[&kp])?;
         Ok(id)
     }
 
-    pub fn request_target(&self, id: u64) -> i64 {
-        let k = percolator_router::state::request_address(&percolator_router::id(), &self.vault, id).0;
-        let r: percolator_router::state::Request = bytemuck::pod_read_unaligned(&self.env.svm.get_account(&k).unwrap().data);
-        r.target_time
+    /// The address and contents of the pending request with this id. A request lives at its
+    /// owner's address (a trader's wallet, or whoever queued a settlement), so it is looked for
+    /// among the harness's traders and its payer.
+    pub fn request_account(&self, id: u64) -> (Pubkey, percolator_router::state::Request) {
+        let router = percolator_router::id();
+        let mut keys: Vec<Pubkey> = self.traders.values().map(|(_, t)| percolator_router::state::request_address(&router, &self.vault, &t.wallet, false).0).collect();
+        keys.push(percolator_router::state::request_address(&router, &self.vault, &self.payer.pubkey(), true).0);
+        for k in keys {
+            if let Some(a) = self.env.svm.get_account(&k) {
+                if a.data.len() == percolator_router::state::REQUEST_LEN {
+                    let r: percolator_router::state::Request = bytemuck::pod_read_unaligned(&a.data);
+                    if r.id == id {
+                        return (k, r);
+                    }
+                }
+            }
+        }
+        panic!("no pending request {id}");
     }
 
-    pub fn fill_ix(&self, taker: usize, id: u64, executor: &Pubkey) -> Instruction {
-        rclient::fill(executor, self.keys.as_ref().unwrap(), &self.traders[&taker].1, id)
+    pub fn request_target(&self, id: u64) -> i64 {
+        self.request_account(id).1.target_time
+    }
+
+    pub fn fill_ix(&self, taker: usize, _id: u64, executor: &Pubkey) -> Instruction {
+        rclient::fill(executor, self.keys.as_ref().unwrap(), &self.traders[&taker].1)
     }
 
     /// Fills a request whose target the mark is at (executed by the payer).
@@ -313,7 +361,7 @@ impl World {
     pub fn close_out(&mut self, taker: usize) -> Result<u64, String> {
         let t = self.trader(taker);
         let id = self.book().next_id;
-        let ix = rclient::request_close(&self.payer.pubkey(), &t, &self.vault, id);
+        let ix = rclient::request_close(&self.payer.pubkey(), &t, &self.vault);
         self.send(vec![ix], &[])?;
         self.execute(taker, id)
     }
@@ -337,14 +385,14 @@ impl World {
     /// Queues the settlement of the epoch through the router; returns the request id.
     pub fn request_settle(&mut self) -> Result<u64, String> {
         let id = self.book().next_id;
-        let ix = rclient::request_settle(&self.payer.pubkey(), &self.vault, id);
+        let ix = rclient::request_settle(&self.payer.pubkey(), &self.vault);
         self.send(vec![ix], &[])?;
         Ok(id)
     }
 
-    pub fn settle_ix(&self, id: u64) -> Instruction {
+    pub fn settle_ix(&self, _id: u64) -> Instruction {
         let payer = self.payer.pubkey();
-        rclient::settle(&payer, self.keys.as_ref().unwrap(), &payer, id, { self.vault_state().epoch }, self.frontier())
+        rclient::settle(&payer, self.keys.as_ref().unwrap(), &payer, { self.vault_state().epoch }, self.frontier())
     }
 
     /// Queues a settlement and executes it: the first Pyth update at its target (at the current
@@ -436,6 +484,17 @@ impl World {
         self.advance_to(u)?;
         self.converge();
         self.fill(taker, id)
+    }
+
+    /// Closes whatever `taker` holds on the vault's market (nothing to do when flat or unknown).
+    pub fn close_position(&mut self, taker: usize) -> Result<u64, String> {
+        if !self.traders.contains_key(&taker) {
+            return Ok(0);
+        }
+        let m = self.env.svm.get_account(&self.env.market).unwrap().data;
+        let d = self.env.svm.get_account(&self.taker_portfolio(taker)).unwrap().data;
+        let held: i128 = perc::positions(&m, &d).map_err(|e| format!("{e:?}"))?.iter().map(|p| p.size).sum();
+        if held == 0 { Ok(0) } else { self.taker_trade(taker, -held) }
     }
 
     /// A taker's router portfolio (for position checks).

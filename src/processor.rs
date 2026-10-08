@@ -126,6 +126,12 @@ pub const TAG_REQUIRE_FLAT: u8 = 35;
 /// A market with no liquidity providers can be retired this many epochs after it was listed.
 pub const RETIRE_IDLE_EPOCHS: u64 = 3;
 
+/// How many full epochs a vault quotes closing-only (`RequireFlat`) before anyone may force it
+/// flat with `Unwind`. The unwind deleverages every trader on the market and closes it out, so
+/// ordinary order flow gets this long to bring the vault flat first. It was 1: on the test
+/// networks one large withdrawal then closed every trader out about every third hour.
+pub const UNWIND_GRACE_EPOCHS: u64 = 6;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InitParams {
     pub seed: u64,
@@ -739,7 +745,7 @@ fn init_vault(program_id: &Pubkey, accounts: &[AccountInfo], p: InitParams) -> P
         listed_slot: 0,
         armed_size: 0,
         armed_slot: 0,
-        _reserved: [0; 8],
+        flat_required_slot: 0,
     };
     state::store_vault(vault_ai, &v)?;
 
@@ -1140,6 +1146,7 @@ fn roll_epoch(program_id: &Pubkey, accounts: &[AccountInfo], frontier: u64) -> P
         v.inventory = 0; // proven flat above
     }
     v.needs_flat = 0;
+    v.flat_required_slot = 0;
     v.epoch = add(v.epoch, 1)?;
     v.epoch_start_slot = now;
     state::store_vault(vault_ai, &v)?;
@@ -1756,6 +1763,10 @@ fn require_flat(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
     if view.flat || owed <= add(cash, v.pending_deposit_assets)? {
         return Err(VaultError::CanSettleOpen.into());
     }
+    // Flagging it again does not start the grace before `Unwind` over.
+    if v.needs_flat == 0 {
+        v.flat_required_slot = Clock::get()?.slot;
+    }
     v.needs_flat = 1;
     state::store_vault(vault_ai, &v)
 }
@@ -2020,7 +2031,18 @@ fn harvest_fees(
     state::store_vault(vault_ai, &v)
 }
 
-/// Liveness backstop. If an epoch has been over for a further full epoch and its withdrawals
+/// First slot at which `Unwind` is accepted for a vault that has to get flat: `UNWIND_GRACE_EPOCHS`
+/// epoch lengths after the epoch ended or after `RequireFlat` flagged it, whichever came later.
+/// (Counted from the epoch's end alone, a vault whose epoch had been running for hours with no
+/// requests closed every trader out minutes after one large withdrawal arrived.)
+pub fn unwind_allowed_slot(v: &VaultState) -> u64 {
+    let epoch_end = v.epoch_start_slot.saturating_add(v.epoch_len_slots);
+    epoch_end
+        .max(v.flat_required_slot)
+        .saturating_add(v.epoch_len_slots.saturating_mul(UNWIND_GRACE_EPOCHS))
+}
+
+/// Liveness backstop. If an epoch has been over for `UNWIND_GRACE_EPOCHS` further epochs and its withdrawals
 /// still need the vault flat (`RequireFlat`; closing-only quoting did not bring it there, for
 /// example because a taker holds its position on purpose), anyone can make the vault close its own position through
 /// Percolator's unilateral `RebalanceReduce`, at the engine's effective price. A taker holding a
@@ -2043,9 +2065,7 @@ fn unwind(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     key_is(market, &v.market)?;
     key_is(portfolio, &v.lp_portfolio)?;
     let now = Clock::get()?.slot;
-    let overdue = v
-        .epoch_start_slot
-        .saturating_add(v.epoch_len_slots.saturating_mul(2));
+    let overdue = unwind_allowed_slot(&v);
     // Only when the epoch cannot settle with the position open (`RequireFlat`).
     if now < overdue || v.needs_flat == 0 {
         return Err(VaultError::EpochNotOver.into());

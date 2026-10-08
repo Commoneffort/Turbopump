@@ -1,10 +1,10 @@
-// Trader leaderboard for the devnet market, computed from chain data (no indexer):
+// Trader leaderboard for a network's market, computed from chain data (no indexer):
 // every trading portfolio's equity, its deposits and withdrawals from transaction history,
 // and the volume of its trades against the vaults.
 import { Connection, PublicKey } from "@solana/web3.js";
 import L from "./_layout.js";
 import bs58 from "bs58";
-import { FEED_SYMBOLS, MARKET, PERCOLATOR, ROUTER, SEED_WALLETS, VAULT_PROGRAM } from "./_config.js";
+import { FEED_SYMBOLS, PERCOLATOR, ROUTER, SEED_WALLETS, VAULT_PROGRAM, networkOf } from "./_config.js";
 
 const dv = (d: Uint8Array) => new DataView(d.buffer, d.byteOffset, d.byteLength);
 const u64 = (d: Uint8Array, o: number) => dv(d).getBigUint64(o, true);
@@ -14,7 +14,7 @@ const hex = (b: Uint8Array) => Array.from(b, x => x.toString(16).padStart(2, "0"
 
 type Flow = { deposits: bigint; withdrawals: bigint; trades: number; volumeByAsset: Map<number, bigint> };
 const txCache = new Map<string, any>(); // survives between calls on a warm instance
-let cached: { at: number; body: any } | undefined;
+const cached = new Map<string, { at: number; body: any }>(); // by market
 
 async function flowsFor(conn: Connection, portfolio: PublicKey): Promise<Flow> {
   const f: Flow = { deposits: 0n, withdrawals: 0n, trades: 0, volumeByAsset: new Map() };
@@ -58,8 +58,8 @@ async function flowsFor(conn: Connection, portfolio: PublicKey): Promise<Flow> {
   return f;
 }
 
-async function build() {
-  const conn = new Connection(process.env.RPC_URL ?? "https://api.devnet.solana.com", "confirmed");
+async function build(rpc: string, MARKET: string) {
+  const conn = new Connection(rpc, "confirmed");
   const P = L.portfolio;
   const [portfolios, vaults, market, traders] = await Promise.all([
     conn.getProgramAccounts(new PublicKey(PERCOLATOR), { filters: [{ dataSize: P.len }, { memcmp: { offset: 16, bytes: MARKET } }] }),
@@ -133,11 +133,13 @@ async function build() {
   return { updated: Date.now(), rows };
 }
 
-export default async function handler(_req: any, res: any) {
+export default async function handler(req: any, res: any) {
   try {
-    if (!cached || Date.now() - cached.at > 30_000) cached = { at: Date.now(), body: await build() };
+    const net = networkOf(req);
+    let c = cached.get(net.market);
+    if (!c || Date.now() - c.at > 30_000) cached.set(net.market, c = { at: Date.now(), body: await build(net.rpc, net.market) });
     res.setHeader("Cache-Control", "s-maxage=30, stale-while-revalidate=120");
-    return res.status(200).json(cached.body);
+    return res.status(200).json(c.body);
   } catch (e: any) {
     return res.status(500).json({ error: e.message ?? String(e) });
   }

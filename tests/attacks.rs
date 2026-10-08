@@ -1,6 +1,9 @@
 //! Adversarial tests. Each one attempts an attack against the vault on top of the production
 //! Percolator binary and asserts it fails without moving value, or is harmless by design.
 
+// These flows publish Pyth updates; an X1 build has its own tests (x1.rs).
+#![cfg(not(feature = "x1"))]
+
 mod common;
 use common::*;
 use percolator_prog::ix::Instruction as ProgIx;
@@ -409,7 +412,7 @@ fn a_market_is_closed_out_after_an_unwind_and_reopens() {
     w.withdraw(&alice, half).unwrap();
     w.advance(EPOCH_LEN, INITIAL_PRICE);
     w.require_flat().unwrap();
-    w.advance(EPOCH_LEN, INITIAL_PRICE);
+    w.advance(EPOCH_LEN * processor::UNWIND_GRACE_EPOCHS, INITIAL_PRICE);
     let unwind = Instruction {
         program_id: pid(),
         accounts: vec![
@@ -545,7 +548,7 @@ fn withdrawals_beyond_the_cash_reserve_need_the_vault_flat() {
         program_id: router,
         accounts: vec![
             AccountMeta::new_readonly(payer, true),
-            AccountMeta::new(percolator_router::state::request_address(&router, &w.vault, id).0, false),
+            AccountMeta::new(w.request_account(id).0, false),
             AccountMeta::new_readonly(payer, false), // no trader behind a settlement request
             AccountMeta::new(payer, false),
             AccountMeta::new(percolator_router::state::book_address(&router, &w.vault).0, false),
@@ -565,6 +568,45 @@ fn withdrawals_beyond_the_cash_reserve_need_the_vault_flat() {
 #[allow(unused)]
 fn unused() -> Pubkey {
     system_program::ID
+}
+
+/// An epoch only ends when someone has a request in it, so a quiet market's epoch can be many
+/// epochs old when a large withdrawal arrives. The traders still get the whole grace, counted
+/// from the moment the vault is told to get flat. (Seen on devnet: closed out four minutes after
+/// the withdrawal, three times in one morning.)
+#[test]
+fn the_unwind_grace_starts_when_the_vault_is_told_to_get_flat() {
+    let (mut w, alice) = funded();
+    w.taker_trade(0, TEN_M).unwrap();
+    let unwind = |w: &World| Instruction {
+        program_id: pid(),
+        accounts: vec![
+            AccountMeta::new(w.vault, false),
+            AccountMeta::new(w.env.market, false),
+            AccountMeta::new(w.portfolio, false),
+            AccountMeta::new_readonly(perc::PERCOLATOR_PROGRAM_ID, false),
+        ],
+        data: vec![processor::TAG_UNWIND],
+    };
+    // Nobody deposits or withdraws for a long time: the epoch is far past the old deadline.
+    w.advance(EPOCH_LEN * (processor::UNWIND_GRACE_EPOCHS + 4), INITIAL_PRICE);
+    let half = w.tokens(alice.shares) / 2;
+    w.withdraw(&alice, half).unwrap();
+    w.require_flat().unwrap();
+    let flagged = { w.vault_state().flat_required_slot };
+    assert!(flagged > 0);
+    expect_err(w.send(vec![unwind(&w)], &[]), VaultError::EpochNotOver);
+    w.advance(EPOCH_LEN * (processor::UNWIND_GRACE_EPOCHS - 1), INITIAL_PRICE);
+    expect_err(w.send(vec![unwind(&w)], &[]), VaultError::EpochNotOver);
+    // Flagging it again does not push the deadline back.
+    w.require_flat().unwrap();
+    assert_eq!({ w.vault_state().flat_required_slot }, flagged);
+    w.advance(EPOCH_LEN, INITIAL_PRICE);
+    w.send(vec![unwind(&w)], &[]).unwrap();
+    assert!(w.portfolio_view().flat, "the vault closed its own position");
+    w.roll().unwrap();
+    assert_eq!({ w.vault_state().flat_required_slot }, 0, "cleared with the flag");
+    w.claim(&alice, 1).unwrap();
 }
 
 #[test]
@@ -587,7 +629,9 @@ fn a_taker_holding_a_position_cannot_lock_withdrawals() {
     w.advance(EPOCH_LEN, INITIAL_PRICE);
     expect_err(w.roll(), VaultError::NotFlat);
     w.require_flat().unwrap();
-    // One epoch of reduce-only grace first.
+    // Reduce-only grace first: `UNWIND_GRACE_EPOCHS` epochs, not one short of it.
+    expect_err(w.send(vec![unwind(&w)], &[]), VaultError::EpochNotOver);
+    w.advance(EPOCH_LEN * (processor::UNWIND_GRACE_EPOCHS - 1), INITIAL_PRICE);
     expect_err(w.send(vec![unwind(&w)], &[]), VaultError::EpochNotOver);
     w.advance(EPOCH_LEN, INITIAL_PRICE);
     let cu = w.send(vec![unwind(&w)], &[]).unwrap();

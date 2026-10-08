@@ -44,7 +44,7 @@ So the natural liquidity provider on Percolator is the operator of a market, not
 3. **Trade through the router.** Takers queue requests; executors move the mark to the verified Pyth price at each request's target and fill it (see above). The vault is the counterparty, within its caps.
 4. **Earn.** Takers' fees land in the asset's insurance. `HarvestFees` (anyone can call it) moves everything above the fixed floor into the vault. The floor stays in place to protect traders. Of what is harvested, 90% belongs to the depositors pro rata and 10% is set aside for whoever opened the market (Hyperliquid HIP-3 style), who claims it with `ClaimOpenerFees` and has no other powers.
 5. **Settle in epochs, without stopping trading.** Deposits and withdrawals are queued, then priced together at one net asset value when the epoch ends. A flat vault's value does not depend on the price, so anyone can roll it. A vault holding a position is settled through the router instead: anyone queues the settlement, and it executes at the first Pyth price published after its target time, like a trade, so nobody can choose the price it is valued at. Capital stays in Percolator and is counted at Percolator's figure; withdrawals are paid from cash, of which the vault keeps 10% of its value outside Percolator.
-6. **Keep exits open.** If an epoch's withdrawals are larger than the vault's cash, they can only be paid once its position is closed (Percolator pays out only from a flat account). Anyone can then switch the vault to closing-only (`RequireFlat`): it only accepts trades that shrink its position. If a trader keeps a position open on purpose, anyone can call `Unwind` one epoch later, and the vault closes its own position through Percolator's unilateral `RebalanceReduce`. That deleverages the traders on the other side, and Percolator then takes no new position on the market until every position on it is closed. The vault cannot take the other side of a close there, so the router closes the remaining positions out (`RequestClose`: anyone can queue it for any trader, and it executes at the first Pyth price after its target like any request); the market then resets and reopens.
+6. **Keep exits open.** If an epoch's withdrawals are larger than the vault's cash, they can only be paid once its position is closed (Percolator pays out only from a flat account). Anyone can then switch the vault to closing-only (`RequireFlat`): it only accepts trades that shrink its position. If a trader keeps a position open on purpose, anyone can call `Unwind` six epochs later (`UNWIND_GRACE_EPOCHS`: ordinary order flow gets that long to bring the vault flat first), and the vault closes its own position through Percolator's unilateral `RebalanceReduce`. That deleverages the traders on the other side, and Percolator then takes no new position on the market until every position on it is closed. The vault cannot take the other side of a close there, so the router closes the remaining positions out (`RequestClose`: anyone can queue it for any trader, and it executes at the first Pyth price after its target like any request); the market then resets and reopens.
 7. **Liquidate before Percolator has to.** A trader whose equity falls below 12.5% of their positions' notional can be liquidated through the router by anyone: the request executes at the first Pyth price after its target, and closes the position against the vault if the account is still below that level at that price. Percolator's own liquidation (at its 10% maintenance margin, on any crank) remains the backstop; it reduces the position unilaterally, which makes the market close-only until it is closed out as above.
 7. **Retire dead markets.** When a market has had no liquidity providers for three epochs, holds no position and has no trade queued, anyone can call `RetireMarket`: its leftover insurance (trading fees nobody else owns) goes to the opener, Percolator retires the asset, and its slot is reused by the next market opened. The same feed can be opened again later.
 8. **Wind down.** If the market is resolved, `SettleResolved` (anyone can call it) closes the portfolio through Percolator's resolved path. Queued deposits are refunded and shares redeem pro rata.
@@ -64,7 +64,7 @@ So the natural liquidity provider on Percolator is the operator of a market, not
 | 27 | `HarvestFees` | anyone | Moves insurance above the floor into the vault |
 | 22 | `ConvertPnl` | anyone | Turns released profit into withdrawable capital |
 | 21 | `RefreshMatcher` | anyone | Renews Percolator's time-limited matcher approval |
-| 28 | `Unwind` | anyone | Liveness backstop, once `RequireFlat` applies and a further epoch has passed: the vault closes its own position |
+| 28 | `Unwind` | anyone | Liveness backstop, six epoch lengths after `RequireFlat` flagged the vault (or after the epoch ended, if later): the vault closes its own position |
 | 34 | `SyncInventory` | anyone | Re-reads the vault's position from Percolator after it changed outside a fill (a liquidation or close-out on the other side) |
 | 35 | `RequireFlat` | anyone | Switches to closing-only when an overdue epoch's withdrawals exceed the vault's cash |
 | 29 | `ClaimOpenerFees` | market opener | Collects the opener's 10% share of harvested fees |
@@ -90,6 +90,11 @@ So the natural liquidity provider on Percolator is the operator of a market, not
 | 9 | `RequestSettle` | anyone | Queues the settlement of a vault's epoch at the first Pyth price after its target |
 | 10 | `Settle` | anyone | Rolls the vault's epoch at that price, with its position open |
 | 11 | `PostPrice` | the reporter key | Writes a reported (unverified) price for a feed into the router's account for it |
+| 15 | `OpenStats` | anyone, for any trader | Opens the account's track record, starting from its equity now. From then on `Deposit` and `Withdraw` book what they move in it and every `Fill` books the account's equity, so profit (equity minus the start minus net deposits), profitable days, volume and the last 16 fills are the router's own figures |
+| 16 | `SetProfile` | wallet | A name (3 to 16 letters, digits or underscores; unique, compared without case) and a badge |
+| 17 / 18 | `Follow` / `Unfollow` | wallet | A list of who the wallet watches. It moves no money |
+| 19 / 20 | `SetCopy` / `StopCopy` | follower | Signs once: keep my positions at this trader's leverage on every market, times a ratio (up to 3x), within a limit per market. One leader at a time. Stopping leaves positions as they are |
+| 21 | `TriggerCopy` | anyone, for any follower | Queues the trade that brings a follower in line with its leader on one market, when it is more than 10% from it (or the leader opened, closed or turned). The size is computed from the two accounts; the caller can only make it smaller. It is an ordinary request: same margin check, same bond, same fill at the first oracle price after its target |
 
 ## Share pricing
 
@@ -106,6 +111,7 @@ So the natural liquidity provider on Percolator is the operator of a market, not
 - **Requests:** they cannot be cancelled or withdrawn from, and expire only after the grace period with the bond forfeited; margin must survive a stressed move, except for a trade that only reduces a position; withdrawals only reach the owner's wallet; a market with a queued request cannot be retired.
 - **Math and property tests:** withdrawals never exceed NAV, deposit-then-withdraw never profits, incumbents are never diluted, fills never break the caps.
 - **Layout tests:** every account offset and every Percolator instruction encoding the programs use is checked against Percolator's own types and decoder.
+- **X1 build** (`tests/x1.rs`): a market lists at the reported price and not at a Pyth account; a stale report cannot list; only the reporter posts; a reported price moves the mark with nothing queued; a trade fills at the first reported price after its target and nothing else; liquidation and open settlement work on reported prices.
 - **Flows:** canonical vaults are unique per feed, ignore creator-chosen limits, can be listed by anyone, and scale their caps with NAV. Create → deposit → trade → roll → withdraw. List → trade → harvest fees → exit with profit. Gains and losses reach depositors exactly. Maintenance fees. Market resolution with everyone exiting. Retiring an idle market and reopening its feed in the freed slot.
 - **Attacks:** forged matcher calls; a foreign LP routing fills through the vault; inventory caps; rolling while not flat; reduce-only enforcement; matcher expiry and permissionless renewal; claims that are early, doubled, stolen or forged; stale tickets; fake buffers; donations; the first-depositor inflation attack; attach mode and bad modes refused; duplicates and a wrong mint; double listing; sweeps; a taker holding a position to lock withdrawals.
 
@@ -142,9 +148,57 @@ The executor (`app/scripts/executor.ts`) moves marks and fills requests. It need
 The router can also take prices that a **reporter key** posts on chain (`PostPrice`). The reference executor fills them from an exchange-median price service (`JACK_URL`, default `http://jack0.x1.xyz:8090`: the median of top-of-book mid prices across up to eight exchanges, about four updates a second, no API key). That service does not sign its prices and has no history, so the executor records its stream to know the first price at or after a request's target, and the reporter key (`keys/reporter-keypair.json`, not in the repo) vouches for it. Nothing on chain can check such a price: **whoever holds the reporter key is trusted for it.** It is therefore used narrowly.
 
 - **Solana (default build): fallback only.** `Advance` accepts a reported price only for a queued request whose target passed at least 20 seconds ago without a Pyth price, and only as that request's price (the first at or after its target). Anyone can still post the Pyth price within those 20 seconds, which shuts the fallback out. It exists so a Hermes outage or an exhausted quota does not leave requests to expire.
-- **X1 (`--features x1`): the price source.** X1 has no Pyth. In this build a reported price follows the same rules as a Pyth update (newer than the mark, never past a pending request's price), and a market is listed at the reported price. Run the executor with `ORACLE=jack`; it posts a price when a request needs one and refreshes each mark every 30 seconds or on a 0.3% move, not on every tick, since each post is a transaction. The X1 build compiles but has not been deployed: the program ids and Percolator itself still have to be set up there.
+- **X1 (`--features x1`): the price source.** X1 has no Pyth. In this build a reported price follows the same rules as a Pyth update (newer than the mark, never past a pending request's price), and a market is listed at the reported price. Run the executor with `ORACLE=jack`; it posts a price when a request needs one and refreshes each mark every 30 seconds or on a 0.3% move, not on every tick, since each post is a transaction. It is deployed on X1 testnet (see X1 testnet below).
 
 If the service starts signing its prices (ed25519 over symbol, price, timestamp and previous timestamp), the router can verify them on chain and the reporter key is no longer trusted.
+
+## X1 testnet
+
+Live since 2026-10-01: the same three programs, at the same addresses as on Solana devnet, with
+a test USDC (6 decimals) as collateral. Addresses are in `deploy/x1-testnet.json`.
+
+X1 has no Pyth, so the vault and router are built with `--features devnet,x1`: the price a
+market lists at, its mark, and every fill, settlement and liquidation price is the one the
+router's reporter key posts (`PostPrice`), taken from an exchange-median price service. The rule
+that a request fills at the first price at or after its target is the same; what differs is the
+trust: on X1 the reporter key is trusted for prices (see SECURITY.md).
+
+**Markets (19):** SOL, BTC, ETH, HYPE, ZEC, FARTCOIN, gold (XAU), silver (XAG), TSLA, NVDA,
+MSTR, AAPL, GOOGL, META, AMD, COIN, PLTR, SPCX, SPY: everything the price service has except
+USDC. A feed id there is only a market's name (the ones Pyth also has keep their Pyth id; the
+others are `sha256("x1:" + symbol)`). Stocks and the ETF only get new prices while their
+exchanges are open; a trade queued when the service has no new price expires.
+
+```bash
+deploy/x1-testnet.sh                               # build, deploy, set up the market
+cd app
+NETWORK=x1-testnet npx tsx scripts/executor.ts     # prices, fills, liquidations
+NETWORK=x1-testnet npx tsx scripts/seed.ts setup   # open every market; deposit
+NETWORK=x1-testnet npx tsx scripts/seed.ts one 1 SOL 2   # a trade through the router
+```
+
+and the keeper, from the repo root: `PERCOLATOR_FIT_COMPUTE=1 PERCOLATOR_MANIFEST=deploy/x1-testnet.json
+DEVNET_RPC=https://rpc.testnet.x1.xyz PERCOLATOR_KEYPAIR=~/.config/solana/percolator-x1/deployer.json
+deploy/x1-tool keeper`. Logs: `deploy/logs/x1-executor.log`, `deploy/logs/x1-keeper.log`.
+
+The site shows either deployment: the switch in its header (or `?network=x1-testnet`) picks, and
+the faucet and leaderboard follow. On X1 a wallet only signs and the page sends, so the
+transaction goes to X1 whatever network the wallet is set to.
+
+**What it costs to run.** X1 charges 10 lamports for every compute unit a transaction asks for,
+used or not. Everything that sends there therefore asks for what a simulation says it needs
+(`computeLimit` in chain.ts, `PERCOLATOR_FIT_COMPUTE` in the tool); asking for the maximum, as on
+Solana, costs 0.014 XNT a transaction. What remains is Percolator's own design: every market has
+to be cranked forward 10 slots at a time, traded or not, at about 26,000 compute units per
+market per crank. Measured on X1 testnet with 19 markets: **about 270 XNT a day**, nearly all of
+it cranks (about 14 XNT per market per day). A fill costs the executor about 0.013 XNT (two
+versions are sent, one fails), more than the 0.002 XNT bond it earns. Fewer markets, or a market
+created with a longer accrual step (`max_accrual_dt_slots`, a risk parameter: prices then move
+toward the mark more slowly), are the ways to lower it.
+
+Checked: the X1 build's price rules in LiteSVM (`tests/x1.rs`, 9 tests, run by `./test.sh`); the
+whole sequence on a local validator; and on X1 testnet itself, all 19 markets opened and trades
+on SOL, BTC, ETH and TSLA filled in 7 to 14 seconds.
 
 ## Layout
 

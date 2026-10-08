@@ -8,3 +8,7 @@ app/dist/
 app/*.tsbuildinfo
 .vercel/
 demo/build/
+hedging/node_modules/
+hedging/state/
+deploy/x1-tool
+deploy/indexer/

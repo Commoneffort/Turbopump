@@ -1,7 +1,7 @@
-import M from "./devnet.json";
-import { CANON_EPOCH_LEN_SLOTS, ROUTER, ROUTER_DELAY_SECS, ROUTER_GRACE_SECS, slotSeconds } from "./chain";
+import { MANIFEST as M } from "./chain";
+import { CANON_EPOCH_LEN_SLOTS, ROUTER, ROUTER_DELAY_SECS, ROUTER_GRACE_SECS, X1, slotSeconds } from "./chain";
 
-const ex = (k: string) => `https://explorer.solana.com/address/${k}?cluster=devnet`;
+const ex = (k: string) => (X1 ? `https://explorer.testnet.x1.xyz/address/${k}` : `https://explorer.solana.com/address/${k}?cluster=devnet`);
 const A = ({ k }: { k: string }) => <a className="mono" href={ex(k)} target="_blank" rel="noreferrer">{k}</a>;
 
 const TOC = [
@@ -61,6 +61,16 @@ export default function Docs() {
       </aside>
       <article className="doc">
         <h1 id="overview">Percolator Vaults</h1>
+        {X1 && (
+          <p className="callout">
+            <b>You are looking at the X1 testnet deployment.</b> The programs are the same as on Solana devnet, and this page describes
+            the Solana one. What differs on X1: there is no Pyth, so wherever this page says "Pyth price", the price is one posted by
+            the router's reporter key, taken from an exchange-median price service. A trade still fills at the first price at or after
+            its target time, but that price is the reporter's word and nothing on chain can check it: whoever holds the reporter key is
+            trusted for prices. Markets cover crypto, stocks and metals; stocks only have a price while their exchanges are open, and a
+            trade queued outside those hours expires. Collateral is a test USDC; fees and rent are paid in test XNT.
+          </p>
+        )}
         <p className="lead">
           Keyless perpetual markets with liquidity built in, on Anatoly Yakovenko's Percolator risk engine. Anyone can open the
           market for a Pyth price feed. A vault program then owns that market, makes markets on it from one shared pool, and pays
@@ -134,7 +144,7 @@ export default function Docs() {
           <li><b>Trade.</b> Takers queue requests with the router; executors fill them at the first Pyth price at or after each request's target, with the vault as counterparty (see How trades fill).</li>
           <li><b>Harvest.</b> <code>HarvestFees</code> (anyone) moves insurance above the floor into the buffer; 10% is set aside for the opener.</li>
           <li><b>Settle without stopping.</b> When an epoch ends, a flat vault is rolled by anyone. A vault holding a position is settled through the router: the settlement is queued and executes at the first Pyth price published after its target time, like a trade, so nobody can pick the price the vault is valued at. Withdrawals are paid from cash; the vault keeps 10% of its value outside Percolator for that.</li>
-          <li><b>Stay live.</b> If an epoch's withdrawals are larger than that cash, they can only be paid once the vault's position is closed. Anyone can then switch it to closing-only (<code>RequireFlat</code>). If a taker holds a position so the vault can't get flat, <code>Unwind</code> (anyone, one epoch later) makes the vault close its own position through Percolator's unilateral <code>RebalanceReduce</code>. That scales down the positions on the other side, and Percolator then takes no new position on the market until all of them are closed; the vault cannot take the other side of a close there, so the router closes them out (<code>RequestClose</code>, which anyone can queue for any trader and which executes at the first Pyth price after its target, like any request). The market then resets and reopens.</li>
+          <li><b>Stay live.</b> If an epoch's withdrawals are larger than that cash, they can only be paid once the vault's position is closed. Anyone can then switch it to closing-only (<code>RequireFlat</code>). If a taker holds a position so the vault can't get flat, <code>Unwind</code> (anyone, six epochs later) makes the vault close its own position through Percolator's unilateral <code>RebalanceReduce</code>. That scales down the positions on the other side, and Percolator then takes no new position on the market until all of them are closed; the vault cannot take the other side of a close there, so the router closes them out (<code>RequestClose</code>, which anyone can queue for any trader and which executes at the first Pyth price after its target, like any request). The market then resets and reopens.</li>
           <li><b>Liquidate early.</b> An account whose equity falls below 12.5% of its positions' notional can be liquidated through the router by anyone: at the first Pyth price after the request's target, the position is closed against the vault if the account is still below that level. Percolator's own liquidation at 10% stays as the backstop; it would make the market close-only.</li>
           <li><b>Retire.</b> Once a market has had no liquidity providers for three epochs and holds no position, <code>RetireMarket</code> (anyone) pays its leftover insurance to the opener and has Percolator retire the asset. The next market opened reuses the slot, and the same feed can be opened again later.</li>
           <li><b>Wind down.</b> If the market is resolved, <code>SettleResolved</code> closes the portfolio through Percolator's resolved path; queued deposits are refunded, and shares redeem pro rata with <code>RedeemTerminal</code>.</li>
@@ -189,7 +199,7 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           <li><b>Margin stays in while you hold a position.</b> Percolator pays margin out only from an account with no open position on any market, so a trader closes everything before withdrawing. A queued trade must also leave enough margin for a further 10% price move; a trade that only reduces a position is always accepted.</li>
           <li><b>Fallback prices are trusted.</b> If Pyth has not served a queued trade 20 seconds after its target, a reporter key may post the price from an exchange-median price service instead, so trades survive an outage of Pyth's API. Nothing on chain can verify that price. Anyone posting the Pyth price within those 20 seconds keeps the fallback out.</li>
           <li><b>No funding rate.</b> Percolator derives funding from the gap between mark and index price. Here both are the same Pyth price, which is what stops front-running, so funding is always zero and nothing pays traders to balance longs and shorts. The vault carries the imbalance, within its position limit, for the fees.</li>
-          <li><b>An unwind closes the market out.</b> If withdrawals larger than the vault's cash reserve have waited a full extra epoch and the vault still holds a position, the vault closes it unilaterally. Traders on the other side are scaled down, and the positions left on that market are closed out at the next Pyth price before it reopens. A trader can have a position closed this way without choosing to.</li>
+          <li><b>An unwind closes the market out.</b> If withdrawals larger than the vault's cash reserve have waited six further epochs and the vault still holds a position, the vault closes it unilaterally. Traders on the other side are scaled down, and the positions left on that market are closed out at the next Pyth price before it reopens. A trader can have a position closed this way without choosing to.</li>
           <li><b>Cost per position.</b> Each price move leaves every open position on that asset out of date until it is cranked, and Percolator takes no new position on the asset until all of them are. The executor does this in front of each fill, so keeping a market tradable costs more the more positions it has.</li>
           <li><b>Percolator fixes.</b> Devnet runs our Percolator integration branch, which includes fixes not yet merged upstream, among them the one that makes permissionless listing work while traders hold open positions (<a href="https://github.com/aeyakovenko/percolator-prog/pull/447" target="_blank" rel="noreferrer">percolator-prog #447</a>).</li>
         </ul>
@@ -203,6 +213,15 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           <li><b>No backing out.</b> A request cannot be cancelled. If nobody fills it within {ROUTER_GRACE_SECS} seconds of its target it expires, nothing is traded, and its bond is forfeited.</li>
         </ol>
         <p>The router has no admin: no pause, no allow or block list, and its upgrade authority is to be burned before mainnet.</p>
+
+        <h2 id="copy">Track records and copy trading</h2>
+        <ul>
+          <li><b>A record nobody can write but the router.</b> Once an account's track record is open, the router books every deposit and withdrawal in it, and the account's equity at every fill. Profit is equity now, minus equity when the record was opened, minus net deposits since. Profitable days, volume and the latest fills come from the same account. Nothing is self-reported.</li>
+          <li><b>Names and badges.</b> A wallet can take a name (unique, 3 to 16 letters, digits or underscores) and a badge. Both live in an account of the router under that wallet.</li>
+          <li><b>Following.</b> A list of traders you watch. Their fills on a market are marked on your chart with their badge: under the candle for a buy, over it for a sell.</li>
+          <li><b>Copying.</b> You sign once: keep my account at this trader's leverage on every market, times a ratio you choose, and never more than a limit per market. When they open, add, cut or close, anyone (the executors do) can queue the trade that brings you in line. The router computes its size from the two accounts; the caller cannot make it bigger or turn it round. It then fills like any order, at the first oracle price after its target time, so a copy can be front-run no more than a trade can.</li>
+          <li><b>What a copy cannot do.</b> It cannot withdraw, and it cannot trade more than the margin rule allows. A trader you copy who loses loses your money too, in proportion: a good record is not a promise. Each copy trade pays the usual 0.05% fee; small differences (under 10% of the target) are left alone so you do not pay it on every tick. While you copy, positions you open yourself are brought back in line. Stop at any time: your positions stay as they are.</li>
+        </ul>
 
         <h2 id="security">Security model</h2>
         <table className="doc-table">
@@ -342,7 +361,7 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           <dt>Can the same pair be listed twice?</dt>
           <dd>Not through this program: the vault address is derived from the feed, so the second attempt fails on-chain.</dd>
           <dt>What stops someone from blocking withdrawals by holding a position?</dt>
-          <dd>Reduce-only quoting after the epoch, then <code>Unwind</code>, which lets anyone make the vault close its own position one epoch later.</dd>
+          <dd>Reduce-only quoting after the epoch, then <code>Unwind</code>, which lets anyone make the vault close its own position six epochs later.</dd>
           <dt>Who pays for maintenance?</dt>
           <dd>Whoever sends it. Each transaction costs a network fee only; a roll also pays a small rent for the epoch record.</dd>
           <dt>What is the "Devnet Burner" wallet?</dt>

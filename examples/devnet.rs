@@ -11,6 +11,12 @@
 //! State goes to deploy/devnet.json. The payer/admin keypair is PERCOLATOR_KEYPAIR (default
 //! ~/.config/solana/percolator-test/deployer.json); the RPC URL is DEVNET_RPC or the file
 //! ~/.config/solana/percolator-test/devnet-rpc.
+//!
+//! The same tool serves another network (X1 testnet: see deploy/x1-testnet.sh) through
+//! PERCOLATOR_MANIFEST (the state file), PERCOLATOR_NETWORK (its label), DEVNET_RPC,
+//! PERCOLATOR_KEYPAIR and PERCOLATOR_FAUCET_KEY (the test USDC's mint authority). `create-vault`
+//! lists at a Pyth price and so is for Solana only; on X1 a market is opened with the app's
+//! scripts, at the reporter's price.
 
 use percolator_prog::{ix::Instruction as ProgIx, state as pstate};
 use percolator_vault::{
@@ -33,7 +39,9 @@ use solana_sdk::{
 };
 use std::{str::FromStr, thread::sleep, time::Duration};
 
-const MANIFEST: &str = "deploy/devnet.json";
+fn manifest() -> String {
+    std::env::var("PERCOLATOR_MANIFEST").unwrap_or_else(|_| "deploy/devnet.json".into())
+}
 /// Pyth SOL/USD sponsored price account and feed id (same on devnet and mainnet).
 const SOL_USD_ACCOUNT: &str = "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE";
 const SOL_USD_FEED: &str = "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
@@ -61,32 +69,45 @@ fn payer() -> Keypair {
 }
 
 fn send(rpc: &RpcClient, payer: &Keypair, ixs: Vec<Instruction>, extra: &[&Keypair]) -> Result<String, String> {
-    let mut all = vec![
-        ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
-        ComputeBudgetInstruction::set_compute_unit_price(20_000),
-    ];
-    all.extend(ixs);
     let mut signers: Vec<&Keypair> = vec![payer];
     signers.extend_from_slice(extra);
     let bh = rpc.get_latest_blockhash().map_err(|e| e.to_string())?;
-    let tx = Transaction::new_signed_with_payer(&all, Some(&payer.pubkey()), &signers, bh);
+    let build = |budget: Vec<Instruction>| {
+        let all: Vec<Instruction> = budget.into_iter().chain(ixs.iter().cloned()).collect();
+        Transaction::new_signed_with_payer(&all, Some(&payer.pubkey()), &signers, bh)
+    };
+    let mut tx = build(vec![
+        ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+        ComputeBudgetInstruction::set_compute_unit_price(20_000),
+    ]);
+    // X1 charges 10 lamports for every compute unit a transaction asks for, used or not (0.014
+    // XNT at the maximum). With PERCOLATOR_FIT_COMPUTE set, a transaction asks for what a
+    // simulation says it uses, plus a fifth, and pays no priority fee.
+    if std::env::var("PERCOLATOR_FIT_COMPUTE").is_ok() {
+        let sim = rpc.simulate_transaction(&tx).map_err(|e| e.to_string())?.value;
+        if let Some(err) = sim.err {
+            return Err(format!("{err:?}\n{}", sim.logs.unwrap_or_default().join("\n")));
+        }
+        let units = sim.units_consumed.map(|u| (u + u / 5 + 10_000).min(1_400_000)).unwrap_or(1_400_000);
+        tx = build(vec![ComputeBudgetInstruction::set_compute_unit_limit(units as u32)]);
+    }
     rpc.send_and_confirm_transaction(&tx)
         .map(|s| s.to_string())
         .map_err(|e| format!("{e}"))
 }
 
 fn load() -> Value {
-    std::fs::read_to_string(MANIFEST)
+    std::fs::read_to_string(manifest())
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or(json!({}))
 }
 fn save(v: &Value) {
     std::fs::create_dir_all("deploy").unwrap();
-    std::fs::write(MANIFEST, serde_json::to_string_pretty(v).unwrap()).unwrap();
+    std::fs::write(manifest(), serde_json::to_string_pretty(v).unwrap()).unwrap();
 }
 fn key(v: &Value, k: &str) -> Pubkey {
-    Pubkey::from_str(v[k].as_str().unwrap_or_else(|| panic!("{k} missing from {MANIFEST}"))).unwrap()
+    Pubkey::from_str(v[k].as_str().unwrap_or_else(|| panic!("{k} missing from {}", manifest()))).unwrap()
 }
 
 fn market_state(rpc: &RpcClient, market: &Pubkey) -> (pstate::WrapperConfigV16, pstate::MarketGroupV16, Vec<u8>) {
@@ -207,7 +228,7 @@ fn setup_market(rpc: &RpcClient, admin: &Keypair) {
             vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market.pubkey(), false)]),
     ], &[]).expect("fee policies");
 
-    m["network"] = json!("devnet");
+    m["network"] = json!(std::env::var("PERCOLATOR_NETWORK").unwrap_or_else(|_| "devnet".into()));
     m["percolator_program"] = json!(perc::PERCOLATOR_PROGRAM_ID.to_string());
     m["vault_program"] = json!(percolator_vault::id().to_string());
     m["collateral_mint"] = json!(mint_key.to_string());
@@ -216,7 +237,7 @@ fn setup_market(rpc: &RpcClient, admin: &Keypair) {
     m["percolator_vault_authority"] = json!(vault_auth.to_string());
     m["admin"] = json!(admin.pubkey().to_string());
     save(&m);
-    println!("market ready; manifest in {MANIFEST}");
+    println!("market ready; manifest in {}", manifest());
 }
 
 fn create_ata_idempotent(payer: &Pubkey, owner: &Pubkey, mint: &Pubkey) -> Instruction {
@@ -244,7 +265,8 @@ fn faucet(rpc: &RpcClient, admin: &Keypair, to: &Pubkey, amount: u64) -> Pubkey 
     let mint = key(&m, "collateral_mint");
     let ata = client::associated_token_address(to, &mint);
     // The mint authority moved to a dedicated faucet key (keys/faucet.json) after setup.
-    let authority = read_keypair_file("keys/faucet.json").unwrap_or_else(|_| admin.insecure_clone());
+    let faucet_key = std::env::var("PERCOLATOR_FAUCET_KEY").unwrap_or_else(|_| "keys/faucet.json".into());
+    let authority = read_keypair_file(&faucet_key).unwrap_or_else(|_| admin.insecure_clone());
     send(rpc, admin, vec![
         create_ata_idempotent(&admin.pubkey(), to, &mint),
         spl_token::instruction::mint_to(&spl_token::ID, &mint, &ata, &authority.pubkey(), &[], amount).unwrap(),
@@ -434,7 +456,25 @@ fn maybe_retire(rpc: &RpcClient, payer: &Keypair, k: &VaultKeys, v: &VaultState,
     }
     let asset_epoch = pstate::read_asset_control_sequences(&data, v.asset_index as usize).map_err(|e| format!("{e:?}"))?.authority_epoch;
     let market_epoch = pstate::read_asset_control_sequences(&data, 0).map_err(|e| format!("{e:?}"))?.authority_epoch;
-    send(rpc, payer, vec![client::retire_market(k, asset_epoch, market_epoch)], &[])
+    // Percolator only lets a market go that is accrued to the present (LockActive otherwise), and
+    // an idle one is kept some tens of slots behind: the cranks that bring it up to date go in
+    // the same transaction, in front of the retirement.
+    let slot = rpc.get_slot().map_err(|e| e.to_string())?;
+    let (_, g, _) = market_state(rpc, &k.market);
+    let last = g.assets[v.asset_index as usize].slot_last;
+    let cranks = (slot.saturating_sub(last) as usize).div_ceil(10);
+    if cranks > 30 {
+        return Err(format!("not yet: {} slots behind", slot - last));
+    }
+    let hint = percolator_prog::ix::CrankObservationHint { asset_index: v.asset_index, oracle_accounts: 0 };
+    let crank = prog(ProgIx::PermissionlessCrank { now_slot: slot, observations: vec![hint] }, vec![
+        AccountMeta::new(payer.pubkey(), true),
+        AccountMeta::new(k.market, false),
+        AccountMeta::new(v.lp_portfolio, false),
+    ]);
+    let mut ixs = vec![crank; cranks];
+    ixs.push(client::retire_market(k, asset_epoch, market_epoch));
+    send(rpc, payer, ixs, &[])
 }
 
 /// Renews Percolator's time-limited approval of the vault as its portfolio's matcher. A roll renews
@@ -460,6 +500,8 @@ fn retire_idle(rpc: &RpcClient, payer: &Keypair) {
     for (k, v) in all_vaults(rpc) {
         match maybe_retire(rpc, payer, &k, &v, now) {
             Ok(s) => println!("{} asset {}: retired ({s})", k.vault, { v.asset_index }),
+            // RETIRE_LOGS=1 prints the programs' own log lines for a refusal, not only its code.
+            Err(e) if std::env::var("RETIRE_LOGS").is_ok() => println!("{} asset {}: {}", k.vault, { v.asset_index }, e),
             Err(e) => println!("{} asset {}: {}", k.vault, { v.asset_index }, e.lines().next().unwrap_or("")),
         }
     }
@@ -534,7 +576,7 @@ fn keeper(rpc: &RpcClient, payer: &Keypair) {
             // Only canonical markets are kept current while idle (old creator vaults are not).
             let lag = market_state(rpc, &k.market).1.assets.get(v.asset_index as usize)
                 .map(|a| if a.oi_eff_long_q != 0 || a.oi_eff_short_q != 0 { u64::MAX }
-                    else if v.vault_kind == state::KIND_CANONICAL { now.saturating_sub(a.slot_last) } else { 0 })
+                    else if v.vault_kind == state::KIND_CANONICAL && std::env::var("PERCOLATOR_SKIP_IDLE").is_err() { now.saturating_sub(a.slot_last) } else { 0 })
                 .unwrap_or(0);
             if lag > 40 && !queued {
                 if let Err(e) = crank_vault(rpc, payer, &k.market, &v) {
@@ -568,9 +610,9 @@ fn keeper(rpc: &RpcClient, payer: &Keypair) {
             // trades that reduce its position, so a flat vault with requests is rolled on the first
             // pass after its epoch ends. A roll fails while the vault holds a position, and one
             // with no requests is not urgent: those are retried every 10th pass.
-            // Once the epoch is overdue by a full epoch the vault may close its own position
+            // Once the epoch is overdue by `UNWIND_GRACE_EPOCHS` epochs the vault may close its own position
             // (Unwind), so that is urgent as well.
-            let overdue = now >= v.epoch_start_slot + 2 * v.epoch_len_slots;
+            let overdue = now >= percolator_vault::processor::unwind_allowed_slot(&v);
             // With a position open the epoch is settled through the router (the executor queues
             // it); the keeper only rolls flat vaults, and unwinds one that has to get flat.
             let has_requests = v.pending_deposit_assets != 0 || v.pending_withdraw_shares != 0;

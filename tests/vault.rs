@@ -1,5 +1,9 @@
 //! End-to-end flows: the vault and the production Percolator binary in LiteSVM.
 
+#![recursion_limit = "256"]
+// These flows publish Pyth updates; an X1 build has its own tests (x1.rs).
+#![cfg(not(feature = "x1"))]
+
 mod common;
 use common::*;
 #[allow(unused_imports)]
@@ -558,20 +562,25 @@ fn export_layout_for_frontend() {
             "side": offset_of!(percolator::PortfolioLegV16Account, side),
             "active": offset_of!(percolator::PortfolioLegV16Account, active),
             "kf_epoch_snap": offset_of!(percolator::PortfolioLegV16Account, kf_epoch_snap),
+            "k_snap": offset_of!(percolator::PortfolioLegV16Account, k_snap),
             "a_basis": offset_of!(percolator::PortfolioLegV16Account, a_basis),
             "epoch_snap": offset_of!(percolator::PortfolioLegV16Account, epoch_snap)
         },
         "router": {
             "program": percolator_router::id().to_string(),
-            "book": f!(percolator_router::state::Book, 0, vault, len, mark_publish_time, mark_prev_publish_time, mark_price, next_id, forfeited_bonds, pending_id, pending_target),
+            "book": f!(percolator_router::state::Book, 0, vault, len, mark_set_time, mark_publish_time, mark_prev_publish_time, mark_price, next_id, forfeited_bonds, pending_id, pending_target),
             "book_len": size_of::<percolator_router::state::Book>(),
-            "request": f!(percolator_router::state::Request, 0, vault, wallet, id, size, target_time, created_slot, kind),
+            "request": f!(percolator_router::state::Request, 0, vault, wallet, id, size, target_time, created_slot, kind, order_index),
+            "order": f!(percolator_router::state::Order, 0, vault, wallet, index, kind, reduce_only, side, size, trigger, peak, slice, interval, next_time, expiry, queued_id),
+            "order_len": size_of::<percolator_router::state::Order>(),
+            "max_orders": percolator_router::state::MAX_ORDERS,
             "request_len": size_of::<percolator_router::state::Request>(),
             "trader": f!(percolator_router::state::TraderState, 0, market, wallet, portfolio, collateral, has_pending, pending_vault, pending_id),
             "trader_len": size_of::<percolator_router::state::TraderState>(),
             "max_pending": percolator_router::state::MAX_PENDING,
             "delay_secs": percolator_router::DELAY_SECS,
             "grace_secs": percolator_router::GRACE_SECS,
+            "stall_secs": percolator_router::STALL_SECS,
             "stress_bps": percolator_router::STRESS_BPS as u64,
             "liquidation_bps": percolator_router::LIQUIDATION_BPS as u64,
             "reserve_bps": percolator_vault::processor::RESERVE_BPS,
@@ -595,6 +604,8 @@ fn export_layout_for_frontend() {
             "lifecycle": offset_of!(percolator::AssetStateV16Account, lifecycle),
             "raw_oracle_target_price": offset_of!(percolator::AssetStateV16Account, raw_oracle_target_price),
             "kf_epoch_long": offset_of!(percolator::AssetStateV16Account, kf_epoch_long),
+            "k_long": offset_of!(percolator::AssetStateV16Account, k_long),
+            "k_short": offset_of!(percolator::AssetStateV16Account, k_short),
             "kf_epoch_short": offset_of!(percolator::AssetStateV16Account, kf_epoch_short),
             "a_long": offset_of!(percolator::AssetStateV16Account, a_long),
             "a_short": offset_of!(percolator::AssetStateV16Account, a_short),

@@ -15,7 +15,7 @@ export const BurnerName = "Devnet Burner" as WalletName<"Devnet Burner">;
 const ICON =
   "data:image/svg+xml;base64," +
   btoa(
-    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="#5b7cf0"/><path d="M16 5c2 5 7 7 7 13a7 7 0 0 1-14 0c0-3 2-5 3-7 1 2 2 3 3 3-1-4 0-7 1-9z" fill="#fff"/></svg>`,
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="#E15A48"/><path d="M16 5c2 5 7 7 7 13a7 7 0 0 1-14 0c0-3 2-5 3-7 1 2 2 3 3 3-1-4 0-7 1-9z" fill="#fff"/></svg>`,
   );
 
 function loadKeypair(): Keypair {

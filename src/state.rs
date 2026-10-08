@@ -122,7 +122,10 @@ pub struct VaultState {
     /// The matcher refuses every other fill, so trades can only happen through the router.
     pub armed_size: i128,
     pub armed_slot: u64,
-    pub _reserved: [u8; 8],
+    /// Slot at which `needs_flat` was set (0 while it is clear, and for a vault flagged before
+    /// this field existed). The grace before `Unwind` runs from here: an epoch only ends once
+    /// someone has a request in it, so it may already be many epochs old when it is flagged.
+    pub flat_required_slot: u64,
 }
 
 pub const VAULT_STATE_LEN: usize = core::mem::size_of::<VaultState>();

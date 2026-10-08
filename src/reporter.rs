@@ -11,11 +11,13 @@ use solana_program::{account_info::AccountInfo, pubkey::Pubkey};
 
 use crate::{error::VaultError, pyth::PriceUpdate, ROUTER_PROGRAM_ID};
 
-/// The key allowed to post prices. Deployments use the operator's reporter key; the default
-/// build (tests) uses a fixed test key (the ed25519 key of seed `[42; 32]`).
-#[cfg(any(feature = "devnet", feature = "x1"))]
+/// The key allowed to post prices. Deployments (the `devnet` feature, which also compiles in the
+/// deployed Percolator id; an X1 deployment is `devnet,x1`) use the operator's reporter key.
+/// Test builds, with or without `x1`, use a fixed test key (the ed25519 key of seed `[42; 32]`);
+/// they talk to the test harness's Percolator id and cannot run on a real chain.
+#[cfg(feature = "devnet")]
 pub const REPORTER: Pubkey = solana_program::pubkey!("9KhhASTNPmDGy1M2TeLRhEEbFUzy8wgTz9g4cijViXuk");
-#[cfg(not(any(feature = "devnet", feature = "x1")))]
+#[cfg(not(feature = "devnet"))]
 pub const REPORTER: Pubkey = solana_program::pubkey!("2iXtA8oeZqUU5pofxK971TCEvFGfems2AcDRaZHKD2pQ");
 /// How long a queued request's target must have passed without a Pyth price before a reported
 /// price may serve it (Solana builds).

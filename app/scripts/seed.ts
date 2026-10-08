@@ -10,8 +10,12 @@ import * as C from "../src/chain";
 
 const conn = new Connection(process.env.RPC ?? C.RPC_URL, { commitment: "confirmed", disableRetryOnRateLimit: true, fetch: C.politeFetch() });
 const KEYS = "../keys/seed";
-const deployer = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(`${process.env.HOME}/.config/solana/percolator-test/deployer.json`, "utf8"))));
-const faucet = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync("../keys/faucet.json", "utf8"))));
+// On X1 testnet (NETWORK=x1-testnet) the deploy wallet is another one, and it is the test USDC's
+// mint authority until a faucet key (keys/x1-faucet.json) takes that over.
+const read = (p: string) => Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(p, "utf8"))));
+const deployer = read(process.env.KEYPAIR ?? `${process.env.HOME}/.config/solana/${C.X1 ? "percolator-x1" : "percolator-test"}/deployer.json`);
+const faucetKey = process.env.FAUCET_KEY ?? (C.X1 ? "../keys/x1-faucet.json" : "../keys/faucet.json");
+const faucet = fs.existsSync(faucetKey) ? read(faucetKey) : deployer;
 const wallet = (name: string) => {
   const p = `${KEYS}/${name}.json`;
   if (!fs.existsSync(p)) fs.writeFileSync(p, JSON.stringify(Array.from(Keypair.generate().secretKey)));
@@ -36,7 +40,7 @@ async function confirmed(sig: string) {
 async function send(label: string, kp: Keypair, ixs: TransactionInstruction[], extra: Keypair[] = []) {
   for (let i = 0; i < 3; i++) {
     try {
-      const sig = await conn.sendTransaction(new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }), ...ixs), [kp, ...extra]);
+      const sig = await conn.sendTransaction(new Transaction().add(await C.computeLimit(conn, kp.publicKey, ixs), ...ixs), [kp, ...extra]);
       await confirmed(sig);
       console.log("ok  ", label);
       return true;
@@ -57,7 +61,7 @@ async function fund(kp: Keypair, usdc: number, sol: number) {
   ];
   const bal = await conn.getBalance(kp.publicKey);
   if (bal < sol * LAMPORTS_PER_SOL) ixs.push(SystemProgram.transfer({ fromPubkey: deployer.publicKey, toPubkey: kp.publicKey, lamports: Math.round(sol * LAMPORTS_PER_SOL) - bal }));
-  await send(`fund ${kp.publicKey.toBase58().slice(0, 6)}`, deployer, ixs, [faucet]);
+  await send(`fund ${kp.publicKey.toBase58().slice(0, 6)}`, deployer, ixs, faucet === deployer ? [] : [faucet]);
 }
 
 async function openMarket(sym: string) {
@@ -70,7 +74,7 @@ async function openMarket(sym: string) {
   const v = C.decodeVault(vault, new Uint8Array((await conn.getAccountInfo(vault))!.data));
   if (v.status === 0) {
     const m = await C.fetchMarket(conn);
-    const pyth = C.decodePyth(new Uint8Array((await conn.getAccountInfo(C.feedAccount(f.id)))!.data));
+    const pyth = C.decodePrice(new Uint8Array((await conn.getAccountInfo(C.priceAccount(f.id)))!.data));
     await send(`open ${sym}: list`, LP, [C.listAsset(LP.publicKey, vault, f.id, m.listSlot, m.nextMarketId, pyth.e6)]);
   }
   if (!(await conn.getAccountInfo(C.bookAddress(vault)))) await send(`open ${sym}: router book`, LP, [C.openBook(LP.publicKey, vault)]);
@@ -78,10 +82,17 @@ async function openMarket(sym: string) {
 }
 
 async function setup() {
-  await fund(LP, 20_000, 0.6);
+  // On X1 every market the price service has is opened (about 0.12 XNT of rent each).
+  const deposits: Record<string, number> = C.X1 ? Object.fromEntries(C.FEEDS.map(f => [f.symbol, 3_000])) : { SOL: 6_000, BTC: 6_000, ETH: 5_000 };
+  await fund(LP, C.X1 ? 80_000 : 20_000, C.X1 ? 3.5 : 0.6);
   for (const t of TRADERS) await fund(t, 3_000, 0.3);
-  const deposits: Record<string, number> = { SOL: 6_000, BTC: 6_000, ETH: 5_000 };
   for (const [sym, amt] of Object.entries(deposits)) {
+    // A market can only be listed at a price posted in the last few minutes (the executor's job).
+    if (!(await conn.getAccountInfo(C.canonicalVaultAddress(C.FEEDS.find(x => x.symbol === sym)!.id)).then(a => a && C.decodeVault(C.MARKET, new Uint8Array(a.data)).status !== 0))) {
+      const pa = await conn.getAccountInfo(C.priceAccount(C.FEEDS.find(x => x.symbol === sym)!.id));
+      const age = pa ? Date.now() / 1000 - C.decodePrice(new Uint8Array(pa.data)).publish : Infinity;
+      if (age > 240) { console.log(`skip ${sym}: no recent price to list at (${pa ? Math.round(age) + " s old" : "none posted"})`); continue; }
+    }
     const vault = await openMarket(sym);
     const s = await C.fetchVault(conn, vault, LP.publicKey);
     const t = s.ticket;
@@ -106,7 +117,7 @@ async function trade(kp: Keypair, sym: string, size: number) {
   if (!s.book) { console.log(`skip ${sym}: no router book`); return; }
   const q = BigInt(Math.round(size * 1e6));
   const label = `${kp.publicKey.toBase58().slice(0, 6)} ${size > 0 ? "long" : "short"} ${Math.abs(size)} ${sym}`;
-  if (!(await send(`queue ${label}`, kp, [C.requestTrade(kp.publicKey, vault, s.book.nextId, q)]))) return;
+  if (!(await send(`queue ${label}`, kp, [C.requestTrade(kp.publicKey, vault, q)]))) return;
   for (let i = 0; i < 60; i++) {
     await sleep(3000);
     const t = await conn.getAccountInfo(C.traderAddress(kp.publicKey)).catch(() => null);

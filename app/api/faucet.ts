@@ -1,14 +1,14 @@
-// Devnet faucet: mints test USDC (and a little SOL for fees and rent) to a wallet.
-// FAUCET_SECRET holds the faucet keypair (JSON byte array); it is the test USDC mint authority.
+// Faucet: mints test USDC (and a little SOL, or XNT on X1 testnet, for fees and rent) to a wallet.
+// FAUCET_SECRET (FAUCET_SECRET_X1 for X1) holds the faucet keypair (JSON byte array); it is that
+// network's test USDC mint authority.
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import { createAssociatedTokenAccountIdempotentInstruction, createMintToInstruction, getAssociatedTokenAddressSync } from "@solana/spl-token";
-// Test USDC mint of the devnet market (deploy/devnet.json: collateral_mint).
-const TEST_USDC_MINT = "FT7B8rR8NN1ciyGPmTDT8AxUUWtF1PGc4NCmuisYVPkh";
+import { networkOf } from "./_config.js";
 
 const USDC = 1_000_000;
 const DRIP_USDC = 1_000;
 const MAX_HELD_USDC = 5_000;
-const DRIP_SOL = 0.3; // enough to launch a market (~0.12) or open a trading account (~0.07)
+// The coin drip (0.3) is enough to launch a market (~0.12) or open a trading account (~0.07).
 
 export default async function handler(req: any, res: any) {
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
@@ -18,11 +18,13 @@ export default async function handler(req: any, res: any) {
   } catch {
     return res.status(400).json({ error: "invalid address" });
   }
-  const secret = process.env.FAUCET_SECRET;
+  const net = networkOf(req);
+  const DRIP_SOL = net.drip;
+  const secret = process.env[net.faucetSecret];
   if (!secret) return res.status(500).json({ error: "faucet not configured" });
   const faucet = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(secret)));
-  const conn = new Connection(process.env.RPC_URL ?? "https://api.devnet.solana.com", "confirmed");
-  const mint = new PublicKey(TEST_USDC_MINT);
+  const conn = new Connection(net.rpc, "confirmed");
+  const mint = new PublicKey(net.mint);
   const ata = getAssociatedTokenAddressSync(mint, to);
 
   const held = await conn.getTokenAccountBalance(ata).then(b => Number(b.value.amount) / USDC).catch(() => 0);
@@ -33,12 +35,12 @@ export default async function handler(req: any, res: any) {
     createAssociatedTokenAccountIdempotentInstruction(faucet.publicKey, ata, to, mint),
     createMintToInstruction(mint, ata, faucet.publicKey, BigInt(DRIP_USDC * USDC)),
   );
-  const sendSol = sol < 0.2;
+  const sendSol = sol < net.lowWater;
   if (sendSol) tx.add(SystemProgram.transfer({ fromPubkey: faucet.publicKey, toPubkey: to, lamports: DRIP_SOL * LAMPORTS_PER_SOL }));
   try {
     const sig = await conn.sendTransaction(tx, [faucet]);
     await conn.confirmTransaction(sig, "confirmed");
-    return res.status(200).json({ usdc: DRIP_USDC, sol: sendSol ? DRIP_SOL : 0, sig });
+    return res.status(200).json({ usdc: DRIP_USDC, sol: sendSol ? DRIP_SOL : 0, coin: net.coin, sig });
   } catch (e: any) {
     return res.status(500).json({ error: e.message ?? String(e) });
   }

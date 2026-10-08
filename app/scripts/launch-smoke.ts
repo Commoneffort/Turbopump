@@ -8,7 +8,7 @@ const sym = process.argv[3] ?? "BTC";
 const conn = new Connection(process.env.RPC ?? C.RPC_URL, "confirmed");
 const send = async (label: string, ixs: TransactionInstruction[]) => {
   try {
-    const sig = await conn.sendTransaction(new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_000_000 }), ...ixs), [kp]);
+    const sig = await conn.sendTransaction(new Transaction().add(await C.computeLimit(conn, kp.publicKey, ixs), ...ixs), [kp]);
     await conn.confirmTransaction(sig, "confirmed");
     console.log("ok  ", label, sig.slice(0, 20));
     return true;
@@ -21,7 +21,7 @@ const send = async (label: string, ixs: TransactionInstruction[]) => {
   await send(`create ${sym} vault ${vault.toBase58()}`, [C.initVault(kp.publicKey, feed.id, m.nextMarketId).ix]);
   await send(`create a SECOND ${sym} vault (must fail)`, [C.initVault(kp.publicKey, feed.id, m.nextMarketId).ix]);
   const m2 = await C.fetchMarket(conn);
-  const pyth = C.decodePyth(new Uint8Array((await conn.getAccountInfo(C.feedAccount(feed.id)))!.data));
+  const pyth = C.decodePrice(new Uint8Array((await conn.getAccountInfo(C.priceAccount(feed.id)))!.data));
   await send(`list ${sym}`, [C.listAsset(kp.publicKey, vault, feed.id, m2.slots, m2.nextMarketId, pyth.e6)]);
   const s = await C.fetchVault(conn, vault, kp.publicKey);
   console.log("canonical", s.vault.canonical, "status", s.vault.status, "epochLen", s.vault.epochLen.toString(), "navBps", s.vault.positionNavBps, s.vault.fillNavBps, "asset", s.vault.assetIndex, "price", s.asset.price.toString());
