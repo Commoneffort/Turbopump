@@ -17,7 +17,7 @@ running() { [ -f $PID ] && kill -0 -- "-$(cat $PID)" 2>/dev/null; }
 case "$2" in
   start)
     if ! running; then
-      (cd app && NETWORK=$NET RPC=$RPC BOT_PACE_SECS=$PACE setsid sh -c "echo \$\$ > ../$PID; exec npx tsx scripts/bots.ts run $SYMBOLS" >> ../deploy/logs/$NAME.log 2>&1 < /dev/null &)
+      (cd app && NETWORK=$NET RPC=$RPC BOT_PACE_SECS=$PACE setsid sh -c "echo \$\$ > ../$PID; while :; do npx tsx scripts/bots.ts run $SYMBOLS; echo \"\$(date -u +%T) restart: $NAME exited with status \$?, starting them again in 30 s\"; sleep 30; done" >> ../deploy/logs/$NAME.log 2>&1 < /dev/null &)
     fi
     sleep 2; "$0" "$1" status ;;
   stop) if running; then kill -- "-$(cat $PID)"; echo "$NAME stopped"; fi; rm -f $PID ;;

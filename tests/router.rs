@@ -60,6 +60,9 @@ fn a_trade_fills_at_the_first_pyth_price_after_its_target_and_nothing_else() {
     w.trader(0);
     let equity0 = equity(&w, 0);
 
+    // (The mark is a minute old: the price band takes the moves below.)
+    let now = w.clock_ts();
+    at(&mut w, now + 60);
     // The trader "knows" the real price is 1.10 while the mark still says 1.00, and buys.
     let id = w.request(0, size).unwrap();
     let target = w.request_target(id);
@@ -67,7 +70,7 @@ fn a_trade_fills_at_the_first_pyth_price_after_its_target_and_nothing_else() {
 
     // Before the target: the mark can move forward, but the request cannot fill yet.
     at(&mut w, target - 2);
-    let before = w.next_pyth(1.max(target - 2 - w.pyth_time), 1_050_000);
+    let before = w.next_pyth(1.max(target - 2 - w.pyth_time), 1_080_000);
     w.advance_to(before).unwrap();
     w.converge();
     expect(w.fill(0, id), router_code(RouterError::NotAtTarget));
@@ -455,6 +458,37 @@ fn a_trader_below_the_liquidation_level_is_closed_against_the_vault() {
     w.taker_trade(1, UNIT as i128).unwrap();
 }
 
+/// The mark's circuit breaker: a price further from the mark than a market moves in the time
+/// between the two is refused, a real move that large is accepted once that time has passed.
+#[test]
+fn a_price_too_far_from_the_mark_for_the_time_passed_is_refused() {
+    use percolator_router::{within_band, BAND_BASE_BPS, BAND_PER_SEC_BPS};
+    assert_eq!((BAND_BASE_BPS, BAND_PER_SEC_BPS), (200, 50));
+    assert!(within_band(0, 5, 0), "a book's first mark");
+    assert!(within_band(1_000_000, 1_025_000, 1) && !within_band(1_000_000, 1_025_001, 1));
+    assert!(within_band(1_000_000, 975_000, 1) && !within_band(1_000_000, 974_999, 1));
+    assert!(!within_band(1_000_000, 500_000, 95) && within_band(1_000_000, 500_000, 96));
+
+    let mut w = live();
+    w.taker_trade(0, UNIT as i128).unwrap();
+    let b = w.book();
+    let (t0, p0) = (b.mark_publish_time, b.mark_price);
+    at(&mut w, t0 + 10);
+    // 30% away one second later: a broken feed, not a market.
+    let wild = w.pyth_update(p0 * 13 / 10, t0 + 1, t0);
+    expect(w.advance_to(wild), router_code(RouterError::PriceBand));
+    assert_eq!({ w.book().mark_price }, p0);
+    // 2.5% in that second is the most it takes.
+    let edge = w.pyth_update(p0 * 1_025 / 1_000, t0 + 1, t0);
+    w.advance_to(edge).unwrap();
+    let p1 = { w.book().mark_price };
+    // A real crash of 30% is taken a minute later (2% + 60 x 0.5% = 32%).
+    at(&mut w, t0 + 70);
+    let crash = w.pyth_update(p1 * 7 / 10, t0 + 61, t0 + 1);
+    w.advance_to(crash).unwrap();
+    assert_eq!({ w.book().mark_price }, p1 * 7 / 10);
+}
+
 /// A trader has one place in the queue, so while a request of its own waits nobody can queue its
 /// liquidation. An account below the level could keep itself out of reach that way for as long
 /// as it kept sending small requests (filling them itself returns the bond). So the fill of any
@@ -583,6 +617,9 @@ fn a_request_the_account_cannot_afford_at_its_price_ends_without_trading() {
     w.send(vec![rclient::open_account(&t, &mint), rclient::deposit(&t, &u.collateral, &w.env.vault, 5_000_000)], &[&u.kp]).unwrap();
     w.traders.insert(7, (u, t));
     w.taker_trade(7, 10 * UNIT as i128).unwrap();
+    // (Two minutes pass, so that the price band takes the fall below.)
+    let now = w.clock_ts();
+    at(&mut w, now + 120);
     let id = w.request(7, 12 * UNIT as i128).unwrap(); // twelve more, while it still can
     let behind = w.request(1, UNIT as i128).unwrap(); // someone else, queued behind it
     // Its price turns out to be 0.60: 1 USDC of equity is 16.7% of the 6 it holds (above the

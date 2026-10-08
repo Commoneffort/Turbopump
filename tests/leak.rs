@@ -50,7 +50,7 @@ fn stray(w: &World) -> i128 {
 /// Moves the mark and Percolator's price to `price`, settling nobody.
 fn move_unsettled(w: &mut World, price: u64) {
     w.tick(20);
-    let secs = (w.clock_ts() - w.pyth_time).max(1);
+    let secs = w.band_secs(price);
     let u = w.next_pyth(secs, price);
     w.advance_to(u).expect("advance mark");
     walk(w);

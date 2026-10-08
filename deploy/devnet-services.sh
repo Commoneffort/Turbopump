@@ -2,6 +2,8 @@
 # Starts, stops or shows the two Solana devnet services (executor and keeper). Each one's process
 # group id is kept in deploy/logs/, so stopping never has to search the process list by name.
 #   deploy/devnet-services.sh start | stop | status | restart-executor
+# A service that exits (a crash, or the executor's own watchdog) is started again after 5 s;
+# `stop` ends the restart loop with it.
 cd "$(dirname "$0")/.."
 RPC=${DEVNET_RPC:-https://api.devnet.solana.com}
 mkdir -p deploy/logs
@@ -10,10 +12,10 @@ stop() { if running $1; then kill -- "-$(cat deploy/logs/$1.pid)"; echo "$1 stop
 case "$1" in
   start)
     if ! running devnet-executor; then
-      (cd app && RPC=$RPC setsid sh -c 'echo $$ > ../deploy/logs/devnet-executor.pid; exec npx tsx scripts/executor.ts' >> ../deploy/logs/executor.log 2>&1 < /dev/null &)
+      (cd app && RPC=$RPC setsid sh -c 'echo $$ > ../deploy/logs/devnet-executor.pid; while :; do npx tsx scripts/executor.ts; echo "$(date -u +%T) restart: devnet-executor exited with status $?, starting it again in 5 s"; sleep 5; done' >> ../deploy/logs/executor.log 2>&1 < /dev/null &)
     fi
     if ! running devnet-keeper; then
-      (DEVNET_RPC=$RPC setsid sh -c 'echo $$ > deploy/logs/devnet-keeper.pid; exec deploy/devnet-tool keeper' >> deploy/logs/keeper.log 2>&1 < /dev/null &)
+      (DEVNET_RPC=$RPC setsid sh -c 'echo $$ > deploy/logs/devnet-keeper.pid; while :; do deploy/devnet-tool keeper; echo "$(date -u +%T) restart: devnet-keeper exited with status $?, starting it again in 5 s"; sleep 5; done' >> deploy/logs/keeper.log 2>&1 < /dev/null &)
     fi
     sleep 2
     "$0" status

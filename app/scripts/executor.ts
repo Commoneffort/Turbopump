@@ -882,6 +882,18 @@ async function refreshUnlistedFeeds(listed: Set<string>) {
   }
 }
 
+// Watchdog: the loop below ends every pass by noting the time. If no pass has ended for three
+// minutes the process is stuck in a way no time limit caught (it froze for 8.5 minutes on
+// 2026-10-08 with trades waiting); it exits, and the service script starts it again.
+let lastPass = Date.now();
+const WATCHDOG_MS = Number(process.env.WATCHDOG_SECS ?? 180) * 1000;
+setInterval(() => {
+  if (Date.now() - lastPass > WATCHDOG_MS) {
+    log("watchdog", `no pass finished for ${Math.round((Date.now() - lastPass) / 1000)} s: exiting to be restarted`);
+    process.exit(3);
+  }
+}, 10_000).unref();
+
 (async () => {
   log("executor", payer.publicKey.toBase58(), "router", C.ROUTER.toBase58(), "prices:", ORACLE === "jack" ? `${JACK} (reported)` : `Pyth via ${HERMES}${reporter ? `, fallback ${JACK} (reported)` : ""}`);
   let lastStats = Date.now();
@@ -973,6 +985,7 @@ async function refreshUnlistedFeeds(listed: Set<string>) {
     } catch (e: any) {
       log("error", String(e?.message ?? e).slice(0, 140));
     }
+    lastPass = Date.now();
     await new Promise(r => setTimeout(r, waiting ? (C.X1 ? 200 : 500) : 1500));
   }
 })();

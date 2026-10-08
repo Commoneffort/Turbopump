@@ -88,6 +88,25 @@ const POS_SCALE: u128 = 1_000_000;
 /// otherwise keep the queue full of small trades and never be reached.
 pub const RESERVED_PENDING: usize = 4;
 
+/// Circuit breaker on the mark. A new mark may differ from the one before it by at most
+/// `BAND_BASE_BPS` plus `BAND_PER_SEC_BPS` for every second between the two prices' publish
+/// times. A price further away than any market moves in that time (a broken feed, a wrong price
+/// from the reporter) is refused; a real move that large is accepted once enough time has
+/// passed, so the mark is held back for seconds, never stopped. While it is held back nothing
+/// fills on that market, and a request whose own price is refused expires.
+pub const BAND_BASE_BPS: u128 = 200;
+pub const BAND_PER_SEC_BPS: u128 = 50;
+
+/// Whether `price`, published `secs` after the mark `last`, is within the band around it.
+pub fn within_band(last: u64, price: u64, secs: i64) -> bool {
+    if last == 0 {
+        return true; // the first mark of a book
+    }
+    let allowed_bps = BAND_BASE_BPS.saturating_add(BAND_PER_SEC_BPS.saturating_mul(secs.max(0) as u128));
+    let diff = (price as u128).abs_diff(last as u128);
+    diff.saturating_mul(10_000) <= (last as u128).saturating_mul(allowed_bps)
+}
+
 pub const TAG_OPEN_ACCOUNT: u8 = 0;
 pub const TAG_DEPOSIT: u8 = 1;
 pub const TAG_WITHDRAW: u8 = 2;
@@ -163,6 +182,8 @@ pub enum RouterError {
     NameTaken,
     /// `TriggerCopy` on a follower whose position is already in line with its leader's.
     InLine,
+    /// A price too far from the mark for the time that has passed since it (see `within_band`).
+    PriceBand,
 }
 
 impl From<RouterError> for ProgramError {
@@ -1082,6 +1103,9 @@ fn advance(program_id: &Pubkey, accounts: &[AccountInfo], observation_sequence: 
         if earliest <= u.publish_time && !u.is_first_at_or_after(earliest) {
             return Err(RouterError::WrongUpdate.into());
         }
+    }
+    if !within_band(b.mark_price, price, u.publish_time.saturating_sub(b.mark_publish_time)) {
+        return Err(RouterError::PriceBand.into());
     }
     let mut data = vec![TAG_PUSH_MARK];
     data.extend_from_slice(&price.to_le_bytes());

@@ -234,10 +234,25 @@ impl World {
         self.move_price(slots, (price as u64) / 100);
     }
 
+    /// How many seconds after the last Pyth update the next one, at `price_e6`, has to be for the
+    /// router's price band to take it (a move is only accepted after the time a market needs for
+    /// it); the clock is moved forward to that time if it is not there yet.
+    pub fn band_secs(&mut self, price_e6: u64) -> i64 {
+        let last = { self.book().mark_price };
+        let bps = if last == 0 { 0 } else { (price_e6 as i128 - last as i128).unsigned_abs() * 10_000 / last as u128 };
+        let need = if bps > 200 { ((bps - 200) / 50 + 2) as i64 } else { 1 };
+        let secs = (self.clock_ts() - self.pyth_time).max(need);
+        if self.pyth_time + secs > self.clock_ts() {
+            let slot = self.env.current_slot() + 1;
+            self.env.set_clock(slot, self.pyth_time + secs);
+        }
+        secs
+    }
+
     /// Moves time forward by `slots`, then the mark to `price_e6` (a fresh Pyth update), converged.
     pub fn move_price(&mut self, slots: u64, price_e6: u64) {
         self.tick(slots);
-        let secs = (self.clock_ts() - self.pyth_time).max(1);
+        let secs = self.band_secs(price_e6);
         let u = self.next_pyth(secs, price_e6);
         self.advance_to(u).expect("advance mark");
         self.converge();

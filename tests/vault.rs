@@ -181,6 +181,70 @@ fn e2e_create_deposit_trade_roll_withdraw() {
 }
 
 
+
+/// A provider who leaves is paid its part of the fees that have not been collected from
+/// Percolator yet, out of the vault's cash. (Before, it gave that part to those who stayed;
+/// collecting fees is refused by Percolator much of the time, so it was not a small part.)
+/// The last one out is paid what cash there is: the roll never waits for a collection.
+#[test]
+fn a_provider_who_leaves_is_paid_its_part_of_uncollected_fees() {
+    let mut w = World::new();
+    w.env.set_clock(5, 1_000);
+    w.env.update_market_init_fee_policy(LISTING_FEE as u128).unwrap();
+    w.env.update_trade_fee_policy(10).unwrap();
+    w.create_vault(operate_params(2)).unwrap();
+    let lister = w.new_user(10_000_000);
+    let pyth = w.env.set_pyth_price(&FEED, 100_000_000, -8, 0, 1_000);
+    w.list_asset(&lister, pyth).unwrap();
+    let asset = w.vault_state().asset_index as usize;
+    let (alice, bob) = (w.new_user(100_000_000), w.new_user(100_000_000));
+    w.deposit(&alice, 50_000_000).unwrap();
+    w.deposit(&bob, 50_000_000).unwrap();
+    let mut ts = 1_000i64;
+    w.advance_oracle(pyth, EPOCH_LEN, &mut ts, 100_000_000);
+    w.roll().unwrap();
+    w.claim(&alice, 0).unwrap();
+    w.claim(&bob, 0).unwrap();
+    let unit = UNIT as i128;
+    for i in 0..6 {
+        w.advance_oracle(pyth, 2, &mut ts, 100_000_000);
+        w.taker_trade_asset(0, asset as u16, if i % 2 == 0 { 10 * unit } else { -10 * unit }).unwrap();
+    }
+    let uncollected = {
+        let data = w.env.market_data(false);
+        let base = perc::MARKET_SLOTS_OFF + asset * perc::MARKET_ASSET_SLOT_LEN + 512;
+        let rd = |o: usize| u128::from_le_bytes(data[base + o..base + o + 16].try_into().unwrap());
+        (rd(515) + rd(531) - rd(547) - rd(563)) as u64 - 10_000
+    };
+    println!("uncollected {uncollected}");
+    let providers_part = uncollected - uncollected / 10; // the opener's tenth is not theirs
+
+    // Alice leaves with nothing collected: half the vault, and half the providers' fees.
+    // (The vault paid its own side of the trade fees, so it is worth a little under 100.)
+    let nav = w.nav();
+    w.withdraw(&alice, w.tokens(alice.shares)).unwrap();
+    w.advance_oracle(pyth, EPOCH_LEN, &mut ts, 100_000_000);
+    w.roll().unwrap();
+    let before = w.tokens(alice.collateral);
+    w.claim(&alice, 1).unwrap();
+    let paid = w.tokens(alice.collateral) - before;
+    let fair = nav / 2 + providers_part / 2;
+    assert!(paid > nav / 2 + 40_000, "more than half the vault without the fees");
+    assert!(paid <= fair && paid + 200 >= fair, "paid {paid}, fair {fair}");
+
+    // Bob, the last one out, is owed more than the cash that is left (his part of the fees is
+    // still in Percolator): he is paid the cash, and the roll goes through.
+    let left = w.nav();
+    w.withdraw(&bob, w.tokens(bob.shares)).unwrap();
+    w.advance_oracle(pyth, EPOCH_LEN, &mut ts, 100_000_000);
+    w.roll().unwrap();
+    let before = w.tokens(bob.collateral);
+    w.claim(&bob, 2).unwrap();
+    let paid = w.tokens(bob.collateral) - before;
+    println!("bob: paid {paid}, the vault held {left}");
+    assert!(paid <= left && paid + 200 >= left, "paid {paid} of {left}");
+}
+
 #[test]
 fn e2e_operate_mode_lists_asset_and_harvests_fees() {
     let mut w = World::new();

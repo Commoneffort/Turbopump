@@ -1062,9 +1062,6 @@ fn roll_epoch(program_id: &Pubkey, accounts: &[AccountInfo], frontier: u64) -> P
     };
     let supply = mint_supply(share_mint)?;
     let w = v.pending_withdraw_shares;
-    let assets_out = math::assets_for_shares(w, nav_low, supply)?;
-    let supply_after_burn = sub(supply, w)?;
-    let nav_after_out_low = sub(nav_low, assets_out)?;
     // Fees sitting in the vault's asset insurance above the floor belong to current holders too;
     // counting them in the deposit price stops a deposit from buying into them at a discount.
     // Only the depositors' part: the opener's cut of those fees will not belong to the pool.
@@ -1074,6 +1071,17 @@ fn roll_epoch(program_id: &Pubkey, accounts: &[AccountInfo], frontier: u64) -> P
     } else {
         0
     };
+    // A provider who leaves is paid its part of those fees as well. They are not in the buffer
+    // yet (Percolator only releases them from a healthy, current asset, and a roll must not
+    // depend on that), so that part is paid from the vault's cash, as far as the cash goes, and
+    // those who stay keep the whole of the uncollected fees in exchange. Without the fees the
+    // price is the one it always was, so a roll that could settle still can. (Before, whoever
+    // left gave its part of every uncollected fee to those who stayed.)
+    let base_out = math::assets_for_shares(w, nav_low, supply)?;
+    let with_fees = math::assets_for_shares(w, nav_low.saturating_add(pending_fees), supply)?;
+    let assets_out = with_fees.min(base_out.max(cash));
+    let supply_after_burn = sub(supply, w)?;
+    let nav_after_out_low = sub(nav_low, assets_out)?;
     let nav_high = nav_after_out_low
         .saturating_add(unrealized)
         .saturating_add(pending_fees);

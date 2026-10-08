@@ -124,6 +124,9 @@ fn a_trade_fills_at_the_first_reported_price_after_its_target_and_nothing_else()
     let size = 10 * UNIT as i128;
     w.trader(0);
     let equity0 = equity(&w, 0);
+    // (The mark is a minute old: the price band takes the moves below.)
+    let now = w.clock_ts();
+    at(&mut w, now + 60);
     let id = w.request(0, size).unwrap();
     let target = w.request_target(id);
     let last = w.pyth_time;
@@ -142,15 +145,15 @@ fn a_trade_fills_at_the_first_reported_price_after_its_target_and_nothing_else()
     expect(w.advance_to(late), router_code(RouterError::WrongUpdate));
 
     // The first price at or after the target is the fill price.
-    let first = w.post_report(&reporter_kp, 1_200_000, target + 4, target - 1).unwrap();
+    let first = w.post_report(&reporter_kp, 1_140_000, target + 4, target - 1).unwrap();
     w.advance_to(first).unwrap();
-    w.price = 1_200_000;
+    w.price = 1_140_000;
     w.pyth_time = target + 4;
     w.converge();
     w.fill(0, id).unwrap();
     assert_eq!(position(&w, 0), size);
-    // Bought at 1.20: no gain from the 1.10 and 1.30 prices that were never the trade's price.
-    w.move_price(5, 1_200_000);
+    // Bought at 1.14: no gain from the 1.10 and 1.30 prices that were never the trade's price.
+    w.move_price(5, 1_140_000);
     assert!(equity(&w, 0) <= equity0, "the trader paid fees and gained nothing: {} -> {}", equity0, equity(&w, 0));
     // The round trip closes at the next reported price.
     w.taker_trade(0, -size).unwrap();
