@@ -687,6 +687,7 @@ async function lpRoutine(bot: Bot, m: Market) {
   }
   if (waiting) return; // its epoch has not rolled yet
   if (v.needsFlat) { note({ type: "skip", bot: bot.name, symbol: m.symbol, why: "the vault is closing its position before it pays withdrawals" }); return; }
+  if (v.frozenUntil * 1000 >= Date.now() - 5_000) { note({ type: "skip", bot: bot.name, symbol: m.symbol, why: "the epoch is being settled: new requests wait for the roll" }); return; }
   if (s.userShares > 0n && Math.random() < 0.5) {
     const shares = Math.random() < 0.3 ? s.userShares : s.userShares / 2n;
     const r = await send(`${bot.name} withdraw from ${m.symbol}`, kp, [C.requestWithdraw(v, me, shares)]);

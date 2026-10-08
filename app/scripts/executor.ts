@@ -661,8 +661,16 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
   //    the mark has held its price for the stall time: it is in the way of every request behind
   //    it (the mark cannot move past it), and a liquidation may be among them.
   const stalled = b.markSet > 0 && now > b.markSet + C.ROUTER_STALL_SECS;
-  for (const r of reqs.filter(r => now > r.target + C.ROUTER_GRACE_SECS || (stalled && refused.has(r.id) && b.markPrev < r.target && r.target <= b.markPublish))) {
-    await send(`expire ${v.feed?.symbol} #${r.id}${now > r.target + C.ROUTER_GRACE_SECS ? "" : " (it cannot fill, and others are waiting behind it)"}`, [C.expireRequest(payer.publicKey, r)]);
+  // A settlement whose epoch has rolled already (another one, or the keeper, got there first)
+  // has nothing left to do and goes at once: the mark cannot move past it while it is queued.
+  let dead = false;
+  if (reqs.some(r => r.settle)) {
+    const va = await conn.getAccountInfo(v.key);
+    const cur = va && C.decodeVault(v.key, new Uint8Array(va.data));
+    dead = !!cur && (snap.slot < cur.epochStart + cur.epochLen || (cur.pendingDeposit === 0n && cur.pendingWithdraw === 0n));
+  }
+  for (const r of reqs.filter(r => now > r.target + C.ROUTER_GRACE_SECS || (dead && r.settle) || (stalled && refused.has(r.id) && b.markPrev < r.target && r.target <= b.markPublish))) {
+    await send(`expire ${v.feed?.symbol} #${r.id}${now > r.target + C.ROUTER_GRACE_SECS ? "" : dead && r.settle ? " (its epoch has rolled)" : " (it cannot fill, and others are waiting behind it)"}`, [C.expireRequest(payer.publicKey, r)]);
   }
 
   // 4. Free: move the mark to Pyth's sponsored feed account when it is newer, never past a
@@ -751,7 +759,7 @@ async function serviceCopies(vaults: C.Vault[], books: Map<string, C.Book>, mark
     const eq = (d: Uint8Array) => { const p = C.decodePortfolio(d, 0); return p.capital + p.pnl; };
     for (const v of vaults) {
       const b = books.get(v.key.toBase58());
-      if (!b || b.pending.length >= 30 || C.closeOnly(market, v.assetIndex)) continue;
+      if (!b || b.pending.length >= 28 || C.closeOnly(market, v.assetIndex)) continue; // (the last 4 places are for forced closes and settlements)
       const price = C.decodeAsset(market, v.assetIndex).price;
       const held = C.decodePortfolio(fd, v.assetIndex, market).position, lead = C.decodePortfolio(ld, v.assetIndex, market).position;
       const target = S.copyTarget(lead, eq(ld), eq(fd), c.ratioBps, c.maxNotional, price);
@@ -763,7 +771,12 @@ async function serviceCopies(vaults: C.Vault[], books: Map<string, C.Book>, mark
       if (grows && abs(target) > room) {
         const reach = target > 0n ? room : -room;
         size = reach - held;
-        if (size === 0n || (size > 0n) !== (target - held > 0n) || abs(size) * price / C.UNIT < S.MIN_COPY_NOTIONAL) { copyRetry.set(c.key.toBase58(), Date.now() + 60_000); continue; }
+        // The router takes no less than a quarter of the difference, or the follower's equity
+        // in notional if that is less (nobody can keep a follower's place in the queue taken
+        // with slivers).
+        const quarter = abs(target - held) / 4n, oneX = eq(fd) > 0n && price > 0n ? eq(fd) * C.UNIT / price : abs(target - held);
+        const minPart = quarter < oneX ? quarter : oneX;
+        if (size === 0n || (size > 0n) !== (target - held > 0n) || abs(size) * price / C.UNIT < S.MIN_COPY_NOTIONAL || abs(size) < minPart) { copyRetry.set(c.key.toBase58(), Date.now() + 60_000); continue; }
       }
       const who = `${c.follower.toBase58().slice(0, 6)} to ${c.leader.toBase58().slice(0, 6)}`;
       const ok = await send(`copy: bring ${who} in line on ${v.feed?.symbol} (${Number(held) / 1e6} -> ${Number(size === 0n ? target : held + size) / 1e6})`, [S.triggerCopy(payer.publicKey, c, v.key, size)], true);

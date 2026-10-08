@@ -265,6 +265,7 @@ export function LiquidityPanel({ state, send, busy }: { state: C.State; send: Se
   const pending = !!t && (t.deposit > 0n || t.withdraw > 0n) && t.epoch === v.epoch;
   const atoms = BigInt(Math.floor(Number(amount || 0) * C.USDC));
   const tooMuch = atoms > state.userCollateral;
+  const frozen = v.frozenUntil * 1000 >= Date.now();
   const claimIxs = (u: PublicKey) => [
     createAssociatedTokenAccountIdempotentInstruction(u, C.ata(u, v.shareMint), u, v.shareMint),
     createAssociatedTokenAccountIdempotentInstruction(u, C.ata(u, C.MINT), u, C.MINT),
@@ -289,7 +290,8 @@ export function LiquidityPanel({ state, send, busy }: { state: C.State; send: Se
       <section className="card">
         <h3>Deposit or withdraw</h3>
         <label className="field"><span>Deposit USDC</span><input value={amount} onChange={e => setAmount(e.target.value)} inputMode="decimal" /></label>
-        <button className="btn primary wide" disabled={!publicKey || !!busy || v.status !== 1 || atoms <= 0n || tooMuch}
+        {frozen && <p className="small">This epoch is being settled at a price that is already fixed, so new requests wait until it has rolled (a minute or two at most).</p>}
+        <button className="btn primary wide" disabled={!publicKey || !!busy || v.status !== 1 || atoms <= 0n || tooMuch || frozen}
           onClick={() => publicKey && send("Deposit request", [
             ...(claimable ? claimIxs(publicKey) : []),
             createAssociatedTokenAccountIdempotentInstruction(publicKey, C.ata(publicKey, C.MINT), publicKey, C.MINT),
@@ -297,12 +299,12 @@ export function LiquidityPanel({ state, send, busy }: { state: C.State; send: Se
           ])}>Request deposit</button>
         {publicKey && tooMuch && <p className="small down">You have {usd(state.userCollateral)} test USDC. Use "Get test USDC" first.</p>}
         <label className="field"><span>Withdraw shares</span><input value={out} placeholder={shares(state.userShares)} onChange={e => setOut(e.target.value)} inputMode="decimal" /></label>
-        <button className="btn wide" disabled={!publicKey || !!busy || state.userShares === 0n || v.status !== 1}
+        <button className="btn wide" disabled={!publicKey || !!busy || state.userShares === 0n || v.status !== 1 || frozen}
           onClick={() => publicKey && send("Withdraw request", [
             ...(claimable ? claimIxs(publicKey) : []),
             C.requestWithdraw(v, publicKey, out ? BigInt(Math.floor(Number(out) * 10 ** C.SHARE_DECIMALS)) : state.userShares),
           ])}>Request withdrawal</button>
-        <p className="muted small">Requests settle together at one price when the epoch ends, so nobody trades against a stale share price. Withdrawals can't be blocked: if a trader holds a position to stop the vault going flat, anyone can make the vault close it one epoch later.</p>
+        <p className="muted small">Requests settle together at one price when the epoch ends, so nobody trades against a stale share price. Withdrawals can't be blocked: if a trader holds a position to stop the vault going flat, anyone can make the vault close it six epoch lengths after it was told to.</p>
       </section>
     </>
   );

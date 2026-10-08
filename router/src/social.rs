@@ -16,6 +16,23 @@ pub const MIN_COPY_NOTIONAL: u128 = 1_000_000;
 /// not. Smaller differences (both accounts' equity drifts with every price) are left alone, so a
 /// follower does not pay a fee on every tick.
 pub const COPY_BAND_BPS: u128 = 1_000;
+/// A caller who brings a follower in line with less than the whole difference must trade at least
+/// one part in this many of it, or the follower's whole equity in notional (one step of 1x
+/// leverage) if that is less. The follower has one place in the queue: with no lower limit,
+/// anyone could keep it taken with one-atom copies (filling them oneself returns the bond), and
+/// the follower could then neither trade nor withdraw. With it, a few steps bring the follower
+/// in line or to the end of its margin, and then there is nothing left to queue.
+pub const MIN_COPY_PART: u128 = 4;
+
+/// The smallest part of `delta` a copy may trade (see `MIN_COPY_PART`). An account with nothing
+/// left is only ever brought in line whole: what it does then is close, which needs no margin.
+pub fn min_copy_part(delta: i128, follower_equity: i128, price: u64) -> u128 {
+    let whole = delta.unsigned_abs();
+    if follower_equity <= 0 || price == 0 {
+        return whole;
+    }
+    (whole / MIN_COPY_PART).min((follower_equity as u128).saturating_mul(POS_SCALE) / price as u128)
+}
 /// Largest share of the leader's leverage a follower can ask for (3x).
 pub const MAX_COPY_RATIO_BPS: u32 = 30_000;
 
@@ -410,7 +427,7 @@ pub(crate) fn trigger_copy(program_id: &Pubkey, accounts: &[AccountInfo], data: 
     if t.has_pending != 0 {
         return Err(RouterError::RequestPending.into());
     }
-    if b.len as usize >= MAX_PENDING {
+    if b.len as usize >= MAX_PENDING - RESERVED_PENDING {
         return Err(RouterError::BookFull.into());
     }
     perc::expect_market(market)?;
@@ -424,7 +441,7 @@ pub(crate) fn trigger_copy(program_id: &Pubkey, accounts: &[AccountInfo], data: 
     let delta = target - held;
     let size = if asked == 0 {
         delta
-    } else if (asked > 0) == (delta > 0) && asked.unsigned_abs() <= delta.unsigned_abs() {
+    } else if (asked > 0) == (delta > 0) && asked.unsigned_abs() <= delta.unsigned_abs() && asked.unsigned_abs() >= min_copy_part(delta, equity(portfolio)?, price) {
         asked
     } else {
         return Err(RouterError::InvalidInstruction.into());

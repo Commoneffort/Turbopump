@@ -22,7 +22,9 @@ have=$(solana program show -u "$RPC" $ROUTER | sed -n 's/^Data Length: \([0-9]*\
 need=$(stat -c %s "$SO")
 echo "router on $RPC: $have bytes deployed, the new build is $need"
 if [ "$need" -gt "$have" ]; then
-  solana program extend -u "$RPC" -k "$KEY" $ROUTER $((need - have + 8192))
+  # (Solana refuses to extend a program by less than 10,240 bytes.)
+  more=$((need - have + 8192)); [ "$more" -lt 10240 ] && more=10240
+  solana program extend -u "$RPC" -k "$KEY" $ROUTER $more
 fi
 solana program deploy -u "$RPC" -k "$KEY" --program-id keys/router-keypair.json --upgrade-authority "$KEY" "$SO"
 solana program show -u "$RPC" $ROUTER | grep -E "Slot|Length"

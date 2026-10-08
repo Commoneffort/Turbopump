@@ -295,6 +295,10 @@ fn a_follower_is_brought_in_line_with_its_leader_by_anyone() {
     expect(trigger(&mut w, 1, 0, 600 * U), RouterError::InvalidInstruction);
     w.tick(1);
     expect(trigger(&mut w, 1, 0, -100 * U), RouterError::InvalidInstruction);
+    // Nor a sliver of it: the follower's one place in the queue is not anyone's to keep taken.
+    w.tick(1);
+    expect(trigger(&mut w, 1, 0, 100 * U), RouterError::InvalidInstruction);
+    assert_eq!(percolator_router::social::MIN_COPY_PART, 4);
     let payer_before = w.env.svm.get_balance(&w.payer.pubkey()).unwrap();
     let wallet_before = w.env.svm.get_balance(&f.wallet).unwrap();
     w.tick(1);

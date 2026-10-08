@@ -38,6 +38,9 @@ pub enum VaultError {
     NotSettled,
     /// `RequireFlat`: the epoch's withdrawals fit in the vault's cash, so no flat roll is needed.
     CanSettleOpen,
+    /// A deposit or withdrawal request while this epoch's settlement is queued: its price is
+    /// already fixed. The request is accepted again once the epoch has rolled.
+    SettlementQueued,
 }
 
 impl From<VaultError> for ProgramError {

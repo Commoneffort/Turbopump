@@ -166,6 +166,9 @@ export type Vault = {
   openerFeesTotal: bigint;
   /** The epoch is overdue and its withdrawals exceed the vault's cash: closing-only until flat. */
   needsFlat: boolean;
+  /** Unix time until which the vault takes no deposit or withdrawal requests (its epoch's
+   *  settlement is queued and its price fixed); 0 when it takes them. */
+  frozenUntil: number;
 };
 
 export function decodeVault(k: PublicKey, d: Uint8Array): Vault {
@@ -206,6 +209,7 @@ export function decodeVault(k: PublicKey, d: Uint8Array): Vault {
     openerFeesOwed: u64(d, v.opener_fees_owed),
     openerFeesTotal: u64(d, v.opener_fees_total),
     needsFlat: d[v.needs_flat] === 1,
+    frozenUntil: u32(d, v.requests_frozen_until),
   };
 }
 
@@ -948,7 +952,7 @@ export const postPrice = (reporter: PublicKey, feedHex: string, priceE6: bigint,
 /** Queues the settlement of a vault's epoch at the first Pyth price after its target time. */
 export const requestSettle = (payer: PublicKey, vault: PublicKey) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [rw(payer, true), ro(vault), rw(bookAddress(vault)), rw(requestAddress(vault, payer, true)), ro(SystemProgram.programId)],
+  keys: [rw(payer, true), rw(vault), rw(bookAddress(vault)), rw(requestAddress(vault, payer, true)), ro(SystemProgram.programId), ro(routerAuthority()), ro(VAULT_PROGRAM)],
   data: new W().u8(9).done(),
 });
 /** Executes a queued settlement: rolls the vault's epoch through the router at the mark. */
@@ -1015,6 +1019,7 @@ export const fillRequest = (executor: PublicKey, v: Vault, r: RouterRequest) => 
 });
 export const expireRequest = (caller: PublicKey, r: RouterRequest) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [ro(caller, true), rw(r.key), rw(traderAddress(r.wallet)), rw(r.wallet), rw(bookAddress(r.vault)), ...(r.order !== undefined ? [rw(orderAddress(r.vault, r.wallet, r.order))] : [])],
+  // (A settlement names its vault: it can then go as soon as its epoch has rolled.)
+  keys: [ro(caller, true), rw(r.key), rw(traderAddress(r.wallet)), rw(r.wallet), rw(bookAddress(r.vault)), ...(r.order !== undefined ? [rw(orderAddress(r.vault, r.wallet, r.order))] : r.settle ? [ro(r.vault)] : [])],
   data: new W().u8(7).done(),
 });

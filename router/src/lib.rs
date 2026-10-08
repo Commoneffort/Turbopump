@@ -31,7 +31,7 @@ use solana_program::msg;
 use bytemuck::Zeroable;
 use percolator_vault::{
     percolator::{self as perc, PERCOLATOR_PROGRAM_ID},
-    processor::{TAG_ARM_FILL, TAG_PUSH_MARK},
+    processor::{TAG_ARM_FILL, TAG_FREEZE_REQUESTS, TAG_PUSH_MARK},
     pyth, reporter,
     state::{self as vstate, MODE_OPERATE, STATUS_ACTIVE},
 };
@@ -83,6 +83,10 @@ pub const STRESS_BPS: u128 = 1_000;
 /// until every position on it is closed; closing against the vault first avoids that.
 pub const LIQUIDATION_BPS: u128 = 1_250;
 const POS_SCALE: u128 = 1_000_000;
+/// Places in a vault's queue that trades cannot take: they are kept for forced closes
+/// (liquidations, close-outs) and epoch settlements. A trader about to be liquidated could
+/// otherwise keep the queue full of small trades and never be reached.
+pub const RESERVED_PENDING: usize = 4;
 
 pub const TAG_OPEN_ACCOUNT: u8 = 0;
 pub const TAG_DEPOSIT: u8 = 1;
@@ -582,7 +586,7 @@ fn request(program_id: &Pubkey, accounts: &[AccountInfo], size: i128) -> Program
     if size == 0 || size == i128::MIN {
         return Err(RouterError::InvalidInstruction.into());
     }
-    if b.len as usize >= MAX_PENDING {
+    if b.len as usize >= MAX_PENDING - RESERVED_PENDING {
         return Err(RouterError::BookFull.into());
     }
     perc::expect_market(market)?;
@@ -944,7 +948,7 @@ fn trigger_order(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
     if t.has_pending != 0 {
         return Err(RouterError::RequestPending.into());
     }
-    if b.len as usize >= MAX_PENDING {
+    if b.len as usize >= MAX_PENDING - RESERVED_PENDING {
         return Err(RouterError::BookFull.into());
     }
     if perc::asset_close_only(&market.try_borrow_data()?, v.asset_index)? {
@@ -1185,6 +1189,7 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let before = held(portfolio, market)?;
     // A forced close (size 0) trades whatever closes the position, or nothing at all.
     let mut size = r.size;
+    let mut liquidated = false;
     if let Some((_, o)) = &order {
         // The position may have changed since the order was carried out: a reduce-only order
         // never opens or enlarges one. A limit order does not trade at a price worse than its limit.
@@ -1206,7 +1211,15 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         // close-only, or one the account no longer has the margin for at this price.
         let close_only = perc::asset_close_only(&market.try_borrow_data()?, v.asset_index)?;
         let reduces = before != 0 && (before > 0) != (size > 0) && size.unsigned_abs() <= before.unsigned_abs();
-        if (close_only && !reduces) || !margin_covers_at(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, v.asset_index, size, 0)? {
+        if !close_only && liquidatable(&market.try_borrow_data()?, &portfolio.try_borrow_data()?)? {
+            // Below the liquidation level at this price: the one thing a fill does for such an
+            // account is close its position here, whatever was asked. A trader has one place in
+            // the queue, so while a request of its own waits nobody can queue its liquidation;
+            // without this, an account kept busy with small requests could not be liquidated
+            // through the router at all.
+            liquidated = before != 0;
+            size = before.checked_neg().ok_or(RouterError::Overflow)?;
+        } else if (close_only && !reduces) || !margin_covers_at(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, v.asset_index, size, 0)? {
             size = 0;
         }
     } else if r.size == 0 {
@@ -1235,7 +1248,9 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     t.has_pending = 0;
     store(trader_ai, &t)?;
     if let Some((order_ai, o)) = order {
-        settle_order(order_ai, o, traded, wallet)?;
+        // A liquidation is not the order's trade: a limit or TWAP order keeps what it had left.
+        let protective = matches!(o.kind, ORDER_STOP | ORDER_TAKE | ORDER_TRAIL);
+        settle_order(order_ai, o, if liquidated && !protective { 0 } else { traded }, wallet)?;
     }
     close(request_ai, BOND_LAMPORTS, executor, rent_to)
 }
@@ -1296,7 +1311,12 @@ fn trade_against_vault(accounts: &[AccountInfo], t: &TraderState, v: &vstate::Va
 /// priced at the first Pyth price published at or after this request's target time, exactly
 /// like a trade. Anyone can queue it once the epoch is over and has requests waiting.
 ///
-/// Accounts: 0 payer [s, w], 1 vault, 2 book [w], 3 request [w], 4 system program.
+/// From here until the epoch rolls (or this request has expired) the vault takes no new deposit
+/// or withdrawal requests: the settlement's price is fixed at the target time, and a request
+/// that could still join the epoch after that would be priced at a price its sender knows.
+///
+/// Accounts: 0 payer [s, w], 1 vault [w], 2 book [w], 3 request [w], 4 system program,
+/// 5 router authority, 6 vault program.
 #[inline(never)]
 fn request_settle(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let payer = acc(accounts, 0)?;
@@ -1304,11 +1324,16 @@ fn request_settle(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResul
     let book_ai = acc(accounts, 2)?;
     let request_ai = acc(accounts, 3)?;
     let system = acc(accounts, 4)?;
+    let authority = acc(accounts, 5)?;
+    let vault_program = acc(accounts, 6)?;
     signer(payer)?;
-    for w in [payer, book_ai, request_ai] {
+    for w in [payer, vault_ai, book_ai, request_ai] {
         writable(w)?;
     }
     key_is(system, &system_program::ID)?;
+    key_is(vault_program, &percolator_vault::id())?;
+    let (ak, abump) = authority_address(program_id);
+    key_is(authority, &ak)?;
     let v = load_vault(vault_ai)?;
     let mut b: Book = load(book_ai, program_id, BOOK_MAGIC)?;
     if b.vault != *vault_ai.key {
@@ -1321,7 +1346,20 @@ fn request_settle(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResul
     if b.len as usize >= MAX_PENDING {
         return Err(RouterError::BookFull.into());
     }
-    enqueue(program_id, payer, payer.key, None, vault_ai, book_ai, &mut b, request_ai, system, 0, None)
+    enqueue(program_id, payer, payer.key, None, vault_ai, book_ai, &mut b, request_ai, system, 0, None)?;
+    let r: Request = load(request_ai, program_id, REQUEST_MAGIC)?;
+    let until = r.target_time.saturating_add(GRACE_SECS).saturating_add(5).clamp(1, u32::MAX as i64) as u32;
+    let mut data = vec![TAG_FREEZE_REQUESTS];
+    data.extend_from_slice(&until.to_le_bytes());
+    invoke_signed(
+        &Instruction {
+            program_id: percolator_vault::id(),
+            accounts: vec![AccountMeta::new_readonly(ak, true), AccountMeta::new(*vault_ai.key, false)],
+            data,
+        },
+        &[authority.clone(), vault_ai.clone(), vault_program.clone()],
+        &[&[SEED_AUTHORITY, &[abump]]],
+    )
 }
 
 /// Executes a queued settlement: with the mark at the request's target price and Percolator's
@@ -1393,7 +1431,8 @@ fn settle(program_id: &Pubkey, accounts: &[AccountInfo], frontier: u64) -> Progr
 /// in the book with the bond (the trader did not pay it).
 ///
 /// Accounts: 0 caller [s], 1 request [w], 2 trader [w], 3 trader wallet [w], 4 book [w],
-/// 5 the standing order [w] (only for a request one queued).
+/// 5 the standing order [w] (only for a request one queued), or for a settlement, optionally,
+/// its vault (to remove it early once its epoch has rolled).
 #[inline(never)]
 fn expire(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let caller = acc(accounts, 0)?;
@@ -1415,7 +1454,19 @@ fn expire(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     // Past its grace period; or its price has been the mark for `STALL_SECS` and nobody filled it.
     let at_mark = b.mark_prev_publish_time < r.target_time && r.target_time <= b.mark_publish_time;
     let stalled = at_mark && b.mark_set_time != 0 && now > (b.mark_set_time as i64).saturating_add(STALL_SECS);
-    if now <= r.target_time.saturating_add(GRACE_SECS) && !stalled {
+    // Or a settlement with nothing left to settle: the epoch it was queued for has rolled (another
+    // settlement, or the keeper's flat roll, got there first). The mark cannot move past a request
+    // in the queue, so it would otherwise hold every trade behind it up for the stall time.
+    let dead = r.kind == KIND_SETTLE
+        && match accounts.get(5) {
+            Some(vault_ai) if *vault_ai.key == r.vault => {
+                let v = vstate::load_vault(vault_ai, &percolator_vault::id())?;
+                let over = Clock::get()?.slot >= v.epoch_start_slot.saturating_add(v.epoch_len_slots);
+                !over || (v.pending_deposit_assets == 0 && v.pending_withdraw_shares == 0)
+            }
+            _ => false,
+        };
+    if now <= r.target_time.saturating_add(GRACE_SECS) && !stalled && !dead {
         return Err(RouterError::TooEarly.into());
     }
     // A settlement request belongs to no trader (account 2 is then ignored).

@@ -525,6 +525,107 @@ fn only_the_router_settles_an_open_epoch_and_only_at_its_target_price() {
     assert_eq!({ w.vault_state().epoch }, 1);
 }
 
+/// A settlement's price is fixed at its target time and everyone can see it a moment later, some
+/// seconds before the settlement executes. A deposit or withdrawal that could still join the
+/// epoch in that gap would be priced at a price its sender already knows (buy shares when the
+/// market has since moved the vault's way, leave when it has moved against it). From the moment a
+/// settlement is queued the epoch therefore takes no new requests.
+#[test]
+fn requests_cannot_join_an_epoch_once_its_settlement_is_queued() {
+    let (mut w, alice) = funded();
+    w.taker_trade(0, TEN_M).unwrap();
+    let bob = w.new_user(100_000_000);
+    w.deposit(&bob, 20_000_000).unwrap();
+    w.advance(EPOCH_LEN, INITIAL_PRICE);
+    // The epoch is over but nothing is queued yet: still open (its price is still unknown).
+    let carol = w.new_user(100_000_000);
+    w.deposit(&carol, 1_000_000).unwrap();
+    assert_eq!({ w.vault_state().requests_frozen_until }, 0);
+
+    let id = w.request_settle().unwrap();
+    let target = w.request_target(id);
+    assert_eq!({ w.vault_state().requests_frozen_until } as i64, target + percolator_router::GRACE_SECS + 5);
+    let dave = w.new_user(100_000_000);
+    expect_err(w.deposit(&dave, 5_000_000), VaultError::SettlementQueued);
+    expect_err(w.withdraw(&alice, 1_000), VaultError::SettlementQueued);
+
+    // The price arrives. It is known now, and the epoch stays closed until it has rolled.
+    let slot = w.env.current_slot() + 1;
+    w.env.set_clock(slot, target.max(w.clock_ts()));
+    let prev = w.pyth_time;
+    w.pyth_time = target;
+    let u = w.pyth_update(w.price, target, prev);
+    w.advance_to(u).unwrap();
+    w.converge();
+    let erin = w.new_user(100_000_000);
+    expect_err(w.deposit(&erin, 5_000_000), VaultError::SettlementQueued);
+    let ix = w.settle_ix(id);
+    w.send(vec![ix], &[]).unwrap();
+    assert_eq!({ w.vault_state().epoch }, 2);
+    assert_eq!({ w.vault_state().requests_frozen_until }, 0);
+    // The next epoch takes requests again, at a price nobody knows yet.
+    w.deposit(&erin, 5_000_000).unwrap();
+    w.withdraw(&alice, 1_000).unwrap();
+}
+
+/// A settlement that never executes does not keep requests out for good: the freeze ends with
+/// the request's own life. Only the router can set it.
+#[test]
+fn the_freeze_ends_with_the_settlement_request_and_only_the_router_sets_it() {
+    let (mut w, _alice) = funded();
+    w.taker_trade(0, TEN_M).unwrap();
+    let bob = w.new_user(100_000_000);
+    w.deposit(&bob, 20_000_000).unwrap();
+    w.advance(EPOCH_LEN, INITIAL_PRICE);
+    let mallory = Keypair::new();
+    w.env.svm.airdrop(&mallory.pubkey(), 1_000_000_000).unwrap();
+    let mut data = vec![processor::TAG_FREEZE_REQUESTS];
+    data.extend_from_slice(&u32::MAX.to_le_bytes());
+    let forged = Instruction {
+        program_id: pid(),
+        accounts: vec![AccountMeta::new_readonly(mallory.pubkey(), true), AccountMeta::new(w.vault, false)],
+        data,
+    };
+    expect_err(w.send(vec![forged], &[&mallory]), VaultError::NotRouter);
+
+    let id = w.request_settle().unwrap();
+    let until = { w.vault_state().requests_frozen_until } as i64;
+    assert_eq!(until, w.request_target(id) + percolator_router::GRACE_SECS + 5);
+    let carol = w.new_user(100_000_000);
+    let slot = w.env.current_slot() + 1;
+    w.env.set_clock(slot, until);
+    expect_err(w.deposit(&carol, 1_000_000), VaultError::SettlementQueued);
+    w.env.set_clock(slot + 1, until + 1);
+    w.deposit(&carol, 2_000_000).unwrap();
+}
+
+/// A settlement whose epoch has rolled already (here the flat roll got there first) has nothing
+/// left to do. It can be removed at once, so it does not hold the mark still behind it.
+#[test]
+fn a_settlement_with_nothing_left_to_settle_can_be_removed_at_once() {
+    let (mut w, _alice) = funded();
+    let bob = w.new_user(100_000_000);
+    w.deposit(&bob, 20_000_000).unwrap();
+    w.advance(EPOCH_LEN, INITIAL_PRICE);
+    w.request_settle().unwrap();
+    let payer = w.payer.pubkey();
+    let with_vault = percolator_router::client::expire_settle(&payer, &w.vault, &payer);
+    // While it can still settle it stays, vault named or not.
+    let too_early = format!("0x{:x}", percolator_router::RouterError::TooEarly as u32);
+    assert!(w.send(vec![with_vault.clone()], &[]).unwrap_err().contains(&too_early));
+    w.roll().unwrap();
+    w.tick(1);
+    let mut without = with_vault.clone();
+    without.accounts.pop();
+    assert!(w.send(vec![without], &[]).unwrap_err().contains(&too_early));
+    // Another vault's account does not do either.
+    let mut wrong = with_vault.clone();
+    wrong.accounts[5] = AccountMeta::new_readonly(w.env.market, false);
+    assert!(w.send(vec![wrong], &[]).unwrap_err().contains(&too_early));
+    w.send(vec![with_vault], &[]).unwrap();
+    assert_eq!({ w.book().len }, 0);
+}
+
 #[test]
 fn withdrawals_beyond_the_cash_reserve_need_the_vault_flat() {
     let (mut w, alice) = funded();

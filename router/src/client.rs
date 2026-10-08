@@ -165,10 +165,12 @@ pub fn request_settle(payer: &Pubkey, vault: &Pubkey) -> Instruction {
         program_id: crate::id(),
         accounts: vec![
             AccountMeta::new(*payer, true),
-            ro(*vault),
+            w(*vault),
             w(book_address(&crate::id(), vault).0),
             w(request_address(&crate::id(), vault, payer, true).0),
             ro(system_program::ID),
+            ro(authority_address(&crate::id()).0),
+            ro(percolator_vault::id()),
         ],
         data: vec![TAG_REQUEST_SETTLE],
     }
@@ -257,6 +259,23 @@ pub fn expire(caller: &Pubkey, vault: &Pubkey, t: &TraderKeys) -> Instruction {
             w(t.trader),
             w(t.wallet),
             w(book_address(&id(), vault).0),
+        ],
+        data: vec![TAG_EXPIRE],
+    }
+}
+
+/// Removes a settlement request `payer` queued (see `expire`); with the vault named, as here, it
+/// can go as soon as its epoch has rolled.
+pub fn expire_settle(caller: &Pubkey, vault: &Pubkey, payer: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: id(),
+        accounts: vec![
+            AccountMeta::new_readonly(*caller, true),
+            w(request_address(&id(), vault, payer, true).0),
+            ro(*payer),
+            w(*payer),
+            w(book_address(&id(), vault).0),
+            ro(*vault),
         ],
         data: vec![TAG_EXPIRE],
     }

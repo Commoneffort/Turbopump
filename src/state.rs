@@ -82,7 +82,12 @@ pub struct VaultState {
     /// vault holds outside Percolator, so they can only be paid once its position is closed.
     /// While set, the vault only takes fills that shrink its position. Cleared by the roll.
     pub needs_flat: u8,
-    pub _pad1: [u8; 4],
+    /// Unix time until which deposit and withdrawal requests are refused: set by the router when
+    /// it queues this epoch's settlement (to that request's last possible fill time), cleared by
+    /// the roll. The settlement's price is fixed from its target time on and known to everyone a
+    /// moment later; a request that could still join the epoch then would be priced at a price
+    /// its sender already knows. 0 = not frozen.
+    pub requests_frozen_until: u32,
     pub oracle_max_staleness_secs: u64,
     pub oracle_soft_stale_slots: u64,
     pub oracle_ewma_halflife_slots: u64,

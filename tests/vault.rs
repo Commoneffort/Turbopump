@@ -543,7 +543,7 @@ fn export_layout_for_frontend() {
         "vault": f!(V, o, magic, status, share_decimals, market, creator, seed, collateral_mint, share_mint, buffer, share_escrow,
             lp_portfolio, matcher_delegate, portfolio_id, asset_index, spread_bps, unwind_spread_bps, max_inventory_abs,
             epoch_len_slots, matcher_ttl_slots, mode, insurance_floor, oracle_feeds, max_fill_abs, vault_kind, position_nav_bps, fill_nav_bps, opener_fees_owed, opener_fees_total, asset_market_id, inventory, epoch, epoch_start_slot,
-            pending_deposit_assets, pending_withdraw_shares, reserved_assets, last_nav, created_slot, total_fills, total_fees_harvested, listed_slot, armed_size, armed_slot, needs_flat),
+            pending_deposit_assets, pending_withdraw_shares, reserved_assets, last_nav, created_slot, total_fills, total_fees_harvested, listed_slot, armed_size, armed_slot, needs_flat, requests_frozen_until, flat_required_slot),
         "vault_len": state::VAULT_ACCOUNT_LEN,
         "ticket": f!(Ticket, 0, vault, owner, epoch, deposit_assets, withdraw_shares),
         "ticket_len": size_of::<Ticket>(),

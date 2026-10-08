@@ -455,6 +455,52 @@ fn a_trader_below_the_liquidation_level_is_closed_against_the_vault() {
     w.taker_trade(1, UNIT as i128).unwrap();
 }
 
+/// A trader has one place in the queue, so while a request of its own waits nobody can queue its
+/// liquidation. An account below the level could keep itself out of reach that way for as long
+/// as it kept sending small requests (filling them itself returns the bond). So the fill of any
+/// request of such an account closes its position instead.
+#[test]
+fn a_trader_below_the_liquidation_level_cannot_hide_behind_its_own_requests() {
+    let mut w = live();
+    leveraged_long(&mut w);
+    w.move_price(20, 850_000);
+    assert_eq!(position(&w, 7), 20 * UNIT as i128);
+    // It asks to sell one unit of its twenty. While that waits, the liquidation cannot be queued.
+    let id = w.request(7, -(UNIT as i128)).unwrap();
+    let t = w.trader(7);
+    let close = rclient::request_close(&w.payer.pubkey(), &t, &w.vault);
+    expect(w.send(vec![close], &[]), router_code(RouterError::RequestPending));
+    // Its own request fills: at that price the account is below the level, and all of it closes.
+    w.execute(7, id).unwrap();
+    assert_eq!(position(&w, 7), 0);
+    assert!(w.portfolio_view().flat);
+    let a = asset_state(&w);
+    assert_eq!((a.a_long, a.a_short), (percolator::ADL_ONE, percolator::ADL_ONE));
+    // A healthy account's request is still just its request.
+    w.taker_trade(1, 3 * UNIT as i128).unwrap();
+    w.taker_trade(1, -(UNIT as i128)).unwrap();
+    assert_eq!(position(&w, 1), 2 * UNIT as i128);
+}
+
+/// The last places in a vault's queue are kept for forced closes and settlements: trades cannot
+/// fill the queue up and keep a liquidation out.
+#[test]
+fn trades_cannot_fill_the_queue_and_keep_a_liquidation_out() {
+    let mut w = live();
+    leveraged_long(&mut w);
+    w.move_price(20, 850_000);
+    let room = rstate::MAX_PENDING - percolator_router::RESERVED_PENDING;
+    for i in 0..room {
+        w.request(100 + i, UNIT as i128 / 100).unwrap();
+    }
+    assert_eq!({ w.book().len } as usize, room);
+    expect(w.request(100 + room, UNIT as i128 / 100), router_code(RouterError::BookFull));
+    let t = w.trader(7);
+    let close = rclient::request_close(&w.payer.pubkey(), &t, &w.vault);
+    w.send(vec![close], &[]).unwrap();
+    assert_eq!({ w.book().len } as usize, room + 1);
+}
+
 #[test]
 fn a_liquidation_does_nothing_if_the_trader_recovered_by_its_fill_price() {
     let mut w = live();
@@ -530,16 +576,22 @@ fn two_traders_can_send_requests_at_the_same_moment() {
 #[test]
 fn a_request_the_account_cannot_afford_at_its_price_ends_without_trading() {
     let mut w = live();
-    leveraged_long(&mut w); // 20 long on 5 USDC
-    let id = w.request(7, 2 * UNIT as i128).unwrap(); // two more, while it still can
+    // 10 long on 5 USDC.
+    let u = w.new_user(100_000_000);
+    let t = rclient::TraderKeys::new(w.env.market, u.kp.pubkey());
+    let mint = w.env.mint;
+    w.send(vec![rclient::open_account(&t, &mint), rclient::deposit(&t, &u.collateral, &w.env.vault, 5_000_000)], &[&u.kp]).unwrap();
+    w.traders.insert(7, (u, t));
+    w.taker_trade(7, 10 * UNIT as i128).unwrap();
+    let id = w.request(7, 12 * UNIT as i128).unwrap(); // twelve more, while it still can
     let behind = w.request(1, UNIT as i128).unwrap(); // someone else, queued behind it
-    // Its price turns out to be 0.84: 1.8 USDC of equity against 18.5 of positions with the
-    // two extra units is under the 10% Percolator asks for.
-    w.price = 840_000;
+    // Its price turns out to be 0.60: 1 USDC of equity is 16.7% of the 6 it holds (above the
+    // liquidation level), but under the 10% Percolator asks for on 13.2 with the extra twelve.
+    w.price = 600_000;
     let executor = w.payer.pubkey();
     let before = w.env.svm.get_balance(&executor).unwrap();
     w.execute(7, id).unwrap();
-    assert_eq!(position(&w, 7), 20 * UNIT as i128, "nothing traded");
+    assert_eq!(position(&w, 7), 10 * UNIT as i128, "nothing traded");
     assert!(w.env.svm.get_balance(&executor).unwrap() > before, "whoever ended it earned the bond");
     assert_eq!({ w.book().len }, 1);
     // The trader is free again, and the request behind fills.

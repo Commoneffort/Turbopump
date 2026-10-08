@@ -122,6 +122,7 @@ pub const TAG_PUSH_MARK: u8 = 32;
 pub const TAG_ARM_FILL: u8 = 33;
 pub const TAG_SYNC_INVENTORY: u8 = 34;
 pub const TAG_REQUIRE_FLAT: u8 = 35;
+pub const TAG_FREEZE_REQUESTS: u8 = 36;
 
 /// A market with no liquidity providers can be retired this many epochs after it was listed.
 pub const RETIRE_IDLE_EPOCHS: u64 = 3;
@@ -495,6 +496,12 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
             no_args(rest)?;
             require_flat(program_id, accounts)
         }
+        TAG_FREEZE_REQUESTS => {
+            if rest.len() != 4 {
+                return Err(VaultError::InvalidInstruction.into());
+            }
+            freeze_requests(program_id, accounts, u32::from_le_bytes(rest.try_into().unwrap()))
+        }
         TAG_SYNC_INVENTORY => {
             no_args(rest)?;
             sync_inventory(program_id, accounts)
@@ -721,7 +728,7 @@ fn init_vault(program_id: &Pubkey, accounts: &[AccountInfo], p: InitParams) -> P
         oracle_conf_filter_bps: p.oracle_conf_filter_bps,
         vault_kind: kind,
         needs_flat: 0,
-        _pad1: [0; 4],
+        requests_frozen_until: 0,
         oracle_max_staleness_secs: p.oracle_max_staleness_secs,
         oracle_soft_stale_slots: p.oracle_soft_stale_slots,
         oracle_ewma_halflife_slots: p.oracle_ewma_halflife_slots,
@@ -821,6 +828,34 @@ fn open_ticket<'a>(
     Ok(t)
 }
 
+/// Deposit and withdrawal requests are refused while the epoch's settlement is queued (see
+/// `VaultState::requests_frozen_until`).
+fn requests_open(v: &VaultState) -> ProgramResult {
+    let until = v.requests_frozen_until;
+    if until != 0 && Clock::get()?.unix_timestamp <= until as i64 {
+        return Err(VaultError::SettlementQueued.into());
+    }
+    Ok(())
+}
+
+/// Closes the epoch to new deposit and withdrawal requests until `until` (unix time) or the roll,
+/// whichever comes first. Only the router calls it, when it queues the epoch's settlement.
+///
+/// Accounts: 0 router authority [signer], 1 vault [w]. Data: until (u32).
+fn freeze_requests(program_id: &Pubkey, accounts: &[AccountInfo], until: u32) -> ProgramResult {
+    let router = acc(accounts, 0)?;
+    let vault_ai = acc(accounts, 1)?;
+    router_signed(router)?;
+    writable(vault_ai)?;
+    let mut v = state::load_vault(vault_ai, program_id)?;
+    if v.status != STATUS_ACTIVE {
+        return Err(VaultError::NotActive.into());
+    }
+    // Several settlements can be queued for one epoch (anyone may queue one): the latest counts.
+    v.requests_frozen_until = { v.requests_frozen_until }.max(until);
+    state::store_vault(vault_ai, &v)
+}
+
 /// Queues a deposit for the current epoch. Accounts: 0 user [s,w], 1 vault [w], 2 ticket [w],
 /// 3 user collateral [w], 4 buffer [w], 5 token program, 6 system program.
 fn request_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -> ProgramResult {
@@ -844,6 +879,7 @@ fn request_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
         return Err(VaultError::NotActive.into());
     }
     check_vault_token_account(buffer, &v.buffer, &v.collateral_mint, vault_ai.key)?;
+    requests_open(&v)?;
     let mut t = open_ticket(program_id, &v, vault_ai.key, user, ticket, system)?;
 
     invoke(
@@ -880,6 +916,7 @@ fn request_withdraw(program_id: &Pubkey, accounts: &[AccountInfo], shares: u64) 
         return Err(VaultError::NotActive.into());
     }
     check_vault_token_account(escrow, &v.share_escrow, &v.share_mint, vault_ai.key)?;
+    requests_open(&v)?;
     let mut t = open_ticket(program_id, &v, vault_ai.key, user, ticket, system)?;
 
     invoke(
@@ -1147,6 +1184,7 @@ fn roll_epoch(program_id: &Pubkey, accounts: &[AccountInfo], frontier: u64) -> P
     }
     v.needs_flat = 0;
     v.flat_required_slot = 0;
+    v.requests_frozen_until = 0;
     v.epoch = add(v.epoch, 1)?;
     v.epoch_start_slot = now;
     state::store_vault(vault_ai, &v)?;
