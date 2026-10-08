@@ -610,9 +610,10 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
   //    current slot (which also walks Percolator's price to the mark) and settle the positions
   //    that leaves out of date; a miss is retried next pass.
   const refused = new Set<bigint>();
+  const tried = new Set<bigint>(); // settlements executed (or attempted) in this pass
   for (const r of live.filter(r => b.markPrev < r.target && r.target <= b.markPublish)) {
     const what = `${v.feed?.symbol} #${r.id}`;
-    if (r.settle) { await settleEpoch(v, r, what); continue; }
+    if (r.settle) { await settleEpoch(v, r, what); tried.add(r.id); continue; }
     // Getting ready (catching up, settling the market's accounts) and the fill follow each other
     // here without going back through the whole pass in between, which cost seconds each time.
     for (let attempt = 0; attempt < 4; attempt++) {
@@ -664,12 +665,12 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
   // A settlement whose epoch has rolled already (another one, or the keeper, got there first)
   // has nothing left to do and goes at once: the mark cannot move past it while it is queued.
   let dead = false;
-  if (reqs.some(r => r.settle)) {
+  if (reqs.some(r => r.settle && !tried.has(r.id))) {
     const va = await conn.getAccountInfo(v.key);
     const cur = va && C.decodeVault(v.key, new Uint8Array(va.data));
     dead = !!cur && (snap.slot < cur.epochStart + cur.epochLen || (cur.pendingDeposit === 0n && cur.pendingWithdraw === 0n));
   }
-  for (const r of reqs.filter(r => now > r.target + C.ROUTER_GRACE_SECS || (dead && r.settle) || (stalled && refused.has(r.id) && b.markPrev < r.target && r.target <= b.markPublish))) {
+  for (const r of reqs.filter(r => now > r.target + C.ROUTER_GRACE_SECS || (dead && r.settle && !tried.has(r.id)) || (stalled && refused.has(r.id) && b.markPrev < r.target && r.target <= b.markPublish))) {
     await send(`expire ${v.feed?.symbol} #${r.id}${now > r.target + C.ROUTER_GRACE_SECS ? "" : dead && r.settle ? " (its epoch has rolled)" : " (it cannot fill, and others are waiting behind it)"}`, [C.expireRequest(payer.publicKey, r)]);
   }
 
