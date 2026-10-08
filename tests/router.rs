@@ -458,6 +458,80 @@ fn a_trader_below_the_liquidation_level_is_closed_against_the_vault() {
     w.taker_trade(1, UNIT as i128).unwrap();
 }
 
+/// A trader's own request carries a deposit of 0.1% of its size in the chain's coin. It comes
+/// back with a fill, and with an expiry whose price never arrived; it is kept when the request
+/// expires after its price was the mark (the trader has seen the price by then, and letting
+/// the request lapse must not be free).
+#[test]
+fn a_request_that_lapses_after_its_price_arrived_loses_its_deposit() {
+    use percolator_router::{expiry_deposit, EXPIRY_DEPOSIT_BPS, LAMPORTS_PER_ATOM};
+    assert_eq!(expiry_deposit(-(1_000 * UNIT as i128), 2_000_000), 2_000_000_000 * EXPIRY_DEPOSIT_BPS as u64 / 10_000 * LAMPORTS_PER_ATOM);
+    let mut w = live();
+    let t = w.trader(0);
+    let kp = w.trader_kp(0);
+    let size = 100 * UNIT as i128;
+    let rent = w.env.svm.minimum_balance_for_rent_exemption(rstate::REQUEST_LEN);
+    let deposit = expiry_deposit(size, 1_000_000);
+    assert!(deposit > 0);
+    let bal = |w: &World, k: &Pubkey| w.env.svm.get_balance(k).unwrap();
+
+    // Filled: everything but the bond comes back.
+    let start = bal(&w, &t.wallet);
+    let id = w.request(0, size).unwrap();
+    let (rk, _) = w.request_account(id);
+    assert_eq!(bal(&w, &rk), rent + BOND_LAMPORTS + deposit);
+    let queued = bal(&w, &t.wallet);
+    assert!(start - queued >= rent + BOND_LAMPORTS + deposit);
+    w.execute(0, id).unwrap();
+    assert_eq!(bal(&w, &t.wallet), queued + rent + deposit);
+
+    // Its price never arrives (no oracle, no executor): only the bond is lost.
+    let id = w.request(0, size).unwrap();
+    let queued = bal(&w, &t.wallet);
+    let target = w.request_target(id);
+    at(&mut w, target + GRACE_SECS + 1);
+    let expire = rclient::expire(&w.payer.pubkey(), &w.vault, &t);
+    w.send(vec![expire.clone()], &[]).unwrap();
+    assert_eq!(bal(&w, &t.wallet), queued + rent + deposit);
+
+    // Its price is the mark, nobody fills it, and it lapses: the deposit stays in the book.
+    w.tick(1);
+    let id = w.request(0, size).unwrap();
+    let queued = bal(&w, &t.wallet);
+    let target = w.request_target(id);
+    at(&mut w, target + 1);
+    let prev = w.pyth_time;
+    w.pyth_time = target + 1;
+    let u = w.pyth_update(w.price, target + 1, prev);
+    w.advance_to(u).unwrap();
+    let book = percolator_router::state::book_address(&percolator_router::id(), &w.vault).0;
+    let (book_before, set) = (bal(&w, &book), w.clock_ts());
+    at(&mut w, set + STALL_SECS + 1);
+    let mut again = expire.clone();
+    again.accounts[0] = AccountMeta::new_readonly(kp.pubkey(), true); // the trader itself lets it lapse
+    w.send(vec![again], &[&kp]).unwrap();
+    assert_eq!(bal(&w, &book) - book_before, BOND_LAMPORTS + deposit);
+    assert!(bal(&w, &t.wallet) <= queued + rent, "only the rent came back");
+}
+
+/// The router liquidates below 15% of the positions' notional (it was 12.5%): further from
+/// Percolator's own 10%, whose liquidation closes the whole market to new positions.
+#[test]
+fn the_router_liquidates_below_fifteen_percent() {
+    assert_eq!(percolator_router::LIQUIDATION_BPS, 1_500);
+    let mut w = live();
+    leveraged_long(&mut w);
+    // 20 long on 5 USDC. At 0.89 the account holds 2.8 against 17.8: 15.7%, and stays.
+    w.move_price(20, 890_000);
+    expect(w.close_out(7), router_code(RouterError::NotCloseOnly));
+    // At 0.88: 2.6 against 17.6 is 14.8%, and it is closed against the vault.
+    w.move_price(20, 880_000);
+    w.close_out(7).unwrap();
+    assert_eq!(position(&w, 7), 0);
+    let a = asset_state(&w);
+    assert_eq!((a.a_long, a.a_short), (percolator::ADL_ONE, percolator::ADL_ONE));
+}
+
 /// The mark's circuit breaker: a price further from the mark than a market moves in the time
 /// between the two is refused, a real move that large is accepted once that time has passed.
 #[test]

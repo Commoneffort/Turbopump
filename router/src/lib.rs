@@ -81,7 +81,28 @@ pub const STRESS_BPS: u128 = 1_000;
 /// above Percolator's own maintenance margin on purpose. Percolator liquidates by reducing the
 /// position unilaterally, which deleverages the other side and makes the market close-only
 /// until every position on it is closed; closing against the vault first avoids that.
-pub const LIQUIDATION_BPS: u128 = 1_250;
+pub const LIQUIDATION_BPS: u128 = 1_500;
+/// A trader's own request carries a deposit of this share (bps) of its notional, in the chain's
+/// coin, on top of the bond. It comes back when the request fills (or ends without trading), and
+/// when it expires without its price ever having reached the mark. It is kept if the request
+/// expires after its price was the mark: by then everyone has seen that price and what the
+/// market did after it, and a trader who could let such a request lapse for the price of a bond
+/// would hold a free option whenever no executor filled it in time.
+pub const EXPIRY_DEPOSIT_BPS: u128 = 10;
+/// The chain's coin per atom of collateral (a 6-decimal dollar token), in lamports, for that
+/// deposit. A fixed rate, set for SOL near $110 and XNT near $0.20: the deposit is a deterrent,
+/// not a price, so being off by the coin's moves does not matter.
+#[cfg(not(feature = "x1"))]
+pub const LAMPORTS_PER_ATOM: u64 = 9;
+#[cfg(feature = "x1")]
+pub const LAMPORTS_PER_ATOM: u64 = 5_000;
+
+/// The deposit (lamports) that goes with a request of `size` at `price` (see `EXPIRY_DEPOSIT_BPS`).
+pub fn expiry_deposit(size: i128, price: u64) -> u64 {
+    let notional = size.unsigned_abs().saturating_mul(price as u128) / POS_SCALE;
+    let lamports = notional.saturating_mul(EXPIRY_DEPOSIT_BPS) / 10_000 * LAMPORTS_PER_ATOM as u128;
+    u64::try_from(lamports).unwrap_or(u64::MAX)
+}
 const POS_SCALE: u128 = 1_000_000;
 /// Places in a vault's queue that trades cannot take: they are kept for forced closes
 /// (liquidations, close-outs) and epoch settlements. A trader about to be liquidated could
@@ -516,13 +537,14 @@ fn open_book(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
 
 /// Stressed margin check: after the trade, equity must cover initial margin plus fees on every
 /// position with prices `STRESS_BPS` higher, and a `STRESS_BPS` loss on all of them.
-fn margin_covers(market: &[u8], portfolio: &[u8], asset: u16, size: i128) -> Result<bool, ProgramError> {
-    margin_covers_at(market, portfolio, asset, size, STRESS_BPS)
+fn margin_covers(market: &[u8], portfolio: &[u8], v: &vstate::VaultState, size: i128) -> Result<bool, ProgramError> {
+    margin_covers_at(market, portfolio, v, size, STRESS_BPS)
 }
 
 /// The same check with a price move of `stress_bps` (0: at the current price, which is what
 /// Percolator itself asks for at the fill).
-fn margin_covers_at(market: &[u8], portfolio: &[u8], asset: u16, size: i128, stress_bps: u128) -> Result<bool, ProgramError> {
+fn margin_covers_at(market: &[u8], portfolio: &[u8], v: &vstate::VaultState, size: i128, stress_bps: u128) -> Result<bool, ProgramError> {
+    let asset = v.asset_index;
     let (im_bps, min_im, fee_bps) = perc::margin_params(market)?;
     let (capital, pnl, _) = perc::portfolio_exposure(portfolio)?;
     let legs: Vec<(u16, i128)> = perc::positions(market, portfolio)?.iter().map(|p| (p.asset, p.size)).collect();
@@ -614,10 +636,12 @@ fn request(program_id: &Pubkey, accounts: &[AccountInfo], size: i128) -> Program
     if perc::asset_close_only(&market.try_borrow_data()?, v.asset_index)? {
         return Err(RouterError::CloseOnly.into());
     }
-    if !margin_covers(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, v.asset_index, size)? {
+    if !margin_covers(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, &v, size)? {
         return Err(RouterError::InsufficientMargin.into());
     }
-    enqueue(program_id, wallet, wallet.key, Some((trader_ai, &mut t)), vault_ai, book_ai, &mut b, request_ai, system, size, None)
+    // The deposit is counted at the mark (Percolator's price for a book that has none yet).
+    let price = if b.mark_price != 0 { b.mark_price } else { perc::asset_price(&market.try_borrow_data()?, v.asset_index)?.1 };
+    enqueue(program_id, wallet, wallet.key, Some((trader_ai, &mut t)), vault_ai, book_ai, &mut b, request_ai, system, size, None, expiry_deposit(size, price))
 }
 
 /// Stores a request for `owner`'s trading account (paid for by `payer`) and adds it to the book.
@@ -637,6 +661,7 @@ fn enqueue<'a>(
     system: &AccountInfo<'a>,
     size: i128,
     order: Option<u8>,
+    deposit: u64,
 ) -> ProgramResult {
     let clock = Clock::get()?;
     let target = clock.unix_timestamp.max(b.mark_publish_time).checked_add(DELAY_SECS).ok_or(RouterError::Overflow)?;
@@ -644,7 +669,7 @@ fn enqueue<'a>(
     let settlement = trader.is_none();
     let (rk, rbump) = request_address(program_id, vault_ai.key, owner, settlement);
     key_is(request_ai, &rk)?;
-    create_pda(payer, request_ai, system, program_id, REQUEST_LEN, BOND_LAMPORTS, &[SEED_REQUEST, vault_ai.key.as_ref(), owner.as_ref(), &[settlement as u8], &[rbump]])?;
+    create_pda(payer, request_ai, system, program_id, REQUEST_LEN, BOND_LAMPORTS.saturating_add(deposit), &[SEED_REQUEST, vault_ai.key.as_ref(), owner.as_ref(), &[settlement as u8], &[rbump]])?;
     store(
         request_ai,
         &Request {
@@ -730,7 +755,7 @@ fn request_close(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
             return Err(RouterError::NotCloseOnly.into());
         }
     }
-    enqueue(program_id, payer, wallet.key, Some((trader_ai, &mut t)), vault_ai, book_ai, &mut b, request_ai, system, 0, None)
+    enqueue(program_id, payer, wallet.key, Some((trader_ai, &mut t)), vault_ai, book_ai, &mut b, request_ai, system, 0, None, 0)
 }
 
 // ---- standing orders: stop, take-profit, trailing stop, limit, TWAP ----
@@ -975,12 +1000,12 @@ fn trigger_order(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
     if perc::asset_close_only(&market.try_borrow_data()?, v.asset_index)? {
         return Err(RouterError::CloseOnly.into());
     }
-    if !margin_covers(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, v.asset_index, size)? {
+    if !margin_covers(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, &v, size)? {
         return Err(RouterError::InsufficientMargin.into());
     }
     o.queued_id = b.next_id.checked_add(1).ok_or(RouterError::Overflow)?;
     store(order_ai, &o)?;
-    enqueue(program_id, payer, wallet.key, Some((trader_ai, &mut t)), vault_ai, book_ai, &mut b, request_ai, system, size, Some(o.index))
+    enqueue(program_id, payer, wallet.key, Some((trader_ai, &mut t)), vault_ai, book_ai, &mut b, request_ai, system, size, Some(o.index), 0)
 }
 
 /// Books what a request queued by a standing order traded, and removes the order once it has
@@ -1205,6 +1230,9 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if effective != b.mark_price {
         return Err(RouterError::NotConverged.into());
     }
+    // (Percolator charges a trade against a matcher the market's base fee whatever is passed
+    // here: "only the market base fee may debit the unsigned LP". The vault's spread setting
+    // therefore cannot be charged as a fee from the router.)
     let (_, _, fee_bps) = perc::margin_params(&market.try_borrow_data()?)?;
 
     let held = |p: &AccountInfo, m: &AccountInfo| -> Result<i128, ProgramError> {
@@ -1243,7 +1271,7 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             // through the router at all.
             liquidated = before != 0;
             size = before.checked_neg().ok_or(RouterError::Overflow)?;
-        } else if (close_only && !reduces) || !margin_covers_at(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, v.asset_index, size, 0)? {
+        } else if (close_only && !reduces) || !margin_covers_at(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, &v, size, 0)? {
             size = 0;
         }
     } else if r.size == 0 {
@@ -1370,7 +1398,7 @@ fn request_settle(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResul
     if b.len as usize >= MAX_PENDING {
         return Err(RouterError::BookFull.into());
     }
-    enqueue(program_id, payer, payer.key, None, vault_ai, book_ai, &mut b, request_ai, system, 0, None)?;
+    enqueue(program_id, payer, payer.key, None, vault_ai, book_ai, &mut b, request_ai, system, 0, None, 0)?;
     let r: Request = load(request_ai, program_id, REQUEST_MAGIC)?;
     let until = r.target_time.saturating_add(GRACE_SECS).saturating_add(5).clamp(1, u32::MAX as i64) as u32;
     let mut data = vec![TAG_FREEZE_REQUESTS];
@@ -1516,6 +1544,17 @@ fn expire(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     }
     if r.kind == KIND_COPY {
         return close(request_ai, BOND_LAMPORTS, book_ai, book_ai);
+    }
+    // Its price was the mark and it still was not filled: the deposit that came with it stays
+    // here with the bond (see `EXPIRY_DEPOSIT_BPS`); only the account's rent goes back. A request
+    // whose price never arrived (no oracle price, no executor) lost nothing but its bond.
+    if r.kind == KIND_TRADE && at_mark {
+        let rent = Rent::get()?.minimum_balance(REQUEST_LEN);
+        let kept = request_ai.lamports().saturating_sub(rent).max(BOND_LAMPORTS);
+        let mut b: Book = load(book_ai, program_id, BOOK_MAGIC)?;
+        b.forfeited_bonds = b.forfeited_bonds.saturating_add(kept - BOND_LAMPORTS);
+        store(book_ai, &b)?;
+        return close(request_ai, kept, book_ai, wallet);
     }
     close(request_ai, BOND_LAMPORTS, book_ai, wallet)
 }

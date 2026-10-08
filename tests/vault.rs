@@ -365,6 +365,7 @@ fn market_offsets_match_engine() {
     assert_eq!(perc::MARKET_CONFIG_OFF, c::MARKET_GROUP_OFF + offset_of!(percolator::MarketGroupV16HeaderAccount, config));
     assert_eq!(perc::CONFIG_INITIAL_MARGIN_BPS, offset_of!(C, initial_margin_bps));
     assert_eq!(perc::CONFIG_MIN_NONZERO_IM_REQ, offset_of!(C, min_nonzero_im_req));
+    assert_eq!(perc::CONFIG_MAX_TRADING_FEE_BPS, offset_of!(C, max_trading_fee_bps));
     assert_eq!(perc::WRAPPER_TRADE_FEE_BASE_BPS, c::HEADER_LEN + offset_of!(percolator_prog::state::WrapperConfigV16, trade_fee_base_bps));
     assert_eq!(perc::ASSET_EFFECTIVE_PRICE, offset_of!(A, effective_price));
     assert_eq!(perc::ASSET_SLOT_LAST, offset_of!(A, slot_last));
@@ -652,7 +653,9 @@ fn export_layout_for_frontend() {
             "im_bps_off": perc::MARKET_CONFIG_OFF + perc::CONFIG_INITIAL_MARGIN_BPS,
             "min_im_off": perc::MARKET_CONFIG_OFF + perc::CONFIG_MIN_NONZERO_IM_REQ,
             "fee_bps_off": perc::WRAPPER_TRADE_FEE_BASE_BPS,
-            "bond_lamports": percolator_router::BOND_LAMPORTS
+            "bond_lamports": percolator_router::BOND_LAMPORTS,
+            "expiry_deposit_bps": percolator_router::EXPIRY_DEPOSIT_BPS as u64,
+            "lamports_per_atom": percolator_router::LAMPORTS_PER_ATOM
         },
         "market_header": {
             "next_market_id": percolator_prog::constants::MARKET_GROUP_OFF + offset_of!(percolator::MarketGroupV16HeaderAccount, next_market_id),

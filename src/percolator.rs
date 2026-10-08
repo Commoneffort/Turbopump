@@ -133,6 +133,7 @@ pub fn expect_market(ai: &AccountInfo) -> Result<(), ProgramError> {
 pub const MARKET_CONFIG_OFF: usize = 464 + 32;
 pub const CONFIG_INITIAL_MARGIN_BPS: usize = 62;
 pub const CONFIG_MIN_NONZERO_IM_REQ: usize = 22;
+pub const CONFIG_MAX_TRADING_FEE_BPS: usize = 70;
 pub const WRAPPER_TRADE_FEE_BASE_BPS: usize = HEADER_LEN + 128;
 pub const ASSET_EFFECTIVE_PRICE: usize = 25;
 pub const ASSET_SLOT_LAST: usize = 41;
@@ -163,6 +164,11 @@ pub fn margin_params(d: &[u8]) -> Result<(u64, u128, u64), ProgramError> {
         rd_u128(d, MARKET_CONFIG_OFF + CONFIG_MIN_NONZERO_IM_REQ)?,
         rd_u64(d, WRAPPER_TRADE_FEE_BASE_BPS)?,
     ))
+}
+
+/// The most Percolator lets a trade be charged, in bps of its notional.
+pub fn max_trading_fee_bps(d: &[u8]) -> Result<u64, ProgramError> {
+    rd_u64(d, MARKET_CONFIG_OFF + CONFIG_MAX_TRADING_FEE_BPS)
 }
 
 /// An asset's generation (`market_id`), effective price (e6) and last accrual slot.

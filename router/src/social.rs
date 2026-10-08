@@ -449,13 +449,13 @@ pub(crate) fn trigger_copy(program_id: &Pubkey, accounts: &[AccountInfo], data: 
     if perc::asset_close_only(&market.try_borrow_data()?, v.asset_index)? {
         return Err(RouterError::CloseOnly.into());
     }
-    if !margin_covers(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, v.asset_index, size)? {
+    if !margin_covers(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, &v, size)? {
         return Err(RouterError::InsufficientMargin.into());
     }
     c.triggers = c.triggers.saturating_add(1);
     store(copy_ai, &c)?;
     msg!("copy {} {}", c.leader, size);
-    enqueue(program_id, payer, wallet.key, Some((trader_ai, &mut t)), vault_ai, book_ai, &mut b, request_ai, system, size, None)?;
+    enqueue(program_id, payer, wallet.key, Some((trader_ai, &mut t)), vault_ai, book_ai, &mut b, request_ai, system, size, None, 0)?;
     // Queued by someone else than the trader: the request's rent goes back to them.
     let mut r: Request = load(request_ai, program_id, REQUEST_MAGIC)?;
     r.kind = KIND_COPY;

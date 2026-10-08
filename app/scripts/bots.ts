@@ -132,7 +132,9 @@ const trade = (label: string, kp: Keypair, vault: PublicKey, size: bigint) => se
 const deployer = () => read(process.env.KEYPAIR ?? `${process.env.HOME}/.config/solana/${C.X1 ? "percolator-x1" : "percolator-test"}/deployer.json`);
 // Every order carries a bond that goes to whoever fills it (our own executor, so it comes back
 // to the wallet that pays this). A bot is topped up for about thirty orders at a time.
-const GAS_LOW = C.ROUTER_BOND_LAMPORTS * 4, GAS_FILL = C.ROUTER_BOND_LAMPORTS * 30;
+// (A request also carries a deposit that comes back when it fills: room for one of $2,000.)
+const DEPOSIT_FLOAT = Number(C.expiryDeposit(2_000n * C.UNIT, 1_000_000n));
+const GAS_LOW = C.ROUTER_BOND_LAMPORTS * 4 + DEPOSIT_FLOAT, GAS_FILL = C.ROUTER_BOND_LAMPORTS * 30 + DEPOSIT_FLOAT;
 // Below this the paying wallet is reported on every pass (PAYER_WARN to change it): about a day
 // of what the services were measured to spend (X1 ~270 XNT a day with 19 markets, devnet ~1 SOL).
 const PAYER_WARN = Number(process.env.PAYER_WARN ?? (C.X1 ? 300 : 1.5));

@@ -438,6 +438,7 @@ function Ticket({ state, send, busy }: { state: C.State; send: Send; busy?: stri
       <p className="fine">
         Orders fill at the first oracle price published {C.ROUTER_DELAY_SECS} seconds after the request lands. Nobody can know that price
         when the order is sent, so nobody can trade ahead of it. An order cannot be cancelled; unfilled after {C.ROUTER_GRACE_SECS} s, it expires.
+        {want > 0n && <> A deposit of {(Number(C.expiryDeposit(sent, state.asset.price)) / 1e9).toFixed(4)} {C.COIN} ({C.EXPIRY_DEPOSIT_BPS / 100}% of the order) goes with it and comes back when it fills; it is kept only if the order's price arrived and the order still expired.</>}
       </p>
     </div>
   );

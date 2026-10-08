@@ -47,6 +47,11 @@ pub const CANON_INSURANCE_FLOOR: u64 = 10_000;
 /// Share of the vault's value kept as cash outside Percolator when it redeploys at a roll, so
 /// that ordinary withdrawals can be paid without closing the vault's position first.
 pub const RESERVE_BPS: u64 = 1_000;
+/// A canonical vault's quoted spread. It has no effect on what a trade costs: Percolator trades
+/// at its own price whatever the matcher quotes, and charges a trade against a matcher the
+/// market's base fee only (the caller's fee is ignored there). What providers earn is that base
+/// fee, through the asset's insurance.
+pub const CANON_SPREAD_BPS: u16 = 10;
 pub const CANON_POSITION_NAV_BPS: u16 = 30_000; // position up to 3x the vault's NAV
 pub const CANON_FILL_NAV_BPS: u16 = 7_500; // each fill up to 0.75x the vault's NAV
 #[cfg(feature = "devnet")]
@@ -74,7 +79,7 @@ impl InitParams {
         Self {
             seed: 0,
             asset_index: 0,
-            spread_bps: 10,
+            spread_bps: CANON_SPREAD_BPS,
             unwind_spread_bps: 0,
             trade_fee_cap_bps: 10_000,
             backing_fee_cap_bps: 0,

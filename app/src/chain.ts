@@ -760,7 +760,7 @@ export function marginRoom(market: Uint8Array, portfolio: Uint8Array, asset: num
     if (a !== asset) other += (q < 0n ? -q : q) * price(a) / UNIT;
   }
   const equity = u128(portfolio, P.capital) + i128(portfolio, P.pnl);
-  const stress = BigInt(R.stress_bps), rate = u64(market, R.im_bps_off) + u64(market, R.fee_bps_off);
+  const stress = BigInt(R.stress_bps), rate = u64(market, R.im_bps_off) + marketRates(market).feeBps;
   // need(total) = total * perUnit / 1e8 + minimum
   const perUnit = (10_000n + stress) * rate + stress * 10_000n;
   const total = (equity - u128(market, R.min_im_off)) * 100_000_000n / perUnit - other;
@@ -789,6 +789,12 @@ export const ROUTER_GRACE_SECS = R.grace_secs;
 /** What a request posts and its executor earns. Larger on X1 (the router's X1 build), where a
  *  fill costs its sender about that much in fees. */
 export const ROUTER_BOND_LAMPORTS = X1 ? 20_000_000 : R.bond_lamports;
+/** The deposit (lamports) a trader's own request carries on top of the bond: a share of its
+ *  notional, in the chain's coin at a fixed rate. It comes back when the request fills, and is
+ *  kept only if the request expires after its price had arrived. */
+export const EXPIRY_DEPOSIT_BPS: number = R.expiry_deposit_bps;
+export const LAMPORTS_PER_ATOM = X1 ? 5_000 : R.lamports_per_atom;
+export const expiryDeposit = (size: bigint, priceE6: bigint) => (size < 0n ? -size : size) * priceE6 / UNIT * BigInt(EXPIRY_DEPOSIT_BPS) / 10_000n * BigInt(LAMPORTS_PER_ATOM);
 export const TRADER_LEN = R.trader_len;
 const rpda = (...seeds: (Uint8Array | Buffer)[]) => PublicKey.findProgramAddressSync(seeds, ROUTER)[0];
 export const routerAuthority = () => rpda(Buffer.from("authority"));
