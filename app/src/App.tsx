@@ -26,7 +26,7 @@ function useRoute(): [string[], (to: string) => void] {
 // ---------------------------------------------------------------- transactions
 
 const ERRORS: Record<string, string> = {
-  "0x1": `not enough test USDC (use Get test USDC), or not enough ${C.COIN} in the wallet for the fee and the order's bond`, "0x5608": "vault not active", "0x560a": "claim your previous request first",
+  "0x1": `not enough test USDC (use Get test USDC), or not enough ${C.COIN} in the wallet for the fee, the order's bond and its deposit`, "0x5608": "vault not active", "0x560a": "claim your previous request first",
   "0x560b": "nothing to claim", "0x560c": "epoch not over", "0x560d": "epoch not settled yet", "0x560e": "vault not flat yet",
   "0x5610": "amount is zero", "0x5611": "unknown asset", "0x15": "market busy: try again in a few seconds",
   "0x13": "close your open positions first (margin can only be withdrawn from an account with none)", "0xe": "not enough margin", "0x12": "asset generation changed: retry",

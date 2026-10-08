@@ -132,18 +132,26 @@ const trade = (label: string, kp: Keypair, vault: PublicKey, size: bigint) => se
 const deployer = () => read(process.env.KEYPAIR ?? `${process.env.HOME}/.config/solana/${C.X1 ? "percolator-x1" : "percolator-test"}/deployer.json`);
 // Every order carries a bond that goes to whoever fills it (our own executor, so it comes back
 // to the wallet that pays this). A bot is topped up for about thirty orders at a time.
-// (A request also carries a deposit that comes back when it fills: room for one of $2,000.)
-const DEPOSIT_FLOAT = Number(C.expiryDeposit(2_000n * C.UNIT, 1_000_000n));
-const GAS_LOW = C.ROUTER_BOND_LAMPORTS * 4 + DEPOSIT_FLOAT, GAS_FILL = C.ROUTER_BOND_LAMPORTS * 30 + DEPOSIT_FLOAT;
+const GAS_LOW = C.ROUTER_BOND_LAMPORTS * 4, GAS_FILL = C.ROUTER_BOND_LAMPORTS * 30;
+// A request also carries a deposit (0.1% of its size, in the chain's coin) that comes back when
+// it fills: each bot keeps enough for the largest order its money allows (about 5x of it).
+const floats = new Map<string, number>();
+function depositFloat(pk: PublicKey) {
+  if (!floats.size) for (const b of BOTS) floats.set(wallet(b.name).publicKey.toBase58(), Number(C.expiryDeposit(BigInt(b.usdc * 5) * C.UNIT, 1_000_000n)));
+  return floats.get(pk.toBase58()) ?? Number(C.expiryDeposit(2_000n * C.UNIT, 1_000_000n));
+}
 // Below this the paying wallet is reported on every pass (PAYER_WARN to change it): about a day
 // of what the services were measured to spend (X1 ~270 XNT a day with 19 markets, devnet ~1 SOL).
 const PAYER_WARN = Number(process.env.PAYER_WARN ?? (C.X1 ? 300 : 1.5));
 async function gas(kp: Keypair) {
-  if (await conn.getBalance(kp.publicKey) >= GAS_LOW) return;
+  const float = depositFloat(kp.publicKey);
+  const have = await conn.getBalance(kp.publicKey);
+  if (have >= GAS_LOW + float) return;
   const from = deployer();
-  if (await conn.getBalance(from.publicKey) < GAS_FILL + 0.3 * LAMPORTS_PER_SOL) { say(`the paying wallet is low on ${C.COIN}: ${kp.publicKey.toBase58().slice(0, 6)} was not topped up`); return; }
-  const r = await send(`fees for ${kp.publicKey.toBase58().slice(0, 6)}`, from, [SystemProgram.transfer({ fromPubkey: from.publicKey, toPubkey: kp.publicKey, lamports: GAS_FILL })]);
-  note({ type: "gas", wallet: kp.publicKey.toBase58(), lamports: GAS_FILL, ok: r === true });
+  const lamports = GAS_FILL + float - have;
+  if (await conn.getBalance(from.publicKey) < lamports + 0.3 * LAMPORTS_PER_SOL) { say(`the paying wallet is low on ${C.COIN}: ${kp.publicKey.toBase58().slice(0, 6)} was not topped up`); return; }
+  const r = await send(`fees for ${kp.publicKey.toBase58().slice(0, 6)}`, from, [SystemProgram.transfer({ fromPubkey: from.publicKey, toPubkey: kp.publicKey, lamports })]);
+  note({ type: "gas", wallet: kp.publicKey.toBase58(), lamports, ok: r === true });
 }
 async function mint(kp: Keypair, usdc: number) {
   const from = deployer();
