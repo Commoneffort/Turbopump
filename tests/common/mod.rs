@@ -144,10 +144,21 @@ impl World {
                 AccountMeta::new_readonly(self.env.vault_authority, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(perc::PERCOLATOR_PROGRAM_ID, false),
+                AccountMeta::new(self.treasury(), false),
             ],
             data,
         };
         self.send(vec![ix], &[])
+    }
+
+    /// The platform treasury's collateral account (made on first use).
+    pub fn treasury(&mut self) -> Pubkey {
+        let key = Pubkey::new_from_array([0x7e; 32]);
+        if self.env.svm.get_account(&key).is_none() {
+            let mint = self.vault_state().collateral_mint;
+            set_token(&mut self.env.svm, key, mint, processor::TREASURY, 0);
+        }
+        key
     }
 }
 

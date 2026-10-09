@@ -1028,6 +1028,14 @@ export const fillRequest = (executor: PublicKey, v: Vault, r: RouterRequest) => 
   ],
   data: new W().u8(6).done(),
 });
+/** The platform's treasury: its share of harvested fees, and what expired requests leave behind. */
+export const TREASURY = new PublicKey("B9Ke1KTC8x46ZxAMTa7oU73HXEzPXt17GC7bZujxiiWV");
+/** Sends what expired requests left in a vault's book to the treasury (anyone may). */
+export const sweepBook = (vault: PublicKey) => new TransactionInstruction({
+  programId: ROUTER,
+  keys: [rw(bookAddress(vault)), rw(TREASURY)],
+  data: new W().u8(23).done(),
+});
 export const expireRequest = (caller: PublicKey, r: RouterRequest) => new TransactionInstruction({
   programId: ROUTER,
   // (A settlement names its vault: it can then go as soon as its epoch has rolled.)

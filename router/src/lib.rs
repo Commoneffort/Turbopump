@@ -151,6 +151,7 @@ pub const TAG_SET_COPY: u8 = 19;
 pub const TAG_STOP_COPY: u8 = 20;
 pub const TAG_TRIGGER_COPY: u8 = 21;
 pub const TAG_CONVERT_PNL: u8 = 22;
+pub const TAG_SWEEP: u8 = 23;
 /// Widest trail, in basis points.
 pub const MAX_TRAIL_BPS: u64 = 5_000;
 /// Shortest time between two slices of a TWAP order, and the most slices one can have.
@@ -245,8 +246,32 @@ pub fn process_instruction(program_id: &Pubkey, accounts: &[AccountInfo], data: 
         TAG_STOP_COPY => social::stop_copy(program_id, accounts),
         TAG_TRIGGER_COPY => social::trigger_copy(program_id, accounts, rest),
         TAG_CONVERT_PNL => convert_pnl(program_id, accounts),
+        TAG_SWEEP => sweep(program_id, accounts),
         _ => Err(RouterError::InvalidInstruction.into()),
     }
+}
+
+/// Moves what expired requests left in a book (forfeited bonds and expiry deposits) to the
+/// platform's treasury. Anyone may call it: the destination is fixed, and the book keeps the
+/// rent it needs. The money never goes to whoever fills or expires requests, so nobody earns by
+/// letting one lapse.
+///
+/// Accounts: 0 book [w], 1 treasury [w] (`percolator_vault::processor::TREASURY`).
+fn sweep(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let book_ai = acc(accounts, 0)?;
+    let treasury = acc(accounts, 1)?;
+    writable(book_ai)?;
+    writable(treasury)?;
+    key_is(treasury, &percolator_vault::processor::TREASURY)?;
+    let _: Book = load(book_ai, program_id, BOOK_MAGIC)?;
+    let keep = Rent::get()?.minimum_balance(book_ai.data_len());
+    let spare = book_ai.lamports().saturating_sub(keep);
+    if spare == 0 {
+        return Err(RouterError::InvalidInstruction.into());
+    }
+    **book_ai.try_borrow_mut_lamports()? -= spare;
+    **treasury.try_borrow_mut_lamports()? = treasury.lamports().checked_add(spare).ok_or(RouterError::Overflow)?;
+    Ok(())
 }
 
 // ---- helpers ----

@@ -245,7 +245,8 @@ pub fn convert_pnl(k: &VaultKeys) -> Instruction {
     }
 }
 
-pub fn harvest_fees(k: &VaultKeys, authority_epoch: u64, max_amount: u64) -> Instruction {
+/// `treasury`: a collateral token account owned by `processor::TREASURY`.
+pub fn harvest_fees(k: &VaultKeys, authority_epoch: u64, max_amount: u64, treasury: &Pubkey) -> Instruction {
     let mut data = with_u64(processor::TAG_HARVEST_FEES, authority_epoch);
     data.extend_from_slice(&max_amount.to_le_bytes());
     Instruction {
@@ -258,6 +259,7 @@ pub fn harvest_fees(k: &VaultKeys, authority_epoch: u64, max_amount: u64) -> Ins
             ro(k.percolator_vault_authority),
             ro(spl_token::ID),
             ro(perc::PERCOLATOR_PROGRAM_ID),
+            w(*treasury),
         ],
         data,
     }

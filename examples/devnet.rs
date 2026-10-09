@@ -639,9 +639,13 @@ fn keeper(rpc: &RpcClient, payer: &Keypair) {
             let remaining = (rd(515) + rd(531)).saturating_sub(rd(547) + rd(563));
             if remaining > v.insurance_floor as u128 + USDC as u128 {
                 let seq = pstate::read_asset_control_sequences(&data, v.asset_index as usize).unwrap();
-                match send(rpc, payer, vec![client::harvest_fees(&k, seq.authority_epoch, u64::MAX)], &[]) {
-                    Ok(s) => println!("{} harvested fees ({s})", k.vault),
-                    Err(e) => eprintln!("{} harvest: {}", k.vault, e.lines().next().unwrap_or("")),
+                // The platform's share is paid into the treasury's collateral account, named in the manifest.
+                match load()["treasury_collateral"].as_str().and_then(|a| Pubkey::from_str(a).ok()) {
+                    None => eprintln!("{} harvest skipped: treasury_collateral missing from {}", k.vault, manifest()),
+                    Some(treasury) => match send(rpc, payer, vec![client::harvest_fees(&k, seq.authority_epoch, u64::MAX, &treasury)], &[]) {
+                        Ok(s) => println!("{} harvested fees ({s})", k.vault),
+                        Err(e) => eprintln!("{} harvest: {}", k.vault, e.lines().next().unwrap_or("")),
+                    },
                 }
             }
             if epoch_over {

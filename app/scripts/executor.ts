@@ -61,6 +61,10 @@ const JACK_SYMBOL: Record<string, string> = { XAU: "GOLD", XAG: "SILVER" };
 const IDLE_JUMP = process.env.IDLE_JUMP === "1";
 const IDLE_MARK_SECS = Number(process.env.IDLE_MARK_SECS ?? 600);
 const IDLE_MARK_MOVE = Number(process.env.IDLE_MARK_MOVE ?? 0.005);
+const HELD_MARK_SECS = Number(process.env.HELD_MARK_SECS ?? 60);
+const HELD_MARK_MOVE = 0.001;
+const SWEEP_MIN = C.X1 ? 1e9 : 0.02e9; // lamports: below this a sweep is not worth its fee
+let sweptAt = 0, bookRent = 0;
 const URGENT_MARK_MOVE = 0.01; // a move this large on a market with positions is posted even while trades are queued elsewhere
 const reporter = (() => {
   const p = process.env.REPORTER_KEY ?? "../keys/reporter-keypair.json";
@@ -689,9 +693,13 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
     const moved = j && b.markPrice > 0n ? Math.abs(Number(j.price) / Number(b.markPrice) - 1) : 1;
     const a = C.decodeAsset(snap.market, v.assetIndex);
     const held = a.oiLong !== 0n || a.oiShort !== 0n;
-    const [every, move] = held ? [30, 0.003] : [IDLE_MARK_SECS, IDLE_MARK_MOVE];
+    const [every, move] = held ? [HELD_MARK_SECS, 0.003] : [IDLE_MARK_SECS, IDLE_MARK_MOVE];
     const urgent = held && moved >= URGENT_MARK_MOVE;
-    if ((!queued || urgent) && j && j.publish > b.markPublish && (j.publish - b.markPublish >= every || moved >= move)) await advanceReported(v, j, urgent && queued ? "refresh: the price moved 1% or more" : held ? "refresh" : "refresh, no positions");
+    // With positions open: at once on a 0.3% move, after 30 s on a 0.1% move, and every 60 s
+    // whatever the price did. Each update is followed by a re-valuation of every account on the
+    // market, which is most of what the service costs; a price that has not moved needs neither.
+    const age = j ? j.publish - b.markPublish : 0;
+    if ((!queued || urgent) && j && j.publish > b.markPublish && (age >= every || moved >= move || (held && age >= 30 && moved >= HELD_MARK_MOVE))) await advanceReported(v, j, urgent && queued ? "refresh: the price moved 1% or more" : held ? "refresh" : "refresh, no positions");
   } else if (snap.feed && live.length === 0 && reqs.length === 0) {
     const p = C.decodePyth(snap.feed);
     const a = C.decodeAsset(snap.market, v.assetIndex);
@@ -974,6 +982,15 @@ setInterval(() => {
         busy = (await serviceVault(v, now, snap, queued).catch(e => { log("error", v.feed?.symbol, String(e?.message ?? e).slice(0, 140)); return false; })) || busy;
       }
       const books = new Map(vaults.flatMap((v, i) => (accs[2 + 2 * i] ? [[v.key.toBase58(), C.decodeBook(new Uint8Array(accs[2 + 2 * i]!.data))] as [string, C.Book]] : [])));
+      // Once an hour: what expired requests left in the books goes to the treasury.
+      if (Date.now() - sweptAt > 3_600_000) {
+        sweptAt = Date.now();
+        bookRent ||= await conn.getMinimumBalanceForRentExemption(accs[2]?.data.length ?? 0);
+        for (const [i, v] of vaults.entries()) {
+          const spare = (accs[2 + 2 * i]?.lamports ?? 0) - bookRent;
+          if (accs[2 + 2 * i] && spare >= SWEEP_MIN) await send(`sweep ${(spare / 1e9).toFixed(3)} ${C.X1 ? "XNT" : "SOL"} left by expired requests on ${v.feed?.symbol} to the treasury`, [C.sweepBook(v.key)]);
+        }
+      }
       await serviceOrders(vaults, books, market, now, slot).catch(e => log("error", "orders", String(e?.message ?? e).slice(0, 140)));
       await serviceCopies(vaults, books, market).catch(e => log("error", "copies", String(e?.message ?? e).slice(0, 140)));
       if (!queued) await openTrackRecords().catch(e => log("error", "track records", String(e?.message ?? e).slice(0, 140)));

@@ -217,7 +217,7 @@ fn a_provider_who_leaves_is_paid_its_part_of_uncollected_fees() {
         (rd(515) + rd(531) - rd(547) - rd(563)) as u64 - 10_000
     };
     println!("uncollected {uncollected}");
-    let providers_part = uncollected - uncollected / 20; // the opener's twentieth is not theirs
+    let providers_part = uncollected - uncollected / 20 - uncollected / 10; // the opener's twentieth and the platform's tenth are not theirs
 
     // Alice leaves with nothing collected: half the vault, and half the providers' fees.
     // (The vault paid its own side of the trade fees, so it is worth a little under 100.)
@@ -307,10 +307,22 @@ fn e2e_operate_mode_lists_asset_and_harvests_fees() {
     let (_, g) = w.env.primary_market_state();
     println!("neg_pnl_accounts={} loss_stale={} stress={}", g.negative_pnl_account_count, g.loss_stale_active, g.threshold_stress_active);
     let buffer_before = w.tokens(w.buffer);
+    // The platform's share is only paid into an account of the treasury key.
+    {
+        let v = w.vault_state();
+        let epoch = w.env.primary_control_sequences(v.asset_index as usize).authority_epoch;
+        let ix = client::harvest_fees(&w.keys.unwrap(), epoch, u64::MAX, &alice.collateral);
+        assert!(w.send(vec![ix], &[]).is_err(), "not the treasury's account");
+        assert_eq!(w.tokens(w.buffer), buffer_before);
+    }
     w.harvest(u64::MAX).unwrap();
-    let harvested = w.tokens(w.buffer) - buffer_before;
-    println!("harvested {harvested}");
+    // The platform's tenth (a fifth of what traders paid) went straight to the treasury's account.
+    let treasury = w.treasury();
+    let platform = w.tokens(treasury);
+    let harvested = w.tokens(w.buffer) - buffer_before + platform;
+    println!("harvested {harvested}, of which the platform's {platform}");
     assert_eq!(harvested as u128, insurance - 10_000);
+    assert_eq!(platform, harvested / 10);
     assert_eq!({ w.vault_state().total_fees_harvested }, harvested);
     assert!(w.harvest(u64::MAX).unwrap_err().contains("0x5615"), "nothing left above the floor");
 

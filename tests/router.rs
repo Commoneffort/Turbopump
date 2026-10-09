@@ -512,6 +512,22 @@ fn a_request_that_lapses_after_its_price_arrived_loses_its_deposit() {
     w.send(vec![again], &[&kp]).unwrap();
     assert_eq!(bal(&w, &book) - book_before, BOND_LAMPORTS + deposit);
     assert!(bal(&w, &t.wallet) <= queued + rent, "only the rent came back");
+
+    // What lapsed requests left in the book goes to the treasury, and nowhere else; the book
+    // keeps its rent, and a second sweep finds nothing.
+    let treasury = percolator_vault::processor::TREASURY;
+    let book_rent = w.env.svm.minimum_balance_for_rent_exemption(rstate::BOOK_LEN);
+    let spare = bal(&w, &book) - book_rent;
+    assert!(spare >= 2 * BOND_LAMPORTS + deposit);
+    let mut wrong = rclient::sweep(&w.vault);
+    wrong.accounts[1] = AccountMeta::new(kp.pubkey(), false);
+    assert!(w.send(vec![wrong], &[]).is_err(), "only the treasury");
+    let had = w.env.svm.get_balance(&treasury).unwrap_or(0);
+    w.send(vec![rclient::sweep(&w.vault)], &[]).unwrap();
+    assert_eq!(w.env.svm.get_balance(&treasury).unwrap_or(0) - had, spare);
+    assert_eq!(bal(&w, &book), book_rent);
+    w.tick(1);
+    assert!(w.send(vec![rclient::sweep(&w.vault)], &[]).is_err());
 }
 
 /// The router liquidates below 15% of the positions' notional (it was 12.5%): further from

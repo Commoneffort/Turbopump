@@ -264,6 +264,15 @@ pub fn expire(caller: &Pubkey, vault: &Pubkey, t: &TraderKeys) -> Instruction {
     }
 }
 
+/// Sends what expired requests left in a vault's book to the platform's treasury.
+pub fn sweep(vault: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: id(),
+        accounts: vec![w(book_address(&id(), vault).0), w(percolator_vault::processor::TREASURY)],
+        data: vec![TAG_SWEEP],
+    }
+}
+
 /// Removes a settlement request `payer` queued (see `expire`); with the vault named, as here, it
 /// can go as soon as its epoch has rolled.
 pub fn expire_settle(caller: &Pubkey, vault: &Pubkey, payer: &Pubkey) -> Instruction {

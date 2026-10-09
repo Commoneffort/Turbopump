@@ -63,6 +63,24 @@ pub const UNCAPPED: u128 = (i128::MAX as u128) / 4;
 /// style). It carries no powers: the opener can only claim what has accrued.
 pub const OPENER_FEE_BPS: u64 = 500;
 
+/// Share of a canonical market's harvested fees paid to the platform's treasury: a fifth of what
+/// traders pay (the other half of a harvest is the vault's own fees coming back). It pays for
+/// what no trade pays for: price updates, re-valuations, liquidations, the service itself.
+pub const PROTOCOL_FEE_BPS: u64 = 1_000;
+
+/// Where the platform's share goes: any token account of the collateral mint this key owns.
+/// Harvesting is open to anyone and pays it on the spot, so the key signs nothing here.
+pub const TREASURY: Pubkey = solana_program::pubkey!("B9Ke1KTC8x46ZxAMTa7oU73HXEzPXt17GC7bZujxiiWV");
+
+/// The platform's cut of `amount` of harvested fees for vault `v`.
+pub fn protocol_cut(v: &VaultState, amount: u64) -> u64 {
+    if v.vault_kind == KIND_CANONICAL {
+        ((amount as u128 * PROTOCOL_FEE_BPS as u128) / 10_000) as u64
+    } else {
+        0
+    }
+}
+
 /// The opener's cut of `amount` of harvested fees for vault `v`.
 pub fn opener_cut(v: &VaultState, amount: u64) -> u64 {
     if v.vault_kind == KIND_CANONICAL {
@@ -1087,10 +1105,11 @@ fn roll_epoch(program_id: &Pubkey, accounts: &[AccountInfo], frontier: u64) -> P
     let w = v.pending_withdraw_shares;
     // Fees sitting in the vault's asset insurance above the floor belong to current holders too;
     // counting them in the deposit price stops a deposit from buying into them at a discount.
-    // Only the depositors' part: the opener's cut of those fees will not belong to the pool.
+    // Only the depositors' part: the opener's and the platform's cuts of those fees will not
+    // belong to the pool.
     let pending_fees = if v.mode == MODE_OPERATE {
         let excess = insurance_excess(market, &v)?;
-        excess - opener_cut(&v, excess)
+        excess - opener_cut(&v, excess) - protocol_cut(&v, excess)
     } else {
         0
     };
@@ -2048,7 +2067,8 @@ fn retire_market(
 /// empty) the floor no longer applies: nothing is left for it to protect.
 ///
 /// Accounts: 0 vault [w], 1 market [w], 2 buffer [w], 3 Percolator collateral vault [w],
-/// 4 Percolator vault authority, 5 token program, 6 Percolator program.
+/// 4 Percolator vault authority, 5 token program, 6 Percolator program, 7 a collateral token
+/// account owned by `TREASURY` [w] (canonical vaults: the platform's share is paid into it).
 /// Data: the asset's authority epoch (checked by Percolator), the most to move.
 fn harvest_fees(
     program_id: &Pubkey,
@@ -2122,7 +2142,23 @@ fn harvest_fees(
     v.opener_fees_owed = add(v.opener_fees_owed, cut)?;
     v.opener_fees_total = v.opener_fees_total.saturating_add(cut);
     v.reserved_assets = add(v.reserved_assets, cut)?;
-    state::store_vault(vault_ai, &v)
+    state::store_vault(vault_ai, &v)?;
+    // The platform's cut leaves at once, to an account only the treasury key controls.
+    let platform = protocol_cut(&v, received);
+    if platform == 0 {
+        return Ok(());
+    }
+    let treasury = acc(accounts, 7)?;
+    writable(treasury)?;
+    let t = token_account(treasury)?;
+    if t.owner != TREASURY || t.mint != v.collateral_mint || t.state != AccountState::Initialized {
+        return Err(VaultError::BadAccount.into());
+    }
+    invoke_signed(
+        &spl_token::instruction::transfer(&spl_token::ID, buffer.key, treasury.key, vault_ai.key, &[], platform)?,
+        &[buffer.clone(), treasury.clone(), vault_ai.clone(), token.clone()],
+        &[vault_seeds!(v, bump)],
+    )
 }
 
 /// First slot at which `Unwind` is accepted for a vault that has to get flat: `UNWIND_GRACE_EPOCHS`
