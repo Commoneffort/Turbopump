@@ -507,6 +507,17 @@ fn retire_idle(rpc: &RpcClient, payer: &Keypair) {
     }
 }
 
+/// Brings the market's trade fee to the vault program's value (anyone may send this).
+fn set_trade_fee(rpc: &RpcClient, payer: &Keypair, market: &Pubkey) {
+    let (_, _, data) = market_state(rpc, market);
+    let seq = pstate::read_asset_control_sequences(&data, 0).unwrap();
+    let ix = client::set_trade_fee(&percolator_vault::id(), market, seq.authority_epoch, seq.trade_fee + 1);
+    match send(rpc, payer, vec![ix], &[]) {
+        Ok(s) => println!("trade fee is now {} bps a side ({s})", percolator_vault::processor::CANON_TRADE_FEE_BPS),
+        Err(e) => eprintln!("set trade fee: {e}"),
+    }
+}
+
 /// One-time: makes the program's governor PDA the market authority (the payer must hold it now).
 fn accept_governance(rpc: &RpcClient, admin: &Keypair, market: &Pubkey) {
     let (_, _, data) = market_state(rpc, market);
@@ -773,7 +784,8 @@ fn main() {
         Some("retire-idle") => retire_idle(&rpc, &admin),
         Some("refresh-matchers") => refresh_matchers(&rpc, &admin),
         Some("accept-governance") => accept_governance(&rpc, &admin, &key(&load(), "market")),
+        Some("set-trade-fee") => set_trade_fee(&rpc, &admin, &key(&load(), "market")),
         Some("status") => status(&rpc),
-        _ => eprintln!("usage: devnet setup-market | create-vault | faucet <pubkey> <usdc> | keeper | accept-governance | retire-idle | refresh-matchers | status"),
+        _ => eprintln!("usage: devnet setup-market | create-vault | faucet <pubkey> <usdc> | keeper | accept-governance | set-trade-fee | retire-idle | refresh-matchers | status"),
     }
 }

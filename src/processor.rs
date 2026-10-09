@@ -61,7 +61,7 @@ pub const CANON_MATCHER_TTL_SLOTS: u64 = 200; // short in tests, so expiry and r
 pub const UNCAPPED: u128 = (i128::MAX as u128) / 4;
 /// Share of a canonical market's harvested fees paid to whoever opened it (Hyperliquid HIP-3
 /// style). It carries no powers: the opener can only claim what has accrued.
-pub const OPENER_FEE_BPS: u64 = 1_000;
+pub const OPENER_FEE_BPS: u64 = 500;
 
 /// The opener's cut of `amount` of harvested fees for vault `v`.
 pub fn opener_cut(v: &VaultState, amount: u64) -> u64 {
@@ -128,6 +128,13 @@ pub const TAG_ARM_FILL: u8 = 33;
 pub const TAG_SYNC_INVENTORY: u8 = 34;
 pub const TAG_REQUIRE_FLAT: u8 = 35;
 pub const TAG_FREEZE_REQUESTS: u8 = 36;
+pub const TAG_SET_TRADE_FEE: u8 = 37;
+
+/// The fee every canonical market charges on a trade, in basis points of its size. The engine
+/// takes it from both sides, so a vault pays it too and gets its own part back when fees are
+/// harvested: what providers earn is the traders' half. It is the only fee the engine applies to
+/// a trade against a vault, whatever the caller passes.
+pub const CANON_TRADE_FEE_BPS: u64 = 10;
 
 /// A market with no liquidity providers can be retired this many epochs after it was listed.
 pub const RETIRE_IDLE_EPOCHS: u64 = 3;
@@ -506,6 +513,17 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
                 return Err(VaultError::InvalidInstruction.into());
             }
             freeze_requests(program_id, accounts, u32::from_le_bytes(rest.try_into().unwrap()))
+        }
+        TAG_SET_TRADE_FEE => {
+            if rest.len() != 16 {
+                return Err(VaultError::InvalidInstruction.into());
+            }
+            set_trade_fee(
+                program_id,
+                accounts,
+                u64::from_le_bytes(rest[..8].try_into().unwrap()),
+                u64::from_le_bytes(rest[8..].try_into().unwrap()),
+            )
         }
         TAG_SYNC_INVENTORY => {
             no_args(rest)?;
@@ -1865,6 +1883,31 @@ fn accept_governance(program_id: &Pubkey, accounts: &[AccountInfo], authority_ep
     invoke_signed(
         &perc::update_market_authority(current.key, governor.key, market.key, authority_epoch),
         &[current.clone(), governor.clone(), market.clone(), percolator.clone()],
+        &[&[SEED_GOVERNOR, market.key.as_ref(), &[bump]]],
+    )
+}
+
+/// Brings a governed market's trade fee to `CANON_TRADE_FEE_BPS`. Anyone can call it: the value is
+/// this program's, the caller chooses nothing. It is refused once the market already charges it.
+/// Accounts: 0 governor PDA, 1 market [w], 2 Percolator program.
+/// Data: the market's authority epoch and the next trade-fee sequence (both checked by Percolator).
+fn set_trade_fee(program_id: &Pubkey, accounts: &[AccountInfo], authority_epoch: u64, sequence: u64) -> ProgramResult {
+    let governor = acc(accounts, 0)?;
+    let market = acc(accounts, 1)?;
+    let percolator = acc(accounts, 2)?;
+    writable(market)?;
+    key_is(percolator, &PERCOLATOR_PROGRAM_ID)?;
+    if market.owner != &PERCOLATOR_PROGRAM_ID {
+        return Err(VaultError::BadPercolatorAccount.into());
+    }
+    let (expected, bump) = state::governor_address(program_id, market.key);
+    key_is(governor, &expected)?;
+    if perc::trade_fee_base_bps(&market.try_borrow_data()?)? == CANON_TRADE_FEE_BPS {
+        return Err(VaultError::InvalidInstruction.into());
+    }
+    invoke_signed(
+        &perc::update_trade_fee_policy(governor.key, market.key, CANON_TRADE_FEE_BPS, sequence, authority_epoch),
+        &[governor.clone(), market.clone(), percolator.clone()],
         &[&[SEED_GOVERNOR, market.key.as_ref(), &[bump]]],
     )
 }

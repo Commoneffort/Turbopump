@@ -102,7 +102,7 @@ export function OpenerPanel({ state, send, busy }: { state: C.State; send: Send;
       <div className="card-head">
         <div>
           <h3>You opened this market</h3>
-          <p className="muted small">You earn {C.OPENER_FEE_BPS / 100}% of every fee this market harvests, forever. You have no other powers over it.</p>
+          <p className="muted small">You earn {C.OPENER_FEE_BPS / 100}% of the fees this market harvests (a tenth of what its traders pay), forever. You have no other powers over it.</p>
           <p className="muted small">
             {state.asset.insurance <= v.insuranceFloor
               ? `Trading fees first fill this market's insurance buffer of ${usd(v.insuranceFloor)} (it covers bad debt): ${usd(state.asset.insurance)} collected so far. Fees beyond that are harvested, and your share starts then.`

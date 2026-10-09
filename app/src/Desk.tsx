@@ -221,7 +221,7 @@ function MarketBar({ state, markets, day, go }: { state: C.State; markets: Card[
         <Cell label="Open interest" value={money(oiUsd, 0)} sub={`${units(state.asset.oiLong)} ${sym}`} />
         <Cell label="Vault liquidity" value={usd(C.navOf(state), 0)} />
         <Cell label="Oracle" value={C.X1 ? "Exchange median" : "Pyth"} sub={age !== undefined ? ago(age) : undefined} />
-        <Cell label="Fee" value="0.05%" sub="no spread, no price impact" />
+        <Cell label="Fee" value={C.TRADE_FEE_PCT} sub="no spread, no price impact" />
         <Cell label={`Liquidity epoch ${v.epoch}`} value={left > 0n ? `${Math.max(1, Math.ceil(Number(left) * C.slotSeconds() / 60))} min left` : v.pendingDeposit > 0n || v.pendingWithdraw > 0n ? "settling" : "no requests"} />
       </div>
     </header>
@@ -414,7 +414,7 @@ function Ticket({ state, send, busy }: { state: C.State; send: Send; busy?: stri
       <div className="sum">
         <div><span>Order value</span><b className="mono">{money(notional)}</b></div>
         <div><span>Margin used (10×)</span><b className="mono">{money(notional / 10)}</b></div>
-        <div><span>Fee (0.05%)</span><b className="mono">{money(notional * 0.0005)}</b></div>
+        <div><span>Fee ({C.TRADE_FEE_PCT})</span><b className="mono">{money(notional * C.TRADE_FEE_BPS / 10_000)}</b></div>
         <div><span>Position after</span><b className="mono">{after === 0 ? "flat" : `${after > 0 ? "long" : "short"} ${fmt(Math.abs(after), 4).replace(/\.?0+$/, "")} ${sym}`}</b></div>
         <div><span>Est. liquidation price</span><b className="mono">{liqAfter && want > 0n ? fmt(liqAfter, dp) : "—"}</b></div>
         <div><span>Largest order now</span><b className="mono">{state.trader ? `${units(most)} ${sym}` : `${units(vaultMax)} ${sym}`}</b></div>
@@ -708,7 +708,7 @@ function Bottom({ state, markets, fills, entry, liq, send, busy, go }: {
                   <td className="r mono">{fmt(Math.abs(f.size), 4).replace(/\.?0+$/, "")}</td>
                   <td className="r mono">{fmt(f.price, priceDp(f.price))}</td>
                   <td className="r mono">{money(Math.abs(f.size) * f.price)}</td>
-                  <td className="r mono">{money(Math.abs(f.size) * f.price * 0.0005)}</td>
+                  <td className="r mono">{money(Math.abs(f.size) * f.price * C.feeBpsAt(f.slot) / 10_000)}</td>
                   <td className="r"><a href={explorer("tx", f.sig)} target="_blank" rel="noreferrer">{short(f.sig)}</a></td>
                 </tr>
               ))}
@@ -719,7 +719,7 @@ function Bottom({ state, markets, fills, entry, liq, send, busy, go }: {
           <div className="mkt">
             <div className="kv">
               <div><span>Leverage</span><b>up to 10×</b></div>
-              <div><span>Trading fee</span><b>0.05% per trade</b></div>
+              <div><span>Trading fee</span><b>{C.TRADE_FEE_PCT} per trade</b></div>
               <div><span>Price</span><b>{C.X1 ? "exchange median, posted by the router's reporter" : "Pyth, verified on chain"}</b></div>
               <div><span>Fill</span><b>first oracle price {C.ROUTER_DELAY_SECS} s after the request</b></div>
               <div><span>Liquidation</span><b>below {fmt(Number(C.LIQUIDATION_BPS) / 100, 1)}% margin</b></div>

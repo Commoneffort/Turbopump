@@ -709,7 +709,7 @@ let orderCache: C.StandingOrder[] = [];
  *  take-profit, limit, a TWAP slice that is due), records a trailing stop's better mark once it
  *  is 0.1% better than the one recorded, and removes orders that can do nothing any more. Each is
  *  one small transaction; the request it queues is then filled like any other. */
-async function serviceOrders(vaults: C.Vault[], books: Map<string, C.Book>, market: Uint8Array, now: number) {
+async function serviceOrders(vaults: C.Vault[], books: Map<string, C.Book>, market: Uint8Array, now: number, slot: bigint) {
   if (Date.now() - ordersAt > 4_000) {
     const accs = await conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: C.ORDER_LEN }] });
     orderCache = accs.map(a => C.decodeOrder(a.pubkey, new Uint8Array(a.account.data)));
@@ -729,6 +729,12 @@ async function serviceOrders(vaults: C.Vault[], books: Map<string, C.Book>, mark
     // A trail's record is only worth a transaction once the mark is clearly better.
     if (what === "record" && (o.peak === 0n || (b.markPrice > o.peak ? b.markPrice - o.peak : o.peak - b.markPrice) * 1000n < o.peak)) continue;
     if (what === "fire" && (queuedNow.has(o.wallet.toBase58()) || C.decodeTrader(new Uint8Array(tr.data)).hasPending || b.pending.length >= 30 || C.closeOnly(market, v.assetIndex))) continue;
+    // A vault closing its position to pay withdrawals takes only trades that shrink it: an order
+    // the other way would be queued, filled with nothing and due again at once. It waits.
+    if (what === "fire" && v.needsFlat && slot >= v.epochStart + v.epochLen) {
+      const buys = o.kind <= C.ORDER.TRAIL ? held < 0n : o.size > 0n;
+      if (buys ? v.inventory <= 0n : v.inventory >= 0n) { orderRetry.set(o.key.toBase58(), Date.now() + 30_000); continue; }
+    }
     const name = ["stop", "take-profit", "trailing stop", "limit", "TWAP"][o.kind] ?? "order";
     const ok = await send(`${what === "fire" ? "carry out" : what === "record" ? "record a better mark for" : "remove"} ${name} of ${o.wallet.toBase58().slice(0, 6)} on ${v.feed?.symbol} (mark ${Number(b.markPrice) / 1e6})`, [C.triggerOrder(payer.publicKey, o)], true);
     // Refused (not enough margin, the mark moved back): leave it a while. Done: read the orders again.
@@ -968,7 +974,7 @@ setInterval(() => {
         busy = (await serviceVault(v, now, snap, queued).catch(e => { log("error", v.feed?.symbol, String(e?.message ?? e).slice(0, 140)); return false; })) || busy;
       }
       const books = new Map(vaults.flatMap((v, i) => (accs[2 + 2 * i] ? [[v.key.toBase58(), C.decodeBook(new Uint8Array(accs[2 + 2 * i]!.data))] as [string, C.Book]] : [])));
-      await serviceOrders(vaults, books, market, now).catch(e => log("error", "orders", String(e?.message ?? e).slice(0, 140)));
+      await serviceOrders(vaults, books, market, now, slot).catch(e => log("error", "orders", String(e?.message ?? e).slice(0, 140)));
       await serviceCopies(vaults, books, market).catch(e => log("error", "copies", String(e?.message ?? e).slice(0, 140)));
       if (!queued) await openTrackRecords().catch(e => log("error", "track records", String(e?.message ?? e).slice(0, 140)));
       await convertProfits(vaults, market).catch(e => log("error", "profits", String(e?.message ?? e).slice(0, 140)));

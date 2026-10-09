@@ -429,7 +429,7 @@ export function TraderPage({ wallet, send, busy, tick, go }: { wallet: string; s
                   <div><span>Their leverage now</span><b className="mono">{fmt(r!.leverage, 1)}×</b></div>
                   <div><span>Yours would be</span><b className="mono">{fmt(r!.leverage * ratioBps / 10_000, 1)}×</b></div>
                   <div><span>Your margin</span><b className="mono">${fmt(myEquity)}</b></div>
-                  <div><span>Fee</span><b className="mono">0.05% per trade</b></div>
+                  <div><span>Fee</span><b className="mono">{C.TRADE_FEE_PCT} per trade</b></div>
                 </div>
                 {!publicKey ? <div className="why">Connect a wallet to copy.</div> : (
                   <>

@@ -39,14 +39,14 @@ function Diagram() {
       <g className="d-box"><rect x="710" y="40" width="170" height="64" rx="10" /><text x="795" y="68">Pyth</text><text x="795" y="88" className="d-sub">price feed account</text></g>
       <g className="d-box accent"><rect x="330" y="200" width="240" height="84" rx="10" /><text x="450" y="232">Vault program</text><text x="450" y="252" className="d-sub">matcher + pool + market owner</text><text x="450" y="268" className="d-sub">no admin instruction</text></g>
       <g className="d-box"><rect x="20" y="210" width="170" height="64" rx="10" /><text x="105" y="238">Liquidity providers</text><text x="105" y="258" className="d-sub">deposit, share 90% of fees</text></g>
-      <g className="d-box"><rect x="710" y="210" width="170" height="64" rx="10" /><text x="795" y="238">Market opener</text><text x="795" y="258" className="d-sub">earns 10% of fees</text></g>
+      <g className="d-box"><rect x="710" y="210" width="170" height="64" rx="10" /><text x="795" y="238">Market opener</text><text x="795" y="258" className="d-sub">earns 5% of fees</text></g>
       <g className="d-box"><rect x="330" y="340" width="240" height="64" rx="10" /><text x="450" y="368">Keeper (anyone)</text><text x="450" y="388" className="d-sub">marks, fills, rolls, harvests</text></g>
       <path className="d-line" d="M190,72 L330,72" markerEnd="url(#arr)" /><text x="260" y="62" className="d-label">request → router</text>
       <path className="d-line" d="M710,72 L570,72" markerEnd="url(#arr)" /><text x="640" y="62" className="d-label">verified price</text>
       <path className="d-line" d="M430,114 L430,200" markerEnd="url(#arr)" /><text x="424" y="160" className="d-label end">asks for a fill</text>
       <path className="d-line" d="M470,200 L470,114" markerEnd="url(#arr)" /><text x="478" y="160" className="d-label start">size, at mark</text>
       <path className="d-line" d="M190,242 L330,242" markerEnd="url(#arr)" /><text x="260" y="232" className="d-label">deposits</text>
-      <path className="d-line" d="M570,242 L710,242" markerEnd="url(#arr)" /><text x="640" y="232" className="d-label">10% of fees</text>
+      <path className="d-line" d="M570,242 L710,242" markerEnd="url(#arr)" /><text x="640" y="232" className="d-label">5% of fees</text>
       <path className="d-line dash" d="M450,340 L450,284" markerEnd="url(#arr)" />
     </svg>
   );
@@ -142,7 +142,7 @@ export default function Docs() {
           <li><b>Roll.</b> When an epoch ends and the LP portfolio is flat, <code>RollEpoch</code> (anyone) withdraws all capital from Percolator, prices every queued withdrawal and deposit, burns and mints shares, redeploys everything that is not owed, and renews the matcher approval.</li>
           <li><b>Claim.</b> Each depositor's <code>Claim</code> collects their shares or collateral from the settled epoch, pro rata from the epoch record.</li>
           <li><b>Trade.</b> Takers queue requests with the router; executors fill them at the first Pyth price at or after each request's target, with the vault as counterparty (see How trades fill).</li>
-          <li><b>Harvest.</b> <code>HarvestFees</code> (anyone) moves insurance above the floor into the buffer; 10% is set aside for the opener.</li>
+          <li><b>Harvest.</b> <code>HarvestFees</code> (anyone) moves insurance above the floor into the buffer; 5% is set aside for the opener.</li>
           <li><b>Settle without stopping.</b> When an epoch ends, a flat vault is rolled by anyone. A vault holding a position is settled through the router: the settlement is queued and executes at the first Pyth price published after its target time, like a trade, so nobody can pick the price the vault is valued at. Withdrawals are paid from cash; the vault keeps 10% of its value outside Percolator for that.</li>
           <li><b>Stay live.</b> If an epoch's withdrawals are larger than that cash, they can only be paid once the vault's position is closed. Anyone can then switch it to closing-only (<code>RequireFlat</code>). If a taker holds a position so the vault can't get flat, <code>Unwind</code> (anyone, six epochs later) makes the vault close its own position through Percolator's unilateral <code>RebalanceReduce</code>. That scales down the positions on the other side, and Percolator then takes no new position on the market until all of them are closed; the vault cannot take the other side of a close there, so the router closes them out (<code>RequestClose</code>, which anyone can queue for any trader and which executes at the first Pyth price after its target, like any request). The market then resets and reopens.</li>
           <li><b>Liquidate early.</b> An account whose equity falls below 12.5% of its positions' notional can be liquidated through the router by anyone: at the first Pyth price after the request's target, the position is closed against the vault if the account is still below that level. Percolator's own liquidation at 10% stays as the backstop; it would make the market close-only.</li>
@@ -160,8 +160,8 @@ export default function Docs() {
             <tr><td>Insurance floor</td><td>100 USDC kept in insurance for traders; only fees above it are harvested</td></tr>
             <tr><td>Price</td><td>Verified Pyth prices only, moved forward by the router; listing needs a price at most 300 seconds old</td></tr>
             <tr><td>Execution</td><td>The first Pyth price published at or after {ROUTER_DELAY_SECS} seconds after the request landed</td></tr>
-            <tr><td>Leverage and fee</td><td>10× (10% initial margin) and a 0.05% base fee per side, set by the market</td></tr>
-            <tr><td>Opener's share</td><td>10% of harvested fees, forever, with no other powers</td></tr>
+            <tr><td>Leverage and fee</td><td>10× (10% initial margin) and a 0.10% fee per side, fixed by the program</td></tr>
+            <tr><td>Opener's share</td><td>5% of harvested fees (a tenth of what traders pay), forever, with no other powers</td></tr>
             <tr><td>Matcher approval</td><td>216,000 slots (about {Math.round(216_000 * slotSeconds() / 3600)} hours), renewed at every roll; anyone can renew it with <code>RefreshMatcher</code></td></tr>
           </tbody>
         </table>
@@ -182,8 +182,8 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
 
         <h2 id="fees">Fees and yield</h2>
         <ul>
-          <li>Every trade pays the market's base fee (0.05%) on both sides into the asset's insurance. On a trade against the vault, the vault pays its side too, and gets both back when fees are harvested.</li>
-          <li>Harvested fees above the 100 USDC floor are split 90% to depositors (by raising the share price) and 10% to the opener (claimable with <code>ClaimOpenerFees</code>).</li>
+          <li>Every trade pays the market's fee (0.10%) on both sides into the asset's insurance. On a trade against the vault, the vault pays its side too, and gets both back when fees are harvested.</li>
+          <li>Harvested fees above the 100 USDC floor are split 95% to depositors (by raising the share price) and 5% to the opener. Half of what is harvested is the vault's own payments coming back, so the opener's 5% is a tenth of what traders paid (claimable with <code>ClaimOpenerFees</code>).</li>
           <li>The vault is the counterparty to traders, so its result is <b>fees + what traders lose − what traders win</b>. Fees are the compensation for that exposure.</li>
         </ul>
 
@@ -227,7 +227,7 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
         <table className="doc-table">
           <thead><tr><th>Party</th><th>Can</th><th>Cannot</th></tr></thead>
           <tbody>
-            <tr><td>Opener</td><td>Pick the feed; claim 10% of harvested fees</td><td>Choose any parameter; open a second market for a feed; move funds; pause</td></tr>
+            <tr><td>Opener</td><td>Pick the feed; claim 5% of harvested fees</td><td>Choose any parameter; open a second market for a feed; move funds; pause</td></tr>
             <tr><td>Depositors</td><td>Queue deposits and withdrawals, claim, redeem after wind-down</td><td>Affect other depositors' prices</td></tr>
             <tr><td>Anyone</td><td>Roll, harvest, convert, renew, unwind, settle, sweep, retire an idle market</td><td>Choose amounts or destinations: value only moves into the vault's own accounts, or to the opener when a market is retired</td></tr>
             <tr><td>Traders</td><td>Queue trades through the router; move margin in, and out to their own wallet</td><td>Trade at a price they know, cancel a queued trade, withdraw while one is queued, trade against the vault any other way, or lock withdrawals</td></tr>

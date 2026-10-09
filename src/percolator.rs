@@ -90,6 +90,7 @@ const TAG_WITHDRAW_INSURANCE_ASSET: u8 = 57;
 pub const ASSET_ACTION_ACTIVATE: u8 = 0;
 const ASSET_ACTION_RETIRE: u8 = 2;
 const TAG_UPDATE_AUTHORITY: u8 = 32;
+const TAG_UPDATE_TRADE_FEE_POLICY: u8 = 55;
 const TAG_CONFIGURE_AUTH_MARK: u8 = 62;
 const TAG_PUSH_AUTH_MARK: u8 = 63;
 const TAG_REBALANCE_REDUCE: u8 = 44;
@@ -673,6 +674,25 @@ pub fn retire_asset(
         accounts: vec![AccountMeta::new_readonly(*marketauth, true), AccountMeta::new(*market, false)],
         data,
     }
+}
+
+/// Sets the market's base trade fee. Percolator gates it on asset 0's insurance authority, which
+/// for a governed market is the governor.
+pub fn update_trade_fee_policy(authority: &Pubkey, market: &Pubkey, fee_bps: u64, sequence: u64, authority_epoch: u64) -> Instruction {
+    let mut data = vec![TAG_UPDATE_TRADE_FEE_POLICY];
+    data.extend_from_slice(&fee_bps.to_le_bytes());
+    data.extend_from_slice(&sequence.to_le_bytes());
+    data.extend_from_slice(&authority_epoch.to_le_bytes());
+    Instruction {
+        program_id: PERCOLATOR_PROGRAM_ID,
+        accounts: vec![AccountMeta::new_readonly(*authority, true), AccountMeta::new(*market, false)],
+        data,
+    }
+}
+
+/// The market's base trade fee, in basis points.
+pub fn trade_fee_base_bps(d: &[u8]) -> Result<u64, ProgramError> {
+    rd_u64(d, WRAPPER_TRADE_FEE_BASE_BPS)
 }
 
 /// Rotates the market-level authority. Both the current and the new authority sign.

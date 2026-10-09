@@ -438,7 +438,12 @@ export function claim(v: Vault, user: PublicKey, epoch: bigint) {
   });
 }
 
-export const OPENER_FEE_BPS = 1_000;
+export const OPENER_FEE_BPS = 500;
+/** The fee each side of a trade pays, fixed by the vault program (CANON_TRADE_FEE_BPS). */
+export const TRADE_FEE_BPS = 10;
+/** The fee was 5 bps until this slot (2026-10-09): older fills in a history are shown at that. */
+export const feeBpsAt = (slot: number) => (slot >= (X1 ? 194_112_461 : 509_124_939) ? TRADE_FEE_BPS : 5);
+export const TRADE_FEE_PCT = `${(TRADE_FEE_BPS / 100).toFixed(2)}%`;
 
 export function claimOpenerFees(v: Vault, opener: PublicKey) {
   return new TransactionInstruction({

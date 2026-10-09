@@ -313,7 +313,7 @@ function LaunchPage({ send, busy, go, initial }: { send: Send; busy?: string; go
           Each Pyth feed gets exactly one market and one shared liquidity vault, enforced on-chain: the vault's address is derived
           from the feed, so a second one can't exist. Whoever opens it pays about 0.12 test {C.COIN} of rent and a 1 USDC listing fee,
           and chooses nothing else. Every market runs on the same fixed rules, so nobody can open a market set up to fail. In
-          return, the opener earns 10% of the market's fees for as long as it trades.
+          return, the opener earns 5% of the market's fees for as long as it trades.
         </p>
         <div className="feed-grid">
           {C.FEEDS.map(f => (
@@ -334,8 +334,8 @@ function LaunchPage({ send, busy, go, initial }: { send: Send; busy?: string; go
         <div className="row"><span>Epoch</span><b>about {Math.round(C.CANON_EPOCH_LEN_SLOTS * C.slotSeconds() / 60)} minutes</b></div>
         <div className="row"><span>Insurance kept for traders</span><b>$100</b></div>
         <div className="row"><span>Price</span><b>Pyth, ≤ 5 min old</b></div>
-        <div className="row"><span>Leverage, fee</span><b>10×, 0.05%</b></div>
-        <div className="row"><span>Opener's share of fees</span><b>10%, forever</b></div>
+        <div className="row"><span>Leverage, fee</span><b>10×, {C.TRADE_FEE_PCT}</b></div>
+        <div className="row"><span>Opener's share of fees</span><b>5%, forever</b></div>
         <p className="muted small">Limits scale with the vault: an empty vault quotes nothing, and every deposit deepens the market. Depositors share the other 90% of fees pro rata.</p>
       </section>
       <section className="card">

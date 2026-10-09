@@ -320,6 +320,17 @@ pub fn claim_opener_fees(k: &VaultKeys, opener: &Pubkey, dest: &Pubkey) -> Instr
     }
 }
 
+/// Brings the market's trade fee to the program's `CANON_TRADE_FEE_BPS`. Anyone can send it.
+pub fn set_trade_fee(program: &Pubkey, market: &Pubkey, authority_epoch: u64, sequence: u64) -> Instruction {
+    let mut data = with_u64(processor::TAG_SET_TRADE_FEE, authority_epoch);
+    data.extend_from_slice(&sequence.to_le_bytes());
+    Instruction {
+        program_id: *program,
+        accounts: vec![ro(state::governor_address(program, market).0), w(*market), ro(perc::PERCOLATOR_PROGRAM_ID)],
+        data,
+    }
+}
+
 /// Hands the market's `marketauth` to the program's governor PDA (signed by the current one).
 pub fn accept_governance(program: &Pubkey, current: &Pubkey, market: &Pubkey, authority_epoch: u64) -> Instruction {
     Instruction {

@@ -217,7 +217,7 @@ fn a_provider_who_leaves_is_paid_its_part_of_uncollected_fees() {
         (rd(515) + rd(531) - rd(547) - rd(563)) as u64 - 10_000
     };
     println!("uncollected {uncollected}");
-    let providers_part = uncollected - uncollected / 10; // the opener's tenth is not theirs
+    let providers_part = uncollected - uncollected / 20; // the opener's twentieth is not theirs
 
     // Alice leaves with nothing collected: half the vault, and half the providers' fees.
     // (The vault paid its own side of the trade fees, so it is worth a little under 100.)
@@ -323,9 +323,9 @@ fn e2e_operate_mode_lists_asset_and_harvests_fees() {
     println!("alice collateral: before 100000000, after {alice_after}");
     assert!(alice_after > 100_000_000, "fee income reaches depositors");
 
-    // The opener's 10% of harvested fees was set aside, and only the opener can take it.
+    // The opener's 5% of harvested fees (a tenth of what traders paid) was set aside, and only the opener can take it.
     let v = w.vault_state();
-    assert_eq!({ v.opener_fees_owed }, harvested / 10);
+    assert_eq!({ v.opener_fees_owed }, harvested / 20);
     let k = w.keys.unwrap();
     let thief = w.new_user(0);
     let ix = client::claim_opener_fees(&k, &thief.kp.pubkey(), &thief.collateral);
@@ -336,7 +336,7 @@ fn e2e_operate_mode_lists_asset_and_harvests_fees() {
     let creator_kp = w.creator.insecure_clone();
     let ix = client::claim_opener_fees(&k, &creator, &opener_dest);
     w.send(vec![ix], &[&creator_kp]).unwrap();
-    assert_eq!(w.tokens(opener_dest), harvested / 10);
+    assert_eq!(w.tokens(opener_dest), harvested / 20);
     assert_eq!({ w.vault_state().opener_fees_owed }, 0);
     assert_eq!(w.tokens(w.buffer), { w.vault_state().reserved_assets }, "buffer holds exactly what is owed");
     let ix = client::claim_opener_fees(&k, &creator, &opener_dest);
@@ -767,6 +767,41 @@ fn retire_ix(w: &World) -> solana_sdk::instruction::Instruction {
     };
     let market_epoch = w.env.primary_control_sequences(0).authority_epoch;
     client::retire_market(&w.keys.unwrap(), asset_epoch, market_epoch)
+}
+
+/// The market's trade fee is the program's: anyone can bring a governed market to it, nobody can
+/// set anything else, and before the governor holds the market the program cannot touch it.
+#[test]
+fn anyone_can_bring_the_trade_fee_to_the_programs_value() {
+    let mut w = World::new();
+    w.env.set_clock(5, 1_000);
+    w.env.update_trade_fee_policy(5).unwrap();
+    let fee = |w: &World| perc::trade_fee_base_bps(&w.env.market_data(false)).unwrap();
+    assert_eq!(fee(&w), 5);
+    let ix = |w: &World| {
+        let seq = w.env.primary_control_sequences(0);
+        client::set_trade_fee(&pid(), &w.env.market, seq.authority_epoch, seq.trade_fee + 1)
+    };
+    assert!(w.send(vec![ix(&w)], &[]).is_err(), "the governor does not hold the market yet");
+
+    w.env.update_market_authority_from_admin(4).unwrap();
+    let admin = w.env.actors[4].signer.insecure_clone();
+    let epoch0 = w.env.primary_control_sequences(0).authority_epoch;
+    w.send(vec![client::accept_governance(&pid(), &admin.pubkey(), &w.env.market, epoch0)], &[&admin]).unwrap();
+
+    // A stale sequence is refused by the engine; the right one goes through, sent by nobody special.
+    let seq = w.env.primary_control_sequences(0);
+    let stale = client::set_trade_fee(&pid(), &w.env.market, seq.authority_epoch, seq.trade_fee);
+    assert!(w.send(vec![stale], &[]).is_err());
+    assert_eq!(fee(&w), 5);
+    w.send(vec![ix(&w)], &[]).unwrap();
+    assert_eq!(fee(&w), processor::CANON_TRADE_FEE_BPS);
+    assert!(w.send(vec![ix(&w)], &[]).is_err(), "nothing left to change");
+
+    // The governor of another market is not this market's.
+    let mut wrong = ix(&w);
+    wrong.accounts[0].pubkey = state::governor_address(&pid(), &Pubkey::new_unique()).0;
+    assert!(w.send(vec![wrong], &[]).is_err());
 }
 
 /// An operate-mode market nobody provides liquidity to can be retired by anyone once it has been
