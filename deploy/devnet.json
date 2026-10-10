@@ -17,5 +17,6 @@
   "vault": "6QFyaoJ6A4D9cM3n7hVHgEdZoqvEQFAZfX5ucjmUEC5P",
   "vault_creator": "6tukrXNVMiutg2HrRAoHgvec4NDizuZUmvdHHScn6CMk",
   "vault_program": "BSync6F8gtJs3Wj4w8L6H3ZtS397w2XoCYGEAJGmeYX",
-  "vault_seed": 2
+  "vault_seed": 2,
+  "treasury_collateral": "6eKLkNRrzFYXDpQ9SSZsVd83K2q7oDatTJs9BBc7LwrM"
 }

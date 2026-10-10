@@ -184,7 +184,9 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
         <ul>
           <li>Every trade pays the market's fee (0.10%) on both sides into the asset's insurance. On a trade against the vault, the vault pays its side too, and gets both back when fees are harvested.</li>
           <li>Harvested fees above the 100 USDC floor are split 85% to depositors (by raising the share price), 5% to the opener and 10% to the platform's treasury, which pays for price updates, re-valuations and liquidations. Half of what is harvested is the vault's own payments coming back, so of what traders paid, depositors keep 70%, the opener gets 10% and the platform 20% (claimable with <code>ClaimOpenerFees</code>).</li>
-          <li>The vault is the counterparty to traders, so its result is <b>fees + what traders lose − what traders win</b>. Fees are the compensation for that exposure.</li>
+          <li>A vault worth less than 5,000 USDC at its last roll pays the platform nothing: its depositors keep that part too, so a new market's first providers earn the most.</li>
+          <li><b>Rebates.</b> The platform pays part of its own share back, weekly: a wallet that traded 100,000 USDC or more in the week gets 0.5 basis points of it back, 1,000,000 or more gets 1 basis point. Whoever invited a wallet (the wallet confirms it once, on chain, and it can never be changed) gets 0.5 basis points of what it trades. Rebates are never more than three quarters of what the treasury took in that week, and they cost depositors and openers nothing.</li>
+          <li>The vault is the counterparty to traders, so its result is <b>fees + what traders lose − what traders win</b>. Fees are the compensation for that exposure. Each market's liquidity panel shows what a share was worth at its last rolls.</li>
         </ul>
 
         <h2 id="risks">Risks</h2>

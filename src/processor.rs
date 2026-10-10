@@ -67,14 +67,22 @@ pub const OPENER_FEE_BPS: u64 = 500;
 /// traders pay (the other half of a harvest is the vault's own fees coming back). It pays for
 /// what no trade pays for: price updates, re-valuations, liquidations, the service itself.
 pub const PROTOCOL_FEE_BPS: u64 = 1_000;
+/// A vault worth less than this (collateral units: 5,000 with six decimals) pays the platform
+/// nothing, so a new market's first providers keep everything it earns.
+pub const PLATFORM_FREE_NAV: u64 = 5_000_000_000;
 
 /// Where the platform's share goes: any token account of the collateral mint this key owns.
 /// Harvesting is open to anyone and pays it on the spot, so the key signs nothing here.
 pub const TREASURY: Pubkey = solana_program::pubkey!("B9Ke1KTC8x46ZxAMTa7oU73HXEzPXt17GC7bZujxiiWV");
 
 /// The platform's cut of `amount` of harvested fees for vault `v`.
+///
+/// Nothing while the vault is small: its providers keep the platform's part until the vault was
+/// worth `PLATFORM_FREE_NAV` at its last roll. (The roll prices deposits with the value of the
+/// roll before, and a harvest pays with the value of the last roll; across the one roll where a
+/// vault passes the line, the two can differ by this cut of one epoch's fees.)
 pub fn protocol_cut(v: &VaultState, amount: u64) -> u64 {
-    if v.vault_kind == KIND_CANONICAL {
+    if v.vault_kind == KIND_CANONICAL && v.last_nav >= PLATFORM_FREE_NAV {
         ((amount as u128 * PROTOCOL_FEE_BPS as u128) / 10_000) as u64
     } else {
         0

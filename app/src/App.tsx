@@ -336,7 +336,7 @@ function LaunchPage({ send, busy, go, initial }: { send: Send; busy?: string; go
         <div className="row"><span>Price</span><b>Pyth, ≤ 5 min old</b></div>
         <div className="row"><span>Leverage, fee</span><b>10×, {C.TRADE_FEE_PCT}</b></div>
         <div className="row"><span>Opener's share of fees</span><b>5%, forever</b></div>
-        <p className="muted small">Limits scale with the vault: an empty vault quotes nothing, and every deposit deepens the market. Depositors share the other 90% of fees pro rata.</p>
+        <p className="muted small">Limits scale with the vault: an empty vault quotes nothing, and every deposit deepens the market. Depositors share the rest pro rata: 85%, after the platform's 10% (which a vault under $5,000 does not pay).</p>
       </section>
       <section className="card">
         <h3>{st === 1 ? `${feed.symbol}-PERP is live` : st === 0 ? `Finish listing ${feed.symbol}-PERP` : `Open ${feed.symbol}-PERP`}</h3>

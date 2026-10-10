@@ -417,6 +417,14 @@ pub fn follow(wallet: &Pubkey, leader: &Pubkey) -> Instruction {
     }
 }
 
+pub fn set_referrer(wallet: &Pubkey, referrer: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: id(),
+        accounts: vec![AccountMeta::new(*wallet, true), w(referral_address(&id(), wallet).0), ro(*referrer), ro(system_program::ID)],
+        data: vec![TAG_SET_REFERRER],
+    }
+}
+
 pub fn unfollow(wallet: &Pubkey, leader: &Pubkey) -> Instruction {
     Instruction {
         program_id: id(),

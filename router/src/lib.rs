@@ -152,6 +152,7 @@ pub const TAG_STOP_COPY: u8 = 20;
 pub const TAG_TRIGGER_COPY: u8 = 21;
 pub const TAG_CONVERT_PNL: u8 = 22;
 pub const TAG_SWEEP: u8 = 23;
+pub const TAG_SET_REFERRER: u8 = 24;
 /// Widest trail, in basis points.
 pub const MAX_TRAIL_BPS: u64 = 5_000;
 /// Shortest time between two slices of a TWAP order, and the most slices one can have.
@@ -247,6 +248,7 @@ pub fn process_instruction(program_id: &Pubkey, accounts: &[AccountInfo], data: 
         TAG_TRIGGER_COPY => social::trigger_copy(program_id, accounts, rest),
         TAG_CONVERT_PNL => convert_pnl(program_id, accounts),
         TAG_SWEEP => sweep(program_id, accounts),
+        TAG_SET_REFERRER => social::set_referrer(program_id, accounts),
         _ => Err(RouterError::InvalidInstruction.into()),
     }
 }

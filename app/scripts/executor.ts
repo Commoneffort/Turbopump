@@ -63,6 +63,29 @@ const IDLE_MARK_SECS = Number(process.env.IDLE_MARK_SECS ?? 600);
 const IDLE_MARK_MOVE = Number(process.env.IDLE_MARK_MOVE ?? 0.005);
 const HELD_MARK_SECS = Number(process.env.HELD_MARK_SECS ?? 60);
 const HELD_MARK_MOVE = 0.001;
+// How often accounts are re-valued while nothing needs them (a fill always settles the accounts it
+// needs itself). On X1 every compute unit costs, and re-valuing all accounts on every third pass
+// was four fifths of the executor's fees (measured 2026-10-10): there, only once a price has moved
+// SETTLE_MOVE since the last time, or after SETTLE_SECS. Liquidation is at 15% of the positions
+// and Percolator's own level at 10%, so a quarter of a percent of delay is well inside the gap.
+const SETTLE_SECS = Number(process.env.SETTLE_SECS ?? (C.X1 ? 120 : 0));
+const SETTLE_MOVE = Number(process.env.SETTLE_MOVE ?? 0.0025);
+let settledAt = 0;
+const settledPrice = new Map<number, bigint>();
+function settleDue(market: Uint8Array, assets: number[]) {
+  if (!SETTLE_SECS || Date.now() - settledAt > SETTLE_SECS * 1000) return true;
+  return assets.some(a => {
+    const now = Number(C.decodeAsset(market, a).price), then = Number(settledPrice.get(a) ?? 0n);
+    return !then || Math.abs(now - then) / then >= SETTLE_MOVE;
+  });
+}
+function settledNow(market: Uint8Array, assets: number[]) {
+  settledAt = Date.now();
+  for (const a of assets) settledPrice.set(a, C.decodeAsset(market, a).price);
+}
+// On a rate-limited RPC (public devnet) the jobs that are not about a waiting trade run this
+// seldom, so the passes that fill trades are not refused for want of requests.
+const SLOW_JOBS_MS = Number(process.env.SLOW_JOBS_SECS ?? (C.X1 ? 0 : 15)) * 1000;
 const SWEEP_MIN = C.X1 ? 1e9 : 0.02e9; // lamports: below this a sweep is not worth its fee
 let sweptAt = 0, bookRent = 0;
 const URGENT_MARK_MOVE = 0.01; // a move this large on a market with positions is posted even while trades are queued elsewhere
@@ -518,25 +541,30 @@ async function upkeep(vaults: C.Vault[], market: Uint8Array, slot: bigint, pass:
   const lag = Number(slot - oldest);
   if (!assets.length) return;
   const vehicle = vaults[0].lpPortfolio;
+  const due = settleDue(market, all);
+  if (force && !due) return;
   // `force`: the settling pass that runs while trades are queued. Routine cranking is off then,
   // so the assets are usually far behind: they are caught up first, then the accounts settled.
   if (force && lag > 60) await catchUp("catch up before settling accounts", C.crank(payer.publicKey, vehicle, assets), lag, true);
   // Far behind, nothing can be settled yet (a settling transaction would need a crank for every
   // ten slots of the gap, thousands of them): only catch up, on every pass.
   if (lag > FAR_BEHIND) { if (!force) await catchUp("catch up", C.crank(payer.publicKey, vehicle, assets), lag, false); return; }
-  if ((pass % 3 === 0 && lag <= 60) || force) {
-    const plan = C.crankPlan(await C.marketSnapshot(conn), payer.publicKey, vehicle, undefined, undefined, assets);
+  if (due && ((pass % 3 === 0 && lag <= 60) || force)) {
+    const snap = await C.marketSnapshot(conn);
+    const plan = C.crankPlan(snap, payer.publicKey, vehicle, undefined, undefined, assets);
     // Still too far behind for one transaction to bridge (it holds about ten lag cranks, and more
     // do not even fit in its size): the next pass catches up further.
     if (plan.lag > 100) return;
     // Many accounts and the assets close to current: all at once (see `settleAll`).
-    if (plan.settle.length > 6 && plan.lag < 10) { await settleAll("out of date", plan.settleAlone); return; }
+    if (plan.settle.length > 6 && plan.lag < 10) { if (await settleAll("out of date", plan.settleAlone)) settledNow(snap.market, all); return; }
     if (plan.settle.length) {
       const t = await tune(plan.lagCrank, Math.max(1, Math.ceil((plan.lag + LAND_SLOTS) / 10)), plan.settle.slice(0, 6), []);
       if (typeof t === "string") log("fail", "settle positions", t);
-      else if (t.settle.length) await send(`settle ${t.settle.length} out-of-date portfolio(s)`, [...Array(t.k).fill(plan.lagCrank), ...t.settle]);
+      else if (t.settle.length) { await send(`settle ${t.settle.length} out-of-date portfolio(s)`, [...Array(t.k).fill(plan.lagCrank), ...t.settle]); if (plan.settle.length <= 6) settledNow(snap.market, all); }
       return;
     }
+    // Nothing is out of date: the next look is a period away, or a price move.
+    settledNow(snap.market, all);
   }
   if (lag > 50) await send(`crank ${assets.length} asset(s) (${lag} slots behind)`, Array(Math.min(10, Math.ceil(lag / 10))).fill(C.crank(payer.publicKey, vehicle, assets)));
 }
@@ -718,7 +746,7 @@ let orderCache: C.StandingOrder[] = [];
  *  is 0.1% better than the one recorded, and removes orders that can do nothing any more. Each is
  *  one small transaction; the request it queues is then filled like any other. */
 async function serviceOrders(vaults: C.Vault[], books: Map<string, C.Book>, market: Uint8Array, now: number, slot: bigint) {
-  if (Date.now() - ordersAt > 4_000) {
+  if (Date.now() - ordersAt > (C.X1 ? 4_000 : 6_000)) {
     const accs = await conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: C.ORDER_LEN }] });
     orderCache = accs.map(a => C.decodeOrder(a.pubkey, new Uint8Array(a.account.data)));
     ordersAt = Date.now();
@@ -758,7 +786,7 @@ const copyRetry = new Map<string, number>();
  *  anyone may, the size is the router's to compute). Where the follower's margin does not take
  *  the whole difference, the step that it does take is sent. One request per wallet at a time. */
 async function serviceCopies(vaults: C.Vault[], books: Map<string, C.Book>, market: Uint8Array) {
-  if (Date.now() - copiesAt > 6_000) {
+  if (Date.now() - copiesAt > (C.X1 ? 6_000 : 20_000)) {
     const accs = await conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: S.COPY_LEN }, { memcmp: { offset: 0, bytes: S.COPY_TAG } }, { memcmp: { offset: 8, bytes: C.MARKET.toBase58() } }] });
     copyCache = accs.map(a => S.decodeCopy(a.pubkey, new Uint8Array(a.account.data)));
     copiesAt = Date.now();
@@ -916,6 +944,7 @@ setInterval(() => {
   let pass = 0;
   let watchAt = 0;
   let upkeepAt = 0;
+  let slowAt = 0;
   for (;;) {
     let waiting = false; // a trade is queued: come back sooner
     try {
@@ -956,7 +985,7 @@ setInterval(() => {
       // Liquidations and close-outs are looked for whether or not trades are queued: a busy
       // market always has some, and an account below the level cannot wait for a quiet moment.
       // While trades are queued the scan runs every 6 seconds at most (it reads every account).
-      const scan = queued ? Date.now() - watchAt > 6_000 : pass % 3 === 1;
+      const scan = queued || !C.X1 ? Date.now() - watchAt > 6_000 : pass % 3 === 1;
       if (vaults.length && (scan || !queued)) {
         if (scan) watchAt = Date.now();
         const sent = await watch(vaults, market, scan).catch(e => { log("error", "watch", String(e?.message ?? e).slice(0, 140)); return false; });
@@ -993,8 +1022,11 @@ setInterval(() => {
       }
       await serviceOrders(vaults, books, market, now, slot).catch(e => log("error", "orders", String(e?.message ?? e).slice(0, 140)));
       await serviceCopies(vaults, books, market).catch(e => log("error", "copies", String(e?.message ?? e).slice(0, 140)));
-      if (!queued) await openTrackRecords().catch(e => log("error", "track records", String(e?.message ?? e).slice(0, 140)));
-      await convertProfits(vaults, market).catch(e => log("error", "profits", String(e?.message ?? e).slice(0, 140)));
+      if (Date.now() - slowAt >= SLOW_JOBS_MS) {
+        slowAt = Date.now();
+        if (!queued) await openTrackRecords().catch(e => log("error", "track records", String(e?.message ?? e).slice(0, 140)));
+        await convertProfits(vaults, market).catch(e => log("error", "profits", String(e?.message ?? e).slice(0, 140)));
+      }
       // Low priority, in the background, and only while no trade is waiting.
       if (!busy && !refreshing) {
         refreshing = true;

@@ -197,9 +197,10 @@ fn a_provider_who_leaves_is_paid_its_part_of_uncollected_fees() {
     let pyth = w.env.set_pyth_price(&FEED, 100_000_000, -8, 0, 1_000);
     w.list_asset(&lister, pyth).unwrap();
     let asset = w.vault_state().asset_index as usize;
-    let (alice, bob) = (w.new_user(100_000_000), w.new_user(100_000_000));
-    w.deposit(&alice, 50_000_000).unwrap();
-    w.deposit(&bob, 50_000_000).unwrap();
+    // (5,000 each: a vault worth less than 5,000 pays the platform nothing.)
+    let (alice, bob) = (w.new_user(10_000_000_000), w.new_user(10_000_000_000));
+    w.deposit(&alice, 5_000_000_000).unwrap();
+    w.deposit(&bob, 5_000_000_000).unwrap();
     let mut ts = 1_000i64;
     w.advance_oracle(pyth, EPOCH_LEN, &mut ts, 100_000_000);
     w.roll().unwrap();
@@ -245,6 +246,42 @@ fn a_provider_who_leaves_is_paid_its_part_of_uncollected_fees() {
     assert!(paid <= left && paid + 200 >= left, "paid {paid} of {left}");
 }
 
+/// A vault worth less than `PLATFORM_FREE_NAV` at its last roll keeps the platform's part: its
+/// providers get everything but the opener's twentieth.
+#[test]
+fn a_small_vault_pays_the_platform_nothing() {
+    let mut w = World::new();
+    w.env.set_clock(5, 1_000);
+    w.env.update_market_init_fee_policy(LISTING_FEE as u128).unwrap();
+    w.env.update_trade_fee_policy(10).unwrap();
+    w.create_vault(operate_params(2)).unwrap();
+    let lister = w.new_user(10_000_000);
+    let pyth = w.env.set_pyth_price(&FEED, 100_000_000, -8, 0, 1_000);
+    w.list_asset(&lister, pyth).unwrap();
+    let asset = w.vault_state().asset_index;
+    let alice = w.new_user(100_000_000);
+    w.deposit(&alice, 50_000_000).unwrap();
+    let mut ts = 1_000i64;
+    w.advance_oracle(pyth, EPOCH_LEN, &mut ts, 100_000_000);
+    w.roll().unwrap();
+    w.claim(&alice, 0).unwrap();
+    assert!({ w.vault_state().last_nav } < percolator_vault::processor::PLATFORM_FREE_NAV);
+    let unit = UNIT as i128;
+    for i in 0..6 {
+        w.advance_oracle(pyth, 2, &mut ts, 100_000_000);
+        w.taker_trade_asset(0, asset, if i % 2 == 0 { 10 * unit } else { -10 * unit }).unwrap();
+    }
+    w.advance_oracle(pyth, 1, &mut ts, 100_000_000);
+    let before = w.tokens(w.buffer);
+    w.harvest(u64::MAX).unwrap();
+    let harvested = w.tokens(w.buffer) - before;
+    let treasury = w.treasury();
+    assert!(harvested > 0);
+    assert_eq!(w.tokens(treasury), 0, "nothing for the platform");
+    assert_eq!({ w.vault_state().total_fees_harvested }, harvested);
+    assert_eq!({ w.vault_state().opener_fees_owed }, harvested / 20);
+}
+
 #[test]
 fn e2e_operate_mode_lists_asset_and_harvests_fees() {
     let mut w = World::new();
@@ -275,8 +312,8 @@ fn e2e_operate_mode_lists_asset_and_harvests_fees() {
     println!("oracle mode {}", profile.oracle_mode);
 
     // Fund the vault, roll it live.
-    let alice = w.new_user(100_000_000);
-    w.deposit(&alice, 50_000_000).unwrap();
+    let alice = w.new_user(10_000_000_000);
+    w.deposit(&alice, 6_000_000_000).unwrap();
     let mut ts = 1_000i64;
     w.advance_oracle(pyth, EPOCH_LEN, &mut ts, 100_000_000);
     w.roll().unwrap();
@@ -332,8 +369,8 @@ fn e2e_operate_mode_lists_asset_and_harvests_fees() {
     w.roll().unwrap();
     w.claim(&alice, 1).unwrap();
     let alice_after = w.tokens(alice.collateral);
-    println!("alice collateral: before 100000000, after {alice_after}");
-    assert!(alice_after > 100_000_000, "fee income reaches depositors");
+    println!("alice collateral: before 10000000000, after {alice_after}");
+    assert!(alice_after > 10_000_000_000, "fee income reaches depositors");
 
     // The opener's 5% of harvested fees (a tenth of what traders paid) was set aside, and only the opener can take it.
     let v = w.vault_state();

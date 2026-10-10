@@ -256,6 +256,29 @@ fn following_is_a_list_and_nothing_else() {
     assert!(read::<Follow>(&w, &key).is_none());
 }
 
+#[test]
+fn a_referrer_is_named_once_and_never_changed() {
+    let mut w = live();
+    let (a, b, c) = (w.new_user(0), w.new_user(0), w.new_user(0));
+    let key = rstate::referral_address(&RID(), &a.kp.pubkey()).0;
+    // Nobody refers themselves, and nobody names a referrer for someone else.
+    expect(w.send(vec![rclient::set_referrer(&a.kp.pubkey(), &a.kp.pubkey())], &[&a.kp]), RouterError::BadAccount);
+    let mut theirs = rclient::set_referrer(&b.kp.pubkey(), &c.kp.pubkey());
+    theirs.accounts[1].pubkey = key;
+    assert!(w.send(vec![theirs], &[&b.kp]).is_err());
+    w.send(vec![rclient::set_referrer(&a.kp.pubkey(), &b.kp.pubkey())], &[&a.kp]).unwrap();
+    let r: rstate::Referral = read(&w, &key).unwrap();
+    assert_eq!((r.wallet, r.referrer), (a.kp.pubkey(), b.kp.pubkey()));
+    // It stays as it was written.
+    expect(w.send(vec![rclient::set_referrer(&a.kp.pubkey(), &c.kp.pubkey())], &[&a.kp]), RouterError::BadAccount);
+    let r: rstate::Referral = read(&w, &key).unwrap();
+    assert_eq!(r.referrer, b.kp.pubkey());
+    // The page tells the router's accounts apart by their length.
+    let lens = [rstate::REFERRAL_LEN, FOLLOW_LEN, COPY_LEN, NAME_LEN, PROFILE_LEN, STATS_LEN, rstate::TRADER_LEN, rstate::REQUEST_LEN, rstate::ORDER_LEN, rstate::BOOK_LEN];
+    assert_eq!(lens.iter().filter(|l| **l == rstate::REFERRAL_LEN).count(), 1, "{lens:?}");
+    assert_eq!(rstate::REFERRAL_LEN, 104);
+}
+
 // ---------------------------------------------------------------- copying
 
 #[test]

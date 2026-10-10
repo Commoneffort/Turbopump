@@ -254,6 +254,36 @@ export function entryPrice(fills: Fill[], position: number): number | undefined 
 
 // ---------------------------------------------------------------- liquidity
 
+/** What a share was worth at the vault's last rolls: the providers' actual result, fees and the
+ *  traders' wins and losses together. */
+function PastResults({ state }: { state: C.State }) {
+  const { connection } = useConnection();
+  const [rows, setRows] = useState<{ epoch: bigint; price: number; slot: bigint }[]>();
+  const v = state.vault;
+  useEffect(() => { let on = true; C.vaultHistory(connection, v).then(r => on && setRows(r)).catch(() => on && setRows([])); return () => { on = false; }; }, [connection, v.key.toBase58(), String(v.epoch)]);
+  if (!rows) return <section className="card"><h3>Past results</h3><p className="muted small">Loading…</p></section>;
+  if (rows.length < 2) return <section className="card"><h3>Past results</h3><p className="muted small">This vault has not finished two epochs yet.</p></section>;
+  const last = rows[rows.length - 1];
+  const since = (n: number) => { const from = rows[Math.max(0, rows.length - 1 - n)]; return { pct: (last.price / from.price - 1) * 100, hours: Number(last.slot - from.slot) * C.slotSeconds() / 3600 }; };
+  const spans = [...new Set([Math.min(6, rows.length - 1), Math.min(24, rows.length - 1), rows.length - 1])].map(since);
+  const lo = Math.min(...rows.map(r => r.price)), hi = Math.max(...rows.map(r => r.price));
+  const pts = rows.map((r, i) => `${(i / (rows.length - 1) * 100).toFixed(2)},${(hi === lo ? 14 : 26 - (r.price - lo) / (hi - lo) * 24).toFixed(2)}`).join(" ");
+  const worst = Math.min(...rows.slice(1).map((r, i) => (r.price / rows[i].price - 1) * 100));
+  return (
+    <section className="card">
+      <h3>Past results</h3>
+      <svg viewBox="0 0 100 28" preserveAspectRatio="none" width="100%" height="56" className={last.price >= rows[0].price ? "up" : "down"} aria-label="Share price at each roll">
+        <polyline points={pts} fill="none" stroke="currentColor" strokeWidth="1.2" vectorEffect="non-scaling-stroke" />
+      </svg>
+      {spans.map((x, i) => (
+        <div className="row" key={i}><span>Last {x.hours < 48 ? `${fmt(x.hours, 1)} hours` : `${fmt(x.hours / 24, 1)} days`}</span><b className={x.pct >= 0 ? "up" : "down"}>{x.pct >= 0 ? "+" : ""}{fmt(x.pct, 2)}%</b></div>
+      ))}
+      <div className="row"><span>Worst single epoch</span><b className={worst >= 0 ? "" : "down"}>{fmt(worst, 2)}%</b></div>
+      <p className="muted small">The share price at each of the last {rows.length} rolls. It moves with the fees the vault earned and with what its traders won or lost: the vault is the other side of every trade, so this can fall as well as rise.{v.lastNav < C.PLATFORM_FREE_NAV ? " This vault is under $5,000, so the platform takes no share of its fees." : ""}</p>
+    </section>
+  );
+}
+
 export function LiquidityPanel({ state, send, busy }: { state: C.State; send: Send; busy?: string }) {
   const { publicKey } = useWallet();
   const [amount, setAmount] = useState("100");
@@ -306,6 +336,7 @@ export function LiquidityPanel({ state, send, busy }: { state: C.State; send: Se
           ])}>Request withdrawal</button>
         <p className="muted small">Requests settle together at one price when the epoch ends, so nobody trades against a stale share price. Withdrawals can't be blocked: if a trader holds a position to stop the vault going flat, anyone can make the vault close it six epoch lengths after it was told to.</p>
       </section>
+      <PastResults state={state} />
     </>
   );
 }

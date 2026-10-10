@@ -272,6 +272,30 @@ pub(crate) fn unfollow(program_id: &Pubkey, accounts: &[AccountInfo]) -> Program
     close(follow_ai, 0, wallet, wallet)
 }
 
+// ---- referrals ----
+
+/// Records who referred the wallet. Once: the account already existing is an error, and nothing
+/// closes it. A wallet cannot name itself.
+/// Accounts: 0 wallet [s, w], 1 referral [w], 2 referrer, 3 system program.
+#[inline(never)]
+pub(crate) fn set_referrer(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let wallet = acc(accounts, 0)?;
+    let referral_ai = acc(accounts, 1)?;
+    let referrer = acc(accounts, 2)?;
+    let system = acc(accounts, 3)?;
+    signer(wallet)?;
+    writable(wallet)?;
+    writable(referral_ai)?;
+    key_is(system, &system_program::ID)?;
+    if referrer.key == wallet.key || referral_ai.data_len() != 0 {
+        return Err(RouterError::BadAccount.into());
+    }
+    let (rk, bump) = referral_address(program_id, wallet.key);
+    key_is(referral_ai, &rk)?;
+    create_pda(wallet, referral_ai, system, program_id, REFERRAL_LEN, 0, &[SEED_REFERRAL, wallet.key.as_ref(), &[bump]])?;
+    store(referral_ai, &Referral { magic: REFERRAL_MAGIC, wallet: *wallet.key, referrer: *referrer.key, since: Clock::get()?.unix_timestamp, bump, _pad: [0; 23] })
+}
+
 // ---- copying ----
 
 /// Starts copying `leader`, or changes the terms (one leader at a time per trading account).

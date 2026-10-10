@@ -1028,6 +1028,25 @@ export const fillRequest = (executor: PublicKey, v: Vault, r: RouterRequest) => 
   ],
   data: new W().u8(6).done(),
 });
+/** A vault worth less than this at its last roll pays the platform nothing (the program's PLATFORM_FREE_NAV). */
+export const PLATFORM_FREE_NAV = 5_000_000_000n;
+
+/** What one share was worth at each of the vault's last `n` rolls, oldest first. A roll's record
+ *  holds the vault's value and the shares outstanding at that moment. */
+export async function vaultHistory(conn: Connection, v: Vault, n = 96): Promise<{ epoch: bigint; price: number; slot: bigint }[]> {
+  const epochs: bigint[] = [];
+  for (let e = v.epoch - 1n; e >= 0n && epochs.length < n; e--) epochs.push(e);
+  const accs = await conn.getMultipleAccountsInfo(epochs.map(e => epochAddress(v.key, e)));
+  const out: { epoch: bigint; price: number; slot: bigint }[] = [];
+  for (const [i, a] of accs.entries()) {
+    if (!a || a.data.length < 112) continue;
+    const d = new Uint8Array(a.data);
+    const nav = u64(d, 80), supply = u64(d, 96);
+    if (supply > 0n) out.push({ epoch: epochs[i], price: Number(nav) / USDC / (Number(supply) / 10 ** SHARE_DECIMALS), slot: u64(d, 104) });
+  }
+  return out.reverse();
+}
+
 /** The platform's treasury: its share of harvested fees, and what expired requests leave behind. */
 export const TREASURY = new PublicKey("B9Ke1KTC8x46ZxAMTa7oU73HXEzPXt17GC7bZujxiiWV");
 /** Sends what expired requests left in a vault's book to the treasury (anyone may). */

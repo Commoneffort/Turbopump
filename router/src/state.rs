@@ -178,6 +178,8 @@ pub const SEED_PROFILE: &[u8] = b"profile";
 pub const SEED_NAME: &[u8] = b"name";
 pub const SEED_FOLLOW: &[u8] = b"follow";
 pub const SEED_COPY: &[u8] = b"copy";
+pub const REFERRAL_MAGIC: u64 = u64::from_le_bytes(*b"PRREFER1");
+pub const SEED_REFERRAL: &[u8] = b"referral";
 /// Trading days and fills a track record keeps (the newest replace the oldest).
 pub const STATS_DAYS: usize = 30;
 pub const STATS_FILLS: usize = 16;
@@ -286,6 +288,21 @@ pub struct Follow {
 }
 pub const FOLLOW_LEN: usize = core::mem::size_of::<Follow>();
 
+/// Who brought `wallet` to the platform. Written once by the wallet itself and never changed; it
+/// moves no money. The platform pays referrers a part of its own share of the fees the wallet
+/// pays from `since` on, worked out from the wallets' track records.
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+#[repr(C, packed)]
+pub struct Referral {
+    pub magic: u64,
+    pub wallet: Pubkey,
+    pub referrer: Pubkey,
+    pub since: i64,
+    pub bump: u8,
+    pub _pad: [u8; 23],
+}
+pub const REFERRAL_LEN: usize = core::mem::size_of::<Referral>();
+
 /// `follower`'s instruction to keep its positions in line with `leader`'s: the same leverage on
 /// every market, times `ratio_bps` / 10,000, and at most `max_notional` (collateral atoms, 0 = no
 /// limit) on any one market. Signed once by the follower; from then on anyone may bring the
@@ -320,6 +337,9 @@ pub fn name_address(program_id: &Pubkey, lower: &[u8]) -> (Pubkey, u8) {
 }
 pub fn follow_address(program_id: &Pubkey, follower: &Pubkey, leader: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[SEED_FOLLOW, follower.as_ref(), leader.as_ref()], program_id)
+}
+pub fn referral_address(program_id: &Pubkey, wallet: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[SEED_REFERRAL, wallet.as_ref()], program_id)
 }
 pub fn copy_address(program_id: &Pubkey, market: &Pubkey, follower: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[SEED_COPY, market.as_ref(), follower.as_ref()], program_id)

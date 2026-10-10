@@ -93,6 +93,24 @@ export const setProfile = (wallet: PublicKey, name: string, oldName: string | un
 export const follow = (wallet: PublicKey, leader: PublicKey) => new TransactionInstruction({
   programId: C.ROUTER, keys: [rw(wallet, true), rw(followAddress(wallet, leader)), ro(leader), ro(SystemProgram.programId)], data: Buffer.from([17]),
 });
+// ---- referrals ----
+export const REFERRAL_LEN = 104;
+export const referralAddress = (wallet: PublicKey) => rpda(Buffer.from("referral"), wallet.toBuffer());
+export type Referral = { wallet: PublicKey; referrer: PublicKey; since: number };
+export const decodeReferral = (d: Uint8Array): Referral => ({ wallet: key(d, 8), referrer: key(d, 40), since: Number(i64(d, 72)) });
+/** Records who referred `wallet`: once, never changed, and it moves no money. */
+export const setReferrer = (wallet: PublicKey, referrer: PublicKey) => new TransactionInstruction({
+  programId: C.ROUTER, keys: [rw(wallet, true), rw(referralAddress(wallet)), ro(referrer), ro(SystemProgram.programId)], data: Buffer.from([24]),
+});
+/** What the platform gives back out of its own share of the fees (a fifth of what traders pay,
+ *  2 basis points of what they trade), in millionths of the volume (100 = one basis point). A referrer earns
+ *  on what the wallets it referred trade; a wallet that trades a lot in a week earns on its own. */
+export const REBATE = {
+  referrerPerMillion: 50, // 0.5 basis points of the referred wallet's volume
+  tiers: [{ weekVolume: 1_000_000, perMillion: 100 }, { weekVolume: 100_000, perMillion: 50 }], // 1 and 0.5 basis points
+  mostOfIncome: 0.75, // never more than three quarters of what the treasury took in
+};
+
 export const unfollow = (wallet: PublicKey, leader: PublicKey) => new TransactionInstruction({
   programId: C.ROUTER, keys: [rw(wallet, true), rw(followAddress(wallet, leader))], data: Buffer.from([18]),
 });

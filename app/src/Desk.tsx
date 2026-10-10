@@ -5,7 +5,7 @@
 // oracle price published a few seconds after the request. What stands in its place is the vault's
 // capacity: how much it can take on each side right now.
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useWallet } from "@solana/wallet-adapter-react";
+import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
 import { PublicKey } from "@solana/web3.js";
 import { createAssociatedTokenAccountIdempotentInstruction } from "@solana/spl-token";
@@ -570,6 +570,38 @@ function Pending({ r, sym, send, busy }: { r: C.RouterRequest; sym: string; send
 
 // ---------------------------------------------------------------- account
 
+/** The invitation that brought this visitor, kept from the link (`?ref=<wallet>`) until it is confirmed. */
+const invitedBy = (): PublicKey | undefined => {
+  try {
+    const q = new URLSearchParams(window.location.search).get("ref");
+    if (q) localStorage.setItem("pv:ref", q);
+    const r = localStorage.getItem("pv:ref");
+    return r ? new PublicKey(r) : undefined;
+  } catch { return undefined; }
+};
+
+/** A wallet's invitation link, and the one-time confirmation of who invited it. */
+function Invite({ me, send, busy, tick }: { me: PublicKey; send: Send; busy?: string; tick: number }) {
+  const { connection } = useConnection();
+  const [by, setBy] = useState<PublicKey | null>();
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    let on = true;
+    connection.getAccountInfo(S.referralAddress(me)).then(a => on && setBy(a && a.data.length === S.REFERRAL_LEN ? S.decodeReferral(new Uint8Array(a.data)).referrer : null)).catch(() => undefined);
+    return () => { on = false; };
+  }, [connection, me.toBase58(), tick]);
+  const offer = invitedBy();
+  const link = `${window.location.origin}/?ref=${me.toBase58()}`;
+  return (
+    <div className="fine">
+      Invite traders: you earn {S.REBATE.referrerPerMillion / 100} basis points of what they trade, paid weekly from the platform's share.{" "}
+      <a href={link} onClick={e => { e.preventDefault(); navigator.clipboard?.writeText(link).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); }); }}>{copied ? "Copied" : "Copy your link"}</a>
+      {by ? <> · Invited by <span className="mono">{short(by)}</span></>
+        : by === null && offer && !offer.equals(me) && <> · <a href="#" onClick={e => { e.preventDefault(); if (!busy) send("Confirm invitation", [S.setReferrer(me, offer)]); }}>Confirm you were invited by <span className="mono">{short(offer)}</span></a> (once, it cannot be changed)</>}
+    </div>
+  );
+}
+
 function Account({ state, send, busy }: { state: C.State; send: Send; busy?: string }) {
   const { publicKey } = useWallet();
   const [amount, setAmount] = useState("100");
@@ -607,6 +639,7 @@ function Account({ state, send, busy }: { state: C.State; send: Send; busy?: str
               </div>
               {locked ? <div className="fine">Withdrawals are paused while an order is queued.</div>
                 : state.openPositions > 0 && <div className="fine">Margin can be withdrawn once no position is open on any market. Deposits always work.</div>}
+              <Invite me={publicKey} send={send} busy={busy} tick={Math.floor(Number(state.slot) / 300)} />
             </>
           )}
         </div>

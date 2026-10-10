@@ -120,9 +120,18 @@ async function wouldFail(kp: Keypair, ixs: TransactionInstruction[]): Promise<st
   const tx = new Transaction().add(...ixs);
   tx.feePayer = kp.publicKey;
   tx.recentBlockhash = (await conn.getLatestBlockhash()).blockhash;
-  const r = await conn.simulateTransaction(tx, [kp]);
-  if (!r.value.err) return "ok";
-  return (r.value.logs ?? []).map(l => l.match(/custom program error: (0x[0-9a-f]+)/)?.[1]).filter(Boolean).pop() ?? JSON.stringify(r.value.err);
+  // An answer that is about the server and not about the instructions (a public RPC's servers are
+  // not all at the same block, and one that has not seen the blockhash yet says so) is asked again,
+  // and reported as "rpc" if it stays: nothing was learned about the program, so nothing is judged.
+  for (let i = 0; ; i++) {
+    const r = await conn.simulateTransaction(tx, [kp]).catch(() => null);
+    if (r && !r.value.err) return "ok";
+    const code = r && ((r.value.logs ?? []).map(l => l.match(/custom program error: (0x[0-9a-f]+)/)?.[1]).filter(Boolean).pop() ?? JSON.stringify(r.value.err));
+    if (code && !/BlockhashNotFound|AccountNotFound/.test(code)) return code;
+    if (i === 2) return "rpc";
+    await new Promise(res => setTimeout(res, 1500));
+    tx.recentBlockhash = (await conn.getLatestBlockhash()).blockhash;
+  }
 }
 
 /** Queues a trade for `kp`'s account. */
@@ -426,19 +435,19 @@ async function act(bot: Bot, m: Market, feeBps: bigint) {
     const tooMuch = marginMax(sign) * 13n / 10n + 1_000_000n;
     if (tooMuch <= (sign > 0n ? room.long : room.short)) {
       const code = await wouldFail(kp, [C.requestTrade(kp.publicKey, m.vault, tooMuch * sign)]);
-      note({ type: "refusal", bot: bot.name, what: "order above the margin limit", code, ok: code === "0x5706" });
-      if (code !== "0x5706") say("CHECK FAILED", bot.name, "an order above the margin limit answered", code);
+      if (code !== "rpc") note({ type: "refusal", bot: bot.name, what: "order above the margin limit", code, ok: code === "0x5706" });
+      if (code !== "0x5706" && code !== "rpc") say("CHECK FAILED", bot.name, "an order above the margin limit answered", code);
     }
     if (s.openPositions > 0) {
       const code = await wouldFail(kp, [createAssociatedTokenAccountIdempotentInstruction(kp.publicKey, C.ata(kp.publicKey, C.MINT), kp.publicKey, C.MINT), C.routerWithdraw(kp.publicKey, 1_000_000n)]);
-      note({ type: "refusal", bot: bot.name, what: "withdrawal with a position open", code, ok: code === "0x13" });
-      if (code !== "0x13") say("CHECK FAILED", bot.name, "a withdrawal with a position open answered", code);
+      if (code !== "rpc") note({ type: "refusal", bot: bot.name, what: "withdrawal with a position open", code, ok: code === "0x13" });
+      if (code !== "0x13" && code !== "rpc") say("CHECK FAILED", bot.name, "a withdrawal with a position open answered", code);
     }
     // Nobody can force a healthy account closed (the market is not close-only here).
     if (held !== 0n && s.health && !s.health.liquidatable && s.health.equity * 10_000n > s.health.notional * (C.LIQUIDATION_BPS + 100n)) {
       const code = await wouldFail(kp, [C.requestClose(kp.publicKey, kp.publicKey, m.vault)]);
-      note({ type: "refusal", bot: bot.name, what: "forced close of a healthy account", code, ok: code === "0x5710" });
-      if (code !== "0x5710") say("CHECK FAILED", bot.name, "a forced close of a healthy account answered", code);
+      if (code !== "rpc") note({ type: "refusal", bot: bot.name, what: "forced close of a healthy account", code, ok: code === "0x5710" });
+      if (code !== "0x5710" && code !== "rpc") say("CHECK FAILED", bot.name, "a forced close of a healthy account answered", code);
     }
   }
 
@@ -554,7 +563,7 @@ async function ordersRoutine(bot: Bot, m: Market, feeBps: bigint) {
     twap: await wouldFail(kp, [order(6, C.ORDER.TWAP, q, 0n, { slices: 3, interval: 5 })]),
     trail: await wouldFail(kp, [order(6, C.ORDER.TRAIL, 0n, 5_001n)]),
   };
-  ok(codes.stop === "0x5714" && codes.twap === "0x5714" && codes.trail === "0x5714", "orders that make no sense are refused (a stop with no position, a TWAP every 5 s, a 50% trail)", codes);
+  if (!Object.values(codes).includes("rpc")) ok(codes.stop === "0x5714" && codes.twap === "0x5714" && codes.trail === "0x5714", "orders that make no sense are refused (a stop with no position, a TWAP every 5 s, a 50% trail)", codes);
 
   // 1. A position to work on: 4 units.
   await market("market order", dir * 4n * q);
@@ -568,7 +577,7 @@ async function ordersRoutine(bot: Bot, m: Market, feeBps: bigint) {
   s = await state();
   const far = s.orders.find(o => o.index === 7);
   const early = far ? await wouldFail(kp, [C.triggerOrder(me, far)]) : "missing";
-  ok(!!far && !far.queued && pos(s) === dir * 4n * q && early === "0x5713", "a limit far from the price waits, and cannot be carried out early", { early });
+  if (early !== "rpc") ok(!!far && !far.queued && pos(s) === dir * 4n * q && early === "0x5713", "a limit far from the price waits, and cannot be carried out early", { early });
   await must("cancel", [C.cancelOrder(me, m.vault, 7)]);
   s = await state();
   ok(!has(s, 7), "the owner can cancel a waiting order");
@@ -765,7 +774,7 @@ async function crossRoutine(bot: Bot, feeBps: bigint) {
     if (most > stepOf(s.asset.price) * 100n && most * 14n / 10n < (side > 0n ? room.long : room.short)) {
       const under = await wouldFail(kp, [C.requestTrade(me, m.vault, side * most * 97n / 100n)]);
       const over = await wouldFail(kp, [C.requestTrade(me, m.vault, side * (most * 13n / 10n + 1_000_000n))]);
-      check(under === "ok" && over === "0x5706", "with positions on several markets, the largest order shown is what the program accepts", { symbol: m.symbol, positions: s.openPositions, most, under, over });
+      if (under !== "rpc" && over !== "rpc") check(under === "ok" && over === "0x5706", "with positions on several markets, the largest order shown is what the program accepts", { symbol: m.symbol, positions: s.openPositions, most, under, over });
     }
     const step = stepOf(s.asset.price);
     const want = closing ? -held : held !== 0n ? 0n : (Math.random() < 0.5 ? 1n : -1n) * ((cap / 4n) / step * step);
@@ -792,6 +801,7 @@ async function adversaryRoutine(bot: Bot) {
   const clock = await conn.getAccountInfo(SYSVAR_CLOCK_PUBKEY);
   const now = clock ? Number(new DataView(clock.data.buffer, clock.data.byteOffset).getBigInt64(32, true)) : Math.floor(Date.now() / 1000);
   const expect = (code: string, want: string[], what: string, more: Record<string, unknown> = {}) => {
+    if (code === "rpc") { note({ type: "unchecked", bot: bot.name, what }); return; }
     note({ type: "refusal", bot: bot.name, what, code, ok: want.includes(code) });
     if (!want.includes(code)) check(false, `refused: ${what}`, { code, expected: want, ...more });
   };
@@ -807,8 +817,17 @@ async function adversaryRoutine(bot: Bot) {
       const atMark = book.markPrev < r.target && r.target <= book.markPublish;
       if (!atMark) { // (refused by the router; or, if its price arrived between the two reads, by Percolator for want of the cranks a real fill carries)
         const code = await wouldFail(kp, [C.fillRequest(me, v, r)]);
-        note({ type: "refusal", bot: bot.name, what: "filling a request before its price has arrived", code, ok: code !== "ok" });
-        if (code === "ok") check(false, "refused: filling a request before its price has arrived", { code });
+        // "ok" is only wrong if the price had still not arrived: the queue is read again, and
+        // what both reads showed is kept, so a real early fill can be told from a price that
+        // arrived between the read and the attempt.
+        const bz = code === "ok" ? await conn.getAccountInfo(C.bookAddress(v.key)) : null;
+        const later = bz ? C.decodeBook(new Uint8Array(bz.data)) : null;
+        const arrived = !!later && (later.markPrev < r.target && r.target <= later.markPublish || !later.pending.some(p => p.id === r.id));
+        if (code === "rpc" || (code === "ok" && arrived)) note({ type: "unchecked", bot: bot.name, what: "filling a request before its price has arrived" });
+        else {
+          note({ type: "refusal", bot: bot.name, what: "filling a request before its price has arrived", code, ok: code !== "ok" });
+          if (code === "ok") check(false, "refused: filling a request before its price has arrived", { code, request: r.id, target: r.target, markPrev: book.markPrev, markPublish: book.markPublish, markPrevAfter: later?.markPrev, markPublishAfter: later?.markPublish });
+        }
       }
       // The clock and the queue are read again right before the attempt: on a throttled RPC the
       // reads above take many seconds, and by then a request "with time left" has run out of it
@@ -827,8 +846,14 @@ async function adversaryRoutine(bot: Bot) {
     // (Refused by the router; or, if a newer price arrived between the two reads, by Percolator for want of cranks.)
     if (pa && b3 && C.decodePrice(new Uint8Array(pa.data)).publish <= C.decodeBook(new Uint8Array(b3.data)).markPublish) {
       const code = await wouldFail(kp, [C.advanceMark(v, v.oracle, marketData)]);
-      note({ type: "refusal", bot: bot.name, what: "moving the price to one that is not newer", code, ok: code !== "ok" });
-      if (code === "ok") check(false, "refused: moving the price to one that is not newer", { code });
+      // (The same second look as above: a price account that moved on in between is no finding.)
+      const [pz, bz] = code === "ok" ? await conn.getMultipleAccountsInfo([v.oracle, C.bookAddress(v.key)]) : [null, null];
+      const newer = !!pz && !!bz && C.decodePrice(new Uint8Array(pz.data)).publish > C.decodeBook(new Uint8Array(bz.data)).markPublish;
+      if (code === "rpc" || (code === "ok" && newer)) note({ type: "unchecked", bot: bot.name, what: "moving the price to one that is not newer" });
+      else {
+        note({ type: "refusal", bot: bot.name, what: "moving the price to one that is not newer", code, ok: code !== "ok" });
+        if (code === "ok") check(false, "refused: moving the price to one that is not newer", { code, price: C.decodePrice(new Uint8Array(pa.data)).publish, mark: C.decodeBook(new Uint8Array(b3.data)).markPublish, priceAfter: pz && C.decodePrice(new Uint8Array(pz.data)).publish, markAfter: bz && C.decodeBook(new Uint8Array(bz.data)).markPublish });
+      }
     }
     // An order with no size.
     expect(await wouldFail(kp, [C.requestTrade(me, v.key, 0n)]), ["0x5700"], "an order of size zero");
@@ -853,7 +878,7 @@ async function adversaryRoutine(bot: Bot) {
     break;
   }
   const over = await wouldFail(kp, [createAssociatedTokenAccountIdempotentInstruction(me, C.ata(me, C.MINT), me, C.MINT), C.routerWithdraw(me, 1_000_000_000_000n)]);
-  note({ type: "refusal", bot: bot.name, what: "withdrawing more than the account holds", code: over, ok: over !== "ok" });
+  if (over !== "rpc") note({ type: "refusal", bot: bot.name, what: "withdrawing more than the account holds", code: over, ok: over !== "ok" });
   if (over === "ok") check(false, "refused: withdrawing more than the account holds", { code: over });
 }
 
