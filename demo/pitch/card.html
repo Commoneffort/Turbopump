@@ -1,0 +1,33 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  html,body{margin:0;height:100%;background:#121212;color:#F4F4F4;font-family:Inter,sans-serif}
+  .wrap{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:22px;padding:0 120px}
+  .brand{display:flex;align-items:center;gap:22px}
+  .brand svg{color:#E15A48}
+  h1{font-size:110px;margin:0;font-weight:700;letter-spacing:-.03em}
+  p{font-size:38px;color:#8A8A8A;margin:0;max-width:1380px;line-height:1.4}
+  p b{color:#F4F4F4;font-weight:500}
+  .coral{color:#E15A48}
+  .rows{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin-top:26px;width:1500px}
+  .rows div{background:#1C1C1C;border:1px solid #2A2A2A;border-radius:8px;padding:30px 26px;font-size:29px;color:#F4F4F4;line-height:1.35}
+  .rows small{display:block;color:#8A8A8A;font-size:21px;margin-top:10px}
+  .links{font-size:34px;color:#F4F4F4;margin-top:20px;line-height:1.7;font-weight:500}
+  .tag{font-size:23px;color:#8A8A8A;margin-top:26px}
+</style></head>
+<body><div class="wrap" id="w"></div>
+<script>
+  const kind = new URLSearchParams(location.search).get("k");
+  const logo = `<div class="brand"><svg width="100" height="100" viewBox="0 0 22 22"><path d="M11 1.5 20.5 11 11 20.5 1.5 11Z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M11 6.5 15.5 11 11 15.5 6.5 11Z" fill="currentColor"/></svg><h1>Turbopump</h1></div>`;
+  document.getElementById("w").innerHTML = kind === "outro"
+    ? `${logo}<p>Perpetual markets anyone can open,<br><b>nobody controls</b> and <b class="coral">nobody can front-run</b>.</p>
+       <div class="links">turbopumpx.vercel.app<br>github.com/Commoneffort/Turbopump</div>
+       <div class="tag">Live on Solana devnet and X1 testnet · unaudited, test funds only · narration is machine-generated</div>`
+    : `${logo}<p>The perpetuals exchange with no keys.</p>
+       <div class="rows">
+         <div>Anyone opens a market<small>no listing team</small></div>
+         <div>Nobody can pause or drain it<small>the vault holds its own keys</small></div>
+         <div class="coral">Nobody can front-run it<small>fills at a price unknown to all</small></div>
+       </div>
+       <div class="tag">Built on Percolator, Anatoly Yakovenko's risk engine</div>`;
+</script></body></html>
