@@ -60,7 +60,7 @@ export default function Docs() {
         {TOC.map(([id, t]) => <a key={id} href={`#/docs`} onClick={e => { e.preventDefault(); document.getElementById(id)?.scrollIntoView({ behavior: "smooth" }); }}>{t}</a>)}
       </aside>
       <article className="doc">
-        <h1 id="overview">Percolator Vaults</h1>
+        <h1 id="overview">Turbopump</h1>
         {X1 && (
           <p className="callout">
             <b>You are looking at the X1 testnet deployment.</b> The programs are the same as on Solana devnet, and this page describes
@@ -72,7 +72,7 @@ export default function Docs() {
           </p>
         )}
         <p className="lead">
-          Keyless perpetual markets with liquidity built in, on Anatoly Yakovenko's Percolator risk engine. Anyone can open the
+          Turbopump is keyless perpetual markets with liquidity built in, on Anatoly Yakovenko's Percolator risk engine. Anyone can open the
           market for a Pyth price feed. A vault program then owns that market, makes markets on it from one shared pool, and pays
           its trading fees to the people who deposit, and to whoever opened it. Every trade fills at the first Pyth price
           published {ROUTER_DELAY_SECS} seconds after it was requested, so nobody can trade against a price they already know.

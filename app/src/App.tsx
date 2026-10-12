@@ -112,7 +112,7 @@ export default function App() {
             <path d="M11 1.5 20.5 11 11 20.5 1.5 11Z" fill="none" stroke="currentColor" strokeWidth="1.6" />
             <path d="M11 6.5 15.5 11 11 15.5 6.5 11Z" fill="currentColor" />
           </svg>
-          <span className="brand-name">Percolator</span>
+          <span className="brand-name">Turbopump</span>
         </a>
         <nav className="tabs">
           <a className={tab(desk)} href="#/">Trade</a>

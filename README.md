@@ -1,6 +1,6 @@
-# Percolator Vaults
+# Turbopump
 
-Permissionless, adminless liquidity vaults for [Percolator](https://github.com/aeyakovenko/percolator), Anatoly Yakovenko's perpetual-futures risk engine on Solana, with trading that cannot be front-run.
+Turbopump is permissionless, adminless liquidity vaults for [Percolator](https://github.com/aeyakovenko/percolator), Anatoly Yakovenko's perpetual-futures risk engine on Solana, with trading that cannot be front-run.
 
 A vault pools deposits, lists its own perpetual market on Percolator, acts as the counterparty to every trade on it, and pays the market's trading fees to its depositors. Every trade goes through a router that fills it at the first Pyth price published four seconds after the trade was requested, a price nobody could know when they traded. Nobody holds a key over any of it: every parameter is fixed when a vault is created, and every maintenance step can be run by anyone.
 
