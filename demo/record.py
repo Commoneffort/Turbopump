@@ -10,7 +10,7 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-APP = "https://percolator-vaults.vercel.app"
+APP = "https://turbopumpx.vercel.app"
 HERE = Path(__file__).resolve().parent
 BUILD = HERE / "build"
 DUR = json.loads((BUILD / "audio" / "durations.json").read_text())

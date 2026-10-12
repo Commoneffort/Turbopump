@@ -30,7 +30,7 @@ function loadKeypair(): Keypair {
 
 export class DevnetBurnerAdapter extends BaseSignerWalletAdapter {
   name = BurnerName;
-  url = "https://percolator-vaults.vercel.app";
+  url = "https://turbopumpx.vercel.app";
   icon = ICON;
   supportedTransactionVersions = new Set(["legacy", 0] as const);
   private keypair: Keypair | null = null;

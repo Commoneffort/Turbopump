@@ -80,7 +80,7 @@ export default function Docs() {
         </p>
         <div className="callout">
           <b>Status.</b> Live on Solana devnet. Unaudited: neither this program nor Percolator has been audited. Use test funds only.
-          Source: <a href="https://github.com/Commoneffort/percolator-vaults" target="_blank" rel="noreferrer">github.com/Commoneffort/percolator-vaults</a>.
+          Source: <a href="https://github.com/Commoneffort/Turbopump" target="_blank" rel="noreferrer">github.com/Commoneffort/Turbopump</a>.
         </div>
 
         <h2 id="percolator">Percolator in one minute</h2>

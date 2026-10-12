@@ -211,6 +211,6 @@ app/            web app (Vite + React + wallet adapter), the devnet faucet API, 
 pusher/         standalone Pyth price pusher for shared feed accounts (needs a Pyth API key)
 ```
 
-See [SECURITY.md](SECURITY.md) for the threat model and known limits, the live [docs page](https://percolator-vaults.vercel.app/#/docs) for the full protocol description, [docs/SUBMISSION.md](docs/SUBMISSION.md) for the hackathon write-up and [docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md) for the demo.
+See [SECURITY.md](SECURITY.md) for the threat model and known limits, the live [docs page](https://turbopumpx.vercel.app/#/docs) for the full protocol description, [docs/SUBMISSION.md](docs/SUBMISSION.md) for the hackathon write-up and [docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md) for the demo.
 
 Built on Percolator (Apache-2.0).

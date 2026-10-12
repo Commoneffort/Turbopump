@@ -3,9 +3,9 @@
 **One-liner.** Keyless perpetual markets with liquidity built in, that nobody can front-run: anyone can open the market for a Pyth price feed on Anatoly Yakovenko's Percolator engine, a vault program owns it and makes markets on it from one shared pool, and every trade fills at the first Pyth price published four seconds after it was requested, a price nobody could know when they traded.
 
 **Links**
-- Live app (Solana devnet): https://percolator-vaults.vercel.app
-- Source: https://github.com/Commoneffort/percolator-vaults
-- Docs: https://percolator-vaults.vercel.app/#/docs
+- Live app (Solana devnet): https://turbopumpx.vercel.app
+- Source: https://github.com/Commoneffort/Turbopump
+- Docs: https://turbopumpx.vercel.app/#/docs
 - Demo video: `docs/demo.mp4` in the repo (upload link to be added)
 
 ## Problem

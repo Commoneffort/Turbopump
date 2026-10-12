@@ -15,7 +15,7 @@ Recorded against the live devnet app with a Devnet Burner wallet. The narration 
 
 ## Recording a live walkthrough yourself
 
-1. Open https://percolator-vaults.vercel.app, click **Select Wallet → Devnet Burner** (or use Phantom on devnet).
+1. Open https://turbopumpx.vercel.app, click **Select Wallet → Devnet Burner** (or use Phantom on devnet).
 2. **Get test USDC** (1,000 test USDC and 0.3 devnet SOL).
 3. **Open a market** → pick a feed that isn't open yet → **Open** and approve.
 4. Open **BTC-PERP** → **Create trading account** → **Add margin** 100 → size 0.01 → **Long**. The trade is queued and fills a few seconds later, at the first Pyth price published after its target time → **Close position** (queued the same way).

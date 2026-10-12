@@ -156,7 +156,7 @@ export default function App() {
             Unaudited experimental software on {C.NETWORK_NAME} · vault program{" "}
             <a href={explorer("address", C.VAULT_PROGRAM.toString())} target="_blank" rel="noreferrer">{short(C.VAULT_PROGRAM)}</a> · Percolator{" "}
             <a href={explorer("address", C.PERCOLATOR.toString())} target="_blank" rel="noreferrer">{short(C.PERCOLATOR)}</a> ·{" "}
-            <a href="https://github.com/Commoneffort/percolator-vaults" target="_blank" rel="noreferrer">source</a>
+            <a href="https://github.com/Commoneffort/Turbopump" target="_blank" rel="noreferrer">source</a>
           </footer>
         </div>
       )}
