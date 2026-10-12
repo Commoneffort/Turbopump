@@ -1,0 +1,11 @@
+[
+ {"scene": "title", "text": "On most perpetual exchanges, a team holds the keys. It decides which markets exist, it can pause them, and fast traders see the price before the liquidity pool does. Turbopump removes all three."},
+ {"scene": "markets", "text": "Turbopump is a perpetuals exchange where anyone can open a market and nobody controls it. Pick a price feed, and a vault program lists the market on Percolator, Anatoly Yakovenko's risk engine. The vault holds every key and provides the liquidity: one market and one shared pool per asset."},
+ {"scene": "trade", "text": "This is the trading desk. The vault takes the other side of every trade at the oracle price: no spread, no price impact, a flat ten basis point fee. I go long SOL. The order is queued, and fills at the first Pyth price published four seconds later. Nobody could know that price when I clicked, so nobody can front-run the pool."},
+ {"scene": "orders", "text": "Traders get the tools they expect: limit orders, take profit, stop loss, trailing stops and TWAP, carried out on chain by an executor that anyone can run, next to a full charting toolkit."},
+ {"scene": "earn", "text": "Liquidity providers deposit into the same vault and earn eighty-five percent of its fees. Deposits and withdrawals settle together, at one price, at the end of each epoch, so nobody can dilute anyone else."},
+ {"scene": "launch", "text": "Whoever opens a market earns five percent of its fees for as long as it trades, and gets no other power. Every market runs on the same fixed rules. That is the incentive to list the long tail."},
+ {"scene": "copy", "text": "Every trader's track record is kept by the program itself, so it cannot be faked. Follow a trader to see their trades on your chart, or copy one, and your account mirrors theirs."},
+ {"scene": "proof", "text": "It is live today on two test networks, Solana devnet and X1 testnet, with thousands of test trades filled. More than a hundred tests run it against Percolator's production binary, including front-running and attack scenarios, and the bugs we found in Percolator along the way went back upstream."},
+ {"scene": "outro", "text": "Turbopump. Perpetual markets anyone can open, nobody controls, and nobody can front-run. Unaudited and on test networks today. Next: an audit, then mainnet."}
+]
