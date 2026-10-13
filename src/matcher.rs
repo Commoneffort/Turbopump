@@ -49,7 +49,10 @@ pub fn decode(data: &[u8]) -> Result<Request, VaultError> {
 /// True when the vault only accepts fills that shrink its position: the epoch is over and its
 /// withdrawals cannot be paid from the vault's cash (`needs_flat`), so the vault works toward
 /// flat to settle them. Deposits, and withdrawals the cash covers, settle with the position open
-/// and do not interrupt trading.
+/// and do not interrupt trading. One exception, in `process`: a fill that only reduces the
+/// taker's own position is taken as usual (within the vault's caps), even when it grows the
+/// vault's. A trader's close, stop or liquidation must not wait for the vault, and every such
+/// fill lowers the open interest the vault has to get out of.
 pub fn reduce_only(v: &state::VaultState, now_slot: u64) -> bool {
     let epoch_over = now_slot >= v.epoch_start_slot.saturating_add(v.epoch_len_slots);
     epoch_over && v.needs_flat != 0
@@ -82,9 +85,11 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     if v.armed_slot != now || v.armed_size != req.req_size {
         return Err(VaultError::NotArmed.into());
     }
+    let taker_closes = v.armed_closing != 0;
     v.armed_size = 0;
     v.armed_slot = 0;
-    let ro = reduce_only(&v, now);
+    v.armed_closing = 0;
+    let ro = reduce_only(&v, now) && !taker_closes;
     let taker_buys = req.req_size > 0;
     // The vault takes the other side: a taker buy moves the vault short.
     let lp_sign: i8 = if taker_buys { -1 } else { 1 };

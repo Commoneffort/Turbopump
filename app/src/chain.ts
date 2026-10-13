@@ -453,8 +453,9 @@ export function claimOpenerFees(v: Vault, opener: PublicKey) {
   });
 }
 
-/** The largest fill the vault would take right now in each direction (mirrors the matcher). */
-export function depth(s: State): { long: bigint; short: bigint } {
+/** The largest fill the vault would take right now in each direction (mirrors the matcher).
+ *  `held` is the taker's own position: closing it is taken even while the vault is reduce-only. */
+export function depth(s: State, held = 0n): { long: bigint; short: bigint } {
   const v = s.vault;
   const price = s.asset.price;
   let maxFill = v.maxFill, maxInv = v.maxInventory;
@@ -473,8 +474,12 @@ export function depth(s: State): { long: bigint; short: bigint } {
   };
   const epochOver = s.slot >= v.epochStart + v.epochLen && v.needsFlat;
   if (epochOver) {
-    // Reduce-only: a taker long is only filled if the vault is long (and vice versa).
-    return { long: inv > 0n ? abs : 0n, short: inv < 0n ? abs : 0n };
+    // Reduce-only: a taker long is only filled if the vault is long (and vice versa), or as far
+    // as it closes the taker's own short (within the vault's usual room).
+    const heldAbs = held < 0n ? -held : held;
+    const closing = (lpSign: 1n | -1n) => (heldAbs < room(lpSign) ? heldAbs : room(lpSign));
+    const most = (a: bigint, b: bigint) => (a > b ? a : b);
+    return { long: most(inv > 0n ? abs : 0n, held < 0n ? closing(-1n) : 0n), short: most(inv < 0n ? abs : 0n, held > 0n ? closing(1n) : 0n) };
   }
   // A taker long moves the vault short (lpSign -1).
   return { long: room(-1n), short: room(1n) };

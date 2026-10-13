@@ -176,6 +176,37 @@ fn roll_needs_flat_portfolio_and_reduce_only_gets_there() {
 }
 
 #[test]
+fn a_trader_can_always_close_while_the_vault_is_reduce_only() {
+    let (mut w, alice) = funded();
+    w.taker_trade(0, TEN_M).unwrap(); // trader 0 long 10
+    w.taker_trade(1, -4 * UNIT as i128).unwrap(); // trader 1 short 4: the vault is short 6
+    let half = w.tokens(alice.shares) / 2;
+    w.withdraw(&alice, half).unwrap();
+    w.advance(EPOCH_LEN, INITIAL_PRICE);
+    w.require_flat().unwrap();
+    assert_eq!({ w.vault_state().inventory }, -6 * UNIT as i128);
+
+    // Trader 1 buying back part of its short grows the vault's short. It is that trader's own
+    // close (a stop, a liquidation, a plain exit), so it fills.
+    w.taker_trade(1, UNIT as i128).unwrap();
+    assert_eq!({ w.vault_state().inventory }, -7 * UNIT as i128, "a partial close fills");
+    // More than the position (a flip) is not a close: nothing trades.
+    w.taker_trade(1, 5 * UNIT as i128).unwrap();
+    assert_eq!({ w.vault_state().inventory }, -7 * UNIT as i128, "a flip is not a close");
+    // The rest of the short.
+    w.taker_trade(1, 3 * UNIT as i128).unwrap();
+    assert_eq!({ w.vault_state().inventory }, -TEN_M, "the whole close fills");
+    // Flat now: a buy opens a position and grows the vault's short. Refused as before.
+    w.taker_trade(1, UNIT as i128).unwrap();
+    assert_eq!({ w.vault_state().inventory }, -TEN_M, "no new position in reduce-only");
+    // The last holder leaves; the vault is flat and the epoch rolls.
+    w.taker_trade(0, -TEN_M).unwrap();
+    assert_eq!({ w.vault_state().inventory }, 0);
+    w.roll().unwrap();
+    assert_eq!({ w.vault_state().epoch }, 2);
+}
+
+#[test]
 fn matcher_approval_expires_and_anyone_can_renew_it() {
     let (mut w, _) = funded();
     // The approval lasts CANON_MATCHER_TTL_SLOTS (200 in test builds) and is renewed at rolls.

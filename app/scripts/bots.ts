@@ -423,7 +423,7 @@ async function act(bot: Bot, m: Market, feeBps: bigint) {
   if (s.closeOnly) { note({ type: "skip", bot: bot.name, symbol: m.symbol, why: "market is close-only" }); return; }
   const held = s.portfolio.position;
   const cap = s.margin ?? 0n;                       // the largest position the margin allows
-  const room = C.depth(s);
+  const room = C.depth(s, held);
   const marginMax = (sign: bigint) => (held === 0n || (held > 0n) === (sign > 0n) ? (cap > abs(held) ? cap - abs(held) : 0n) : abs(held) + cap);
   const rnd = Math.random();
   const prices = history.get(m.symbol) ?? [];

@@ -299,10 +299,10 @@ function Ticket({ state, send, busy }: { state: C.State; send: Send; busy?: stri
 
   const pendingHere = state.pending;
   const locked = !!state.trader?.hasPending;
-  const room = C.depth(state);
   // The largest order each way that the router's margin check accepts. Shrinking a position is
   // always accepted; past zero, the new position has to fit the margin.
   const held = p?.position ?? 0n, cap = state.margin ?? 0n;
+  const room = C.depth(state, held);
   const marginMax = (s: 1n | -1n) => (held === 0n || (held > 0n) === (s > 0n) ? (cap > abs(held) ? cap - abs(held) : 0n) : abs(held) + cap);
   const vaultMax = side > 0n ? room.long : room.short;
   const most = marginMax(side) < vaultMax ? marginMax(side) : vaultMax;
@@ -338,7 +338,7 @@ function Ticket({ state, send, busy }: { state: C.State; send: Send; busy?: stri
     : locked ? (pendingHere ? "Your queued order has to fill or expire first" : "You have an order queued on another market")
     : state.closeOnly ? "This market is close-only until its remaining positions are closed"
     : noLiquidity ? "This market has no liquidity yet"
-    : vaultMax === 0n ? (reduceOnly ? "The vault is settling an epoch and only takes orders that reduce its position" : `The vault is at its limit for ${side > 0n ? "longs" : "shorts"}`)
+    : vaultMax === 0n ? (reduceOnly ? "The vault is settling an epoch: it only takes orders that reduce its position or close yours" : `The vault is at its limit for ${side > 0n ? "longs" : "shorts"}`)
     : want <= 0n ? "Enter a size"
     : sent > marginMax(side) ? `Your margin covers at most ${units(marginMax(side))} ${sym} here: add margin or lower the size`
     : undefined;

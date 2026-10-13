@@ -1312,7 +1312,10 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         }
     }
     if size != 0 {
-        trade_against_vault(accounts, &t, &v, abump, market_id, size, fee_bps)?;
+        // A fill that only reduces the trader's own position is marked for the vault, which
+        // takes it even while it accepts nothing else that grows its position.
+        let closing = before != 0 && (before > 0) != (size > 0) && size.unsigned_abs() <= before.unsigned_abs();
+        trade_against_vault(accounts, &t, &v, abump, market_id, size, closing, fee_bps)?;
     }
     // What actually traded (the vault may fill less than requested) and at what price.
     let traded = held(portfolio, market)? - before;
@@ -1348,11 +1351,13 @@ fn reduce_unilaterally<'a>(trader_ai: &AccountInfo<'a>, market: &AccountInfo<'a>
 /// Arms the vault's matcher for `size` and trades it against the vault through Percolator.
 /// `accounts` are `fill`'s, already checked there.
 #[inline(never)]
-fn trade_against_vault(accounts: &[AccountInfo], t: &TraderState, v: &vstate::VaultState, abump: u8, market_id: u64, size: i128, fee_bps: u64) -> ProgramResult {
+#[allow(clippy::too_many_arguments)]
+fn trade_against_vault(accounts: &[AccountInfo], t: &TraderState, v: &vstate::VaultState, abump: u8, market_id: u64, size: i128, closing: bool, fee_bps: u64) -> ProgramResult {
     let (trader_ai, vault_ai, market, portfolio) = (acc(accounts, 2)?, acc(accounts, 5)?, acc(accounts, 6)?, acc(accounts, 7)?);
     let (lp_portfolio, delegate, authority, vault_program, percolator) = (acc(accounts, 8)?, acc(accounts, 9)?, acc(accounts, 10)?, acc(accounts, 11)?, acc(accounts, 12)?);
     let mut arm = vec![TAG_ARM_FILL];
     arm.extend_from_slice(&size.to_le_bytes());
+    arm.push(closing as u8);
     invoke_signed(
         &Instruction {
             program_id: percolator_vault::id(),

@@ -765,11 +765,14 @@ async function serviceOrders(vaults: C.Vault[], books: Map<string, C.Book>, mark
     // A trail's record is only worth a transaction once the mark is clearly better.
     if (what === "record" && (o.peak === 0n || (b.markPrice > o.peak ? b.markPrice - o.peak : o.peak - b.markPrice) * 1000n < o.peak)) continue;
     if (what === "fire" && (queuedNow.has(o.wallet.toBase58()) || C.decodeTrader(new Uint8Array(tr.data)).hasPending || b.pending.length >= 30 || C.closeOnly(market, v.assetIndex))) continue;
-    // A vault closing its position to pay withdrawals takes only trades that shrink it: an order
-    // the other way would be queued, filled with nothing and due again at once. It waits.
-    if (what === "fire" && v.needsFlat && slot >= v.epochStart + v.epochLen) {
-      const buys = o.kind <= C.ORDER.TRAIL ? held < 0n : o.size > 0n;
-      if (buys ? v.inventory <= 0n : v.inventory >= 0n) { orderRetry.set(o.key.toBase58(), Date.now() + 30_000); continue; }
+    // A vault closing its position to pay withdrawals takes only trades that shrink it, and
+    // trades that only reduce the trader's own position (every stop, take-profit and trailing
+    // stop is one). Any other order would be queued, filled with nothing and due again at
+    // once. It waits.
+    if (what === "fire" && o.kind > C.ORDER.TRAIL && v.needsFlat && slot >= v.epochStart + v.epochLen) {
+      const buys = o.size > 0n, size = buys ? o.size : -o.size;
+      const closes = held !== 0n && (held > 0n) !== buys && size <= (held > 0n ? held : -held);
+      if (!closes && (buys ? v.inventory <= 0n : v.inventory >= 0n)) { orderRetry.set(o.key.toBase58(), Date.now() + 30_000); continue; }
     }
     const name = ["stop", "take-profit", "trailing stop", "limit", "TWAP"][o.kind] ?? "order";
     const ok = await send(`${what === "fire" ? "carry out" : what === "record" ? "record a better mark for" : "remove"} ${name} of ${o.wallet.toBase58().slice(0, 6)} on ${v.feed?.symbol} (mark ${Number(b.markPrice) / 1e6})`, [C.triggerOrder(payer.publicKey, o)], true);

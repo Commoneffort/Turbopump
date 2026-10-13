@@ -62,7 +62,10 @@ pub struct VaultState {
     pub position_nav_bps: u16,
     /// Per-fill cap as a multiple of the vault's NAV (basis points of NAV in notional); 0 = off.
     pub fill_nav_bps: u16,
-    pub _pad0: [u8; 2],
+    /// Set with the armed fill when it only reduces the taker's own position (no flip). Such a
+    /// fill is taken even while the vault is reduce-only: a trader can always close.
+    pub armed_closing: u8,
+    pub _pad0: [u8; 1],
     pub max_fill_abs: u128,
     pub max_inventory_abs: u128,
     pub epoch_len_slots: u64,

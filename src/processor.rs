@@ -525,10 +525,10 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
             push_mark(program_id, accounts, r(0), r(8), r(16))
         }
         TAG_ARM_FILL => {
-            if rest.len() != 16 {
+            if (rest.len() != 16 && rest.len() != 17) || rest.get(16).is_some_and(|c| *c > 1) {
                 return Err(VaultError::InvalidInstruction.into());
             }
-            arm_fill(program_id, accounts, i128::from_le_bytes(rest.try_into().unwrap()))
+            arm_fill(program_id, accounts, i128::from_le_bytes(rest[..16].try_into().unwrap()), rest.get(16) == Some(&1))
         }
         TAG_REQUIRE_FLAT => {
             no_args(rest)?;
@@ -764,7 +764,8 @@ fn init_vault(program_id: &Pubkey, accounts: &[AccountInfo], p: InitParams) -> P
         backing_fee_cap_bps: p.backing_fee_cap_bps,
         position_nav_bps: p.position_nav_bps,
         fill_nav_bps: p.fill_nav_bps,
-        _pad0: [0; 2],
+        armed_closing: 0,
+        _pad0: [0; 1],
         max_fill_abs: p.max_fill_abs,
         max_inventory_abs: p.max_inventory_abs,
         epoch_len_slots: p.epoch_len_slots,
@@ -1807,8 +1808,10 @@ fn push_mark(
 /// Arms the one fill the matcher will accept in this slot: the router calls it right before the
 /// trade it executes. Every other fill (a taker trading directly) is refused by the matcher.
 ///
-/// Accounts: 0 router authority [signer], 1 vault [w]. Data: taker size (i128, + = taker buys).
-fn arm_fill(program_id: &Pubkey, accounts: &[AccountInfo], size: i128) -> ProgramResult {
+/// Accounts: 0 router authority [signer], 1 vault [w]. Data: taker size (i128, + = taker buys),
+/// then optionally one byte, 1 when the fill only reduces the taker's own position (the router
+/// reads that from the taker's portfolio); the matcher takes such a fill even when reduce-only.
+fn arm_fill(program_id: &Pubkey, accounts: &[AccountInfo], size: i128, closing: bool) -> ProgramResult {
     let router = acc(accounts, 0)?;
     let vault_ai = acc(accounts, 1)?;
     router_signed(router)?;
@@ -1821,6 +1824,7 @@ fn arm_fill(program_id: &Pubkey, accounts: &[AccountInfo], size: i128) -> Progra
         return Err(VaultError::InvalidParams.into());
     }
     v.armed_size = size;
+    v.armed_closing = closing as u8;
     v.armed_slot = Clock::get()?.slot;
     state::store_vault(vault_ai, &v)
 }
