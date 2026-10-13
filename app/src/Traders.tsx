@@ -388,7 +388,7 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
       // Accounts that have not traded since their record was opened come after those that have.
       .sort((a, b) => Number((b.stats?.trades ?? 0) > 0) - Number((a.stats?.trades ?? 0) > 0) || by[sort](b) - by[sort](a));
   }, [board, sort, view, me, period]);
-  const podium = view === "top" && (sort === "pnl" || sort === "roi") ? rows.filter(r => (r.stats?.trades ?? 0) > 0 && over(r, period)[sort] > 0).slice(0, 3) : [];
+  const podium = view === "top" && (sort === "pnl" || sort === "roi") ? rows.filter(r => (r.stats?.trades ?? 0) > 0).slice(0, 3) : [];
   const periodName = PERIODS.find(p => p[0] === period)![1].toLowerCase();
   const mine = board?.rows.find(r => r.wallet === me.wallet);
   const leader = me.copy && board?.rows.find(r => r.wallet === me.copy!.leader.toBase58());
