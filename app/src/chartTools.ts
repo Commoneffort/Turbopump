@@ -1,6 +1,6 @@
 // Drawing tools the chart library does not ship: a Fibonacci retracement with a colour per level,
 // a measure tool, and a text note. Registered once, then started by name like the built-in ones.
-import { registerOverlay } from "klinecharts";
+import { registerFigure, registerOverlay } from "klinecharts";
 
 const FONT = '"JetBrains Mono", ui-monospace, monospace';
 const GREEN = "72,225,96", CORAL = "225,90,72", WHITE = "244,244,244", GREY = "138,138,138";
@@ -42,6 +42,23 @@ export function registerChartTools() {
     },
   });
 
+  // A badge picture on the chart: the picture the page has already checked and drawn itself
+  // (see `safePicture`), with a rim in the side's colour.
+  registerFigure<{ x: number; y: number; size: number; image: HTMLImageElement }, { borderColor: string }>({
+    name: "badgePicture",
+    checkEventOn: ({ x, y }, a) => x >= a.x && x <= a.x + a.size && y >= a.y && y <= a.y + a.size,
+    draw: (ctx, a, styles) => {
+      if (!a.image.complete || !a.image.naturalWidth) return;
+      ctx.save();
+      ctx.imageSmoothingQuality = "high";
+      ctx.drawImage(a.image, a.x, a.y, a.size, a.size);
+      ctx.strokeStyle = styles.borderColor;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(a.x + 0.5, a.y + 0.5, a.size - 1, a.size - 1);
+      ctx.restore();
+    },
+  });
+
   // Another trader's fill: their badge, tied to the price it filled at. A buy hangs under the
   // price, a sell stands over it; the stem and the small arrow take the side's colour.
   registerOverlay({
@@ -51,15 +68,18 @@ export function registerChartTools() {
     needDefaultXAxisFigure: false,
     needDefaultYAxisFigure: false,
     createPointFigures: ({ coordinates, overlay }) => {
-      const m = overlay.extendData as { points: [number, number][]; color: string; buy: boolean; label: string } | undefined;
+      const m = overlay.extendData as { points: [number, number][]; color: string; picture?: HTMLImageElement; buy: boolean; label: string } | undefined;
       if (!coordinates.length || !m) return [];
       const { x, y } = coordinates[0];
-      const side = m.buy ? GREEN : CORAL, dir = m.buy ? 1 : -1, s = 15;
+      // A trader's own picture is drawn a little larger than a shape, or nothing of it can be made out.
+      const side = m.buy ? GREEN : CORAL, dir = m.buy ? 1 : -1, s = m.picture ? 20 : 15;
       const top = m.buy ? y + 13 : y - 13 - s;
       return [
         { type: "line", ignoreEvent: true, attrs: { coordinates: [{ x, y: y + dir * 4 }, { x, y: y + dir * 13 }] }, styles: { color: rgba(side, 0.9), size: 1 } },
         { type: "polygon", ignoreEvent: true, attrs: { coordinates: [{ x, y: y + dir * 1 }, { x: x - 4, y: y + dir * 7 }, { x: x + 4, y: y + dir * 7 }] }, styles: { style: "fill", color: rgba(side, 1) } },
-        { type: "polygon", attrs: { coordinates: m.points.map(([px, py]) => ({ x: x - s / 2 + px * s, y: top + py * s })) }, styles: { style: "stroke_fill", color: m.color, borderColor: rgba(side, 1), borderSize: 1 } },
+        m.picture
+          ? { type: "badgePicture", attrs: { x: x - s / 2, y: top, size: s, image: m.picture }, styles: { borderColor: rgba(side, 1) } }
+          : { type: "polygon", attrs: { coordinates: m.points.map(([px, py]) => ({ x: x - s / 2 + px * s, y: top + py * s })) }, styles: { style: "stroke_fill", color: m.color, borderColor: rgba(side, 1), borderSize: 1 } },
         { type: "text", ignoreEvent: true, attrs: { x: x + s / 2 + 3, y: top + s / 2, text: m.label, baseline: "middle" }, styles: { ...label(rgba(WHITE, 0.85)), size: 9.5 } },
       ];
     },

@@ -51,7 +51,7 @@ export function badgeOf(wallet: string, profile?: S.Profile): { shape: number; c
 //  - a picture that fails any step is simply not shown: the wallet keeps its shape badge.
 /** Wallets whose picture this page does not show (it cannot be taken off the chain). */
 export const HIDDEN_PICTURES = new Set<string>([]);
-const shown = new Map<string, { of: Uint8Array; url?: string }>();
+const shown = new Map<string, { of: Uint8Array; url?: string; img?: HTMLImageElement }>();
 const watchers = new Set<() => void>();
 let shownVersion = 0;
 const sameBytes = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
@@ -78,13 +78,22 @@ function takePictures(pictures: Map<string, Uint8Array>) {
     if (HIDDEN_PICTURES.has(w)) continue;
     const had = shown.get(w);
     if (had && sameBytes(had.of, bytes)) continue;
-    const entry: { of: Uint8Array; url?: string } = { of: bytes };
+    const entry: { of: Uint8Array; url?: string; img?: HTMLImageElement } = { of: bytes };
     shown.set(w, entry);
-    safePicture(bytes).then(url => { if (shown.get(w) === entry && url) { entry.url = url; shownVersion++; watchers.forEach(f => f()); } });
+    safePicture(bytes).then(async url => {
+      if (shown.get(w) !== entry || !url) return;
+      entry.url = url;
+      // The same picture, ready to be drawn on the chart (a canvas draws only a loaded image).
+      const img = new Image();
+      img.src = url;
+      await img.decode().then(() => { entry.img = img; }).catch(() => undefined);
+      shownVersion++;
+      watchers.forEach(f => f());
+    });
   }
   if (changed) { shownVersion++; watchers.forEach(f => f()); }
 }
-const usePictures = () => useSyncExternalStore(f => { watchers.add(f); return () => { watchers.delete(f); }; }, () => shownVersion);
+export const usePictures = () => useSyncExternalStore(f => { watchers.add(f); return () => { watchers.delete(f); }; }, () => shownVersion);
 
 export function Badge({ wallet, profile, size = 18, picture }: { wallet: string; profile?: S.Profile; size?: number; picture?: string | null }) {
   usePictures();
@@ -658,14 +667,15 @@ export function TraderPage({ wallet, send, busy, tick, go }: { wallet: string; s
 }
 
 /** For other pages: a wallet's trades as chart marks (see Chart `marks`). */
-export type Mark = { key: string; time: number; price: number; size: number; name: string; shape: number; color: string };
+/** `picture`: the trader's badge picture, already checked and loaded, where they have one. */
+export type Mark = { key: string; time: number; price: number; size: number; name: string; shape: number; color: string; picture?: HTMLImageElement };
 export function marksFor(board: S.Board | undefined, leaders: Iterable<string>, asset: number): Mark[] {
   const out: Mark[] = [];
   for (const w of leaders) {
     const r = board?.rows.find(x => x.wallet === w);
     if (!r?.stats) continue;
-    const b = badgeOf(w, r.profile);
-    for (const f of r.stats.fills) if (f.asset === asset) out.push({ key: `${w}:${f.time}:${f.size}`, time: f.time, price: f.price, size: f.size, name: nameOf(w, r.profile), shape: b.shape, color: b.color === "#4A4A4A" ? "#8A8A8A" : b.color });
+    const b = badgeOf(w, r.profile), picture = shown.get(w)?.img;
+    for (const f of r.stats.fills) if (f.asset === asset) out.push({ key: `${w}:${f.time}:${f.size}${picture ? ":p" : ""}`, time: f.time, price: f.price, size: f.size, name: nameOf(w, r.profile), shape: b.shape, color: b.color === "#4A4A4A" ? "#8A8A8A" : b.color, picture });
   }
   return out.sort((a, b) => a.time - b.time);
 }

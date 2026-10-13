@@ -12,7 +12,7 @@ import { createAssociatedTokenAccountIdempotentInstruction } from "@solana/spl-t
 import * as C from "./chain";
 import Chart, { DayStats, useDayStats } from "./Chart";
 import * as S from "./social";
-import { Mark, marksFor, useBoard, useMe } from "./Traders";
+import { Mark, marksFor, useBoard, useMe, usePictures } from "./Traders";
 import { Card, Faucet, Icon, LiquidityPanel, OpenerPanel, Send, ago, capUnits, entryPrice, explorer, fmt, num, priceDp, px, short, units, usd, useActivity, useCards, useFills, useVault } from "./shared";
 
 const UP = "#48E160", DOWN = "#E15A48";
@@ -62,7 +62,9 @@ function DeskInner({ vaultKey, markets, day, send, busy, tick, go }: { vaultKey:
   const me = useMe(board, tick);
   const leaders = useMemo(() => [...new Set([...me.following, ...(me.copy ? [me.copy.leader.toBase58()] : [])])].sort(), [me]);
   const asset = state?.vault.assetIndex ?? -1;
-  const marks = useMemo(() => marksFor(board, leaders, asset), [board, leaders.join(","), asset]);
+  // (Badge pictures are checked and loaded a moment after the board arrives: the marks follow.)
+  const pictures = usePictures();
+  const marks = useMemo(() => marksFor(board, leaders, asset), [board, leaders.join(","), asset, pictures]);
 
   if (err && !state) return <div className="desk-msg">{err}</div>;
   if (!state) return <div className="desk-msg">Loading market…</div>;
