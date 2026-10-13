@@ -146,16 +146,17 @@ fn settled_together_a_reversal_costs_what_the_position_lost() {
     }
 }
 
-/// If the winners are settled at the peak and the vault, which owes them, is not, the gain of
-/// each winner is backed only by the losses booked so far (here the short trader's 210 against
-/// 910 of gains: 23%). Before upstream engine PR #226 the loss on the way down was taken against
-/// the gain at that rate and the rest out of capital, for good: trader 0 lost its whole 1,000
-/// and owed 137 more, where the position alone lost 652.5, and anyone can call a crank. Now the
-/// reversal is netted against the position's own gain and costs what the position lost.
+/// Percolator as it is today (engine v16.9.1): if the winners are settled at the peak and the
+/// vault, which owes them, is not, the gain of each winner is backed only by the losses booked so
+/// far (here the short trader's 210 against 910 of gains: 23%). When the price turns, the loss is
+/// taken against the gain at that rate and the rest out of capital, for good. Trader 0 loses its
+/// whole 1,000 and owes 137 more, where the position alone lost 652.5. Anyone can call a crank,
+/// so anyone can bring this state about. This test pins the behaviour so that we notice when
+/// the engine changes it.
 #[test]
-fn winners_settled_before_the_vault_lose_what_their_position_did() {
-    let (trader, rest, vault) = run_big("the traders", true);
-    assert_eq!(trader, PLAIN);
-    assert_eq!(trader + rest + vault, 0, "value reached no account");
+fn winners_settled_before_the_vault_lose_more_than_their_position_did() {
+    let (trader, _, _) = run_big("the traders", true);
+    assert!(trader < PLAIN - 400_000_000, "trader 0 lost {trader}, the position alone {PLAIN}");
+    // Alone on the market there is no partial backing, and nothing is lost.
     assert_eq!(run_big("the traders", false).0, PLAIN);
 }

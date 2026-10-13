@@ -355,6 +355,10 @@ async function tune(lagCrank: TransactionInstruction, k: number, settle: Transac
     else if (code === 22 && i >= 0 && i < k) k--;
     else if (code === 22 && i >= k && i < k + settle.length) settle = settle.filter((_, j) => j !== i - k);
     else if (code === 21 && i >= k && k < 12) k++;
+    // EngineCounterUnderflow (engine with upstream PR #226): this account cannot be settled
+    // before one of the others is (seen on X1 and devnet on 2026-10-13). The others go now,
+    // this one on the next pass.
+    else if (code === 25 && i >= k && i < k + settle.length && settle.length > 1) settle = settle.filter((_, j) => j !== i - k);
     else return `simulation failed at instruction ${i} of ${k} + ${settle.length} + ${tail.length}: ${JSON.stringify(err)}`;
   }
   return `simulation kept changing: ${seen.join("; ")}`;
@@ -403,12 +407,18 @@ async function settleAll(label: string, cranks: TransactionInstruction[]) {
   const t0 = Date.now();
   const sigs: string[] = [];
   let refusedFirst = "";
-  const one = async (ixs: TransactionInstruction[]) => {
+  let txs = 0;
+  const one = async (ixs: TransactionInstruction[]): Promise<void> => {
     // (X1 charges for the compute asked for. Whichever of these lands first also does the
     // market's price move, which the simulation of the others did not include: more to spare.)
     const head = C.X1 ? [await C.computeLimit(conn, payer.publicKey, ixs, 1.45)] : budget();
     const sig = await conn.sendTransaction(new Transaction().add(...head, ...ixs), [payer]).catch(e => { refusedFirst ||= String(e?.message ?? e).split("\n")[0].slice(0, 100); return null; });
-    if (sig) sigs.push(sig);
+    if (sig) { sigs.push(sig); txs++; return; }
+    // Refused as a whole: one account in it may be unable to settle before another has (the
+    // engine answers EngineCounterUnderflow, see `tune`). Each account then goes alone, so the
+    // rest settle now and the caller's next round gets the one that had to wait.
+    if (ixs.length > 1) { if (C.X1) await Promise.all(ixs.map(ix => one([ix]))); else for (const ix of ixs) await one([ix]); }
+    else txs++;
   };
   // Prepared and sent side by side where the RPC allows it, one after the other where it throttles.
   if (C.X1) await Promise.all(chunks.map(one)); else for (const ixs of chunks) await one(ixs);
@@ -420,7 +430,6 @@ async function settleAll(label: string, cranks: TransactionInstruction[]) {
     landed = st.filter(x => x && !x.err && (x.confirmationStatus === "confirmed" || x.confirmationStatus === "finalized")).length;
     if (st.every(x => x && (x.err || x.confirmationStatus === "confirmed" || x.confirmationStatus === "finalized"))) break;
   }
-  const txs = chunks.length;
   log(landed === txs ? "ok" : "fail", `settle ${cranks.length} account(s) ${label}: ${landed} of ${txs} transaction(s) landed together in ${((Date.now() - t0) / 1000).toFixed(1)} s`, refusedFirst);
   return landed;
 }
