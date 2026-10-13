@@ -5,6 +5,7 @@ import { PublicKey, Transaction } from "@solana/web3.js";
 import bs58 from "bs58";
 import { createAssociatedTokenAccountIdempotentInstruction } from "@solana/spl-token";
 import * as C from "./chain";
+import { readDirect, view } from "./view";
 import Desk from "./Desk";
 import Docs from "./Docs";
 import { TraderPage, TradersPage } from "./Traders";
@@ -74,6 +75,7 @@ function useSend(onDone: () => void): [Send, string | undefined, Toast | undefin
           }
         } else sig = await wallet.sendTransaction(tx, connection);
         await connection.confirmTransaction(sig, "confirmed");
+        readDirect(); // what this changed is not in the shared copy yet
         setToast({ ok: true, text: `${label}: confirmed`, sig });
         onDone();
         return sig;
@@ -98,8 +100,13 @@ export default function App() {
   const refresh = useCallback(() => setTick(t => t + 1), []);
   const [send, busy, toast, clearToast] = useSend(refresh);
   const page = route[0] ?? "";
-  const { connection } = useConnection();
-  useEffect(() => { C.measureSlotSeconds(connection).then(refresh); }, [connection, refresh]);
+  useEffect(() => { C.measureSlotSeconds(view).then(refresh); }, [refresh]);
+  // A tab nobody is looking at reads nothing; it catches up when it is looked at again.
+  useEffect(() => {
+    const on = () => document.hidden || refresh();
+    document.addEventListener("visibilitychange", on);
+    return () => document.removeEventListener("visibilitychange", on);
+  }, [refresh]);
 
   const desk = page === "" || page === "trade" || page === "m";
   const tab = (on: boolean) => (on ? "tab active" : "tab");

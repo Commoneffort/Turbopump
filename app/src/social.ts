@@ -236,11 +236,11 @@ export type Board = {
 };
 
 /** Every trading account with a track record or a profile on this network's market, with what
- *  the page shows about it. Four account scans and one batched read: no transaction history. */
+ *  the page shows about it. Account scans only: no transaction history. */
 export async function loadBoard(conn: Connection): Promise<Board> {
   // Each kind of account starts with its own eight letters: other router accounts can have the same size.
   const kind = (tag: string) => ({ memcmp: { offset: 0, bytes: bs58.encode(Buffer.from(tag, "ascii")) } });
-  const [statAccs, profAccs, followAccs, copyAccs, market, badgeAccs] = await Promise.all([
+  const [statAccs, profAccs, followAccs, copyAccs, market, badgeAccs, portfolioAccs] = await Promise.all([
     conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: STATS_LEN }, kind("PRSTATS1"), { memcmp: { offset: 40, bytes: C.MARKET.toBase58() } }] }),
     conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: PROFILE_LEN }, kind("PRPROFL1")] }),
     conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: FOLLOW_LEN }, kind("PRFOLLW1")] }),
@@ -248,6 +248,8 @@ export async function loadBoard(conn: Connection): Promise<Board> {
     conn.getAccountInfo(C.MARKET),
     // (A router that has no badge pictures yet, or an RPC that refuses the scan: no pictures.)
     conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: BADGE_LEN }, kind("PRBADGE1")] }).catch(() => []),
+    // Every portfolio on the market, in one scan (the traders' are picked out below by address).
+    conn.getProgramAccounts(C.PERCOLATOR, { filters: [{ dataSize: C.PORTFOLIO_LEN }, { memcmp: { offset: 16, bytes: C.MARKET.toBase58() } }] }),
   ]);
   const pictures = new Map<string, Uint8Array>();
   for (const a of badgeAccs) {
@@ -260,11 +262,11 @@ export async function loadBoard(conn: Connection): Promise<Board> {
   const follows = followAccs.map(a => decodeFollow(new Uint8Array(a.account.data)));
   const copies = copyAccs.map(a => decodeCopy(a.pubkey, new Uint8Array(a.account.data)));
   const wallets = [...new Set([...stats.map(s => s.wallet.toBase58()), ...profiles.keys()])];
+  const byAddress = new Map(portfolioAccs.map(a => [a.pubkey.toBase58(), new Uint8Array(a.account.data)] as const));
   const portfolios = new Map<string, Uint8Array>();
-  for (let i = 0; i < wallets.length; i += 100) {
-    const chunk = wallets.slice(i, i + 100);
-    const accs = await conn.getMultipleAccountsInfo(chunk.map(w => C.routerPortfolio(new PublicKey(w))));
-    accs.forEach((a, j) => a && portfolios.set(chunk[j], new Uint8Array(a.data)));
+  for (const w of wallets) {
+    const d = byAddress.get(C.routerPortfolio(new PublicKey(w)).toBase58());
+    if (d) portfolios.set(w, d);
   }
   const m = market ? new Uint8Array(market.data) : undefined;
   const byWallet = new Map(stats.map(s => [s.wallet.toBase58(), s]));

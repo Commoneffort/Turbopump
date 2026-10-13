@@ -7,6 +7,7 @@ import { Connection, PublicKey, TransactionInstruction } from "@solana/web3.js";
 import { SEED_WALLETS } from "../api/_config";
 import * as C from "./chain";
 import * as S from "./social";
+import { view } from "./view";
 import { Send, ago, explorer, fmt, priceDp, short, useCards } from "./shared";
 
 // ---------------------------------------------------------------- badges
@@ -115,7 +116,7 @@ let cache: { net: string; board: S.Board } | undefined;
 let loading: Promise<S.Board> | undefined;
 /** The board, shared by every part of the page that shows it and re-read every 20 seconds. */
 export function useBoard(tick: number): { board?: S.Board; err?: string; reload: () => void } {
-  const { connection } = useConnection();
+  const connection = view;
   const [board, setBoard] = useState<S.Board | undefined>(cache?.net === C.NETWORK ? cache.board : undefined);
   const [err, setErr] = useState<string>();
   const [n, setN] = useState(0);
@@ -127,7 +128,7 @@ export function useBoard(tick: number): { board?: S.Board; err?: string; reload:
       loading.then(b => { cache = { net: C.NETWORK, board: b }; takePictures(b.pictures); if (live) { setBoard(b); setErr(undefined); } }).catch(e => live && setErr(String(e?.message ?? e)));
     };
     load(n > 0);
-    const id = setInterval(() => load(false), 20_000);
+    const id = setInterval(() => document.hidden || load(false), 20_000);
     return () => { live = false; clearInterval(id); };
   }, [connection, tick, n]);
   return { board, err, reload: () => setN(x => x + 1) };

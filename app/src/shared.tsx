@@ -4,6 +4,7 @@ import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { Connection, PublicKey, TransactionInstruction } from "@solana/web3.js";
 import { createAssociatedTokenAccountIdempotentInstruction } from "@solana/spl-token";
 import * as C from "./chain";
+import { view } from "./view";
 
 export const num = (x: bigint, scale: number) => Number(x) / scale;
 export const fmt = (x: number, dp = 2) => x.toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp });
@@ -73,7 +74,7 @@ function keepCards(cards: Card[]) {
 }
 
 export function useCards(tick: number) {
-  const { connection } = useConnection();
+  const connection = view;
   const [cards, setCards] = useState<Card[] | undefined>(cardsBefore);
   const [err, setErr] = useState<string>();
   useEffect(() => {
@@ -95,7 +96,7 @@ export function useCards(tick: number) {
       } catch (e: any) { if (live) setErr(e.message); }
     };
     load();
-    const id = setInterval(load, 8000);
+    const id = setInterval(() => document.hidden || load(), 8000);
     return () => { live = false; clearInterval(id); };
   }, [connection, tick]);
   return { cards, err };
@@ -112,7 +113,8 @@ export function useVault(vaultKey: PublicKey, tick: number) {
   const [history, setHistory] = useState<{ t: number; p: number }[]>([]);
   const load = useCallback(async () => {
     try {
-      const s = await C.fetchVault(connection, vaultKey, publicKey ?? undefined);
+      // Without a wallet there is nothing of the visitor's own to read: the shared copy has it all.
+      const s = await C.fetchVault(publicKey ? connection : view, vaultKey, publicKey ?? undefined);
       statesNow.set(stateKey, { s, at: Date.now() });
       setState(s);
       setErr(undefined);
@@ -123,7 +125,7 @@ export function useVault(vaultKey: PublicKey, tick: number) {
   useEffect(() => { setHistory([]); }, [vaultKey.toString()]);
   // Poll faster while a trade of this wallet is queued, so its fill shows up promptly.
   const waiting = !!state?.trader?.hasPending;
-  useEffect(() => { load(); const id = setInterval(load, waiting ? 2000 : 6000); return () => clearInterval(id); }, [load, tick, waiting]);
+  useEffect(() => { load(); const id = setInterval(() => document.hidden || load(), waiting ? 2000 : 6000); return () => clearInterval(id); }, [load, tick, waiting]);
   return { state, err, history, reload: load };
 }
 
@@ -181,7 +183,7 @@ export function useActivity(vault: C.Vault, tick: number): ActivityRow[] | undef
       } catch { /* public RPC may rate-limit history; keep the last list */ }
     };
     load();
-    const id = setInterval(load, 15000);
+    const id = setInterval(() => document.hidden || load(), 15000);
     return () => { live = false; clearInterval(id); };
   }, [connection, vault.key.toString(), tick]);
   return rows;

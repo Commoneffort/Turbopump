@@ -9,6 +9,13 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link rel="preconnect" href="https://rpc.testnet.x1.xyz" crossorigin />
     <link rel="preconnect" href="https://api.devnet.solana.com" crossorigin />
+    <!-- The market data is asked for now, while the page's script is still on its way (src/view.ts takes the answer). -->
+    <script>
+      try {
+        var n = /^x1/.test(new URLSearchParams(location.search).get("network") || localStorage.getItem("percolator-vaults:network") || "") ? "x1-testnet" : "devnet";
+        window.__state = { net: n, res: fetch("/api/state?network=" + n).then(function (r) { return r.ok ? r.json().then(function (j) { j.age = 1000 * (Number(r.headers.get("age")) || 0); return j; }) : null; }).catch(function () { return null; }) };
+      } catch (e) {}
+    </script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
   </head>
   <body>
