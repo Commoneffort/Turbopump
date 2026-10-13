@@ -21,8 +21,9 @@ import X from "./x1-testnet.json";
  *  reporter key (see `reportAddress`). */
 const NETWORK_KEY = "percolator-vaults:network";
 function chosenNetwork(): string | undefined {
-  // In the browser the visitor chooses (the switch in the header, or a ?network=x1-testnet link),
-  // and the choice is remembered.
+  // In the browser the visitor chooses (the switch in the header, or a link: ?network=x1 for X1
+  // testnet, ?network=solana for Solana devnet; the longer x1-testnet and devnet work too), and
+  // the choice is remembered.
   if (typeof window !== "undefined") {
     try {
       const q = new URLSearchParams(window.location.search).get("network");
@@ -34,10 +35,25 @@ function chosenNetwork(): string | undefined {
   return (import.meta as any).env?.VITE_NETWORK ?? (globalThis as any).process?.env?.NETWORK;
 }
 export const NETWORK: "devnet" | "x1-testnet" = /^x1/.test(chosenNetwork() ?? "") ? "x1-testnet" : "devnet";
+/** The network as the address bar names it: `?network=x1` or `?network=solana`. */
+export const NETWORK_PARAM = NETWORK === "x1-testnet" ? "x1" : "solana";
+// The address always says which network the page shows, so a link copied from it opens the same
+// network for whoever receives it (without this a link made on X1 opened Solana devnet, the
+// default, for a new visitor: other names, other records, no pictures). Whatever else the
+// address holds (a referral, the page after the #) stays as it is.
+if (typeof window !== "undefined" && typeof history !== "undefined") {
+  try {
+    const u = new URL(window.location.href);
+    if (u.searchParams.get("network") !== NETWORK_PARAM) {
+      u.searchParams.set("network", NETWORK_PARAM);
+      history.replaceState(history.state, "", u.pathname + u.search + u.hash);
+    }
+  } catch { /* an address the browser will not rewrite: the page works as before */ }
+}
 /** Switches the page to the other deployment (everything is re-read, so the page reloads). */
 export function setNetwork(n: "devnet" | "x1-testnet") {
   try { localStorage.setItem(NETWORK_KEY, n); } catch { /* ignore */ }
-  window.location.href = window.location.pathname;
+  window.location.href = `${window.location.pathname}?network=${n === "x1-testnet" ? "x1" : "solana"}`;
 }
 /** The coin that pays fees and rent. */
 export const COIN = NETWORK === "x1-testnet" ? "XNT" : "SOL";

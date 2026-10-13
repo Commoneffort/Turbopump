@@ -591,7 +591,7 @@ function Invite({ me, send, busy, tick }: { me: PublicKey; send: Send; busy?: st
     return () => { on = false; };
   }, [connection, me.toBase58(), tick]);
   const offer = invitedBy();
-  const link = `${window.location.origin}/?ref=${me.toBase58()}`;
+  const link = `${window.location.origin}/?network=${C.NETWORK_PARAM}&ref=${me.toBase58()}`;
   return (
     <div className="fine">
       Invite traders: you earn {S.REBATE.referrerPerMillion / 100} basis points of what they trade, paid weekly from the platform's share.{" "}
