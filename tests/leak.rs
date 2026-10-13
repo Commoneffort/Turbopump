@@ -167,7 +167,8 @@ fn where_the_money_goes_under_each_settlement_policy() {
     let steps: usize = std::env::var("LEAK_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
     for seed in [1u64, 2].into_iter().take(if std::env::var("LEAK_TRACE").is_ok() { 1 } else { 2 }) {
         for p in [Policy::EveryoneLosersFirst, Policy::EveryoneWinnersFirst, Policy::VaultAloneBetweenFills] {
-            run(p, seed, steps);
+            // Nothing in no account, whoever is settled when (it was 359 to 450 per run before #226).
+            assert_eq!(run(p, seed, steps).2, 0, "{p:?} seed {seed}");
         }
     }
 }
@@ -228,12 +229,12 @@ fn scripted(with_third: bool) -> i128 {
 }
 
 #[test]
-fn everyone_settled_at_every_price_and_money_still_strays() {
+fn everyone_settled_at_every_price_and_no_money_strays() {
     println!("two takers:"); let two = scripted(false);
     println!("three takers:"); let three = scripted(true);
     println!("in no account: {two} (two takers), {three} (three takers)");
-    // Pinned (engine 6de466b), so that we notice when the engine changes it: A's give-back of
-    // 802 x (0.995473 - 0.992001) is paid out of A's own booked gain and is not counted as
-    // backing for B's gain, so B's gain is cut by that much when the price turns again.
-    assert_eq!((two, three), (2_784_542, 2_784_542));
+    // Before upstream engine PR #226 this lost 2,784,542 atoms in both: A's give-back of
+    // 802 x (0.995473 - 0.992001) was paid out of A's own booked gain and not counted as
+    // backing for B's gain, so B's gain was cut by that much when the price turned again.
+    assert_eq!((two, three), (0, 0));
 }
