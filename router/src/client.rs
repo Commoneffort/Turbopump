@@ -404,6 +404,7 @@ pub fn set_profile(wallet: &Pubkey, name: &str, old_name: Option<&str>, badge: u
             w(rec(name)),
             w(rec(old_name.unwrap_or(name))),
             ro(system_program::ID),
+            w(percolator_vault::processor::TREASURY),
         ],
         data,
     }
@@ -472,6 +473,15 @@ pub fn write_badge_image(wallet: &Pubkey, offset: u16, bytes: &[u8]) -> Instruct
     data.extend_from_slice(&offset.to_le_bytes());
     data.extend_from_slice(bytes);
     Instruction { program_id: id(), accounts: vec![AccountMeta::new_readonly(*wallet, true), w(badge_address(&id(), wallet).0)], data }
+}
+
+/// One more day in the leaderboard's featured row for `wallet`.
+pub fn feature(wallet: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: id(),
+        accounts: vec![AccountMeta::new(*wallet, true), w(profile_address(&id(), wallet).0), w(percolator_vault::processor::TREASURY), ro(system_program::ID)],
+        data: vec![TAG_FEATURE],
+    }
 }
 
 pub fn remove_badge_image(wallet: &Pubkey) -> Instruction {

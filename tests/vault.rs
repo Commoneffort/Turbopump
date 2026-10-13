@@ -766,7 +766,11 @@ fn canonical_vaults_are_unique_per_feed_and_scale_with_nav() {
     w.env.update_market_init_fee_policy(LISTING_FEE as u128).unwrap();
     // A creator asks for absurd limits; the canonical template replaces them.
     let greedy = InitParams { max_inventory_abs: 1, max_fill_abs: 1, epoch_len_slots: 999, ..operate_params(7) };
+    // Opening a market costs its fee once, paid to the platform's treasury.
+    let treasury = |w: &World| w.env.svm.get_balance(&processor::TREASURY).unwrap_or(0);
+    let before = treasury(&w);
     w.create_vault(greedy).unwrap();
+    assert_eq!(treasury(&w) - before, processor::OPEN_MARKET_FEE_LAMPORTS);
     let v = w.vault_state();
     assert_eq!({ v.vault_kind }, state::KIND_CANONICAL);
     assert_eq!({ v.epoch_len_slots }, processor::CANON_EPOCH_LEN_SLOTS);
@@ -778,6 +782,7 @@ fn canonical_vaults_are_unique_per_feed_and_scale_with_nav() {
     let first_creator = std::mem::replace(&mut w.creator, other);
     assert!(w.create_vault(operate_params(8)).is_err(), "second vault for the same feed");
     w.creator = first_creator;
+    assert_eq!(treasury(&w) - before, processor::OPEN_MARKET_FEE_LAMPORTS, "a refused opening pays nothing");
 
     // A stranger can finish the listing, so a created-but-unlisted vault can't squat the feed.
     let stranger = w.new_user(10_000_000);

@@ -74,6 +74,13 @@ pub const PLATFORM_FREE_NAV: u64 = 5_000_000_000;
 /// Where the platform's share goes: any token account of the collateral mint this key owns.
 /// Harvesting is open to anyone and pays it on the spot, so the key signs nothing here.
 pub const TREASURY: Pubkey = solana_program::pubkey!("B9Ke1KTC8x46ZxAMTa7oU73HXEzPXt17GC7bZujxiiWV");
+/// What opening a market costs, once, in the chain's coin, paid to `TREASURY` by whoever
+/// creates its vault: 10 XNT on X1, 0.02 SOL elsewhere (test wallets hold little). A market
+/// that was retired and is opened again is a new opening.
+#[cfg(not(feature = "x1"))]
+pub const OPEN_MARKET_FEE_LAMPORTS: u64 = 20_000_000;
+#[cfg(feature = "x1")]
+pub const OPEN_MARKET_FEE_LAMPORTS: u64 = 10_000_000_000;
 
 /// The platform's cut of `amount` of harvested fees for vault `v`.
 ///
@@ -586,7 +593,9 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
 ///
 /// Accounts: 0 payer [s,w], 1 creator [s], 2 vault [w], 3 market [w], 4 collateral mint,
 /// 5 share mint [w], 6 buffer [w], 7 share escrow [w], 8 LP portfolio [w], 9 matcher delegate,
-/// 10 Percolator program, 11 this program, 12 token program, 13 system program.
+/// 10 Percolator program, 11 this program, 12 token program, 13 system program, and for a
+/// market's own vault (operate mode) 14 the platform treasury [w]: the payer pays it
+/// `OPEN_MARKET_FEE_LAMPORTS`.
 fn init_vault(program_id: &Pubkey, accounts: &[AccountInfo], p: InitParams) -> ProgramResult {
     // Operate mode is canonical: one vault per (market, feed), on the fixed template. The caller
     // only chooses the feed (and how much listing fee it will pay).
@@ -635,6 +644,15 @@ fn init_vault(program_id: &Pubkey, accounts: &[AccountInfo], p: InitParams) -> P
         .ok_or(VaultError::InvalidParams)?;
 
     let kind = if p.mode == MODE_OPERATE { KIND_CANONICAL } else { KIND_LEGACY };
+    if kind == KIND_CANONICAL {
+        let treasury = acc(accounts, 14)?;
+        writable(treasury)?;
+        key_is(treasury, &TREASURY)?;
+        invoke(
+            &system_instruction::transfer(payer.key, treasury.key, OPEN_MARKET_FEE_LAMPORTS),
+            &[payer.clone(), treasury.clone(), system.clone()],
+        )?;
+    }
     let (vault_key, vault_bump) = if kind == KIND_CANONICAL {
         canonical_vault_address(program_id, market.key, &p.oracle_feeds[0])
     } else {

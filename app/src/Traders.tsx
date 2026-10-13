@@ -231,6 +231,8 @@ function ProfileEditor({ me, has, send, busy, done, reload }: { me: Me; has: boo
     const id = setTimeout(() => connection.getAccountInfo(S.nameAddress(name)).then(a => live && setTaken(!!a && a.data.length > 0)).catch(() => undefined), 300);
     return () => { live = false; clearTimeout(id); };
   }, [name, ok, connection, me.profile?.name]);
+  // A name the wallet does not hold yet (its first, or another one) costs the fee; other capitals do not.
+  const newName = ok && name.toLowerCase() !== me.profile?.name.toLowerCase();
   const why = !name ? "Choose a name" : !ok ? `${S.NAME_MIN} to ${S.NAME_MAX} letters, digits or underscores` : taken ? "That name is taken" : undefined;
   const preview: S.Profile | undefined = publicKey ? { wallet: publicKey, name: name || "you", badge, color, created: 0 } : undefined;
   return (
@@ -249,11 +251,11 @@ function ProfileEditor({ me, has, send, busy, done, reload }: { me: Me; has: boo
         {preview && me.wallet && <span className="pedit-prev"><Badge wallet={me.wallet} profile={preview} size={20} /><b>{preview.name}</b></span>}
       </div>
       <div className="btns">
-        <button className="btn primary" disabled={!!why || !!busy || !publicKey} onClick={async () => { if (publicKey && await send("Save profile", [S.setProfile(publicKey, name, me.profile?.name, badge, color)])) done(); }}>{busy ? `${busy}…` : "Save profile"}</button>
+        <button className="btn primary" disabled={!!why || !!busy || !publicKey} onClick={async () => { if (publicKey && await send(newName ? `Save profile (${S.SMALL_FEE_TEXT})` : "Save profile", [S.setProfile(publicKey, name, me.profile?.name, badge, color)])) done(); }}>{busy ? `${busy}…` : newName ? `Save profile · ${S.SMALL_FEE_TEXT}` : "Save profile"}</button>
         <button className="btn ghost" onClick={done}>Cancel</button>
       </div>
       {why && name && <div className="why">{why}</div>}
-      <p className="fine">Your name and badge are stored by the router program under your wallet. A name belongs to one wallet at a time; changing it frees the old one. About 0.002 test {C.COIN} of rent, returned if a name is released.</p>
+      <p className="fine">Your name and badge are stored by the router program under your wallet. A name belongs to one wallet at a time; changing it frees the old one. Taking a name costs {S.SMALL_FEE_TEXT}, paid to the platform, and so does changing it to another; a new badge or colour is free. About 0.002 test {C.COIN} of rent on top, returned if a name is released.</p>
       <PictureEditor me={me} has={has} send={send} busy={busy} reload={reload} />
     </div>
   );
@@ -354,6 +356,7 @@ function useActions(me: Me, send: Send, reload: () => void) {
       S.setCopy(publicKey, new PublicKey(leader), ratioBps, maxNotional),
     ]),
     stop: () => publicKey && run("Stop copying", [S.stopCopy(publicKey)]),
+    feature: () => publicKey && run(`A day in the featured row (${S.SMALL_FEE_TEXT})`, [S.feature(publicKey)]),
   };
 }
 
@@ -390,6 +393,12 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
   }, [board, sort, view, me, period]);
   const podium = view === "top" && (sort === "pnl" || sort === "roi") ? rows.filter(r => (r.stats?.trades ?? 0) > 0).slice(0, 3) : [];
   const periodName = PERIODS.find(p => p[0] === period)![1].toLowerCase();
+  // The featured row: wallets that paid for it, whoever paid furthest ahead first. It is a paid
+  // place and says so; the figures in it are the router's, like everyone's.
+  const nowSecs = Date.now() / 1000;
+  const featured = (board?.rows ?? []).filter(r => (r.profile?.featuredUntil ?? 0) > nowSecs).sort((a, b) => b.profile!.featuredUntil! - a.profile!.featuredUntil!).slice(0, 6);
+  const myUntil = me.profile?.featuredUntil ?? 0;
+  const left = (until: number) => { const s = until - nowSecs; return s >= 86_400 ? `${Math.floor(s / 86_400)} d ${Math.floor(s % 86_400 / 3600)} h` : s >= 3600 ? `${Math.floor(s / 3600)} h` : `${Math.max(1, Math.floor(s / 60))} min`; };
   const mine = board?.rows.find(r => r.wallet === me.wallet);
   const leader = me.copy && board?.rows.find(r => r.wallet === me.copy!.leader.toBase58());
   return (
@@ -413,6 +422,9 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
               </div>
               <button className="btn tiny" onClick={() => setEditing(true)}>{me.profile ? "Edit name, badge and picture" : "Set a name and badge"}</button>
               <button className="btn tiny ghost" onClick={() => go(`/trader/${me.wallet}`)}>My record</button>
+              {me.profile && <button className="btn tiny ghost" disabled={!!busy || Math.max(myUntil, nowSecs) + S.FEATURE_SECS > nowSecs + S.FEATURE_MAX_AHEAD_SECS}
+                title={`Shows you in the Featured row above the leaderboard for a day, marked as paid. ${S.SMALL_FEE_TEXT} a day, to the platform; paying again adds a day, up to 30 ahead.`}
+                onClick={() => act.feature()}>{myUntil > nowSecs ? `Featured, ${left(myUntil)} left · add a day · ${S.SMALL_FEE_TEXT}` : `Get featured · ${S.SMALL_FEE_TEXT} a day`}</button>}
             </div>
             <div className="me-stats">
               <div><span>Profit</span><b className={`mono ${tone(mine?.pnl ?? 0)}`}>{mine?.stats ? signed(mine.pnl) : "—"}</b></div>
@@ -443,6 +455,18 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
         <div className="quiet">{view === "following" ? "You follow nobody yet. Follow a trader and their trades appear on your chart." : "No track records on this network yet. A record starts with an account's first trade."}</div>
       ) : (
         <>
+        {view === "top" && featured.length > 0 && (
+          <div className="featured">
+            <span className="featured-l">Featured <em>paid</em></span>
+            {featured.map(r => (
+              <button key={r.wallet} className="trader" title={`Paid placement, ${left(r.profile!.featuredUntil!)} left. The figures are the router's record, the same as in the table.`} onClick={() => go(`/trader/${r.wallet}`)}>
+                <Badge wallet={r.wallet} profile={r.profile} size={22} />
+                <b>{nameOf(r.wallet, r.profile)}</b>
+                {r.stats && <span className={`mono ${tone(over(r, period).pnl)}`}>{signed(over(r, period).pnl, 0)}</span>}
+              </button>
+            ))}
+          </div>
+        )}
         {podium.length > 0 && (
           <div className="podium">
             {podium.map((r, i) => {
@@ -509,6 +533,7 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
         </>
       )}
       <p className="fine">
+        The Featured row is a paid place ({S.SMALL_FEE_TEXT} a day, to the platform): it changes where a trader is shown, never their figures or their rank.
         Ranked over the period chosen above: 7 and 30 days add up the record's trading days in that time; "all time" is the whole record, including what open positions are worth now.
         Records start when an account's track record is opened (the first trade after this feature went live), not before. Profit is equity now minus equity then minus net deposits since; return is profit over the money that was at work.
         A trading day counts as profitable when the account was worth more at its last fill that day than at the last fill before it. Copiers · followers in the last column. Accounts tagged "test bot" are our own test traffic.

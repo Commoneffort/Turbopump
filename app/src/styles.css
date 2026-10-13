@@ -547,3 +547,6 @@ h3 { margin: 0 0 12px; font-size: 15px; font-weight: 600; }
 .pedit-pic { margin-top: 18px; padding-top: 6px; border-top: 1px solid var(--line); }
 .pedit-pic-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 @media (max-width: 900px) { .podium { grid-template-columns: 1fr; } }
+.featured { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 9px 14px; margin-bottom: 12px; }
+.featured-l { font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+.featured-l em { font: 500 10.5px Inter, sans-serif; font-style: normal; padding: 1px 6px; border-radius: 3px; background: var(--raised); color: var(--muted); }

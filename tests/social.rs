@@ -110,6 +110,7 @@ fn layouts_are_what_the_page_reads() {
         (160, 168, 176, 184, 192, 672)
     );
     assert_eq!((offset_of!(Profile, wallet), offset_of!(Profile, name), offset_of!(Profile, name_len), offset_of!(Profile, badge), offset_of!(Profile, color), offset_of!(Profile, created)), (8, 40, 56, 57, 58, 64));
+    assert_eq!(offset_of!(Profile, featured_until), 60);
     assert_eq!((offset_of!(Follow, follower), offset_of!(Follow, leader), offset_of!(Follow, since)), (8, 40, 72));
     assert_eq!((offset_of!(Copy, market), offset_of!(Copy, follower), offset_of!(Copy, leader), offset_of!(Copy, ratio_bps), offset_of!(Copy, max_notional), offset_of!(Copy, since), offset_of!(Copy, triggers)), (8, 40, 72, 104, 112, 120, 128));
     assert_eq!(offset_of!(rstate::TraderState, has_stats), 138);
@@ -221,12 +222,54 @@ fn days_are_counted_as_they_end() {
 
 // ---------------------------------------------------------------- profiles
 
+/// A day in the featured row: paid for, the wallet's own, a day at a time, a month ahead at most.
+#[test]
+fn a_featured_day_is_paid_for_by_the_wallet_itself() {
+    let mut w = live();
+    let (a, b) = (w.new_user(0), w.new_user(0));
+    let profile = |w: &World, k: &Pubkey| read::<Profile>(w, &rstate::profile_address(&RID(), k).0).unwrap();
+    let fee = percolator_router::FEATURE_FEE_LAMPORTS;
+    // A wallet without a name has nothing to feature.
+    assert!(w.send(vec![rclient::feature(&a.kp.pubkey())], &[&a.kp]).is_err());
+    w.send(vec![rclient::set_profile(&a.kp.pubkey(), "featured_1", None, 0, 0)], &[&a.kp]).unwrap();
+    assert_eq!({ profile(&w, &a.kp.pubkey()).featured_until }, 0);
+    let before = treasury(&w);
+    let now = w.clock_ts();
+    w.send(vec![rclient::feature(&a.kp.pubkey())], &[&a.kp]).unwrap();
+    assert_eq!((treasury(&w) - before, { profile(&w, &a.kp.pubkey()).featured_until } as i64), (fee, now + percolator_router::FEATURE_SECS));
+    // Paid again while the day runs: a day more at the end.
+    w.send(vec![rclient::feature(&a.kp.pubkey())], &[&a.kp]).unwrap();
+    assert_eq!((treasury(&w) - before, { profile(&w, &a.kp.pubkey()).featured_until } as i64), (2 * fee, now + 2 * percolator_router::FEATURE_SECS));
+    // Nobody can feature another wallet's profile, and the fee goes to the treasury only.
+    let mut theirs = rclient::feature(&b.kp.pubkey());
+    theirs.accounts[1].pubkey = rstate::profile_address(&RID(), &a.kp.pubkey()).0;
+    expect(w.send(vec![theirs], &[&b.kp]), RouterError::BadAccount);
+    let mut elsewhere = rclient::feature(&a.kp.pubkey());
+    elsewhere.accounts[2].pubkey = a.kp.pubkey();
+    expect(w.send(vec![elsewhere], &[&a.kp]), RouterError::BadAccount);
+    // A month ahead at most.
+    for _ in 2..30 {
+        w.send(vec![rclient::feature(&a.kp.pubkey())], &[&a.kp]).unwrap();
+    }
+    expect(w.send(vec![rclient::feature(&a.kp.pubkey())], &[&a.kp]), RouterError::FeaturedEnough);
+    assert_eq!(treasury(&w) - before, 30 * fee);
+    // A new badge keeps the time that was paid for.
+    w.send(vec![rclient::set_profile(&a.kp.pubkey(), "featured_1", Some("featured_1"), 4, 1)], &[&a.kp]).unwrap();
+    assert_eq!({ profile(&w, &a.kp.pubkey()).featured_until } as i64, now + 30 * percolator_router::FEATURE_SECS);
+}
+
 #[test]
 fn a_name_belongs_to_one_wallet() {
     let mut w = live();
     let (a, b) = (w.new_user(0), w.new_user(0));
     let profile = |w: &World, k: &Pubkey| read::<Profile>(w, &rstate::profile_address(&RID(), k).0);
+    // Taking a name costs the fee, paid to the treasury and to nobody else.
+    let (fee, before) = (percolator_router::NAME_FEE_LAMPORTS, treasury(&w));
+    let mut elsewhere = rclient::set_profile(&a.kp.pubkey(), "Satoshi_1", None, 3, 2);
+    elsewhere.accounts[5].pubkey = b.kp.pubkey();
+    expect(w.send(vec![elsewhere], &[&a.kp]), RouterError::BadAccount);
     w.send(vec![rclient::set_profile(&a.kp.pubkey(), "Satoshi_1", None, 3, 2)], &[&a.kp]).unwrap();
+    assert_eq!(treasury(&w) - before, fee);
     let p = profile(&w, &a.kp.pubkey()).unwrap();
     assert_eq!((&p.name[..p.name_len as usize], p.badge, p.color), (&b"Satoshi_1"[..], 3, 2));
     // Nobody else gets it, in any case of letters.
@@ -238,8 +281,11 @@ fn a_name_belongs_to_one_wallet() {
     // The holder can change badge and letter case, and take another name, which frees the first.
     w.send(vec![rclient::set_profile(&a.kp.pubkey(), "satoshi_1", Some("Satoshi_1"), 5, 1)], &[&a.kp]).unwrap();
     assert_eq!(profile(&w, &a.kp.pubkey()).unwrap().badge, 5);
+    assert_eq!(treasury(&w) - before, fee, "a new badge or other capitals: no fee");
     w.send(vec![rclient::set_profile(&a.kp.pubkey(), "nakamoto", Some("satoshi_1"), 5, 1)], &[&a.kp]).unwrap();
+    assert_eq!(treasury(&w) - before, 2 * fee, "another name: the fee again");
     w.send(vec![rclient::set_profile(&b.kp.pubkey(), "Satoshi_1", None, 1, 1)], &[&b.kp]).unwrap();
+    assert_eq!(treasury(&w) - before, 3 * fee);
     assert_eq!(&profile(&w, &b.kp.pubkey()).unwrap().name[..9], b"Satoshi_1");
     // Renaming must free the name the profile actually holds.
     let mut cheat = rclient::set_profile(&a.kp.pubkey(), "another", Some("nakamoto"), 0, 0);
@@ -529,6 +575,7 @@ fn builders_print_what_the_page_must_send() {
     show("set_badge_image", rclient::set_badge_image(&wallet, 1_234, &[0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3]));
     show("write_badge_image", rclient::write_badge_image(&wallet, 7, &[4, 5, 6]));
     show("remove_badge_image", rclient::remove_badge_image(&wallet));
+    show("feature", rclient::feature(&wallet));
     show("trigger_copy", rclient::trigger_copy(&payer, &t, &leader, &vault, -1_500_000));
     show("deposit", rclient::deposit(&t, &token, &pv, 7));
     show("withdraw", rclient::withdraw(&t, &token, &pv, 9));

@@ -698,6 +698,7 @@ impl World {
                 AccountMeta::new_readonly(pid(), false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new(processor::TREASURY, false),
             ],
             data: p.encode(),
         }

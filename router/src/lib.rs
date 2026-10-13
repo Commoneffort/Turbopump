@@ -100,6 +100,14 @@ pub const SOCIAL_FEE_LAMPORTS: u64 = 20_000_000;
 pub const SOCIAL_FEE_LAMPORTS: u64 = 10_000_000_000;
 pub const COPY_FEE_LAMPORTS: u64 = SOCIAL_FEE_LAMPORTS;
 pub const BADGE_IMAGE_FEE_LAMPORTS: u64 = SOCIAL_FEE_LAMPORTS;
+/// A tenth of that (1 XNT on X1, 0.002 SOL elsewhere): what taking a name costs, what changing
+/// it costs, and what one day in the leaderboard's featured row costs.
+pub const NAME_FEE_LAMPORTS: u64 = SOCIAL_FEE_LAMPORTS / 10;
+pub const FEATURE_FEE_LAMPORTS: u64 = SOCIAL_FEE_LAMPORTS / 10;
+/// How long one `Feature` payment shows a wallet in the featured row, and how far ahead a
+/// wallet can pay.
+pub const FEATURE_SECS: i64 = 86_400;
+pub const FEATURE_MAX_AHEAD_SECS: i64 = 30 * 86_400;
 
 #[cfg(not(feature = "x1"))]
 pub const LAMPORTS_PER_ATOM: u64 = 9;
@@ -165,6 +173,7 @@ pub const TAG_SET_REFERRER: u8 = 24;
 pub const TAG_SET_BADGE_IMAGE: u8 = 25;
 pub const TAG_WRITE_BADGE_IMAGE: u8 = 26;
 pub const TAG_REMOVE_BADGE_IMAGE: u8 = 27;
+pub const TAG_FEATURE: u8 = 28;
 /// Widest trail, in basis points.
 pub const MAX_TRAIL_BPS: u64 = 5_000;
 /// Shortest time between two slices of a TWAP order, and the most slices one can have.
@@ -219,6 +228,8 @@ pub enum RouterError {
     InLine,
     /// A price too far from the mark for the time that has passed since it (see `within_band`).
     PriceBand,
+    /// `Feature` by a wallet that has already paid for the longest time allowed ahead.
+    FeaturedEnough,
     /// A badge picture that is not a JPEG of at most `BADGE_MAX_BYTES`, or bytes written out of
     /// order or past its end.
     BadImage,
@@ -267,6 +278,7 @@ pub fn process_instruction(program_id: &Pubkey, accounts: &[AccountInfo], data: 
         TAG_SET_BADGE_IMAGE => social::set_badge_image(program_id, accounts, rest),
         TAG_WRITE_BADGE_IMAGE => social::write_badge_image(program_id, accounts, rest),
         TAG_REMOVE_BADGE_IMAGE => social::remove_badge_image(program_id, accounts),
+        TAG_FEATURE => social::feature(program_id, accounts),
         _ => Err(RouterError::InvalidInstruction.into()),
     }
 }

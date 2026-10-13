@@ -63,8 +63,9 @@ export function decodeStats(d: Uint8Array): Stats {
     peakPnl: usd(i64(d, 160)), maxDrawdown: usd(u64(d, 168)), bestDay: usd(i64(d, 176)), worstDay: usd(i64(d, 184)), days, fills,
   };
 }
-export type Profile = { wallet: PublicKey; name: string; badge: number; color: number; created: number };
-export const decodeProfile = (d: Uint8Array): Profile => ({ wallet: key(d, 8), name: Buffer.from(d.slice(40, 40 + Math.min(d[56], NAME_MAX))).toString("ascii"), badge: d[57], color: d[58], created: Number(i64(d, 64)) });
+/** `featuredUntil`: unix time until which the wallet paid for the leaderboard's featured row (0 = never). */
+export type Profile = { wallet: PublicKey; name: string; badge: number; color: number; created: number; featuredUntil?: number };
+export const decodeProfile = (d: Uint8Array): Profile => ({ wallet: key(d, 8), name: Buffer.from(d.slice(40, 40 + Math.min(d[56], NAME_MAX))).toString("ascii"), badge: d[57], color: d[58], created: Number(i64(d, 64)), featuredUntil: u32(d, 60) });
 export type Follow = { follower: PublicKey; leader: PublicKey; since: number };
 export const decodeFollow = (d: Uint8Array): Follow => ({ follower: key(d, 8), leader: key(d, 40), since: Number(i64(d, 72)) });
 export type Copy = { key: PublicKey; market: PublicKey; follower: PublicKey; leader: PublicKey; ratioBps: number; maxNotional: bigint; since: number; triggers: number };
@@ -78,7 +79,8 @@ export const openStats = (payer: PublicKey, wallet: PublicKey) => new Transactio
   keys: [rw(payer, true), rw(C.traderAddress(wallet)), ro(wallet), rw(statsAddress(wallet)), ro(C.MARKET), ro(C.routerPortfolio(wallet)), ro(SystemProgram.programId)],
   data: Buffer.from([15]),
 });
-/** Sets the wallet's name and badge; `oldName` is the name it holds now, if any. */
+/** Sets the wallet's name and badge; `oldName` is the name it holds now, if any. Taking a name,
+ *  or changing it to another, costs `NAME_FEE` (paid to the treasury); badge and colour do not. */
 export const setProfile = (wallet: PublicKey, name: string, oldName: string | undefined, badge: number, color: number) => {
   const data = Buffer.alloc(2 + NAME_MAX + 2);
   data[0] = 16; data[1] = name.length;
@@ -86,7 +88,7 @@ export const setProfile = (wallet: PublicKey, name: string, oldName: string | un
   data[2 + NAME_MAX] = badge; data[3 + NAME_MAX] = color;
   return new TransactionInstruction({
     programId: C.ROUTER,
-    keys: [rw(wallet, true), rw(profileAddress(wallet)), rw(nameAddress(name)), rw(nameAddress(oldName ?? name)), ro(SystemProgram.programId)],
+    keys: [rw(wallet, true), rw(profileAddress(wallet)), rw(nameAddress(name)), rw(nameAddress(oldName ?? name)), ro(SystemProgram.programId), rw(C.TREASURY)],
     data,
   });
 };
@@ -145,6 +147,15 @@ export const triggerCopy = (payer: PublicKey, c: Copy, vault: PublicKey, size = 
  *  `SOCIAL_FEE_LAMPORTS`): 10 XNT on X1, 0.02 SOL on devnet. Paid to the platform's treasury. */
 export const SOCIAL_FEE = C.X1 ? 10_000_000_000n : 20_000_000n;
 export const SOCIAL_FEE_TEXT = C.X1 ? "10 XNT" : "0.02 SOL";
+/** A tenth of that: a name (taking one, or changing it), and one day in the leaderboard's
+ *  featured row (router `NAME_FEE_LAMPORTS`, `FEATURE_FEE_LAMPORTS`). */
+export const NAME_FEE = SOCIAL_FEE / 10n, FEATURE_FEE = SOCIAL_FEE / 10n;
+export const SMALL_FEE_TEXT = C.X1 ? "1 XNT" : "0.002 SOL";
+export const FEATURE_SECS = 86_400, FEATURE_MAX_AHEAD_SECS = 30 * 86_400;
+/** One more day in the featured row for `wallet` (it needs a name first). */
+export const feature = (wallet: PublicKey) => new TransactionInstruction({
+  programId: C.ROUTER, keys: [rw(wallet, true), rw(profileAddress(wallet)), rw(C.TREASURY), ro(SystemProgram.programId)], data: Buffer.from([28]),
+});
 
 /** A badge picture as the router stores it: a 56-byte header, then room for 2,048 bytes. The
  *  page only ever writes, and only ever shows, a JPEG of `BADGE_PX` by `BADGE_PX` pixels. */

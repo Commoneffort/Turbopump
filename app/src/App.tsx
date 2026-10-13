@@ -282,7 +282,7 @@ function LaunchPage({ send, busy, go, initial }: { send: Send; busy?: string; go
     if (st === -1) {
       setStep(1);
       const m = await C.fetchMarket(connection);
-      if (!(await send("Create vault", [C.initVault(publicKey, feed.id, m.nextMarketId).ix]))) return setStep(0);
+      if (!(await send(`Create vault (${C.OPEN_MARKET_FEE_TEXT})`, [C.initVault(publicKey, feed.id, m.nextMarketId).ix]))) return setStep(0);
     }
     setStep(2);
     // Listing appends a new asset slot, so read the market right before it.
@@ -311,7 +311,7 @@ function LaunchPage({ send, busy, go, initial }: { send: Send; busy?: string; go
         <h2>Open a market</h2>
         <p className="muted">
           Each Pyth feed gets exactly one market and one shared liquidity vault, enforced on-chain: the vault's address is derived
-          from the feed, so a second one can't exist. Whoever opens it pays about 0.12 test {C.COIN} of rent and a 1 USDC listing fee,
+          from the feed, so a second one can't exist. Whoever opens it pays {C.OPEN_MARKET_FEE_TEXT} to the platform once, about 0.12 test {C.COIN} of rent and a 1 USDC listing fee,
           and chooses nothing else. Every market runs on the same fixed rules, so nobody can open a market set up to fail. In
           return, the opener earns 5% of the market's fees for as long as it trades.
         </p>
@@ -336,6 +336,7 @@ function LaunchPage({ send, busy, go, initial }: { send: Send; busy?: string; go
         <div className="row"><span>Price</span><b>Pyth, ≤ 5 min old</b></div>
         <div className="row"><span>Leverage, fee</span><b>10×, {C.TRADE_FEE_PCT}</b></div>
         <div className="row"><span>Opener's share of fees</span><b>5%, forever</b></div>
+        <div className="row"><span>To open it</span><b>{C.OPEN_MARKET_FEE_TEXT}, once</b></div>
         <p className="muted small">Limits scale with the vault: an empty vault quotes nothing, and every deposit deepens the market. Depositors share the rest pro rata: 85%, after the platform's 10% (which a vault under $5,000 does not pay).</p>
       </section>
       <section className="card">

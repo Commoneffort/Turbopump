@@ -155,10 +155,13 @@ fn valid_name(name: &[u8]) -> bool {
 
 /// Sets the wallet's name and badge. A name is 3 to 16 letters, digits or underscores, and no
 /// two wallets hold the same one (compared without case): the name's own account records who
-/// has it. Changing the name frees the old one.
+/// has it. Changing the name frees the old one. Taking a name, and changing it to another,
+/// costs `NAME_FEE_LAMPORTS`, paid to the platform's treasury; a new badge or colour, or the
+/// same name in other capitals, costs nothing.
 ///
 /// Accounts: 0 wallet [s, w], 1 profile [w], 2 the new name's account [w], 3 the old name's
-/// account [w] (any account when the name does not change), 4 system program.
+/// account [w] (any account when the name does not change), 4 system program, 5 treasury [w]
+/// (read only when a name is taken).
 /// Data: name length (u8), name (16 bytes, zero padded), badge (u8), colour (u8).
 #[inline(never)]
 pub(crate) fn set_profile(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
@@ -220,6 +223,8 @@ pub(crate) fn set_profile(program_id: &Pubkey, accounts: &[AccountInfo], data: &
             return Err(RouterError::NameTaken.into());
         }
     } else {
+        // A name this wallet did not hold: its first, or a different one.
+        pay_treasury(wallet, acc(accounts, 5)?, system, NAME_FEE_LAMPORTS)?;
         create_pda(wallet, name_ai, system, program_id, NAME_LEN, 0, &[SEED_NAME, &lower[..len], &[nbump]])?;
         store(name_ai, &NameRec { magic: NAME_MAGIC, wallet: *wallet.key, bump: nbump, _pad: [0; 7] })?;
     }
@@ -596,4 +601,36 @@ fn load_head(ai: &AccountInfo, program_id: &Pubkey) -> Result<BadgeImage, Progra
         return Err(RouterError::BadAccount.into());
     }
     Ok(b)
+}
+
+/// One more day in the leaderboard's featured row for the wallet (`FEATURE_SECS`), for
+/// `FEATURE_FEE_LAMPORTS` paid to the platform's treasury. Paid again while a day is running,
+/// it adds a day at the end; at most `FEATURE_MAX_AHEAD_SECS` ahead. Being featured changes
+/// nothing but where the page shows the wallet: its record is the router's as before.
+///
+/// Accounts: 0 wallet [s, w], 1 the wallet's profile [w] (it needs a name first), 2 treasury [w],
+/// 3 system program.
+#[inline(never)]
+pub(crate) fn feature(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let wallet = acc(accounts, 0)?;
+    let profile_ai = acc(accounts, 1)?;
+    let treasury = acc(accounts, 2)?;
+    let system = acc(accounts, 3)?;
+    signer(wallet)?;
+    writable(wallet)?;
+    writable(profile_ai)?;
+    key_is(system, &system_program::ID)?;
+    key_is(profile_ai, &profile_address(program_id, wallet.key).0)?;
+    let mut p: Profile = load(profile_ai, program_id, PROFILE_MAGIC)?;
+    if p.wallet != *wallet.key {
+        return Err(RouterError::BadAccount.into());
+    }
+    let now = Clock::get()?.unix_timestamp;
+    let until = (p.featured_until as i64).max(now).saturating_add(FEATURE_SECS);
+    if until > now.saturating_add(FEATURE_MAX_AHEAD_SECS) {
+        return Err(RouterError::FeaturedEnough.into());
+    }
+    pay_treasury(wallet, treasury, system, FEATURE_FEE_LAMPORTS)?;
+    p.featured_until = u32::try_from(until).map_err(|_| RouterError::Overflow)?;
+    store(profile_ai, &p)
 }

@@ -261,7 +261,9 @@ pub struct Profile {
     pub badge: u8,
     pub color: u8,
     pub bump: u8,
-    pub _pad: [u8; 4],
+    /// Unix time until which the wallet paid to be shown in the leaderboard's featured row
+    /// (0 = never). In what used to be padding, so older profiles read as not featured.
+    pub featured_until: u32,
     pub created: i64,
 }
 pub const PROFILE_LEN: usize = core::mem::size_of::<Profile>();

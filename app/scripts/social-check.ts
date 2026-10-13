@@ -19,6 +19,7 @@ show("stop_copy", S.stopCopy(wallet));
 show("set_badge_image", S.setBadgeImage(wallet, 1_234, new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3])));
 show("write_badge_image", S.writeBadgeImage(wallet, 7, new Uint8Array([4, 5, 6])));
 show("remove_badge_image", S.removeBadgeImage(wallet));
+show("feature", S.feature(wallet));
 show("trigger_copy", S.triggerCopy(payer, { key: S.copyAddress(wallet), market: C.MARKET, follower: wallet, leader, ratioBps: 0, maxNotional: 0n, since: 0, triggers: 0 }, vault, -1_500_000n));
 show("deposit", C.routerDeposit(wallet, 7n));
 show("withdraw", C.routerWithdraw(wallet, 9n));

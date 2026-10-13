@@ -121,6 +121,8 @@ pub fn init_vault(k: &VaultKeys, payer: &Pubkey, collateral_mint: &Pubkey, p: &I
             ro(k.program),
             ro(spl_token::ID),
             ro(system_program::ID),
+            // Read by the program only for a market's own vault, which pays the opening fee.
+            w(crate::processor::TREASURY),
         ],
         data: p.encode(),
     }

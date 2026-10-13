@@ -373,6 +373,10 @@ class W {
 const ro = (pubkey: PublicKey, isSigner = false): AccountMeta => ({ pubkey, isSigner, isWritable: false });
 const rw = (pubkey: PublicKey, isSigner = false): AccountMeta => ({ pubkey, isSigner, isWritable: true });
 
+/** What opening a market costs, once, paid to the platform's treasury by whoever creates its
+ *  vault (vault program `OPEN_MARKET_FEE_LAMPORTS`): 10 XNT on X1, 0.02 SOL on devnet. */
+export const OPEN_MARKET_FEE = NETWORK === "x1-testnet" ? 10_000_000_000n : 20_000_000n;
+export const OPEN_MARKET_FEE_TEXT = NETWORK === "x1-testnet" ? "10 XNT" : "0.02 SOL";
 /** InitVault in operate mode. The program replaces every parameter with its canonical template;
  *  only the feed and the listing-fee budget matter. */
 export function initVault(payer: PublicKey, feedHex: string, frontier: bigint) {
@@ -396,6 +400,7 @@ export function initVault(payer: PublicKey, feedHex: string, frontier: bigint) {
         rw(payer, true), ro(payer, true), rw(vault), rw(MARKET), ro(MINT),
         rw(childAddress("shares", vault)), rw(childAddress("buffer", vault)), rw(childAddress("escrow", vault)),
         rw(portfolio), ro(matcherDelegate(portfolio, vault)), ro(PERCOLATOR), ro(VAULT_PROGRAM), ro(TOKEN_PROGRAM_ID), ro(SystemProgram.programId),
+        rw(TREASURY), // the opening fee (`OPEN_MARKET_FEE`)
       ],
       data,
     }),
