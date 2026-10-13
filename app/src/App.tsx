@@ -118,7 +118,7 @@ export default function App() {
           <a className={tab(desk)} href="#/">Trade</a>
           <a className={tab(page === "markets")} href="#/markets">Markets</a>
           <a className={tab(page === "launch")} href="#/launch">Open a market</a>
-          <a className={tab(page === "traders" || page === "trader" || page === "leaderboard")} href="#/traders">Copy trading</a>
+          <a className={tab(page === "traders" || page === "trader" || page === "leaderboard")} href="#/leaderboard">Leaderboard</a>
           <a className={tab(page === "how" || page === "docs")} href="#/docs">Docs</a>
         </nav>
         <div className="top-right">
@@ -213,7 +213,7 @@ function MarketsPage({ go, tick }: { go: (to: string) => void; tick: number }) {
         <div className="hero-cta">
           <button className="btn primary" onClick={() => go("/")}>Trade</button>
           <button className="btn ghost" onClick={() => go("/launch")}>Open a market</button>
-          <button className="btn ghost" onClick={() => go("/traders")}>Copy trading</button>
+          <button className="btn ghost" onClick={() => go("/leaderboard")}>Leaderboard</button>
           <button className="btn ghost" onClick={() => go("/docs")}>Read the docs</button>
         </div>
         <div className="stats four">

@@ -179,6 +179,8 @@ pub const SEED_NAME: &[u8] = b"name";
 pub const SEED_FOLLOW: &[u8] = b"follow";
 pub const SEED_COPY: &[u8] = b"copy";
 pub const REFERRAL_MAGIC: u64 = u64::from_le_bytes(*b"PRREFER1");
+pub const BADGE_MAGIC: u64 = u64::from_le_bytes(*b"PRBADGE1");
+pub const SEED_BADGE: &[u8] = b"badge";
 pub const SEED_REFERRAL: &[u8] = b"referral";
 /// Trading days and fills a track record keeps (the newest replace the oldest).
 pub const STATS_DAYS: usize = 30;
@@ -324,6 +326,37 @@ pub struct Copy {
     pub _pad2: u32,
 }
 pub const COPY_LEN: usize = core::mem::size_of::<Copy>();
+
+/// The most bytes a badge picture may have, and the one format it may be in.
+pub const BADGE_MAX_BYTES: usize = 2_048;
+pub const BADGE_FORMAT_JPEG: u8 = 1;
+/// How a JPEG file begins. The router refuses a picture that does not begin so; what the bytes
+/// decode to is for whoever shows them to check (the page decodes them as a JPEG and nothing
+/// else, and only shows a picture of the size it makes itself).
+pub const JPEG_START: [u8; 3] = [0xFF, 0xD8, 0xFF];
+
+/// A picture a wallet paid to show as its badge: this header, then `BADGE_MAX_BYTES` of room
+/// (the account always has the same size, so a picture is replaced in place). It counts as
+/// complete, and is shown, once `written == len`.
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+#[repr(C, packed)]
+pub struct BadgeImage {
+    pub magic: u64,
+    pub wallet: Pubkey,
+    /// Bytes of the picture, and how many of them have been written so far (in order).
+    pub len: u16,
+    pub written: u16,
+    pub format: u8,
+    pub bump: u8,
+    pub _pad: [u8; 2],
+    pub created: i64,
+}
+pub const BADGE_HEAD: usize = core::mem::size_of::<BadgeImage>();
+pub const BADGE_LEN: usize = BADGE_HEAD + BADGE_MAX_BYTES;
+
+pub fn badge_address(program_id: &Pubkey, wallet: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[SEED_BADGE, wallet.as_ref()], program_id)
+}
 
 pub fn stats_address(program_id: &Pubkey, market: &Pubkey, wallet: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[SEED_STATS, market.as_ref(), wallet.as_ref()], program_id)

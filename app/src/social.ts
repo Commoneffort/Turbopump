@@ -115,13 +115,14 @@ export const unfollow = (wallet: PublicKey, leader: PublicKey) => new Transactio
   programId: C.ROUTER, keys: [rw(wallet, true), rw(followAddress(wallet, leader))], data: Buffer.from([18]),
 });
 /** Starts copying `leader`, or changes the terms: `ratioBps` of the leader's leverage, and at
- *  most `maxNotional` (collateral atoms, 0 = no limit) on any one market. */
+ *  most `maxNotional` (collateral atoms, 0 = no limit) on any one market. Starting to copy a
+ *  trader costs `SOCIAL_FEE` (router `COPY_FEE_LAMPORTS`), paid to the treasury; new terms do not. */
 export const setCopy = (wallet: PublicKey, leader: PublicKey, ratioBps: number, maxNotional: bigint) => {
   const data = Buffer.alloc(13);
   data[0] = 19; data.writeUInt32LE(ratioBps, 1); data.writeBigUInt64LE(maxNotional, 5);
   return new TransactionInstruction({
     programId: C.ROUTER,
-    keys: [rw(wallet, true), rw(copyAddress(wallet)), ro(C.traderAddress(wallet)), ro(leader), ro(C.traderAddress(leader)), ro(SystemProgram.programId)],
+    keys: [rw(wallet, true), rw(copyAddress(wallet)), ro(C.traderAddress(wallet)), ro(leader), ro(C.traderAddress(leader)), ro(SystemProgram.programId), rw(C.TREASURY)],
     data,
   });
 };
@@ -136,6 +137,47 @@ export const triggerCopy = (payer: PublicKey, c: Copy, vault: PublicKey, size = 
     ro(C.MARKET), ro(C.routerPortfolio(c.follower)), ro(C.traderAddress(c.leader)), ro(C.routerPortfolio(c.leader)), ro(SystemProgram.programId),
   ],
   data: Buffer.concat([Buffer.from([21]), i128le(size)]),
+});
+
+// ---------------------------------------------------------------- fees and badge pictures
+
+/** What starting to copy a trader costs, and what a badge picture costs (router
+ *  `SOCIAL_FEE_LAMPORTS`): 10 XNT on X1, 0.02 SOL on devnet. Paid to the platform's treasury. */
+export const SOCIAL_FEE = C.X1 ? 10_000_000_000n : 20_000_000n;
+export const SOCIAL_FEE_TEXT = C.X1 ? "10 XNT" : "0.02 SOL";
+
+/** A badge picture as the router stores it: a 56-byte header, then room for 2,048 bytes. The
+ *  page only ever writes, and only ever shows, a JPEG of `BADGE_PX` by `BADGE_PX` pixels. */
+export const BADGE_HEAD = 56, BADGE_MAX_BYTES = 2_048, BADGE_LEN = BADGE_HEAD + BADGE_MAX_BYTES;
+export const BADGE_PX = 64;
+/** What the page aims for, so a picture is two transactions: one that pays and one that finishes. */
+export const BADGE_CHUNK = 800, BADGE_TARGET_BYTES = 2 * BADGE_CHUNK;
+export const badgeAddress = (wallet: PublicKey) => rpda(Buffer.from("badge"), wallet.toBuffer());
+const isJpeg = (b: Uint8Array) => b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff;
+/** The picture in a badge account, if it is whole and is what the router says it is. What the
+ *  bytes decode to is checked again where they are shown (`Traders.tsx`, `safePicture`). */
+export function decodeBadgeImage(d: Uint8Array): { wallet: PublicKey; bytes: Uint8Array; written: number; len: number } | undefined {
+  if (d.length !== BADGE_LEN || Buffer.from(d.slice(0, 8)).toString("ascii") !== "PRBADGE1") return undefined;
+  const len = u16(d, 40), written = u16(d, 42);
+  if (d[44] !== 1 || len > BADGE_MAX_BYTES) return undefined;
+  return { wallet: key(d, 8), bytes: d.slice(BADGE_HEAD, BADGE_HEAD + len), written, len };
+}
+/** Starts a picture of `len` bytes with its first bytes, and pays the fee. */
+export const setBadgeImage = (wallet: PublicKey, len: number, first: Uint8Array) => {
+  const head = Buffer.alloc(4);
+  head[0] = 25; head[1] = 1; head.writeUInt16LE(len, 2);
+  return new TransactionInstruction({
+    programId: C.ROUTER, keys: [rw(wallet, true), rw(badgeAddress(wallet)), rw(C.TREASURY), ro(SystemProgram.programId)], data: Buffer.concat([head, Buffer.from(first)]),
+  });
+};
+/** The picture's next bytes, starting at `offset`. */
+export const writeBadgeImage = (wallet: PublicKey, offset: number, bytes: Uint8Array) => {
+  const head = Buffer.alloc(3);
+  head[0] = 26; head.writeUInt16LE(offset, 1);
+  return new TransactionInstruction({ programId: C.ROUTER, keys: [ro(wallet, true), rw(badgeAddress(wallet))], data: Buffer.concat([head, Buffer.from(bytes)]) });
+};
+export const removeBadgeImage = (wallet: PublicKey) => new TransactionInstruction({
+  programId: C.ROUTER, keys: [rw(wallet, true), rw(badgeAddress(wallet))], data: Buffer.from([27]),
 });
 
 // ---------------------------------------------------------------- the copy rule (as the router computes it)
@@ -175,20 +217,33 @@ export type TraderRow = {
   followers: number; copiers: number;
   copying?: string;
 };
-export type Board = { rows: TraderRow[]; follows: Follow[]; copies: Copy[]; profiles: Map<string, Profile>; at: number };
+export type Board = {
+  rows: TraderRow[]; follows: Follow[]; copies: Copy[]; profiles: Map<string, Profile>;
+  /** Whole badge pictures by wallet: raw bytes from the chain, not yet checked as a picture. */
+  pictures: Map<string, Uint8Array>;
+  at: number;
+};
 
 /** Every trading account with a track record or a profile on this network's market, with what
  *  the page shows about it. Four account scans and one batched read: no transaction history. */
 export async function loadBoard(conn: Connection): Promise<Board> {
   // Each kind of account starts with its own eight letters: other router accounts can have the same size.
   const kind = (tag: string) => ({ memcmp: { offset: 0, bytes: bs58.encode(Buffer.from(tag, "ascii")) } });
-  const [statAccs, profAccs, followAccs, copyAccs, market] = await Promise.all([
+  const [statAccs, profAccs, followAccs, copyAccs, market, badgeAccs] = await Promise.all([
     conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: STATS_LEN }, kind("PRSTATS1"), { memcmp: { offset: 40, bytes: C.MARKET.toBase58() } }] }),
     conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: PROFILE_LEN }, kind("PRPROFL1")] }),
     conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: FOLLOW_LEN }, kind("PRFOLLW1")] }),
     conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: COPY_LEN }, kind("PRCOPY01"), { memcmp: { offset: 8, bytes: C.MARKET.toBase58() } }] }),
     conn.getAccountInfo(C.MARKET),
+    // (A router that has no badge pictures yet, or an RPC that refuses the scan: no pictures.)
+    conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: BADGE_LEN }, kind("PRBADGE1")] }).catch(() => []),
   ]);
+  const pictures = new Map<string, Uint8Array>();
+  for (const a of badgeAccs) {
+    const b = decodeBadgeImage(new Uint8Array(a.account.data));
+    // Only at its own wallet's address, whole, and beginning as a JPEG does.
+    if (b && b.written === b.len && isJpeg(b.bytes) && a.pubkey.equals(badgeAddress(b.wallet))) pictures.set(b.wallet.toBase58(), b.bytes);
+  }
   const stats = statAccs.map(a => decodeStats(new Uint8Array(a.account.data)));
   const profiles = new Map(profAccs.map(a => { const p = decodeProfile(new Uint8Array(a.account.data)); return [p.wallet.toBase58(), p] as const; }));
   const follows = followAccs.map(a => decodeFollow(new Uint8Array(a.account.data)));
@@ -205,7 +260,7 @@ export async function loadBoard(conn: Connection): Promise<Board> {
   const count = (xs: { leader: PublicKey }[], w: string) => xs.filter(x => x.leader.toBase58() === w).length;
   const rows = wallets.map(w => row(w, byWallet.get(w), profiles.get(w), portfolios.get(w), m, count(follows, w), count(copies, w), copies.find(c => c.follower.toBase58() === w)?.leader.toBase58()));
   rows.sort((a, b) => b.pnl - a.pnl);
-  return { rows, follows, copies, profiles, at: Date.now() };
+  return { rows, follows, copies, profiles, pictures, at: Date.now() };
 }
 
 function row(wallet: string, s: Stats | undefined, profile: Profile | undefined, portfolio: Uint8Array | undefined, market: Uint8Array | undefined, followers: number, copiers: number, copying?: string): TraderRow {

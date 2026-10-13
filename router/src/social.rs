@@ -299,9 +299,11 @@ pub(crate) fn set_referrer(program_id: &Pubkey, accounts: &[AccountInfo]) -> Pro
 // ---- copying ----
 
 /// Starts copying `leader`, or changes the terms (one leader at a time per trading account).
+/// Starting to copy a trader (the first time, again after stopping, or a different one) costs
+/// `COPY_FEE_LAMPORTS`, paid to the platform's treasury; changing the terms costs nothing.
 ///
 /// Accounts: 0 wallet [s, w], 1 copy [w], 2 the wallet's trader account, 3 leader wallet,
-/// 4 leader's trader account, 5 system program.
+/// 4 leader's trader account, 5 system program, 6 treasury [w].
 /// Data: ratio (u32, bps of the leader's leverage), most notional on one market (u64, 0 = no limit).
 #[inline(never)]
 pub(crate) fn set_copy(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
@@ -345,6 +347,7 @@ pub(crate) fn set_copy(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
         c
     };
     if c.leader != *leader.key {
+        pay_treasury(wallet, acc(accounts, 6)?, system, COPY_FEE_LAMPORTS)?;
         c.leader = *leader.key;
         c.since = now;
         c.triggers = 0;
@@ -484,4 +487,113 @@ pub(crate) fn trigger_copy(program_id: &Pubkey, accounts: &[AccountInfo], data: 
     let mut r: Request = load(request_ai, program_id, REQUEST_MAGIC)?;
     r.kind = KIND_COPY;
     store(request_ai, &r)
+}
+
+// ---- fees and badge pictures ----
+
+/// `lamports` from `wallet` to the platform's treasury, by the system program.
+fn pay_treasury<'a>(wallet: &AccountInfo<'a>, treasury: &AccountInfo<'a>, system: &AccountInfo<'a>, lamports: u64) -> ProgramResult {
+    writable(treasury)?;
+    key_is(treasury, &percolator_vault::processor::TREASURY)?;
+    invoke(&system_instruction::transfer(wallet.key, treasury.key, lamports), &[wallet.clone(), treasury.clone(), system.clone()])
+}
+
+/// Starts a new badge picture for the wallet (its first, or one that replaces the one it has)
+/// and writes the picture's first bytes. Costs `BADGE_IMAGE_FEE_LAMPORTS`, paid to the
+/// platform's treasury, every time. The picture is a JPEG file of at most `BADGE_MAX_BYTES`;
+/// the rest of it follows with `WriteBadgeImage`, and it counts once every byte is there.
+///
+/// Only the wallet itself can write its picture, the account has one fixed size, and nothing
+/// the router does depends on what the bytes are.
+///
+/// Accounts: 0 wallet [s, w], 1 badge [w], 2 treasury [w], 3 system program.
+/// Data: format (u8, 1 = JPEG), length of the whole picture (u16), then its first bytes.
+#[inline(never)]
+pub(crate) fn set_badge_image(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let wallet = acc(accounts, 0)?;
+    let badge_ai = acc(accounts, 1)?;
+    let treasury = acc(accounts, 2)?;
+    let system = acc(accounts, 3)?;
+    signer(wallet)?;
+    writable(wallet)?;
+    writable(badge_ai)?;
+    key_is(system, &system_program::ID)?;
+    let head = data.get(..3).ok_or(RouterError::InvalidInstruction)?;
+    let (format, len) = (head[0], u16::from_le_bytes([head[1], head[2]]) as usize);
+    let first = &data[3..];
+    if format != BADGE_FORMAT_JPEG || len < JPEG_START.len() || len > BADGE_MAX_BYTES || first.len() > len || !first.starts_with(&JPEG_START) {
+        return Err(RouterError::BadImage.into());
+    }
+    let (bk, bump) = badge_address(program_id, wallet.key);
+    key_is(badge_ai, &bk)?;
+    if badge_ai.owner == program_id {
+        let b: BadgeImage = load_head(badge_ai, program_id)?;
+        if b.wallet != *wallet.key {
+            return Err(RouterError::BadAccount.into());
+        }
+    } else {
+        create_pda(wallet, badge_ai, system, program_id, BADGE_LEN, 0, &[SEED_BADGE, wallet.key.as_ref(), &[bump]])?;
+    }
+    pay_treasury(wallet, treasury, system, BADGE_IMAGE_FEE_LAMPORTS)?;
+    let b = BadgeImage { magic: BADGE_MAGIC, wallet: *wallet.key, len: len as u16, written: first.len() as u16, format, bump, _pad: [0; 2], created: Clock::get()?.unix_timestamp };
+    let mut d = badge_ai.try_borrow_mut_data()?;
+    d[..BADGE_HEAD].copy_from_slice(bytemuck::bytes_of(&b));
+    // Nothing of an earlier picture stays behind.
+    d[BADGE_HEAD..].fill(0);
+    d[BADGE_HEAD..BADGE_HEAD + first.len()].copy_from_slice(first);
+    Ok(())
+}
+
+/// The next bytes of the wallet's badge picture, in order.
+/// Accounts: 0 wallet [s], 1 badge [w]. Data: where these bytes start (u16), then the bytes.
+#[inline(never)]
+pub(crate) fn write_badge_image(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    let wallet = acc(accounts, 0)?;
+    let badge_ai = acc(accounts, 1)?;
+    signer(wallet)?;
+    writable(badge_ai)?;
+    key_is(badge_ai, &badge_address(program_id, wallet.key).0)?;
+    let mut b: BadgeImage = load_head(badge_ai, program_id)?;
+    if b.wallet != *wallet.key {
+        return Err(RouterError::BadAccount.into());
+    }
+    let head = data.get(..2).ok_or(RouterError::InvalidInstruction)?;
+    let (offset, bytes) = (u16::from_le_bytes([head[0], head[1]]) as usize, &data[2..]);
+    let end = offset.checked_add(bytes.len()).ok_or(RouterError::Overflow)?;
+    if bytes.is_empty() || offset != b.written as usize || end > b.len as usize {
+        return Err(RouterError::BadImage.into());
+    }
+    b.written = end as u16;
+    let mut d = badge_ai.try_borrow_mut_data()?;
+    d[..BADGE_HEAD].copy_from_slice(bytemuck::bytes_of(&b));
+    d[BADGE_HEAD + offset..BADGE_HEAD + end].copy_from_slice(bytes);
+    Ok(())
+}
+
+/// Takes the wallet's badge picture away (its rent comes back; the fee does not).
+/// Accounts: 0 wallet [s, w], 1 badge [w].
+#[inline(never)]
+pub(crate) fn remove_badge_image(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let wallet = acc(accounts, 0)?;
+    let badge_ai = acc(accounts, 1)?;
+    signer(wallet)?;
+    writable(wallet)?;
+    writable(badge_ai)?;
+    let b: BadgeImage = load_head(badge_ai, program_id)?;
+    if b.wallet != *wallet.key {
+        return Err(RouterError::BadAccount.into());
+    }
+    close(badge_ai, 0, wallet, wallet)
+}
+
+/// The header of a badge picture's account (the account is longer than the header).
+fn load_head(ai: &AccountInfo, program_id: &Pubkey) -> Result<BadgeImage, ProgramError> {
+    if ai.owner != program_id || ai.data_len() != BADGE_LEN {
+        return Err(RouterError::BadAccount.into());
+    }
+    let b: BadgeImage = bytemuck::pod_read_unaligned(&ai.try_borrow_data()?[..BADGE_HEAD]);
+    if b.magic != BADGE_MAGIC {
+        return Err(RouterError::BadAccount.into());
+    }
+    Ok(b)
 }

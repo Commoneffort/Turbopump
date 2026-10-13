@@ -85,6 +85,8 @@ async function setup() {
     const ca = await conn.getAccountInfo(S.copyAddress(me));
     const cur = ca && ca.data.length ? S.decodeCopy(S.copyAddress(me), new Uint8Array(ca.data)) : undefined;
     if (cur?.leader.equals(leader) && cur.ratioBps === c.ratioBps) { say(`${c.key} already copies ${LEADERS[c.leader].name}`); continue; }
+    // Starting to copy a trader costs the platform's fee, from the copier's own wallet.
+    if (!cur?.leader.equals(leader) && BigInt(await conn.getBalance(me)) < S.SOCIAL_FEE + BigInt(gasNeed / 8)) await send(`copy fee for ${c.key}`, deployer, [SystemProgram.transfer({ fromPubkey: deployer.publicKey, toPubkey: me, lamports: Number(S.SOCIAL_FEE) })]);
     // The page's one click: follow (unless following) and copy, in one transaction.
     await send(`${c.key} follows and copies ${LEADERS[c.leader].name} at ${c.ratioBps / 10_000}x${c.cap ? `, at most $${c.cap} a market` : ""}`, kp, [
       ...((await exists(S.followAddress(me, leader))) ? [] : [S.follow(me, leader)]),

@@ -16,7 +16,8 @@ use percolator_router::{
     RouterError,
 };
 use percolator_vault::percolator as perc;
-use solana_sdk::{pubkey::Pubkey, signature::Signer};
+use percolator_router::state::{BadgeImage, BADGE_FORMAT_JPEG, BADGE_HEAD, BADGE_LEN, BADGE_MAX_BYTES};
+use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey, signature::Signer};
 
 const U: i128 = UNIT as i128;
 const RID: fn() -> Pubkey = percolator_router::id;
@@ -73,6 +74,11 @@ fn set_copy(w: &mut World, follower: usize, leader: usize, ratio_bps: u32, max_n
     w.send(vec![rclient::set_copy(&t, &l.wallet, ratio_bps, max_notional)], &[&kp])
 }
 /// Anyone (the harness payer) brings the follower in line; returns the id of the queued request.
+/// What the platform's treasury holds, in lamports.
+fn treasury(w: &World) -> u64 {
+    w.env.svm.get_balance(&percolator_vault::processor::TREASURY).unwrap_or(0)
+}
+
 fn trigger(w: &mut World, follower: usize, leader: usize, size: i128) -> Result<u64, String> {
     let (t, l) = (w.trader(follower), w.trader(leader));
     let id = w.book().next_id;
@@ -107,6 +113,8 @@ fn layouts_are_what_the_page_reads() {
     assert_eq!((offset_of!(Follow, follower), offset_of!(Follow, leader), offset_of!(Follow, since)), (8, 40, 72));
     assert_eq!((offset_of!(Copy, market), offset_of!(Copy, follower), offset_of!(Copy, leader), offset_of!(Copy, ratio_bps), offset_of!(Copy, max_notional), offset_of!(Copy, since), offset_of!(Copy, triggers)), (8, 40, 72, 104, 112, 120, 128));
     assert_eq!(offset_of!(rstate::TraderState, has_stats), 138);
+    assert_eq!((BADGE_HEAD, BADGE_LEN, BADGE_MAX_BYTES), (56, 2104, 2048));
+    assert_eq!((offset_of!(BadgeImage, wallet), offset_of!(BadgeImage, len), offset_of!(BadgeImage, written), offset_of!(BadgeImage, format), offset_of!(BadgeImage, created)), (8, 40, 42, 44, 48));
 }
 
 // ---------------------------------------------------------------- track record
@@ -360,8 +368,17 @@ fn a_copy_is_the_followers_to_set_and_to_end() {
     expect(set_copy(&mut w, 1, 0, 0, 0), RouterError::InvalidInstruction);
     expect(set_copy(&mut w, 1, 0, 30_001, 0), RouterError::InvalidInstruction);
     expect(set_copy(&mut w, 1, 1, 10_000, 0), RouterError::InvalidInstruction);
-    // Half the leader's leverage, at most 100 on a market.
+    // Half the leader's leverage, at most 100 on a market. Starting to copy costs the fee,
+    // paid to the platform's treasury and to nobody else; changing the terms costs nothing.
+    let before_fee = treasury(&w);
+    let kp1 = w.trader_kp(1);
+    let mut elsewhere = rclient::set_copy(&f, &w.traders[&0].1.wallet, 5_000, 100_000_000);
+    elsewhere.accounts[6].pubkey = f.wallet;
+    expect(w.send(vec![elsewhere], &[&kp1]), RouterError::BadAccount);
+    set_copy(&mut w, 1, 0, 10_000, 100_000_000).unwrap();
+    assert_eq!(treasury(&w) - before_fee, percolator_router::COPY_FEE_LAMPORTS);
     set_copy(&mut w, 1, 0, 5_000, 100_000_000).unwrap();
+    assert_eq!(treasury(&w) - before_fee, percolator_router::COPY_FEE_LAMPORTS, "new terms, same trader: no second fee");
     w.taker_trade(0, 2_000 * U).unwrap();
     sync(&mut w, 1, 0).unwrap();
     assert_eq!(position(&w, 1), 100 * U, "limited to 100 of notional at 1.00");
@@ -372,6 +389,7 @@ fn a_copy_is_the_followers_to_set_and_to_end() {
     expect(w.send(vec![stop], &[&other]), RouterError::BadAccount);
     // Another leader: one at a time, and the count starts again.
     set_copy(&mut w, 1, 2, 10_000, 0).unwrap();
+    assert_eq!(treasury(&w) - before_fee, 2 * percolator_router::COPY_FEE_LAMPORTS, "a new leader is a new copy");
     let c = copy(&w, 1).unwrap();
     assert_eq!((c.leader, { c.triggers }), (w.traders[&2].1.wallet, 0));
     // Trader 2 holds nothing: the follower is brought to nothing.
@@ -385,6 +403,82 @@ fn a_copy_is_the_followers_to_set_and_to_end() {
     w.send(vec![rclient::stop_copy(&f)], &[&kp]).unwrap();
     assert!(copy(&w, 1).is_none());
     assert!(trigger(&mut w, 1, 2, 0).is_err());
+}
+
+/// A badge picture: paid for every time, the wallet's own to write, a JPEG within the size
+/// limit, written in order, and gone (with its rent back) when the wallet removes it.
+#[test]
+fn a_badge_picture_is_paid_for_and_only_its_wallet_writes_it() {
+    let mut w = live();
+    let a = w.trader(0).wallet;
+    let b = w.trader(1).wallet;
+    let (ka, kb) = (w.trader_kp(0), w.trader_kp(1));
+    let fee = percolator_router::BADGE_IMAGE_FEE_LAMPORTS;
+    let picture: Vec<u8> = [0xFF, 0xD8, 0xFF, 0xE0].into_iter().chain((0..1_496u32).map(|i| (i % 251) as u8)).collect();
+    let badge = rstate::badge_address(&RID(), &a).0;
+    let stored = |w: &World| -> (BadgeImage, Vec<u8>) {
+        let d = w.env.svm.get_account(&badge).unwrap().data;
+        (bytemuck::pod_read_unaligned(&d[..BADGE_HEAD]), d[BADGE_HEAD..].to_vec())
+    };
+    // Not a JPEG, no bytes that begin like one, too long, or more bytes than the stated length.
+    let mut png = rclient::set_badge_image(&a, 1_500, &[0x89, b'P', b'N', b'G']);
+    expect(w.send(vec![png.clone()], &[&ka]), RouterError::BadImage);
+    png.data[1] = 2;
+    expect(w.send(vec![png], &[&ka]), RouterError::BadImage);
+    expect(w.send(vec![rclient::set_badge_image(&a, 1_500, &[])], &[&ka]), RouterError::BadImage);
+    expect(w.send(vec![rclient::set_badge_image(&a, BADGE_MAX_BYTES as u16 + 1, &picture[..600])], &[&ka]), RouterError::BadImage);
+    expect(w.send(vec![rclient::set_badge_image(&a, 500, &picture[..600])], &[&ka]), RouterError::BadImage);
+    // The fee goes to the treasury and nowhere else.
+    let mut elsewhere = rclient::set_badge_image(&a, 1_500, &picture[..600]);
+    elsewhere.accounts[2].pubkey = a;
+    expect(w.send(vec![elsewhere], &[&ka]), RouterError::BadAccount);
+    assert!(w.env.svm.get_account(&badge).is_none());
+
+    let before = treasury(&w);
+    w.send(vec![rclient::set_badge_image(&a, 1_500, &picture[..600])], &[&ka]).unwrap();
+    assert_eq!(treasury(&w) - before, fee);
+    let (h, _) = stored(&w);
+    assert_eq!((h.wallet, { h.len }, { h.written }, h.format), (a, 1_500, 600, BADGE_FORMAT_JPEG));
+    // In order only, never past the end, and nothing empty.
+    expect(w.send(vec![rclient::write_badge_image(&a, 700, &picture[700..900])], &[&ka]), RouterError::BadImage);
+    expect(w.send(vec![rclient::write_badge_image(&a, 0, &picture[..100])], &[&ka]), RouterError::BadImage);
+    expect(w.send(vec![rclient::write_badge_image(&a, 600, &picture[600..])], &[&ka]).and(w.send(vec![rclient::write_badge_image(&a, 1_500, &[1])], &[&ka])), RouterError::BadImage);
+    expect(w.send(vec![rclient::write_badge_image(&a, 1_500, &[])], &[&ka]), RouterError::BadImage);
+    let (h, bytes) = stored(&w);
+    assert_eq!(({ h.written }, &bytes[..1_500]), (1_500, &picture[..]));
+    assert!(bytes[1_500..].iter().all(|x| *x == 0));
+
+    // Another wallet cannot write it, replace it or remove it: not with its own signature on
+    // this wallet's account, and not by naming this wallet without its signature.
+    let mut theirs = rclient::write_badge_image(&b, 0, &[9]);
+    theirs.accounts[1].pubkey = badge;
+    expect(w.send(vec![theirs], &[&kb]), RouterError::BadAccount);
+    let mut replace = rclient::set_badge_image(&b, 600, &picture[..600]);
+    replace.accounts[1].pubkey = badge;
+    expect(w.send(vec![replace], &[&kb]), RouterError::BadAccount);
+    let mut remove = rclient::remove_badge_image(&b);
+    remove.accounts[1].pubkey = badge;
+    expect(w.send(vec![remove], &[&kb]), RouterError::BadAccount);
+    let mut unsigned = rclient::remove_badge_image(&a);
+    unsigned.accounts[0].is_signer = false;
+    unsigned.accounts.push(AccountMeta::new_readonly(b, true));
+    expect(w.send(vec![unsigned], &[&kb]), RouterError::NotSigner);
+
+    // A new picture costs the fee again and leaves nothing of the old one behind.
+    let small: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xDB, 7, 7, 7, 7];
+    w.send(vec![rclient::set_badge_image(&a, small.len() as u16, &small)], &[&ka]).unwrap();
+    assert_eq!(treasury(&w) - before, 2 * fee);
+    let (h, bytes) = stored(&w);
+    assert_eq!(({ h.len }, { h.written }, &bytes[..8]), (8, 8, &small[..]));
+    assert!(bytes[8..].iter().all(|x| *x == 0), "the old picture's bytes are gone");
+    expect(w.send(vec![rclient::write_badge_image(&a, 8, &[1])], &[&ka]), RouterError::BadImage);
+
+    // Removed: the account is gone and its rent is back with the wallet (the fee is not).
+    let (rent, had) = (w.env.svm.get_account(&badge).unwrap().lamports, w.env.svm.get_balance(&a).unwrap());
+    w.send(vec![rclient::remove_badge_image(&a)], &[&ka]).unwrap();
+    assert!(w.env.svm.get_account(&badge).map_or(true, |x| x.lamports == 0));
+    assert_eq!(w.env.svm.get_balance(&a).unwrap(), had + rent);
+    assert_eq!(treasury(&w) - before, 2 * fee);
 }
 
 #[test]
@@ -432,6 +526,9 @@ fn builders_print_what_the_page_must_send() {
     show("unfollow", rclient::unfollow(&wallet, &leader));
     show("set_copy", rclient::set_copy(&t, &leader, 20_000, 250_000_000));
     show("stop_copy", rclient::stop_copy(&t));
+    show("set_badge_image", rclient::set_badge_image(&wallet, 1_234, &[0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3]));
+    show("write_badge_image", rclient::write_badge_image(&wallet, 7, &[4, 5, 6]));
+    show("remove_badge_image", rclient::remove_badge_image(&wallet));
     show("trigger_copy", rclient::trigger_copy(&payer, &t, &leader, &vault, -1_500_000));
     show("deposit", rclient::deposit(&t, &token, &pv, 7));
     show("withdraw", rclient::withdraw(&t, &token, &pv, 9));

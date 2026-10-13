@@ -92,6 +92,15 @@ pub const EXPIRY_DEPOSIT_BPS: u128 = 10;
 /// The chain's coin per atom of collateral (a 6-decimal dollar token), in lamports, for that
 /// deposit. A fixed rate, set for SOL near $110 and XNT near $0.20: the deposit is a deterrent,
 /// not a price, so being off by the coin's moves does not matter.
+/// What a wallet pays the platform, in the chain's coin, to start copying a trader and to put a
+/// picture of its own on its badge: 10 XNT on X1, 0.02 SOL elsewhere (test wallets hold little).
+#[cfg(not(feature = "x1"))]
+pub const SOCIAL_FEE_LAMPORTS: u64 = 20_000_000;
+#[cfg(feature = "x1")]
+pub const SOCIAL_FEE_LAMPORTS: u64 = 10_000_000_000;
+pub const COPY_FEE_LAMPORTS: u64 = SOCIAL_FEE_LAMPORTS;
+pub const BADGE_IMAGE_FEE_LAMPORTS: u64 = SOCIAL_FEE_LAMPORTS;
+
 #[cfg(not(feature = "x1"))]
 pub const LAMPORTS_PER_ATOM: u64 = 9;
 #[cfg(feature = "x1")]
@@ -153,6 +162,9 @@ pub const TAG_TRIGGER_COPY: u8 = 21;
 pub const TAG_CONVERT_PNL: u8 = 22;
 pub const TAG_SWEEP: u8 = 23;
 pub const TAG_SET_REFERRER: u8 = 24;
+pub const TAG_SET_BADGE_IMAGE: u8 = 25;
+pub const TAG_WRITE_BADGE_IMAGE: u8 = 26;
+pub const TAG_REMOVE_BADGE_IMAGE: u8 = 27;
 /// Widest trail, in basis points.
 pub const MAX_TRAIL_BPS: u64 = 5_000;
 /// Shortest time between two slices of a TWAP order, and the most slices one can have.
@@ -207,6 +219,9 @@ pub enum RouterError {
     InLine,
     /// A price too far from the mark for the time that has passed since it (see `within_band`).
     PriceBand,
+    /// A badge picture that is not a JPEG of at most `BADGE_MAX_BYTES`, or bytes written out of
+    /// order or past its end.
+    BadImage,
 }
 
 impl From<RouterError> for ProgramError {
@@ -249,6 +264,9 @@ pub fn process_instruction(program_id: &Pubkey, accounts: &[AccountInfo], data: 
         TAG_CONVERT_PNL => convert_pnl(program_id, accounts),
         TAG_SWEEP => sweep(program_id, accounts),
         TAG_SET_REFERRER => social::set_referrer(program_id, accounts),
+        TAG_SET_BADGE_IMAGE => social::set_badge_image(program_id, accounts, rest),
+        TAG_WRITE_BADGE_IMAGE => social::write_badge_image(program_id, accounts, rest),
+        TAG_REMOVE_BADGE_IMAGE => social::remove_badge_image(program_id, accounts),
         _ => Err(RouterError::InvalidInstruction.into()),
     }
 }

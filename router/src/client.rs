@@ -448,9 +448,34 @@ pub fn set_copy(t: &TraderKeys, leader: &Pubkey, ratio_bps: u32, max_notional: u
             ro(*leader),
             ro(trader_address(&id(), &t.market, leader).0),
             ro(system_program::ID),
+            w(percolator_vault::processor::TREASURY),
         ],
         data,
     }
+}
+
+/// Starts a badge picture of `len` bytes for `wallet` with its first bytes (the fee is paid here).
+pub fn set_badge_image(wallet: &Pubkey, len: u16, first: &[u8]) -> Instruction {
+    let mut data = vec![TAG_SET_BADGE_IMAGE, BADGE_FORMAT_JPEG];
+    data.extend_from_slice(&len.to_le_bytes());
+    data.extend_from_slice(first);
+    Instruction {
+        program_id: id(),
+        accounts: vec![AccountMeta::new(*wallet, true), w(badge_address(&id(), wallet).0), w(percolator_vault::processor::TREASURY), ro(system_program::ID)],
+        data,
+    }
+}
+
+/// The picture's next bytes, starting at `offset`.
+pub fn write_badge_image(wallet: &Pubkey, offset: u16, bytes: &[u8]) -> Instruction {
+    let mut data = vec![TAG_WRITE_BADGE_IMAGE];
+    data.extend_from_slice(&offset.to_le_bytes());
+    data.extend_from_slice(bytes);
+    Instruction { program_id: id(), accounts: vec![AccountMeta::new_readonly(*wallet, true), w(badge_address(&id(), wallet).0)], data }
+}
+
+pub fn remove_badge_image(wallet: &Pubkey) -> Instruction {
+    Instruction { program_id: id(), accounts: vec![AccountMeta::new(*wallet, true), w(badge_address(&id(), wallet).0)], data: vec![TAG_REMOVE_BADGE_IMAGE] }
 }
 
 pub fn stop_copy(t: &TraderKeys) -> Instruction {

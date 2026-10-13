@@ -1,6 +1,7 @@
-// Copy trading: who trades well here, by a record the router keeps itself; names and badges;
-// following (their trades show on your chart) and copying (your account mirrors theirs).
-import { useEffect, useMemo, useRef, useState } from "react";
+// The leaderboard and copy trading: who trades well here, by a record the router keeps itself;
+// names and badges; following (their trades show on your chart) and copying (your account
+// mirrors theirs).
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { Connection, PublicKey, TransactionInstruction } from "@solana/web3.js";
 import { SEED_WALLETS } from "../api/_config";
@@ -37,8 +38,60 @@ export function badgeOf(wallet: string, profile?: S.Profile): { shape: number; c
   for (const ch of wallet) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
   return { shape: h % BADGES.length, color: "#4A4A4A" };
 }
-export function Badge({ wallet, profile, size = 18 }: { wallet: string; profile?: S.Profile; size?: number }) {
+// ---- badge pictures
+//
+// A wallet can pay to show a picture of its own. The bytes come from a public chain, written by
+// whoever paid, so nothing about them is trusted:
+//  - they are never a link: the page fetches nothing on a stranger's say-so (no tracking, no
+//    requests to other sites), and never anything but a JPEG (an SVG can carry script);
+//  - the browser decodes them as a JPEG and nothing else, the result must be exactly the size
+//    the page itself makes, and what is shown is those pixels drawn again by this page: no
+//    byte a stranger wrote reaches the document, only a picture this page encoded;
+//  - they are shown with <img>, which runs nothing, at a fixed size;
+//  - a picture that fails any step is simply not shown: the wallet keeps its shape badge.
+/** Wallets whose picture this page does not show (it cannot be taken off the chain). */
+export const HIDDEN_PICTURES = new Set<string>([]);
+const shown = new Map<string, { of: Uint8Array; url?: string }>();
+const watchers = new Set<() => void>();
+let shownVersion = 0;
+const sameBytes = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
+/** The bytes as a picture this page drew itself, or undefined if they are not exactly a
+ *  `BADGE_PX` square JPEG. */
+export async function safePicture(bytes: Uint8Array): Promise<string | undefined> {
+  if (bytes.length < 4 || bytes.length > S.BADGE_MAX_BYTES || bytes[0] !== 0xff || bytes[1] !== 0xd8 || bytes[2] !== 0xff) return undefined;
+  try {
+    const bitmap = await createImageBitmap(new Blob([bytes as BlobPart], { type: "image/jpeg" }));
+    try {
+      if (bitmap.width !== S.BADGE_PX || bitmap.height !== S.BADGE_PX) return undefined;
+      const canvas = document.createElement("canvas");
+      canvas.width = canvas.height = S.BADGE_PX;
+      canvas.getContext("2d")!.drawImage(bitmap, 0, 0);
+      return canvas.toDataURL("image/png");
+    } finally { bitmap.close(); }
+  } catch { return undefined; }
+}
+/** Takes the board's pictures in: each is checked once, and again only if its bytes change. */
+function takePictures(pictures: Map<string, Uint8Array>) {
+  let changed = false;
+  for (const w of [...shown.keys()]) if (!pictures.has(w)) { shown.delete(w); changed = true; }
+  for (const [w, bytes] of pictures) {
+    if (HIDDEN_PICTURES.has(w)) continue;
+    const had = shown.get(w);
+    if (had && sameBytes(had.of, bytes)) continue;
+    const entry: { of: Uint8Array; url?: string } = { of: bytes };
+    shown.set(w, entry);
+    safePicture(bytes).then(url => { if (shown.get(w) === entry && url) { entry.url = url; shownVersion++; watchers.forEach(f => f()); } });
+  }
+  if (changed) { shownVersion++; watchers.forEach(f => f()); }
+}
+const usePictures = () => useSyncExternalStore(f => { watchers.add(f); return () => { watchers.delete(f); }; }, () => shownVersion);
+
+export function Badge({ wallet, profile, size = 18, picture }: { wallet: string; profile?: S.Profile; size?: number; picture?: string | null }) {
+  usePictures();
   const b = badgeOf(wallet, profile);
+  // `picture`: a preview (null = show the shape even if the wallet has a picture).
+  const url = picture === undefined ? shown.get(wallet)?.url : picture ?? undefined;
+  if (url) return <img className="badge badge-pic" src={url} width={size} height={size} alt="" draggable={false} />;
   return (
     <svg className="badge" width={size} height={size} viewBox="-0.06 -0.06 1.12 1.12" aria-hidden>
       <polygon points={BADGES[b.shape].points.map(p => p.join(",")).join(" ")} fill={b.color} />
@@ -62,7 +115,7 @@ export function useBoard(tick: number): { board?: S.Board; err?: string; reload:
     const load = (force: boolean) => {
       if (!force && cache?.net === C.NETWORK && Date.now() - cache.board.at < 15_000) return setBoard(cache.board);
       loading ??= S.loadBoard(connection).finally(() => { loading = undefined; });
-      loading.then(b => { cache = { net: C.NETWORK, board: b }; if (live) { setBoard(b); setErr(undefined); } }).catch(e => live && setErr(String(e?.message ?? e)));
+      loading.then(b => { cache = { net: C.NETWORK, board: b }; takePictures(b.pictures); if (live) { setBoard(b); setErr(undefined); } }).catch(e => live && setErr(String(e?.message ?? e)));
     };
     load(n > 0);
     const id = setInterval(() => load(false), 20_000);
@@ -162,7 +215,7 @@ function Search({ board, go }: { board?: S.Board; go: (to: string) => void }) {
 
 // ---------------------------------------------------------------- profile editor
 
-function ProfileEditor({ me, send, busy, done }: { me: Me; send: Send; busy?: string; done: () => void }) {
+function ProfileEditor({ me, has, send, busy, done, reload }: { me: Me; has: boolean; send: Send; busy?: string; done: () => void; reload: () => void }) {
   const { publicKey } = useWallet();
   const { connection } = useConnection();
   const [name, setName] = useState(me.profile?.name ?? "");
@@ -201,6 +254,86 @@ function ProfileEditor({ me, send, busy, done }: { me: Me; send: Send; busy?: st
       </div>
       {why && name && <div className="why">{why}</div>}
       <p className="fine">Your name and badge are stored by the router program under your wallet. A name belongs to one wallet at a time; changing it frees the old one. About 0.002 test {C.COIN} of rent, returned if a name is released.</p>
+      <PictureEditor me={me} has={has} send={send} busy={busy} reload={reload} />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------- badge picture editor
+
+/** A picture file from the user's own computer as the JPEG the page stores: its middle square,
+ *  `BADGE_PX` wide, drawn again by this page. Drawing it again drops everything else the file
+ *  carried (its format, and any record of where and when it was taken). */
+async function makePicture(file: File): Promise<Uint8Array> {
+  if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) throw new Error("Use a JPEG, PNG or WebP picture");
+  if (file.size > 8 * 1024 * 1024) throw new Error("That file is larger than 8 MB");
+  const bitmap = await createImageBitmap(file).catch(() => { throw new Error("This browser cannot read that file as a picture"); });
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = S.BADGE_PX;
+  const g = canvas.getContext("2d")!;
+  g.fillStyle = "#121212";
+  g.fillRect(0, 0, S.BADGE_PX, S.BADGE_PX);
+  const side = Math.min(bitmap.width, bitmap.height);
+  g.imageSmoothingQuality = "high";
+  g.drawImage(bitmap, (bitmap.width - side) / 2, (bitmap.height - side) / 2, side, side, 0, 0, S.BADGE_PX, S.BADGE_PX);
+  bitmap.close();
+  for (const quality of [0.85, 0.75, 0.65, 0.55, 0.45, 0.35, 0.25, 0.15]) {
+    const blob = await new Promise<Blob | null>(r => canvas.toBlob(r, "image/jpeg", quality));
+    if (blob && blob.type === "image/jpeg" && blob.size <= S.BADGE_TARGET_BYTES) return new Uint8Array(await blob.arrayBuffer());
+  }
+  throw new Error("That picture does not get small enough: try a simpler one");
+}
+
+function PictureEditor({ me, has, send, busy, reload }: { me: Me; has: boolean; send: Send; busy?: string; reload: () => void }) {
+  const { publicKey } = useWallet();
+  const [pic, setPic] = useState<{ bytes: Uint8Array; url: string }>();
+  const [err, setErr] = useState<string>();
+  /** Bytes already on the chain of a picture whose later part did not go through. */
+  const [resumeAt, setResumeAt] = useState<number>();
+  const input = useRef<HTMLInputElement>(null);
+  const choose = async (file?: File) => {
+    setErr(undefined); setResumeAt(undefined);
+    if (!file) return;
+    try {
+      const bytes = await makePicture(file);
+      const url = await safePicture(bytes);
+      if (!url) throw new Error("That picture could not be prepared");
+      setPic({ bytes, url });
+    } catch (e: any) { setPic(undefined); setErr(String(e?.message ?? e)); }
+    if (input.current) input.current.value = "";
+  };
+  const parts = pic ? Math.ceil(pic.bytes.length / S.BADGE_CHUNK) : 0;
+  const save = async () => {
+    if (!publicKey || !pic) return;
+    let at = resumeAt ?? 0;
+    if (at === 0) {
+      if (!await send(`Badge picture (1 of ${parts}, ${S.SOCIAL_FEE_TEXT})`, [S.setBadgeImage(publicKey, pic.bytes.length, pic.bytes.slice(0, S.BADGE_CHUNK))])) return;
+      at = Math.min(S.BADGE_CHUNK, pic.bytes.length);
+    }
+    for (; at < pic.bytes.length; at += S.BADGE_CHUNK) {
+      // The fee was paid with the first part: if a later part fails, only that part is sent again.
+      if (!await send(`Badge picture (${at / S.BADGE_CHUNK + 1} of ${parts})`, [S.writeBadgeImage(publicKey, at, pic.bytes.slice(at, at + S.BADGE_CHUNK))])) { setResumeAt(at); return; }
+    }
+    setPic(undefined); setResumeAt(undefined);
+    reload();
+  };
+  return (
+    <div className="pedit-pic">
+      <div className="pedit-l">Badge picture <span className="muted">· optional · {S.SOCIAL_FEE_TEXT}</span></div>
+      <div className="pedit-pic-row">
+        {me.wallet && <Badge wallet={me.wallet} profile={me.profile} size={48} picture={pic ? pic.url : undefined} />}
+        <input ref={input} type="file" accept="image/jpeg,image/png,image/webp" hidden onChange={e => choose(e.target.files?.[0])} />
+        <button className="btn tiny" disabled={!!busy} onClick={() => input.current?.click()}>{pic ? "Choose another" : has ? "Choose a new picture" : "Choose a picture"}</button>
+        {pic && <button className="btn tiny primary" disabled={!!busy || !publicKey} onClick={save}>{busy ? `${busy}…` : resumeAt ? "Finish saving (no new fee)" : `Save picture · ${S.SOCIAL_FEE_TEXT}`}</button>}
+        {pic && !resumeAt && <button className="btn tiny ghost" disabled={!!busy} onClick={() => setPic(undefined)}>Discard</button>}
+        {!pic && has && <button className="btn tiny ghost" disabled={!!busy || !publicKey} onClick={async () => { if (publicKey && await send("Remove badge picture", [S.removeBadgeImage(publicKey)])) reload(); }}>Remove picture</button>}
+      </div>
+      {err && <div className="why">{err}</div>}
+      {resumeAt !== undefined && <div className="why">The second part did not go through. The fee is paid: finish saving and only that part is sent again.</div>}
+      <p className="fine">
+        Your picture replaces the shape on the leaderboard, on your record and next to your name. It is cut to a square and stored as a small {S.BADGE_PX}×{S.BADGE_PX} JPEG by the router program under your wallet, in {parts > 1 ? `${parts} signatures` : "two signatures at most"}.
+        {" "}{S.SOCIAL_FEE_TEXT} goes to the platform each time you save a picture; removing it returns the account's rent (about 0.016 {C.COIN}), not the fee. Pictures are public and cannot be edited by anyone but you.
+      </p>
     </div>
   );
 }
@@ -215,7 +348,7 @@ function useActions(me: Me, send: Send, reload: () => void) {
     unfollow: (leader: string, name: string) => publicKey && run(`Unfollow ${name}`, [S.unfollow(publicKey, new PublicKey(leader))]),
     /** One click: a trading account and its track record if the wallet has none yet, a follow
      *  (so the trader's fills show on the chart), and the copy itself. */
-    copy: (leader: string, name: string, ratioBps = 10_000, maxNotional = 0n) => publicKey && run(`Copy ${name}`, [
+    copy: (leader: string, name: string, ratioBps = 10_000, maxNotional = 0n) => publicKey && run(me.copy?.leader.toBase58() === leader ? `New terms for copying ${name}` : `Copy ${name} (${S.SOCIAL_FEE_TEXT})`, [
       ...setup(publicKey, me),
       ...(me.following.has(leader) ? [] : [S.follow(publicKey, new PublicKey(leader))]),
       S.setCopy(publicKey, new PublicKey(leader), ratioBps, maxNotional),
@@ -227,6 +360,18 @@ function useActions(me: Me, send: Send, reload: () => void) {
 // ---------------------------------------------------------------- the board
 
 type Sort = "pnl" | "roi" | "days" | "volume" | "copiers";
+type Period = "7d" | "30d" | "all";
+const PERIODS: [Period, string][] = [["7d", "7 days"], ["30d", "30 days"], ["all", "All time"]];
+/** A row's profit and return over the board's period. A period's profit is the sum of the
+ *  record's trading days in it (the record keeps the last thirty); "all time" is the record's
+ *  own figure, which also counts what open positions are worth now. */
+function over(r: S.TraderRow, period: Period): { pnl: number; roi: number } {
+  if (period === "all" || !r.stats) return { pnl: r.pnl, roi: r.roi };
+  const since = Math.floor(Date.now() / 86_400_000) - (period === "7d" ? 6 : 29);
+  const pnl = r.days.filter(d => d.day >= since).reduce((t, d) => t + d.pnl, 0);
+  const base = r.stats.startEquity + r.stats.deposited;
+  return { pnl, roi: base > 0 ? pnl / base : 0 };
+}
 
 export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: string; tick: number; go: (to: string) => void }) {
   const { publicKey } = useWallet();
@@ -234,28 +379,31 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
   const me = useMe(board, tick);
   const act = useActions(me, send, reload);
   const [sort, setSort] = useState<Sort>("pnl");
+  const [period, setPeriod] = useState<Period>("7d");
   const [view, setView] = useState<"top" | "following">("top");
   const [editing, setEditing] = useState(false);
   const rows = useMemo(() => {
-    const by: Record<Sort, (r: S.TraderRow) => number> = { pnl: r => r.pnl, roi: r => r.roi, days: r => r.daysUp - r.daysDown, volume: r => r.stats?.volume ?? 0, copiers: r => r.copiers * 1000 + r.followers };
+    const by: Record<Sort, (r: S.TraderRow) => number> = { pnl: r => over(r, period).pnl, roi: r => over(r, period).roi, days: r => r.daysUp - r.daysDown, volume: r => r.stats?.volume ?? 0, copiers: r => r.copiers * 1000 + r.followers };
     return [...(board?.rows ?? [])].filter(r => r.stats && (view === "top" || me.following.has(r.wallet) || me.copy?.leader.toBase58() === r.wallet))
       // Accounts that have not traded since their record was opened come after those that have.
       .sort((a, b) => Number((b.stats?.trades ?? 0) > 0) - Number((a.stats?.trades ?? 0) > 0) || by[sort](b) - by[sort](a));
-  }, [board, sort, view, me]);
+  }, [board, sort, view, me, period]);
+  const podium = view === "top" && (sort === "pnl" || sort === "roi") ? rows.filter(r => (r.stats?.trades ?? 0) > 0 && over(r, period)[sort] > 0).slice(0, 3) : [];
+  const periodName = PERIODS.find(p => p[0] === period)![1].toLowerCase();
   const mine = board?.rows.find(r => r.wallet === me.wallet);
   const leader = me.copy && board?.rows.find(r => r.wallet === me.copy!.leader.toBase58());
   return (
     <main className="traders">
       <div className="traders-head">
         <div>
-          <h2>Copy trading</h2>
-          <p className="muted small">Every trader's record is kept by the router program itself: profit is the account's value minus what was paid in. Follow a trader to see their trades on your chart, or copy one and your account mirrors theirs.</p>
+          <h2>Leaderboard</h2>
+          <p className="muted small">Every trader's record is kept by the router program itself: profit is the account's value minus what was paid in, so it cannot be dressed up. Follow a trader to see their trades on your chart, or copy one ({S.SOCIAL_FEE_TEXT}, once) and your account mirrors theirs.</p>
         </div>
         <Search board={board} go={go} />
       </div>
 
       <section className="mecard">
-        {!publicKey ? <div className="quiet">Connect a wallet to set your name and badge, follow traders and copy them.</div> : editing ? <ProfileEditor me={me} send={send} busy={busy} done={() => { setEditing(false); reload(); }} /> : (
+        {!publicKey ? <div className="quiet">Connect a wallet to set your name and badge, follow traders and copy them.</div> : editing ? <ProfileEditor me={me} has={!!me.wallet && !!board?.pictures.has(me.wallet)} send={send} busy={busy} done={() => { setEditing(false); reload(); }} reload={reload} /> : (
           <>
             <div className="me-id">
               <Badge wallet={me.wallet!} profile={me.profile} size={34} />
@@ -263,7 +411,7 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
                 <b>{nameOf(me.wallet!, me.profile)}</b>
                 <span className="mono muted">{short(me.wallet!)}</span>
               </div>
-              <button className="btn tiny" onClick={() => setEditing(true)}>{me.profile ? "Edit name and badge" : "Set a name and badge"}</button>
+              <button className="btn tiny" onClick={() => setEditing(true)}>{me.profile ? "Edit name, badge and picture" : "Set a name and badge"}</button>
               <button className="btn tiny ghost" onClick={() => go(`/trader/${me.wallet}`)}>My record</button>
             </div>
             <div className="me-stats">
@@ -284,6 +432,9 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
           <button className={view === "following" ? "on" : ""} onClick={() => setView("following")}>Following{me.following.size ? ` ${me.following.size}` : ""}</button>
         </div>
         <div className="seg-tf">
+          {PERIODS.map(([k, l]) => <button key={k} className={period === k ? "on" : ""} onClick={() => setPeriod(k)}>{l}</button>)}
+        </div>
+        <div className="seg-tf">
           {([["pnl", "Profit"], ["roi", "Return"], ["days", "Profitable days"], ["volume", "Volume"], ["copiers", "Copiers"]] as const).map(([k, l]) => <button key={k} className={sort === k ? "on" : ""} onClick={() => setSort(k)}>{l}</button>)}
         </div>
       </div>
@@ -291,12 +442,37 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
       {err && !board ? <div className="quiet">Cannot read the chain: {err}</div> : !board ? <div className="quiet">Reading the chain…</div> : rows.length === 0 ? (
         <div className="quiet">{view === "following" ? "You follow nobody yet. Follow a trader and their trades appear on your chart." : "No track records on this network yet. A record starts with an account's first trade."}</div>
       ) : (
+        <>
+        {podium.length > 0 && (
+          <div className="podium">
+            {podium.map((r, i) => {
+              const name = nameOf(r.wallet, r.profile), o = over(r, period), isMe = r.wallet === me.wallet, copying = me.copy?.leader.toBase58() === r.wallet;
+              return (
+                <div key={r.wallet} className={`podium-card p${i + 1}`}>
+                  <span className="podium-rank mono">{i + 1}</span>
+                  <button className="trader" onClick={() => go(`/trader/${r.wallet}`)}>
+                    <Badge wallet={r.wallet} profile={r.profile} size={44} />
+                    <span className="podium-name"><b>{name}</b><i className="mono muted">{short(r.wallet)}</i></span>
+                  </button>
+                  <div className="podium-nums">
+                    <div><span>Profit, {periodName}</span><b className={`mono ${tone(o.pnl)}`}>{signed(o.pnl)}</b></div>
+                    <div><span>Return</span><b className={`mono ${tone(o.roi)}`}>{pct(o.roi)}</b></div>
+                    <div><span>Copiers</span><b className="mono">{r.copiers}</b></div>
+                  </div>
+                  {!isMe && publicKey && (copying
+                    ? <button className="btn tiny" disabled={!!busy} onClick={() => act.stop()}>Stop copying</button>
+                    : <button className="btn tiny primary" disabled={!!busy} onClick={() => act.copy(r.wallet, name)}>Copy · {S.SOCIAL_FEE_TEXT}</button>)}
+                </div>
+              );
+            })}
+          </div>
+        )}
         <div className="traders-table">
           <table className="tbl">
-            <thead><tr><th>#</th><th>Trader</th><th className="r">Profit</th><th className="r">Return</th><th className="r">Profitable days</th><th>Last 30 trading days</th><th className="r">Largest fall</th><th className="r">Volume</th><th className="r">Trades</th><th className="r">Copiers</th><th /></tr></thead>
+            <thead><tr><th>#</th><th>Trader</th><th className="r">Profit{period === "all" ? "" : `, ${periodName}`}</th><th className="r">Return</th><th className="r">Profitable days</th><th>Last 30 trading days</th><th className="r">Largest fall</th><th className="r">Volume</th><th className="r">Trades</th><th className="r">Copiers</th><th /></tr></thead>
             <tbody>
               {rows.map((r, i) => {
-                const name = nameOf(r.wallet, r.profile), isMe = r.wallet === me.wallet, copying = me.copy?.leader.toBase58() === r.wallet, tag = tagOf(r.wallet);
+                const name = nameOf(r.wallet, r.profile), isMe = r.wallet === me.wallet, copying = me.copy?.leader.toBase58() === r.wallet, tag = tagOf(r.wallet), o = over(r, period);
                 return (
                   <tr key={r.wallet} className={isMe ? "me" : ""}>
                     <td className="mono muted">{i + 1}</td>
@@ -308,8 +484,8 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
                         {isMe && <em>you</em>}{tag && <em title={SEED_WALLETS[r.wallet]}>{tag}</em>}{copying && <em className="on">copying</em>}
                       </button>
                     </td>
-                    <td className={`r mono ${tone(r.pnl)}`}>{signed(r.pnl)}</td>
-                    <td className={`r mono ${tone(r.roi)}`}>{pct(r.roi)}</td>
+                    <td className={`r mono ${tone(o.pnl)}`}>{signed(o.pnl)}</td>
+                    <td className={`r mono ${tone(o.roi)}`}>{pct(o.roi)}</td>
                     <td className="r mono">{r.daysUp} of {r.daysUp + r.daysDown}</td>
                     <td><DayBars days={r.days} /></td>
                     <td className="r mono">{r.drawdownPct >= 0.0005 ? `−${fmt(r.drawdownPct * 100, 1)}%` : "—"}</td>
@@ -322,7 +498,7 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
                         : <button className="btn tiny ghost" disabled={!!busy} onClick={() => act.follow(r.wallet, name)}>Follow</button>)}
                       {!isMe && publicKey && (copying
                         ? <button className="btn tiny" disabled={!!busy} onClick={() => act.stop()}>Stop</button>
-                        : <button className="btn tiny primary" disabled={!!busy} title="Your account mirrors this trader's positions, at the same leverage. One signature." onClick={() => act.copy(r.wallet, name)}>Copy</button>)}
+                        : <button className="btn tiny primary" disabled={!!busy} title={`Your account mirrors this trader's positions, at the same leverage. One signature. Starting to copy costs ${S.SOCIAL_FEE_TEXT}, once.`} onClick={() => act.copy(r.wallet, name)}>Copy · {S.SOCIAL_FEE_TEXT}</button>)}
                     </div></td>
                   </tr>
                 );
@@ -330,8 +506,10 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
             </tbody>
           </table>
         </div>
+        </>
       )}
       <p className="fine">
+        Ranked over the period chosen above: 7 and 30 days add up the record's trading days in that time; "all time" is the whole record, including what open positions are worth now.
         Records start when an account's track record is opened (the first trade after this feature went live), not before. Profit is equity now minus equity then minus net deposits since; return is profit over the money that was at work.
         A trading day counts as profitable when the account was worth more at its last fill that day than at the last fill before it. Copiers · followers in the last column. Accounts tagged "test bot" are our own test traffic.
       </p>
@@ -363,7 +541,7 @@ export function TraderPage({ wallet, send, busy, tick, go }: { wallet: string; s
   const tile = (label: string, value: string, cls = "", sub?: string) => <div className="tile"><span>{label}</span><b className={`mono ${cls}`}>{value}</b>{sub && <i>{sub}</i>}</div>;
   return (
     <main className="traders">
-      <button className="link back" onClick={() => go("/traders")}>← All traders</button>
+      <button className="link back" onClick={() => go("/leaderboard")}>← Leaderboard</button>
       <div className="tp-head">
         <Badge wallet={wallet} profile={r?.profile} size={44} />
         <div className="tp-name">
@@ -430,16 +608,18 @@ export function TraderPage({ wallet, send, busy, tick, go }: { wallet: string; s
                   <div><span>Yours would be</span><b className="mono">{fmt(r!.leverage * ratioBps / 10_000, 1)}×</b></div>
                   <div><span>Your margin</span><b className="mono">${fmt(myEquity)}</b></div>
                   <div><span>Fee</span><b className="mono">{C.TRADE_FEE_PCT} per trade</b></div>
+                  <div><span>To start copying</span><b className="mono">{copying ? "paid" : `${S.SOCIAL_FEE_TEXT}, once`}</b></div>
                 </div>
                 {!publicKey ? <div className="why">Connect a wallet to copy.</div> : (
                   <>
-                    <button className="submit neutral" disabled={!!busy || (!!copying && copying.ratioBps === ratioBps && copying.maxNotional === capAtoms)} onClick={() => act.copy(wallet, name, ratioBps, capAtoms)}>{busy ? `${busy}…` : copying ? "Change terms" : `Copy ${name}`}</button>
+                    <button className="submit neutral" disabled={!!busy || (!!copying && copying.ratioBps === ratioBps && copying.maxNotional === capAtoms)} onClick={() => act.copy(wallet, name, ratioBps, capAtoms)}>{busy ? `${busy}…` : copying ? "Change terms" : `Copy ${name} · ${S.SOCIAL_FEE_TEXT}`}</button>
                     {copying && <button className="closepos" disabled={!!busy} onClick={() => act.stop()}>Stop copying</button>}
                     {myEquity <= 0 && <div className="why">Your trading account holds no margin yet: deposit on the Trade page and the copy starts with their next trade.</div>}
                   </>
                 )}
                 <p className="fine">
                   You sign once. From then on your account is kept at this trader's leverage on every market, times the setting above: when they open, add, cut or close, a trade for your account is queued and fills at the next oracle price, like any order.
+                  Starting to copy a trader costs {S.SOCIAL_FEE_TEXT}, paid to the platform once; changing the terms later costs nothing, and copying someone else, or the same trader again after stopping, is a new start.
                   While you copy, positions you open yourself are brought back in line. Stopping leaves your positions as they are. Nobody can withdraw from your account or choose the size of a copy trade: the router computes it from both accounts.
                   {copying && ` Brought in line ${copying.triggers} time${copying.triggers === 1 ? "" : "s"} so far.`}
                 </p>
