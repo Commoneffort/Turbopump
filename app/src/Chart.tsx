@@ -13,13 +13,49 @@ import { BADGES, Mark } from "./Traders";
 const UP = "#48E160", DOWN = "#E15A48";
 export const TIMEFRAMES: [label: string, res: number][] = [["1m", 60], ["5m", 300], ["15m", 900], ["1H", 3600], ["4H", 14400], ["1D", 86400]];
 
-export async function fetchCandles(symbol: string, res: number, limit = 600): Promise<{ source: string; candles: Candle[] }> {
-  try {
-    const r = await fetch(`/api/candles?symbol=${symbol}&res=${res}&limit=${limit}&network=${C.NETWORK}`);
-    const j = await r.json();
-    if (r.ok && Array.isArray(j.candles)) return j;
-  } catch { /* no API here (local development): ask the exchange directly */ }
-  return { source: "exchange", candles: await exchangeCandles(symbol, res, limit) };
+type History = { source: string; candles: Candle[]; at: number };
+// Histories this browser has had, by network, symbol and timeframe: a chart seen before draws
+// at once from the last one while a newer one is read. A few are kept between visits.
+const HIST_KEY = "pv:history";
+const histories = new Map<string, History>();
+try { for (const [k, h] of Object.entries(JSON.parse(localStorage.getItem(HIST_KEY) ?? "{}") as Record<string, History>)) if (Array.isArray(h?.candles)) histories.set(k, h); } catch { /* none kept */ }
+const reading = new Map<string, Promise<History>>();
+const histKey = (symbol: string, res: number, limit: number) => `${C.NETWORK}:${symbol}:${res}:${limit}`;
+function keepHistory(key: string, h: History) {
+  histories.set(key, h);
+  if (h.candles.length < 100) return; // the day figures: quick to read again
+  try { localStorage.setItem(HIST_KEY, JSON.stringify(Object.fromEntries([...histories].filter(([, x]) => x.candles.length >= 100).sort((x, y) => y[1].at - x[1].at).slice(0, 6)))); } catch { /* storage full or off */ }
+}
+/** The last history had for a chart, however old, if it is still worth drawing first (the
+ *  window it covers has not moved on by more than a sixth). */
+export const candlesBefore = (symbol: string, res: number, limit = 600): History | undefined => {
+  const h = histories.get(histKey(symbol, res, limit));
+  return h && Date.now() - h.at < res * 100_000 ? h : undefined;
+};
+
+/** Price history. One read at a time per chart (the chart library asks three times as it is set
+ *  up), and none when the last one is younger than `fresh` ms. */
+export async function fetchCandles(symbol: string, res: number, limit = 600, fresh = 15_000): Promise<History> {
+  const key = histKey(symbol, res, limit);
+  const had = histories.get(key);
+  if (had && Date.now() - had.at < fresh) return had;
+  let p = reading.get(key);
+  if (!p) {
+    p = (async () => {
+      let h: History | undefined;
+      try {
+        const r = await fetch(`/api/candles?symbol=${symbol}&res=${res}&limit=${limit}&network=${C.NETWORK}`);
+        const j = await r.json();
+        // (The CDN may hand out an answer a few minutes old while it reads a new one: its age counts.)
+        if (r.ok && Array.isArray(j.candles)) h = { source: j.source, candles: j.candles, at: Date.now() - 1000 * (Number(r.headers.get("age")) || 0) };
+      } catch { /* no API here (local development): ask the exchange directly */ }
+      h ??= { source: "exchange", candles: await exchangeCandles(symbol, res, limit), at: Date.now() };
+      if (h.candles.length) keepHistory(key, h);
+      return h;
+    })().finally(() => reading.delete(key));
+    reading.set(key, p);
+  }
+  return p;
 }
 
 export type DayStats = { last: number; change: number; high: number; low: number };
@@ -33,7 +69,7 @@ export function useDayStats(symbols: string[]): Record<string, DayStats> {
     const load = async () => {
       const out: Record<string, DayStats> = {};
       await Promise.all(symbols.map(async s => {
-        const { candles } = await fetchCandles(s, 3600, 25).catch(() => ({ candles: [] as Candle[] }));
+        const { candles } = await fetchCandles(s, 3600, 25, 50_000).catch(() => ({ candles: [] as Candle[] }));
         const day = candles.slice(-24);
         if (day.length < 2) return;
         const first = day[0][1], last = day[day.length - 1][4];
@@ -180,7 +216,11 @@ export default function Chart({ symbol, price, lines, marks = [], slot = 0, comp
     c.setDataLoader({
       getBars: async ({ type, callback }) => {
         if (type !== "init") return callback([], false);
-        const r = await fetchCandles(symbol, res).catch(() => undefined);
+        // A history had before is drawn at once; if it is not a recent one, a new one is read
+        // meanwhile and the chart is set again from it (this is then asked again, and finds it).
+        const before = candlesBefore(symbol, res);
+        if (before && Date.now() - before.at >= 15_000) fetchCandles(symbol, res).then(h => { if (live && chart.current === c && h !== before) c.resetData(); }).catch(() => undefined);
+        const r = before ?? await fetchCandles(symbol, res).catch(() => undefined);
         if (!live) return;
         setSource(r?.source);
         // History first; where this page drew a candle itself and history has none (or it is

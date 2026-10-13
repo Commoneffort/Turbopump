@@ -39,10 +39,18 @@ async function fetchCopy() {
 const early = (globalThis as any).__state as { net: string; res: Promise<Copy | null> } | undefined;
 if (early?.net === NETWORK) loading = early.res.then(c => take(c, c?.age ?? 0)).finally(() => { loading = undefined; });
 
+const pause = (ms: number) => new Promise<void>(ok => setTimeout(ok, ms));
+// How long a request waits for a copy that is being read. X1's RPC answers quickly and does not
+// throttle, so there a slow copy (the first after a quiet spell is read on the spot) is not waited
+// for: the RPC is asked instead. On Solana devnet the copy is the fast way even when it is slow.
+const WAIT_MS = X1 ? 350 : 6_000;
+
 async function current(): Promise<Held | undefined> {
   if (!held || Date.now() - held.got >= REUSE_MS) {
     if (!loading && Date.now() - failed < RETRY_MS) return undefined;
-    await (loading ??= fetchCopy().finally(() => { loading = undefined; }));
+    loading ??= fetchCopy().finally(() => { loading = undefined; });
+    // The copy before this one answers meanwhile, if there is one: a refresh never waits.
+    if (!held || held.old + Date.now() - held.got >= TOO_OLD_MS) await Promise.race([loading, pause(WAIT_MS)]);
   }
   return held && held.old + Date.now() - held.got < TOO_OLD_MS ? held : undefined;
 }

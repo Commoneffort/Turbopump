@@ -6,7 +6,9 @@ export default async function handler(req: any, res: any) {
   const symbol = String(req.query?.symbol ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
   const resolution = Number(req.query?.res ?? 60), limit = Math.min(Number(req.query?.limit ?? 500) || 500, 1000);
   if (!symbol || !RESOLUTIONS[resolution]) return res.status(400).json({ error: "symbol and res (60, 300, 900, 3600, 14400, 86400) are required" });
-  res.setHeader("Cache-Control", "public, s-maxage=5, stale-while-revalidate=30");
+  // A few seconds for everyone at once; for five minutes after, the last answer is handed out at
+  // once while a new one is read (the page counts its age, and draws the newest candle itself).
+  res.setHeader("Cache-Control", "public, s-maxage=8, stale-while-revalidate=300");
   const indexer = process.env.INDEXER_URL;
   if (indexer) {
     try {

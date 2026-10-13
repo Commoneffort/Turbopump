@@ -102,19 +102,24 @@ export function useCards(tick: number) {
   return { cards, err };
 }
 
-const statesNow = new Map<string, { s: C.State; at: number }>();
+/** A market as read, and the wallet whose own accounts were read with it ("" for none). */
+export type VaultState = C.State & { readFor: string };
+const statesNow = new Map<string, { s: VaultState; at: number }>();
 export function useVault(vaultKey: PublicKey, tick: number) {
   const { connection } = useConnection();
   const { publicKey } = useWallet();
   // A market seen a moment ago in this tab shows as it was while it is read again.
   const stateKey = `${vaultKey.toBase58()}:${publicKey?.toBase58() ?? ""}`;
-  const [state, setState] = useState<C.State | undefined>(() => { const had = statesNow.get(stateKey); return had && Date.now() - had.at < 60_000 ? had.s : undefined; });
+  const [state, setState] = useState<VaultState | undefined>(() => { const had = statesNow.get(stateKey); return had && Date.now() - had.at < 60_000 ? had.s : undefined; });
   const [err, setErr] = useState<string>();
   const [history, setHistory] = useState<{ t: number; p: number }[]>([]);
   const load = useCallback(async () => {
     try {
       // Without a wallet there is nothing of the visitor's own to read: the shared copy has it all.
-      const s = await C.fetchVault(publicKey ? connection : view, vaultKey, publicKey ?? undefined);
+      // With one, the market shows from the copy at once, and the wallet's part follows from the
+      // RPC (`readFor` says whose is there: nothing is offered to sign before the wallet's own is).
+      if (publicKey && !statesNow.has(stateKey)) C.fetchVault(view, vaultKey).then(s => setState(now => now ?? { ...s, readFor: "" })).catch(() => undefined);
+      const s = { ...(await C.fetchVault(publicKey ? connection : view, vaultKey, publicKey ?? undefined)), readFor: publicKey?.toBase58() ?? "" };
       statesNow.set(stateKey, { s, at: Date.now() });
       setState(s);
       setErr(undefined);

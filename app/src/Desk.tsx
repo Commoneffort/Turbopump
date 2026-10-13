@@ -285,12 +285,14 @@ function VaultDepth({ state, tick }: { state: C.State; tick: number }) {
 
 // ---------------------------------------------------------------- order ticket
 
-function Ticket({ state, send, busy }: { state: C.State; send: Send; busy?: string }) {
+function Ticket({ state, send, busy }: { state: C.State & { readFor?: string }; send: Send; busy?: string }) {
   const { publicKey } = useWallet();
   const [side, setSide] = useState<1n | -1n>(1n);
   const [text, setText] = useState("");
   const [unit, setUnit] = useState<"coin" | "usd">("coin");
   const [mode, setMode] = useState<"market" | "limit" | "protect" | "twap">("market");
+  // Whether what is shown includes this wallet's own accounts yet (the market itself shows first).
+  const mine = !publicKey || state.readFor === undefined || state.readFor === publicKey.toBase58();
   const v = state.vault, p = state.portfolio, sym = v.feed?.symbol ?? "";
   const priceN = num(state.asset.price, 1e6);
   const dp = priceDp(priceN);
@@ -423,6 +425,7 @@ function Ticket({ state, send, busy }: { state: C.State; send: Send; busy?: stri
       </div>
 
       {!publicKey ? <div className="connect"><WalletMultiButton /></div>
+        : !mine ? <button className="submit neutral" disabled>Reading your account…</button>
         : !state.trader ? <button className="submit neutral" disabled={!!busy} onClick={() => send("Create trading account", [C.openTradingAccount(publicKey), S.openStats(publicKey, publicKey)])}>Create trading account</button>
         : <button className={`submit ${side > 0n ? "up" : "down"}`} disabled={!!blocker || !!busy} onClick={submit}>{busy ? `${busy}…` : `${side > 0n ? "Long" : "Short"} ${want > 0n ? `${units(sent)} ` : ""}${sym}`}</button>}
       {state.trader && held !== 0n && (
@@ -432,7 +435,7 @@ function Ticket({ state, send, busy }: { state: C.State; send: Send; busy?: stri
       )}
       {blocker && publicKey && <div className="why">{blocker}</div>}
       {!blocker && want > vaultMax && <div className="why">The vault takes {units(vaultMax)} {sym} on this side right now, so the order is cut to that.</div>}
-      {!state.trader && publicKey && <div className="why">One account covers every market. It belongs to a program address derived from your wallet: only the router can trade it, and withdrawals only go back to this wallet. About 0.07 test {C.COIN} of rent.</div>}
+      {!state.trader && publicKey && mine && <div className="why">One account covers every market. It belongs to a program address derived from your wallet: only the router can trade it, and withdrawals only go back to this wallet. About 0.07 test {C.COIN} of rent.</div>}
 
       </>}
       {pendingHere && <Pending r={pendingHere} sym={sym} send={send} busy={busy} />}
