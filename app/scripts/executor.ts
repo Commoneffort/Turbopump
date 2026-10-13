@@ -1002,6 +1002,20 @@ setInterval(() => {
         const idle = open.filter(empty).map(v => v.feed!.symbol).sort().join(", ");
         if (idle !== idleNames) { idleNames = idle; log(idle ? `not servicing empty market(s): ${idle}` : "no empty markets"); }
         vaults = open.filter(v => !empty(v));
+        // Nothing fills on a market left alone, but a trade can still be queued on it, and a
+        // wallet with a request waiting can trade nowhere else. Such a request is expired as soon
+        // as the router allows (its grace period), which frees the wallet.
+        const idleVaults = open.filter(empty);
+        if (idleVaults.length) {
+          const books = await conn.getMultipleAccountsInfo(idleVaults.map(v => C.bookAddress(v.key)));
+          for (const [i, v] of idleVaults.entries()) {
+            if (!books[i] || C.decodeBook(new Uint8Array(books[i]!.data)).len === 0) continue;
+            const late = Date.now() / 1000 - C.ROUTER_GRACE_SECS - 5;
+            for (const r of (await C.pendingRequests(conn, v.key)).filter(r => r.target < late)) {
+              await send(`expire ${v.feed?.symbol} #${r.id} (queued on a market that is not serviced)`, [C.expireRequest(payer.publicKey, r)]);
+            }
+          }
+        }
         servicedAssets = vaults.map(v => v.assetIndex);
         vaultsAt = Date.now();
         // Runs in the background. Where the service is the source, every feed is recorded, so

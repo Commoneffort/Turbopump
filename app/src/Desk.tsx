@@ -311,7 +311,9 @@ function Ticket({ state, send, busy }: { state: C.State & { readFor?: string }; 
   const vaultMax = side > 0n ? room.long : room.short;
   const most = marginMax(side) < vaultMax ? marginMax(side) : vaultMax;
   const sent = want > vaultMax ? vaultMax : want; // an order above what the vault takes is cut to it
-  const noLiquidity = v.lastNav === 0n;
+  // (No shares outstanding and no position: every deposit was withdrawn. Such a market is not serviced, so an
+  // order sent to it would wait until it expired, and block the wallet's other trades meanwhile.)
+  const noLiquidity = v.lastNav === 0n || (state.shareSupply === 0n && v.inventory === 0n);
   const reduceOnly = state.slot >= v.epochStart + v.epochLen && v.needsFlat;
   const after = num(held + sent * side, 1e6);
   const liqAfter = liquidationPrice(state, after);
