@@ -43,9 +43,38 @@ export function Icon({ symbol }: { symbol: string }) {
 
 export type Card = { v: C.Vault; asset: C.Asset; nav: bigint };
 
+// The market list as last read, so a page shows at once instead of "Loading markets…": kept in
+// memory between pages and in the browser between visits (ten minutes at most), and replaced by
+// a fresh reading a moment later. It only chooses what is drawn first; nothing is signed from it.
+const CARDS_KEY = `percolator-vaults:cards:${C.NETWORK}`;
+const pack = (x: any): any =>
+  typeof x === "bigint" ? { $b: x.toString() } : x instanceof PublicKey ? { $k: x.toBase58() } : x instanceof Uint8Array ? { $u: Array.from(x) }
+  : Array.isArray(x) ? x.map(pack) : x && typeof x === "object" ? Object.fromEntries(Object.entries(x).map(([k, v]) => [k, pack(v)])) : x;
+const unpack = (x: any): any =>
+  Array.isArray(x) ? x.map(unpack) : x && typeof x === "object"
+    ? ("$b" in x ? BigInt(x.$b) : "$k" in x ? new PublicKey(x.$k) : "$u" in x ? Uint8Array.from(x.$u) : Object.fromEntries(Object.entries(x).map(([k, v]) => [k, unpack(v)])))
+    : x;
+let cardsNow: Card[] | undefined;
+let cardsSaved = 0;
+function cardsBefore(): Card[] | undefined {
+  if (cardsNow) return cardsNow;
+  try {
+    const raw = localStorage.getItem(CARDS_KEY);
+    const j = raw && JSON.parse(raw);
+    if (j && Date.now() - j.at < 600_000) return (cardsNow = unpack(j.cards));
+  } catch { /* nothing kept, or not readable: the page waits for the chain as before */ }
+  return undefined;
+}
+function keepCards(cards: Card[]) {
+  cardsNow = cards;
+  if (Date.now() - cardsSaved < 30_000) return;
+  cardsSaved = Date.now();
+  try { localStorage.setItem(CARDS_KEY, JSON.stringify({ at: Date.now(), cards: pack(cards) })); } catch { /* storage full or off */ }
+}
+
 export function useCards(tick: number) {
   const { connection } = useConnection();
-  const [cards, setCards] = useState<Card[]>();
+  const [cards, setCards] = useState<Card[] | undefined>(cardsBefore);
   const [err, setErr] = useState<string>();
   useEffect(() => {
     let live = true;
@@ -61,6 +90,7 @@ export function useCards(tick: number) {
           return { v, asset: v.status === 0 ? ({} as C.Asset) : C.decodeAsset(m.data, v.assetIndex), nav };
         });
         out.sort((a, b) => (b.nav > a.nav ? 1 : b.nav < a.nav ? -1 : 0));
+        keepCards(out);
         if (live) { setCards(out); setErr(undefined); }
       } catch (e: any) { if (live) setErr(e.message); }
     };
@@ -71,15 +101,19 @@ export function useCards(tick: number) {
   return { cards, err };
 }
 
+const statesNow = new Map<string, { s: C.State; at: number }>();
 export function useVault(vaultKey: PublicKey, tick: number) {
   const { connection } = useConnection();
   const { publicKey } = useWallet();
-  const [state, setState] = useState<C.State>();
+  // A market seen a moment ago in this tab shows as it was while it is read again.
+  const stateKey = `${vaultKey.toBase58()}:${publicKey?.toBase58() ?? ""}`;
+  const [state, setState] = useState<C.State | undefined>(() => { const had = statesNow.get(stateKey); return had && Date.now() - had.at < 60_000 ? had.s : undefined; });
   const [err, setErr] = useState<string>();
   const [history, setHistory] = useState<{ t: number; p: number }[]>([]);
   const load = useCallback(async () => {
     try {
       const s = await C.fetchVault(connection, vaultKey, publicKey ?? undefined);
+      statesNow.set(stateKey, { s, at: Date.now() });
       setState(s);
       setErr(undefined);
       const p = num(s.asset.price, 1e6);

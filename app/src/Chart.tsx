@@ -302,12 +302,25 @@ export default function Chart({ symbol, price, lines, marks = [], slot = 0, comp
     const c = chart.current;
     if (!c) return;
     c.removeOverlay({ groupId: "social" });
-    // The name goes with each trader's latest fill only: a badge is enough for the others.
-    const latest = new Map(marks.map(m => [m.name, m.key]));
+    // The trader's name shows while the pointer is on one of their badges.
+    const over = new Map<string, any>();
+    const hover = (on: boolean) => (e: any) => {
+      if (on) over.set(e.overlay.id, e.overlay.extendData); else over.delete(e.overlay.id);
+      c.overrideOverlay({ id: e.overlay.id, extendData: { ...e.overlay.extendData, hover: on } });
+      return true;
+    };
+    // The pointer can leave the chart straight from a badge, and the chart then reports nothing.
+    const left = () => { for (const [id, data] of over) c.overrideOverlay({ id, extendData: { ...data, hover: false } }); over.clear(); };
+    root.current?.addEventListener("mouseleave", left);
     for (const m of marks) {
       const t = m.time - (m.time % res);
-      c.createOverlay({ name: "traderMark", groupId: "social", lock: true, points: [{ timestamp: t * 1000, value: m.price }], extendData: { points: BADGES[m.shape % BADGES.length].points, color: m.color, picture: m.picture && rememberPicture(m.picture), buy: m.size > 0, label: latest.get(m.name) === m.key ? m.name : "" } } as any);
+      c.createOverlay({
+        name: "traderMark", groupId: "social", lock: true, points: [{ timestamp: t * 1000, value: m.price }],
+        extendData: { points: BADGES[m.shape % BADGES.length].points, color: m.color, picture: m.picture && rememberPicture(m.picture), buy: m.size > 0, label: m.name },
+        onMouseEnter: hover(true), onMouseLeave: hover(false),
+      } as any);
     }
+    return () => root.current?.removeEventListener("mouseleave", left);
   }, [markKey, symbol, res]);
 
   const toggle = (name: string) => setStudies(s => (s.includes(name) ? s.filter(x => x !== name) : [...s, name]));

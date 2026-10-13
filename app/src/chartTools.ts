@@ -48,26 +48,46 @@ export function registerChartTools() {
     },
   });
 
-  // A badge picture on the chart: the picture the page has already checked and drawn itself
-  // (see `safePicture`), with a rim in the side's colour.
-  registerFigure<{ x: number; y: number; size: number; src: string }, { borderColor: string }>({
-    name: "badgePicture",
-    checkEventOn: ({ x, y }, a) => x >= a.x && x <= a.x + a.size && y >= a.y && y <= a.y + a.size,
+  // A trader's badge on the chart: a disc with a rim in the side's colour, holding the trader's
+  // picture (the one the page has already checked and drawn itself, see `safePicture`) or, for a
+  // trader without one, their shape.
+  registerFigure<{ x: number; y: number; r: number; src?: string; points?: [number, number][]; color?: string }, { borderColor: string }>({
+    name: "traderBadge",
+    checkEventOn: ({ x, y }, a) => (x - a.x) ** 2 + (y - a.y) ** 2 <= a.r ** 2,
     draw: (ctx, a, styles) => {
-      const image = pictures.get(a.src);
-      if (!image || !image.complete || !image.naturalWidth) return;
+      const image = a.src ? pictures.get(a.src) : undefined;
       ctx.save();
-      ctx.imageSmoothingQuality = "high";
-      ctx.drawImage(image, a.x, a.y, a.size, a.size);
+      ctx.beginPath();
+      ctx.arc(a.x, a.y, a.r, 0, Math.PI * 2);
+      ctx.fillStyle = "#1C1C1C";
+      ctx.fill();
+      if (image && image.complete && image.naturalWidth) {
+        ctx.save();
+        ctx.clip();
+        ctx.imageSmoothingQuality = "high";
+        ctx.drawImage(image, a.x - a.r, a.y - a.r, 2 * a.r, 2 * a.r);
+        ctx.restore();
+      } else if (a.points?.length) {
+        // The shape, a little smaller than the disc it sits in.
+        const side = a.r * 1.15;
+        ctx.beginPath();
+        a.points.forEach(([px, py], i) => { const X = a.x - side / 2 + px * side, Y = a.y - side / 2 + py * side; if (i) ctx.lineTo(X, Y); else ctx.moveTo(X, Y); });
+        ctx.closePath();
+        ctx.fillStyle = a.color ?? "#8A8A8A";
+        ctx.fill();
+      }
+      ctx.beginPath();
+      ctx.arc(a.x, a.y, a.r - 0.75, 0, Math.PI * 2);
       ctx.strokeStyle = styles.borderColor;
-      ctx.lineWidth = 1;
-      ctx.strokeRect(a.x + 0.5, a.y + 0.5, a.size - 1, a.size - 1);
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
       ctx.restore();
     },
   });
 
   // Another trader's fill: their badge, tied to the price it filled at. A buy hangs under the
-  // price, a sell stands over it; the stem and the small arrow take the side's colour.
+  // price, a sell stands over it; the stem and the small arrow take the side's colour. The
+  // trader's name shows while the pointer is on the badge (`hover`, set by the chart).
   registerOverlay({
     name: "traderMark",
     totalStep: 2,
@@ -75,20 +95,18 @@ export function registerChartTools() {
     needDefaultXAxisFigure: false,
     needDefaultYAxisFigure: false,
     createPointFigures: ({ coordinates, overlay }) => {
-      const m = overlay.extendData as { points: [number, number][]; color: string; picture?: string; buy: boolean; label: string } | undefined;
+      const m = overlay.extendData as { points: [number, number][]; color: string; picture?: string; buy: boolean; label: string; hover?: boolean } | undefined;
       if (!coordinates.length || !m) return [];
       const { x, y } = coordinates[0];
-      // A trader's own picture is drawn a little larger than a shape, or nothing of it can be made out.
-      const side = m.buy ? GREEN : CORAL, dir = m.buy ? 1 : -1, s = m.picture ? 20 : 15;
-      const top = m.buy ? y + 13 : y - 13 - s;
-      return [
+      const side = m.buy ? GREEN : CORAL, dir = m.buy ? 1 : -1, r = 15;
+      const cy = y + dir * (13 + r);
+      const figures: any[] = [
         { type: "line", ignoreEvent: true, attrs: { coordinates: [{ x, y: y + dir * 4 }, { x, y: y + dir * 13 }] }, styles: { color: rgba(side, 0.9), size: 1 } },
         { type: "polygon", ignoreEvent: true, attrs: { coordinates: [{ x, y: y + dir * 1 }, { x: x - 4, y: y + dir * 7 }, { x: x + 4, y: y + dir * 7 }] }, styles: { style: "fill", color: rgba(side, 1) } },
-        m.picture
-          ? { type: "badgePicture", attrs: { x: x - s / 2, y: top, size: s, src: m.picture }, styles: { borderColor: rgba(side, 1) } }
-          : { type: "polygon", attrs: { coordinates: m.points.map(([px, py]) => ({ x: x - s / 2 + px * s, y: top + py * s })) }, styles: { style: "stroke_fill", color: m.color, borderColor: rgba(side, 1), borderSize: 1 } },
-        { type: "text", ignoreEvent: true, attrs: { x: x + s / 2 + 3, y: top + s / 2, text: m.label, baseline: "middle" }, styles: { ...label(rgba(WHITE, 0.85)), size: 9.5 } },
+        { type: "traderBadge", attrs: { x, y: cy, r, src: m.picture, points: m.points, color: m.color }, styles: { borderColor: rgba(side, 1) } },
       ];
+      if (m.hover && m.label) figures.push({ type: "text", ignoreEvent: true, attrs: { x: x + r + 6, y: cy, text: m.label, baseline: "middle" }, styles: { ...label(rgba(WHITE, 1)), size: 14, weight: 600, backgroundColor: "rgba(28,28,28,0.92)", borderColor: rgba(side, 0.9), borderSize: 1, borderRadius: 3, paddingLeft: 7, paddingRight: 7, paddingTop: 4, paddingBottom: 4 } });
+      return figures;
     },
   });
 
