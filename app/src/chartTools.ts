@@ -11,6 +11,12 @@ const label = (color: string) => ({ color, size: 10.5, family: FONT, backgroundC
  *  with the band between two levels tinted. */
 const FIB: [level: number, colour: string][] = [[0, GREY], [0.236, CORAL], [0.382, GREEN], [0.5, WHITE], [0.618, GREEN], [0.786, CORAL], [1, GREY]];
 
+/** Badge pictures the chart may draw, by their address (a data URL the page made itself). The
+ *  chart library copies what a figure is given, and a copied picture is no picture: a figure
+ *  carries the address and the picture is looked up here. */
+const pictures = new Map<string, HTMLImageElement>();
+export const rememberPicture = (img: HTMLImageElement) => { pictures.set(img.src, img); return img.src; };
+
 let done = false;
 export function registerChartTools() {
   if (done) return;
@@ -44,14 +50,15 @@ export function registerChartTools() {
 
   // A badge picture on the chart: the picture the page has already checked and drawn itself
   // (see `safePicture`), with a rim in the side's colour.
-  registerFigure<{ x: number; y: number; size: number; image: HTMLImageElement }, { borderColor: string }>({
+  registerFigure<{ x: number; y: number; size: number; src: string }, { borderColor: string }>({
     name: "badgePicture",
     checkEventOn: ({ x, y }, a) => x >= a.x && x <= a.x + a.size && y >= a.y && y <= a.y + a.size,
     draw: (ctx, a, styles) => {
-      if (!a.image.complete || !a.image.naturalWidth) return;
+      const image = pictures.get(a.src);
+      if (!image || !image.complete || !image.naturalWidth) return;
       ctx.save();
       ctx.imageSmoothingQuality = "high";
-      ctx.drawImage(a.image, a.x, a.y, a.size, a.size);
+      ctx.drawImage(image, a.x, a.y, a.size, a.size);
       ctx.strokeStyle = styles.borderColor;
       ctx.lineWidth = 1;
       ctx.strokeRect(a.x + 0.5, a.y + 0.5, a.size - 1, a.size - 1);
@@ -68,7 +75,7 @@ export function registerChartTools() {
     needDefaultXAxisFigure: false,
     needDefaultYAxisFigure: false,
     createPointFigures: ({ coordinates, overlay }) => {
-      const m = overlay.extendData as { points: [number, number][]; color: string; picture?: HTMLImageElement; buy: boolean; label: string } | undefined;
+      const m = overlay.extendData as { points: [number, number][]; color: string; picture?: string; buy: boolean; label: string } | undefined;
       if (!coordinates.length || !m) return [];
       const { x, y } = coordinates[0];
       // A trader's own picture is drawn a little larger than a shape, or nothing of it can be made out.
@@ -78,7 +85,7 @@ export function registerChartTools() {
         { type: "line", ignoreEvent: true, attrs: { coordinates: [{ x, y: y + dir * 4 }, { x, y: y + dir * 13 }] }, styles: { color: rgba(side, 0.9), size: 1 } },
         { type: "polygon", ignoreEvent: true, attrs: { coordinates: [{ x, y: y + dir * 1 }, { x: x - 4, y: y + dir * 7 }, { x: x + 4, y: y + dir * 7 }] }, styles: { style: "fill", color: rgba(side, 1) } },
         m.picture
-          ? { type: "badgePicture", attrs: { x: x - s / 2, y: top, size: s, image: m.picture }, styles: { borderColor: rgba(side, 1) } }
+          ? { type: "badgePicture", attrs: { x: x - s / 2, y: top, size: s, src: m.picture }, styles: { borderColor: rgba(side, 1) } }
           : { type: "polygon", attrs: { coordinates: m.points.map(([px, py]) => ({ x: x - s / 2 + px * s, y: top + py * s })) }, styles: { style: "stroke_fill", color: m.color, borderColor: rgba(side, 1), borderSize: 1 } },
         { type: "text", ignoreEvent: true, attrs: { x: x + s / 2 + 3, y: top + s / 2, text: m.label, baseline: "middle" }, styles: { ...label(rgba(WHITE, 0.85)), size: 9.5 } },
       ];

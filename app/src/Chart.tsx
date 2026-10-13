@@ -6,7 +6,7 @@ import { ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { Chart as KChart, KLineData, dispose, init } from "klinecharts";
 import { Candle, exchangeCandles, hasHistory } from "../api/_candles";
 import * as C from "./chain";
-import { registerChartTools } from "./chartTools";
+import { registerChartTools, rememberPicture } from "./chartTools";
 import { priceDp } from "./shared";
 import { BADGES, Mark } from "./Traders";
 
@@ -306,7 +306,7 @@ export default function Chart({ symbol, price, lines, marks = [], slot = 0, comp
     const latest = new Map(marks.map(m => [m.name, m.key]));
     for (const m of marks) {
       const t = m.time - (m.time % res);
-      c.createOverlay({ name: "traderMark", groupId: "social", lock: true, points: [{ timestamp: t * 1000, value: m.price }], extendData: { points: BADGES[m.shape % BADGES.length].points, color: m.color, picture: m.picture, buy: m.size > 0, label: latest.get(m.name) === m.key ? m.name : "" } } as any);
+      c.createOverlay({ name: "traderMark", groupId: "social", lock: true, points: [{ timestamp: t * 1000, value: m.price }], extendData: { points: BADGES[m.shape % BADGES.length].points, color: m.color, picture: m.picture && rememberPicture(m.picture), buy: m.size > 0, label: latest.get(m.name) === m.key ? m.name : "" } } as any);
     }
   }, [markKey, symbol, res]);
 
