@@ -452,7 +452,7 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
                   <span className="podium-rank mono">{i + 1}</span>
                   <button className="trader" onClick={() => go(`/trader/${r.wallet}`)}>
                     <Badge wallet={r.wallet} profile={r.profile} size={44} />
-                    <span className="podium-name"><b>{name}</b><i className="mono muted">{short(r.wallet)}</i></span>
+                    <span className="podium-name"><b>{name}</b>{r.profile && <i className="mono muted">{short(r.wallet)}</i>}</span>
                   </button>
                   <div className="podium-nums">
                     <div><span>Profit, {periodName}</span><b className={`mono ${tone(o.pnl)}`}>{signed(o.pnl)}</b></div>
