@@ -42,7 +42,9 @@ const { PythSolanaReceiver } = require("@pythnetwork/pyth-solana-receiver");
 const conn = new Connection(process.env.RPC ?? C.RPC_URL, { commitment: "confirmed", disableRetryOnRateLimit: true, fetch: C.politeFetch(C.X1 ? 0 : 110) });
 // How often a sent transaction is looked up while waiting for it. X1's RPC answers in under
 // 0.1 s and does not throttle (170 requests a second went through); the public devnet one does.
-const POLL_MS = C.X1 ? 150 : 400;
+// (Devnet's public RPC allows few getSignatureStatuses calls: polled every 0.4 s it answered 429
+// to all of them for many minutes, and nothing was confirmed any more.)
+const POLL_MS = C.X1 ? 150 : 1_200;
 const payer = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(
   process.env.KEYPAIR ?? `${process.env.HOME}/.config/solana/${C.X1 ? "percolator-x1" : "percolator-test"}/deployer.json`, "utf8"))));
 // ---- the exchange-median price service, recorded locally ----
@@ -53,6 +55,9 @@ const receiver = new PythSolanaReceiver({ connection: conn, wallet: new Wallet(p
 const FAR_BEHIND = 1_000; // slots: beyond this an asset is caught up before anything else is tried
 const PRIORITY = 1_000; // micro-lamports per CU: devnet needs little
 const log = (...a: unknown[]) => console.log(new Date().toISOString().slice(11, 19), ...a);
+// The step the executor entered last, for the watchdog's message when a pass never finishes.
+let stage = "start", stageAt = Date.now();
+const enter = (s: string) => { stage = s; stageAt = Date.now(); };
 // A rate-limited RPC call must not take the executor down: log it and carry on next pass.
 process.on("unhandledRejection", e => log("rpc", String((e as any)?.message ?? e).split("\n")[0].slice(0, 120)));
 
@@ -154,6 +159,7 @@ function jackLatest(symbol: string) {
  *  (routine cranking stops then), and every account has to be settled next: the catch-up rides in
  *  this transaction, ahead of the price, instead of taking a round of its own afterwards. */
 async function advanceReported(v: C.Vault, u: { price: bigint; publish: number; prev: number }, why: string, catchUpFirst = false) {
+  enter("advanceReported");
   if (!reporter) return false;
   // The previous timestamp must be before the new one, and the account only moves forward.
   const prev = Math.min(u.prev, u.publish - 1);
@@ -192,6 +198,7 @@ let backoffUntil = 0;
 type Update = { vaa: string; publish: number; prev: number; feed: string };
 
 async function hermes(path: string): Promise<any | null> {
+  enter("hermes");
   if (Date.now() < backoffUntil) return null;
   hermesCalls++;
   const r = await fetch(`${HERMES}${path}`, { headers: { Authorization: `Bearer ${API_KEY}` }, signal: AbortSignal.timeout(10_000) });
@@ -225,7 +232,10 @@ async function firstAtOrAfter(feed: string, t: number): Promise<Update | null> {
 // ---- chain ----
 /** Waits for a signature by polling (the public RPC rate-limits the websockets confirmTransaction uses). */
 async function confirmed(sig: string, processedIsEnough = false) {
-  for (let i = 0; i < 20_000 / POLL_MS; i++) {
+  enter("confirmed");
+  // By the clock, not by the number of polls: on a throttled RPC one poll can take many seconds,
+  // and counting polls let this wait for minutes without a word (devnet, 2026-10-13).
+  for (const until = Date.now() + 20_000; Date.now() < until; ) {
     await new Promise(r => setTimeout(r, POLL_MS));
     const st = (await conn.getSignatureStatuses([sig]).catch(() => null))?.value?.[0];
     if (st?.err) throw new Error(`transaction failed: ${JSON.stringify(st.err)}`);
@@ -237,6 +247,7 @@ async function confirmed(sig: string, processedIsEnough = false) {
 /** Sends (with preflight). Only fills wait for confirmation; routine work is checked again on the
  *  next pass from chain state, so it must never hold up a trade's fill. */
 async function send(label: string, ixs: TransactionInstruction[], wait = false) {
+  enter("send");
   const head = await budgetFor(ixs);
   const tx = new Transaction().add(...head, ...ixs);
   try {
@@ -257,6 +268,7 @@ async function send(label: string, ixs: TransactionInstruction[], wait = false) 
 
 /** Sends the Pyth builder's transactions in order (post, consume, close), confirming each by polling. */
 async function sendBuilt(txs: { tx: any; signers: any[] }[]) {
+  enter("sendBuilt");
   // Each transaction builds on the one before, so they go in order; only the last has to be
   // confirmed before acting on it, the others just have to have been processed.
   for (const [i, { tx, signers }] of txs.entries()) {
@@ -268,6 +280,7 @@ async function sendBuilt(txs: { tx: any; signers: any[] }[]) {
 
 /** Posts one verified update (ephemeral account) and moves the vault's mark to it. */
 async function advancePosted(v: C.Vault, u: Update) {
+  enter("advancePosted");
   const market = new Uint8Array((await conn.getAccountInfo(C.MARKET))!.data);
   const builder = receiver.newTransactionBuilder({ closeUpdateAccounts: true });
   await builder.addPostPriceUpdates([u.vaa]);
@@ -292,6 +305,7 @@ let traderKeysAt = 0;
  *  mark cannot move past it), so whatever the scan lacks is looked up through the traders'
  *  accounts, each of which names its pending request and is read directly. */
 async function requestsOf(v: C.Vault, b: C.Book) {
+  enter("requestsOf");
   if (!b.pending.length) return [];
   const listed = (r: C.RouterRequest) => b.pending.some(p => p.id === r.id);
   const found = (await C.pendingRequests(conn, v.key)).filter(listed);
@@ -339,6 +353,7 @@ async function budgetFor(ixs: TransactionInstruction[], atLeast = 0): Promise<Tr
  *  reports: a crank with nothing to do is dropped, and a trade refused because an asset is still
  *  behind gets one more lag crank. Returns what would succeed now, or why nothing does. */
 async function tune(lagCrank: TransactionInstruction, k: number, settle: TransactionInstruction[], tail: TransactionInstruction[]) {
+  enter("tune");
   const seen: string[] = [];
   for (let round = 0; round < 10; round++) {
     // The simulation replaces the blockhash, so any well-formed one will do.
@@ -377,8 +392,8 @@ async function race(label: string, variants: TransactionInstruction[][]) {
     if (sig) sigs.push(sig);
   };
   if (C.X1) await Promise.all(variants.map(one)); else for (const ixs of variants) await one(ixs);
-  for (let i = 0; i < 20_000 / (C.X1 ? POLL_MS : 500) && sigs.length; i++) {
-    await new Promise(r => setTimeout(r, C.X1 ? POLL_MS : 500));
+  for (const until = Date.now() + 20_000; Date.now() < until && sigs.length; ) {
+    await new Promise(r => setTimeout(r, POLL_MS));
     const st = (await conn.getSignatureStatuses(sigs).catch(() => null))?.value ?? [];
     if (st.some(x => x && !x.err && (x.confirmationStatus === "confirmed" || x.confirmationStatus === "finalized"))) { log("ok", label); return true; }
     if (st.length === sigs.length && st.every(x => x?.err)) { log("fail", label, st.map(x => JSON.stringify(x!.err)).join(" / ")); return false; }
@@ -394,6 +409,7 @@ async function race(label: string, variants: TransactionInstruction[][]) {
  *  assets up by itself, so the transactions do not depend on each other or on the slot they land
  *  in. Returns how many transactions landed. */
 async function settleAll(label: string, cranks: TransactionInstruction[]) {
+  enter("settleAll");
   // What fits a transaction's compute: a crank costs about 110,000 units plus 55,000 for each
   // asset it names (measured on X1), and a transaction has 1,400,000.
   const cost = (ix: TransactionInstruction) => 110_000 + 55_000 * ix.data[9];
@@ -423,7 +439,7 @@ async function settleAll(label: string, cranks: TransactionInstruction[]) {
   // Prepared and sent side by side where the RPC allows it, one after the other where it throttles.
   if (C.X1) await Promise.all(chunks.map(one)); else for (const ixs of chunks) await one(ixs);
   let landed = 0;
-  for (let i = 0; i < 12_000 / POLL_MS && sigs.length; i++) {
+  for (const until = Date.now() + 12_000; Date.now() < until && sigs.length; ) {
     await new Promise(r => setTimeout(r, POLL_MS));
     const st = (await conn.getSignatureStatuses(sigs).catch(() => null))?.value ?? [];
     if (st.length !== sigs.length) continue;
@@ -441,6 +457,7 @@ async function settleAll(label: string, cranks: TransactionInstruction[]) {
  *  Only cranks that certainly have work are sent (a crank with nothing to do fails its whole
  *  transaction); the last few slots are left to the fill itself. */
 async function catchUp(label: string, lagCrank: TransactionInstruction, lag: number, wait: boolean) {
+  enter("catchUp");
   const sizes: number[] = [];
   // Further behind than three transactions cover (the services stood still, or trades were queued
   // for minutes on end): more transactions per pass, or catching up takes as long again as the
@@ -474,6 +491,7 @@ async function catchUp(label: string, lagCrank: TransactionInstruction, lag: num
  *  Anyone may queue a forced close for a trader; this queues one per pass and market, and the
  *  fill path executes it at its target Pyth price like any request. */
 async function watch(vaults: C.Vault[], market: Uint8Array, full: boolean) {
+  enter("watch");
   const closing = vaults.filter(v => C.closeOnly(market, v.assetIndex));
   if (!closing.length && !full) return false;
   const [snap, traders, fresh] = await Promise.all([
@@ -534,6 +552,7 @@ async function watch(vaults: C.Vault[], market: Uint8Array, full: boolean) {
  *  ~50 slots of the chain (one crank advances all of them by 10), and every third pass settle
  *  the positions that price moves left out of date, so a fill has little left to do. */
 async function upkeep(vaults: C.Vault[], market: Uint8Array, slot: bigint, pass: number, force = false) {
+  enter("upkeep");
   // IDLE_JUMP=1 is for a Percolator build in which a market with no positions catches up in
   // one crank (a prototype, not deployed anywhere): such markets are then left alone until
   // someone trades on them, and only markets with positions are kept current.
@@ -604,6 +623,7 @@ async function settleEpoch(v: C.Vault, r: C.RouterRequest, what: string) {
 }
 
 async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boolean): Promise<boolean> {
+  enter("serviceVault");
   if (!snap.book) {
     await send(`open book ${v.feed?.symbol}`, [C.openBook(payer.publicKey, v.key)]);
     return false;
@@ -755,6 +775,7 @@ let orderCache: C.StandingOrder[] = [];
  *  is 0.1% better than the one recorded, and removes orders that can do nothing any more. Each is
  *  one small transaction; the request it queues is then filled like any other. */
 async function serviceOrders(vaults: C.Vault[], books: Map<string, C.Book>, market: Uint8Array, now: number, slot: bigint) {
+  enter("serviceOrders");
   if (Date.now() - ordersAt > (C.X1 ? 4_000 : 6_000)) {
     const accs = await conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: C.ORDER_LEN }] });
     orderCache = accs.map(a => C.decodeOrder(a.pubkey, new Uint8Array(a.account.data)));
@@ -798,6 +819,7 @@ const copyRetry = new Map<string, number>();
  *  anyone may, the size is the router's to compute). Where the follower's margin does not take
  *  the whole difference, the step that it does take is sent. One request per wallet at a time. */
 async function serviceCopies(vaults: C.Vault[], books: Map<string, C.Book>, market: Uint8Array) {
+  enter("serviceCopies");
   if (Date.now() - copiesAt > (C.X1 ? 6_000 : 20_000)) {
     const accs = await conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: S.COPY_LEN }, { memcmp: { offset: 0, bytes: S.COPY_TAG } }, { memcmp: { offset: 8, bytes: C.MARKET.toBase58() } }] });
     copyCache = accs.map(a => S.decodeCopy(a.pubkey, new Uint8Array(a.account.data)));
@@ -847,6 +869,7 @@ const convertRetry = new Map<string, number>();
  *  is booked as profit first, and a withdrawal only pays out capital: without this a trader who
  *  won could take out the margin but not the winnings. A few accounts a minute. */
 async function convertProfits(vaults: C.Vault[], market: Uint8Array) {
+  enter("convertProfits");
   if (Date.now() - convertAt < 45_000 || !vaults.length) return;
   convertAt = Date.now();
   const accs = await conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: C.TRADER_LEN }, { memcmp: { offset: 8, bytes: C.MARKET.toBase58() } }] });
@@ -875,6 +898,7 @@ let statsAt = 0;
 /** Opens a track record for every trading account that has none (a few per pass; it costs its
  *  rent once). From then on the router books that account's deposits, withdrawals and fills. */
 async function openTrackRecords() {
+  enter("openTrackRecords");
   if (Date.now() - statsAt < 60_000) return;
   statsAt = Date.now();
   const accs = await conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: C.TRADER_LEN }, { memcmp: { offset: 8, bytes: C.MARKET.toBase58() } }] });
@@ -943,7 +967,7 @@ let lastPass = Date.now();
 const WATCHDOG_MS = Number(process.env.WATCHDOG_SECS ?? 180) * 1000;
 setInterval(() => {
   if (Date.now() - lastPass > WATCHDOG_MS) {
-    log("watchdog", `no pass finished for ${Math.round((Date.now() - lastPass) / 1000)} s: exiting to be restarted`);
+    log("watchdog", `no pass finished for ${Math.round((Date.now() - lastPass) / 1000)} s (last entered: ${stage}, ${Math.round((Date.now() - stageAt) / 1000)} s ago): exiting to be restarted`);
     process.exit(3);
   }
 }, 10_000).unref();
@@ -964,6 +988,7 @@ setInterval(() => {
       // before its first request can expire; everything else is one batched read per pass (the
       // public devnet RPC allows about 100 requests per 10 seconds).
       if (!vaults.length || Date.now() - vaultsAt > 20_000) {
+        enter("list vaults");
         vaultList = await C.listVaults(conn);
         const open = vaultList.filter(v => v.market.equals(C.MARKET) && v.canonical && v.status === 1 && v.feed);
         // A market nobody has money in (no liquidity, no position, nothing queued to come in or
@@ -984,6 +1009,7 @@ setInterval(() => {
         if (reporter) recordJack([...(ORACLE === "jack" ? C.FEEDS.map(f => f.symbol) : []), ...vaults.map(v => v.feed!.symbol)]);
       }
       const keys = [SYSVAR_CLOCK_PUBKEY, C.MARKET, ...vaults.flatMap(v => [C.bookAddress(v.key), C.feedAccount(v.feed!.id)])];
+      enter("read books and feeds");
       const accs = await conn.getMultipleAccountsInfo(keys);
       const clock = new DataView(accs[0]!.data.buffer, accs[0]!.data.byteOffset);
       const now = Number(clock.getBigInt64(32, true));
