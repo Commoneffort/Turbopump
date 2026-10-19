@@ -14,7 +14,7 @@ const me = kp.publicKey;
 
 async function tokenBalance(mint: PublicKey, program: PublicKey, owner: PublicKey) {
   const a = await conn.getAccountInfo(getAssociatedTokenAddressSync(mint, owner, true, program));
-  return a ? Buffer.from(a.data).readBigUInt64LE(64) : 0n;
+  return a ? BigInt(Buffer.from(a.data).readBigUInt64LE(64)) : 0n;
 }
 
 async function swap(p: S.Pool, from: 0 | 1, amountIn: bigint) {

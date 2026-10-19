@@ -62,4 +62,9 @@ export const SEED_WALLETS: Record<string, string> = {
   Fe9J6uEAQLUsBymZcf38AwHwnRyAVzkPAyhRtCQtGQjp: "bot burst 3",
   EzGZ2BAhGKyUZ1zp22cgnkhHGWFcsdvX3U6GfnWuXkiy: "bot burst 4",
   "8gGpXF8SGwtqJY7iwTbF6tvFHf8KuJZpp2ooNnFhXBcP": "bot burst 5",
+  // Swap bots (scripts/swap-bots.ts): xDEX test traffic.
+  C9twNM7uWWaEbBiWTMFNMTdUNWmYDVvyetRHdNrh1Tmm: "bot swap arb",
+  "8qrLBCUuRFY19pQUvo5LiSxkXg5qDwGaSvcXm4D7CkZg": "bot swap random",
+  "3vafojckSEfhHLZXoNnjBEkLboiEnLaHY3BY1McNCig7": "bot swap margin",
+  HZr2HGBmaH7Gm4NCZkx5GGVJkouudRAk2ajr5XUyAuqA: "bot swap explorer",
 };
