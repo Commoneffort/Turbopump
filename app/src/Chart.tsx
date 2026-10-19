@@ -1,13 +1,14 @@
 // The price chart: candles, indicators and drawing tools, drawn with KLineChart (open source,
 // free). History comes from /api/candles (the indexer's recorded oracle prices where it runs,
-// public exchange history otherwise); the last candle follows the market's own price as the
-// page reads it.
+// public exchange history otherwise; a spot pair's from xDEX's record of its swaps); the last
+// candle follows the market's own price as the page reads it.
 import { ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { Chart as KChart, KLineData, dispose, init } from "klinecharts";
 import { Candle, exchangeCandles, hasHistory } from "../api/_candles";
 import * as C from "./chain";
 import { registerChartTools, rememberPicture } from "./chartTools";
 import { priceDp } from "./shared";
+import { isSpot, spotCandles } from "./swap";
 import { BADGES, Mark } from "./Traders";
 
 const UP = "#48E160", DOWN = "#E15A48";
@@ -43,7 +44,8 @@ export async function fetchCandles(symbol: string, res: number, limit = 600, fre
   if (!p) {
     p = (async () => {
       let h: History | undefined;
-      try {
+      if (isSpot(symbol)) h = { source: "xdex", candles: await spotCandles(symbol, res, limit).catch(() => []), at: Date.now() };
+      else try {
         const r = await fetch(`/api/candles?symbol=${symbol}&res=${res}&limit=${limit}&network=${C.NETWORK}`);
         const j = await r.json();
         // (The CDN may hand out an answer a few minutes old while it reads a new one: its age counts.)
@@ -169,7 +171,8 @@ const saved = (key: string, fallback: string[]): string[] => { try { const v = J
  *  `compact` is a secondary window: no drawing toolbar. `dense` is any window that shares the
  *  screen with others: the candle's figures show under the crosshair only. `head` is shown first in the window's bar
  *  (the layout buttons, or a secondary window's market). `marks` are other traders' fills. */
-export default function Chart({ symbol, price, lines, marks = [], slot = 0, compact = false, dense = false, head }: { symbol: string; price: number; lines: Line[]; marks?: Mark[]; slot?: number; compact?: boolean; dense?: boolean; head?: ReactNode }) {
+export default function Chart({ symbol, label, price, lines, marks = [], slot = 0, compact = false, dense = false, head }: { symbol: string; label?: string; price: number; lines: Line[]; marks?: Mark[]; slot?: number; compact?: boolean; dense?: boolean; head?: ReactNode }) {
+  const name = label ?? `${symbol}-PERP`, spot = isSpot(symbol);
   const own = slot ? `:${slot}` : "";
   const el = useRef<HTMLDivElement>(null);
   const chart = useRef<KChart | null>(null);
@@ -211,7 +214,7 @@ export default function Chart({ symbol, price, lines, marks = [], slot = 0, comp
     let live = true;
     last.current = undefined;
     built.current = loadBuilt(symbol, res);
-    c.setSymbol({ ticker: symbol, pricePrecision: dp, volumePrecision: 2 });
+    c.setSymbol({ ticker: name, pricePrecision: dp, volumePrecision: 2 });
     c.setPeriod(period(res));
     c.setDataLoader({
       getBars: async ({ type, callback }) => {
@@ -244,7 +247,7 @@ export default function Chart({ symbol, price, lines, marks = [], slot = 0, comp
     return () => { live = false; };
   }, [symbol, res]);
 
-  useEffect(() => { chart.current?.setSymbol({ ticker: symbol, pricePrecision: dp, volumePrecision: 2 }); }, [dp]);
+  useEffect(() => { chart.current?.setSymbol({ ticker: name, pricePrecision: dp, volumePrecision: 2 }); }, [dp]);
 
   // The candle in progress follows the market's own price.
   useEffect(() => {
@@ -307,7 +310,7 @@ export default function Chart({ symbol, price, lines, marks = [], slot = 0, comp
     if (!url) return;
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${symbol}-${TIMEFRAMES.find(([, r]) => r === res)?.[0] ?? res}-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "")}.png`;
+    a.download = `${name.replace(/[^A-Za-z0-9-]/g, "-")}-${TIMEFRAMES.find(([, r]) => r === res)?.[0] ?? res}-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "")}.png`;
     a.click();
   };
 
@@ -368,7 +371,7 @@ export default function Chart({ symbol, price, lines, marks = [], slot = 0, comp
     <div className={`chart${full ? " full" : ""}${compact && !full ? " compact" : ""}`} ref={root}>
       <div className="chart-bar">
         {!full && head}
-        {full && <div className="chart-sym"><b>{symbol}-PERP</b><span>{price > 0 ? price.toFixed(dp) : ""}</span></div>}
+        {full && <div className="chart-sym"><b>{name}</b><span>{price > 0 ? price.toFixed(dp) : ""}</span></div>}
         <div className="seg-tf">
           {TIMEFRAMES.map(([label, r]) => (
             <button key={r} className={r === res ? "on" : ""} onClick={() => { setRes(r); try { localStorage.setItem(`pv:chart-res${own}`, String(r)); } catch { /* storage unavailable */ } }}>{label}</button>
@@ -395,8 +398,8 @@ export default function Chart({ symbol, price, lines, marks = [], slot = 0, comp
             </div>
           )}
         </div>
-        <div className="chart-src" title="Where the candles come from. The last one always follows this market's own oracle price.">
-          {source === "oracle" || source === "oracle+exchange" ? "Oracle price" : hasHistory(symbol) ? "Exchange history · live oracle price" : "Live oracle price"}
+        <div className="chart-src" title={spot ? "Where the candles come from: xDEX's record of this pair's swaps. The last one follows the pool's own price." : "Where the candles come from. The last one always follows this market's own oracle price."}>
+          {spot ? "xDEX swaps · live pool price" : source === "oracle" || source === "oracle+exchange" ? "Oracle price" : hasHistory(symbol) ? "Exchange history · live oracle price" : "Live oracle price"}
         </div>
         <div className="chart-acts">
           <button title="Zoom out" aria-label="Zoom out" onClick={() => chart.current?.zoomAtCoordinate(0.8, undefined, 150)}>
@@ -454,7 +457,7 @@ export default function Chart({ symbol, price, lines, marks = [], slot = 0, comp
         </div>
         <div className="chart-body">
           <div ref={el} className="chart-canvas" />
-          {empty && <div className="chart-empty">No price for {symbol} yet. The chart draws from this market's own price as it arrives.</div>}
+          {empty && <div className="chart-empty">{spot ? `No swaps recorded for ${name} in this window yet. The chart draws from the pool's own price as it moves.` : `No price for ${symbol} yet. The chart draws from this market's own price as it arrives.`}</div>}
         </div>
       </div>
     </div>

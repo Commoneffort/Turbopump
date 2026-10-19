@@ -9,7 +9,7 @@ import { view } from "./view";
 export const num = (x: bigint, scale: number) => Number(x) / scale;
 export const fmt = (x: number, dp = 2) => x.toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp });
 export const usd = (atoms: bigint, dp = 2) => `$${fmt(num(atoms, C.USDC), dp)}`;
-export const priceDp = (p: number) => (p >= 1000 ? 2 : p >= 1 ? 3 : 5);
+export const priceDp = (p: number) => (p >= 1000 ? 2 : p >= 1 ? 3 : p >= 0.01 || !(p > 0) ? 5 : Math.min(12, Math.ceil(-Math.log10(p)) + 3));
 export const px = (e6: bigint) => { const p = num(e6, 1e6); return `$${fmt(p, priceDp(p))}`; };
 export const units = (q: bigint) => fmt(num(q, Number(C.UNIT)), 4).replace(/\.?0+$/, "") || "0";
 export const shares = (s: bigint) => fmt(num(s, 10 ** C.SHARE_DECIMALS), 2);

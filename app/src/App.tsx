@@ -8,7 +8,7 @@ import * as C from "./chain";
 import { readDirect, view } from "./view";
 import Desk from "./Desk";
 import Docs from "./Docs";
-import SwapPage from "./Swap";
+import SpotDesk from "./Spot";
 import { TraderPage, TradersPage } from "./Traders";
 import { Card, Faucet, Icon, Send, Stat, Toast, ago, explorer, fmt, px, short, units, usd, useCards } from "./shared";
 
@@ -111,7 +111,8 @@ export default function App() {
     return () => document.removeEventListener("visibilitychange", on);
   }, [refresh]);
 
-  const desk = page === "" || page === "trade" || page === "m";
+  const spot = page === "spot" || page === "swap";
+  const desk = spot || page === "" || page === "trade" || page === "m";
   const tab = (on: boolean) => (on ? "tab active" : "tab");
 
   return (
@@ -125,8 +126,8 @@ export default function App() {
           <span className="brand-name">Turbopump</span>
         </a>
         <nav className="tabs">
-          <a className={tab(desk)} href="#/">Trade</a>
-          <a className={tab(page === "swap")} href="#/swap">Swap</a>
+          <a className={tab(desk && !spot)} href="#/">Trade</a>
+          <a className={tab(spot)} href="#/spot">Spot</a>
           <a className={tab(page === "markets")} href="#/markets">Markets</a>
           <a className={tab(page === "launch")} href="#/launch">Open a market</a>
           <a className={tab(page === "traders" || page === "trader" || page === "leaderboard")} href="#/leaderboard">Leaderboard</a>
@@ -141,7 +142,9 @@ export default function App() {
         </div>
       </header>
 
-      {desk ? (
+      {spot ? (
+        <SpotDesk route={route} send={send} busy={busy} tick={tick} go={go} />
+      ) : desk ? (
         <Desk route={route} send={send} busy={busy} tick={tick} go={go} />
       ) : (
         <div className="page">
@@ -154,8 +157,6 @@ export default function App() {
           )}
           {page === "launch" ? (
             <LaunchPage key={route[1] ?? ""} send={send} busy={busy} go={go} initial={route[1]} />
-          ) : page === "swap" ? (
-            <SwapPage send={send} busy={busy} tick={tick} />
           ) : page === "how" || page === "docs" ? (
             <Docs />
           ) : page === "traders" || page === "leaderboard" ? (

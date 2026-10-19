@@ -26,9 +26,10 @@ export const USDC_POOL = (() => {
   return PublicKey.findProgramAddressSync([Buffer.from("pool"), XDEX.ammConfig.toBuffer(), m0.toBuffer(), m1.toBuffer()], XDEX.program)[0];
 })();
 
-export type ListedPool = { pool: string; a: { mint: string; symbol: string }; b: { mint: string; symbol: string }; tvl: number; volume: number };
+type Listed = { mint: string; symbol: string; price: number; volume: number };
+export type ListedPool = { pool: string; a: Listed; b: Listed; tvl: number; volume: number; txns: number };
 
-/** xDEX's pool list for this network (through our /api/pools). */
+/** xDEX's pool list for this network (through our /api/pools, which also serves the charts' history). */
 export async function listPools(): Promise<ListedPool[]> {
   const r = await fetch(`/api/pools?network=${C.NETWORK}`);
   const j = await r.json();
@@ -68,9 +69,10 @@ function mintProblem(owner: PublicKey, d: Uint8Array): string | undefined {
   return undefined;
 }
 
+export const NOT_A_POOL = "not an xDEX pool";
 export async function readPool(conn: Connection, poolKey: PublicKey): Promise<Pool> {
   const pa = await conn.getAccountInfo(poolKey);
-  if (!pa || !pa.owner.equals(XDEX.program) || pa.data.length !== 637) throw new Error("not an xDEX pool");
+  if (!pa || !pa.owner.equals(XDEX.program) || pa.data.length !== 637) throw new Error(NOT_A_POOL);
   const d = pa.data;
   const p = {
     ammConfig: key(d, 8), vaults: [key(d, 72), key(d, 104)] as [PublicKey, PublicKey], mints: [key(d, 168), key(d, 200)] as [PublicKey, PublicKey],
@@ -145,3 +147,49 @@ export function swapInstructions(wallet: PublicKey, p: Pool, from: 0 | 1, q: Quo
   return ixs;
 }
 
+
+// ---------------------------------------------------------------- pairs
+
+/** A pool as a trading pair: `base` is what is bought and sold, priced in `quote`. The quote is
+ *  USDC where the pool has it, else the chain's coin, else the pool's second token. */
+export function pairOf(mints: [PublicKey, PublicKey] | [string, string], symbols?: [string, string]): { base: 0 | 1; quote: 0 | 1 } {
+  const m = mints.map(String), usdc = C.MINT.toBase58(), coin = NATIVE_MINT.toBase58();
+  const isUsd = (i: number) => m[i] === usdc || /USD/i.test(symbols?.[i] ?? "");
+  const quote: 0 | 1 = isUsd(0) && !isUsd(1) ? 0 : isUsd(1) ? 1 : m[0] === coin ? 0 : 1;
+  return { base: (1 - quote) as 0 | 1, quote };
+}
+
+/** The chart's symbol for a pair (Chart.tsx reads its history from xDEX when it sees one). */
+export const spotSymbol = (base: PublicKey | string, quote: PublicKey | string) => `spot:${base}:${quote}`;
+export const isSpot = (symbol: string) => symbol.startsWith("spot:");
+
+/** Price history of a spot symbol, oldest first. */
+export async function spotCandles(symbol: string, res: number, limit: number): Promise<[number, number, number, number, number, number][]> {
+  const [, from, to] = symbol.split(":");
+  const r = await fetch(`/api/pools?network=${C.NETWORK}&candles=1&from=${from}&to=${to}&res=${res}&limit=${limit}`);
+  const j = await r.json();
+  return Array.isArray(j?.candles) ? j.candles : [];
+}
+
+/** The base token's price in the quote token, in whole tokens, from the pool's reserves. */
+export function poolPrice(p: Pool, base: 0 | 1): number {
+  const q = (1 - base) as 0 | 1;
+  const b = Number(p.reserves[base]) / 10 ** p.decimals[base], x = Number(p.reserves[q]) / 10 ** p.decimals[q];
+  return b > 0 ? x / b : 0;
+}
+
+/** How much base the pool holds between its price and `move` above it (bought) or below it
+ *  (sold), fees aside: on a constant-product pool the price moves with the square of a reserve. */
+export function depthAt(p: Pool, base: 0 | 1, move: number): number {
+  const rb = Number(p.reserves[base]) / 10 ** p.decimals[base];
+  return move > 0 ? rb * (1 - 1 / Math.sqrt(1 + move)) : rb * (1 / Math.sqrt(1 + move) - 1);
+}
+
+export type SpotTrade = { sig: string; time: number; signer: string; inMint: string; outMint: string; inAmount: number; outAmount: number };
+
+/** A pool's latest swaps as xDEX recorded them (only `signer`'s, when given). */
+export async function spotTrades(pool: PublicKey, signer?: PublicKey): Promise<SpotTrade[]> {
+  const r = await fetch(`/api/pools?network=${C.NETWORK}&trades=${pool}${signer ? `&signer=${signer}` : ""}`);
+  const j = await r.json();
+  return Array.isArray(j?.trades) ? j.trades : [];
+}
