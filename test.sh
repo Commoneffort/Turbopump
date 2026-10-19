@@ -12,4 +12,4 @@ cargo test "$@"
 # The X1 build (reported prices instead of Pyth): its own binaries, its own tests.
 cargo build-sbf --tools-version v1.53 --features x1 --sbf-out-dir target/deploy-x1-test >/dev/null 2>&1 || cargo build-sbf --tools-version v1.53 --features x1 --sbf-out-dir target/deploy-x1-test
 (cd router && cargo build-sbf --tools-version v1.53 --features x1 --sbf-out-dir ../target/deploy-x1-test >/dev/null 2>&1 || cargo build-sbf --tools-version v1.53 --features x1 --sbf-out-dir ../target/deploy-x1-test)
-cargo test --features x1 --test x1 "$@"
+cargo test --features x1 --test x1 --test swap "$@"

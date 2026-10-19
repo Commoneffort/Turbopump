@@ -26,6 +26,7 @@
 pub mod client;
 pub mod social;
 pub mod state;
+pub mod swap;
 
 use solana_program::msg;
 use bytemuck::Zeroable;
@@ -272,6 +273,7 @@ pub const TAG_WRITE_BADGE_IMAGE: u8 = 26;
 pub const TAG_REMOVE_BADGE_IMAGE: u8 = 27;
 pub const TAG_FEATURE: u8 = 28;
 pub const TAG_SET_TIER: u8 = 29;
+pub const TAG_SWAP: u8 = 30;
 /// Widest trail, in basis points.
 pub const MAX_TRAIL_BPS: u64 = 5_000;
 /// Shortest time between two slices of a TWAP order, and the most slices one can have.
@@ -331,6 +333,8 @@ pub enum RouterError {
     /// A badge picture that is not a JPEG of at most `BADGE_MAX_BYTES`, or bytes written out of
     /// order or past its end.
     BadImage,
+    /// `Swap` delivered less than its `min_out` to the output account.
+    Slippage,
 }
 
 impl From<RouterError> for ProgramError {
@@ -378,6 +382,7 @@ pub fn process_instruction(program_id: &Pubkey, accounts: &[AccountInfo], data: 
         TAG_REMOVE_BADGE_IMAGE => social::remove_badge_image(program_id, accounts),
         TAG_FEATURE => social::feature(program_id, accounts),
         TAG_SET_TIER => set_tier(program_id, accounts),
+        TAG_SWAP => swap::swap(accounts, rest),
         _ => Err(RouterError::InvalidInstruction.into()),
     }
 }

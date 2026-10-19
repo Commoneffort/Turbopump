@@ -559,3 +559,65 @@ pub fn convert_pnl(t: &TraderKeys) -> Instruction {
         data: vec![TAG_CONVERT_PNL],
     }
 }
+
+/// An xDEX pool's accounts, read from its pool account (Raydium CP-Swap layout).
+#[derive(Clone, Copy, Debug)]
+pub struct XdexPool {
+    /// The xDEX program the pool belongs to (`swap::XDEX_PROGRAM` for this build's network).
+    pub program: Pubkey,
+    pub pool: Pubkey,
+    pub amm_config: Pubkey,
+    pub vault0: Pubkey,
+    pub vault1: Pubkey,
+    pub mint0: Pubkey,
+    pub mint1: Pubkey,
+    pub program0: Pubkey,
+    pub program1: Pubkey,
+    pub observation: Pubkey,
+}
+
+impl XdexPool {
+    pub fn from_data(program: Pubkey, pool: Pubkey, d: &[u8]) -> Self {
+        let k = |o: usize| Pubkey::new_from_array(d[o..o + 32].try_into().unwrap());
+        Self { program, pool, amm_config: k(8), vault0: k(72), vault1: k(104), mint0: k(168), mint1: k(200), program0: k(232), program1: k(264), observation: k(296) }
+    }
+    /// The pool's signing address for its vaults.
+    pub fn authority(&self) -> Pubkey {
+        Pubkey::find_program_address(&[b"vault_and_lp_mint_auth_seed"], &self.program).0
+    }
+}
+
+/// Swaps `amount_in` (fee included) of token 0 for token 1 (`zero_for_one`) or the reverse, for
+/// at least `min_out` arriving in `output`. `fee_account` is the treasury's account of the input mint.
+pub fn swap(wallet: &Pubkey, fee_account: &Pubkey, p: &XdexPool, zero_for_one: bool, input: &Pubkey, output: &Pubkey, amount_in: u64, min_out: u64) -> Instruction {
+    let (in_vault, out_vault, in_prog, out_prog, in_mint, out_mint) = if zero_for_one {
+        (p.vault0, p.vault1, p.program0, p.program1, p.mint0, p.mint1)
+    } else {
+        (p.vault1, p.vault0, p.program1, p.program0, p.mint1, p.mint0)
+    };
+    let mut data = vec![TAG_SWAP];
+    data.extend_from_slice(&amount_in.to_le_bytes());
+    data.extend_from_slice(&min_out.to_le_bytes());
+    Instruction {
+        program_id: id(),
+        accounts: vec![
+            AccountMeta::new(*wallet, true),
+            w(*fee_account),
+            ro(p.program),
+            AccountMeta::new(*wallet, true),
+            ro(p.authority()),
+            ro(p.amm_config),
+            w(p.pool),
+            w(*input),
+            w(*output),
+            w(in_vault),
+            w(out_vault),
+            ro(in_prog),
+            ro(out_prog),
+            ro(in_mint),
+            ro(out_mint),
+            w(p.observation),
+        ],
+        data,
+    }
+}

@@ -8,6 +8,7 @@ import * as C from "./chain";
 import { readDirect, view } from "./view";
 import Desk from "./Desk";
 import Docs from "./Docs";
+import SwapPage from "./Swap";
 import { TraderPage, TradersPage } from "./Traders";
 import { Card, Faucet, Icon, Send, Stat, Toast, ago, explorer, fmt, px, short, units, usd, useCards } from "./shared";
 
@@ -43,6 +44,8 @@ const ERRORS: Record<string, string> = {
   "0x5715": "a name is 3 to 16 letters, digits or underscores",
   "0x5716": "that name is taken",
   "0x5717": "the account is already in line with the trader it copies",
+  "0x571b": "the price moved: you would receive less than the least you accepted. Try again, or allow more slippage",
+  "0x1775": "the price moved past your slippage limit (xDEX): try again, or allow more slippage",
 };
 
 function useSend(onDone: () => void): [Send, string | undefined, Toast | undefined, () => void] {
@@ -123,6 +126,7 @@ export default function App() {
         </a>
         <nav className="tabs">
           <a className={tab(desk)} href="#/">Trade</a>
+          <a className={tab(page === "swap")} href="#/swap">Swap</a>
           <a className={tab(page === "markets")} href="#/markets">Markets</a>
           <a className={tab(page === "launch")} href="#/launch">Open a market</a>
           <a className={tab(page === "traders" || page === "trader" || page === "leaderboard")} href="#/leaderboard">Leaderboard</a>
@@ -150,6 +154,8 @@ export default function App() {
           )}
           {page === "launch" ? (
             <LaunchPage key={route[1] ?? ""} send={send} busy={busy} go={go} initial={route[1]} />
+          ) : page === "swap" ? (
+            <SwapPage send={send} busy={busy} tick={tick} />
           ) : page === "how" || page === "docs" ? (
             <Docs />
           ) : page === "traders" || page === "leaderboard" ? (
