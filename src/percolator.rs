@@ -133,6 +133,7 @@ pub fn expect_market(ai: &AccountInfo) -> Result<(), ProgramError> {
 // ---- market config and asset price (offsets pinned to Percolator's types in tests/vault.rs) ----
 pub const MARKET_CONFIG_OFF: usize = 464 + 32;
 pub const CONFIG_INITIAL_MARGIN_BPS: usize = 62;
+pub const CONFIG_MAINTENANCE_MARGIN_BPS: usize = 54;
 pub const CONFIG_MIN_NONZERO_IM_REQ: usize = 22;
 pub const CONFIG_MAX_TRADING_FEE_BPS: usize = 70;
 pub const WRAPPER_TRADE_FEE_BASE_BPS: usize = HEADER_LEN + 128;
@@ -165,6 +166,12 @@ pub fn margin_params(d: &[u8]) -> Result<(u64, u128, u64), ProgramError> {
         rd_u128(d, MARKET_CONFIG_OFF + CONFIG_MIN_NONZERO_IM_REQ)?,
         rd_u64(d, WRAPPER_TRADE_FEE_BASE_BPS)?,
     ))
+}
+
+/// Percolator's own maintenance margin (bps): below it, Percolator itself liquidates (which makes
+/// the asset close-only), so the router's liquidation level is kept above it.
+pub fn maintenance_margin_bps(d: &[u8]) -> Result<u64, ProgramError> {
+    rd_u64(d, MARKET_CONFIG_OFF + CONFIG_MAINTENANCE_MARGIN_BPS)
 }
 
 /// The most Percolator lets a trade be charged, in bps of its notional.

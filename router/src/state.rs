@@ -9,6 +9,7 @@ pub const TRADER_MAGIC: u64 = u64::from_le_bytes(*b"PRTRADR1");
 pub const BOOK_MAGIC: u64 = u64::from_le_bytes(*b"PRBOOK01");
 pub const REQUEST_MAGIC: u64 = u64::from_le_bytes(*b"PRREQST1");
 pub const ORDER_MAGIC: u64 = u64::from_le_bytes(*b"PRORDER1");
+pub const TIERS_MAGIC: u64 = u64::from_le_bytes(*b"PRTIERS1");
 pub const MAX_PENDING: usize = 32;
 /// Standing orders one wallet can have on one vault's market.
 pub const MAX_ORDERS: u8 = 8;
@@ -20,6 +21,7 @@ pub const SEED_COLLATERAL: &[u8] = b"collateral";
 pub const SEED_BOOK: &[u8] = b"book";
 pub const SEED_REQUEST: &[u8] = b"request";
 pub const SEED_ORDER: &[u8] = b"order";
+pub const SEED_TIERS: &[u8] = b"tiers";
 
 /// A trader's router account. Its address owns the trader's Percolator portfolio and collateral
 /// token account; only the router can sign for it.
@@ -408,6 +410,27 @@ pub fn portfolio_address(program_id: &Pubkey, market: &Pubkey, wallet: &Pubkey) 
 pub fn collateral_address(program_id: &Pubkey, market: &Pubkey, wallet: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[SEED_COLLATERAL, market.as_ref(), wallet.as_ref()], program_id)
 }
+/// How many asset slots a market's tier record covers. A slot past it has the default tier.
+pub const TIER_SLOTS: usize = 64;
+/// Each asset's leverage tier on one market (see `percolator_router::tier_levels`), written by
+/// the permissionless `SetTier` from the asset's own vault. A tier counts only while the asset's
+/// generation (`market_id`) is the one it was written for: a retired slot reused by another
+/// asset falls back to the default tier until its vault sets it again.
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+#[repr(C, packed)]
+pub struct Tiers {
+    pub magic: u64,
+    pub market: Pubkey,
+    pub bump: u8,
+    pub _pad: [u8; 7],
+    pub tier: [u8; TIER_SLOTS],
+    pub generation: [u64; TIER_SLOTS],
+}
+pub const TIERS_LEN: usize = core::mem::size_of::<Tiers>();
+pub fn tiers_address(program_id: &Pubkey, market: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[SEED_TIERS, market.as_ref()], program_id)
+}
+
 pub fn book_address(program_id: &Pubkey, vault: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[SEED_BOOK, vault.as_ref()], program_id)
 }

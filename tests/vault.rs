@@ -413,6 +413,7 @@ fn market_offsets_match_engine() {
     use percolator::{AssetStateV16Account as A, PortfolioAccountV16Account as P, PortfolioLegV16Account as L, V16ConfigAccount as C};
     assert_eq!(perc::MARKET_CONFIG_OFF, c::MARKET_GROUP_OFF + offset_of!(percolator::MarketGroupV16HeaderAccount, config));
     assert_eq!(perc::CONFIG_INITIAL_MARGIN_BPS, offset_of!(C, initial_margin_bps));
+    assert_eq!(perc::CONFIG_MAINTENANCE_MARGIN_BPS, offset_of!(C, maintenance_margin_bps));
     assert_eq!(perc::CONFIG_MIN_NONZERO_IM_REQ, offset_of!(C, min_nonzero_im_req));
     assert_eq!(perc::CONFIG_MAX_TRADING_FEE_BPS, offset_of!(C, max_trading_fee_bps));
     assert_eq!(perc::WRAPPER_TRADE_FEE_BASE_BPS, c::HEADER_LEN + offset_of!(percolator_prog::state::WrapperConfigV16, trade_fee_base_bps));
@@ -698,13 +699,24 @@ fn export_layout_for_frontend() {
             "stress_bps": percolator_router::STRESS_BPS as u64,
             "liquidation_bps": percolator_router::LIQUIDATION_BPS as u64,
             "reserve_bps": percolator_vault::processor::RESERVE_BPS,
+            "insurance_nav_bps": percolator_vault::processor::INSURANCE_NAV_BPS,
+            "behind_refund_slots": percolator_router::BEHIND_REFUND_SLOTS,
             "fallback_secs": percolator_vault::reporter::FALLBACK_SECS,
             "im_bps_off": perc::MARKET_CONFIG_OFF + perc::CONFIG_INITIAL_MARGIN_BPS,
             "min_im_off": perc::MARKET_CONFIG_OFF + perc::CONFIG_MIN_NONZERO_IM_REQ,
             "fee_bps_off": perc::WRAPPER_TRADE_FEE_BASE_BPS,
             "bond_lamports": percolator_router::BOND_LAMPORTS,
             "expiry_deposit_bps": percolator_router::EXPIRY_DEPOSIT_BPS as u64,
-            "lamports_per_atom": percolator_router::LAMPORTS_PER_ATOM
+            "lamports_per_atom": percolator_router::LAMPORTS_PER_ATOM,
+            "expiry_deposit_cap": percolator_router::EXPIRY_DEPOSIT_CAP,
+            "mm_bps_off": perc::MARKET_CONFIG_OFF + perc::CONFIG_MAINTENANCE_MARGIN_BPS,
+            "tiers": f!(percolator_router::state::Tiers, 0, magic, market, tier, generation),
+            "tiers_len": size_of::<percolator_router::state::Tiers>(),
+            "tier_slots": percolator_router::state::TIER_SLOTS,
+            "tier_levels": [percolator_router::tier_levels(0), percolator_router::tier_levels(1)],
+            "major_feeds": percolator_router::MAJOR_FEEDS.iter().map(|f| f.iter().map(|b| format!("{b:02x}")).collect::<String>()).collect::<Vec<_>>(),
+            "liq_above_engine_bps": percolator_router::LIQ_ABOVE_ENGINE_BPS,
+            "open_above_liq_bps": percolator_router::OPEN_ABOVE_LIQ_BPS
         },
         "market_header": {
             "next_market_id": percolator_prog::constants::MARKET_GROUP_OFF + offset_of!(percolator::MarketGroupV16HeaderAccount, next_market_id),
@@ -829,9 +841,11 @@ fn retire_ix(w: &World) -> solana_sdk::instruction::Instruction {
 fn anyone_can_bring_the_trade_fee_to_the_programs_value() {
     let mut w = World::new();
     w.env.set_clock(5, 1_000);
-    w.env.update_trade_fee_policy(5).unwrap();
+    // Start the market somewhere else than the program's value (it was 10 bps before 2026-10-18).
+    let start = processor::CANON_TRADE_FEE_BPS * 2;
+    w.env.update_trade_fee_policy(start).unwrap();
     let fee = |w: &World| perc::trade_fee_base_bps(&w.env.market_data(false)).unwrap();
-    assert_eq!(fee(&w), 5);
+    assert_eq!(fee(&w), start);
     let ix = |w: &World| {
         let seq = w.env.primary_control_sequences(0);
         client::set_trade_fee(&pid(), &w.env.market, seq.authority_epoch, seq.trade_fee + 1)
@@ -847,7 +861,7 @@ fn anyone_can_bring_the_trade_fee_to_the_programs_value() {
     let seq = w.env.primary_control_sequences(0);
     let stale = client::set_trade_fee(&pid(), &w.env.market, seq.authority_epoch, seq.trade_fee);
     assert!(w.send(vec![stale], &[]).is_err());
-    assert_eq!(fee(&w), 5);
+    assert_eq!(fee(&w), start);
     w.send(vec![ix(&w)], &[]).unwrap();
     assert_eq!(fee(&w), processor::CANON_TRADE_FEE_BPS);
     assert!(w.send(vec![ix(&w)], &[]).is_err(), "nothing left to change");
@@ -943,4 +957,19 @@ fn idle_market_is_retired_and_its_slot_reused() {
 
     // A freshly listed market cannot be retired before it has had time to attract liquidity.
     assert!(w.send(vec![retire_ix(&w)], &[]).unwrap_err().contains("0x5616"), "too soon after listing");
+}
+
+/// The insurance a live vault keeps before harvesting grows with the vault: its floor, or 3% of
+/// its value in the deployed builds (the test build keeps the floor only).
+#[test]
+fn the_insurance_kept_grows_with_the_vault() {
+    use percolator_vault::processor::insurance_kept_at;
+    use percolator_vault::state::VaultState;
+    let mut v: VaultState = bytemuck::Zeroable::zeroed();
+    v.insurance_floor = 100_000_000;
+    v.last_nav = 1_000_000_000; // 1,000: 3% is 30, under the floor of 100
+    assert_eq!(insurance_kept_at(&v, 300), 100_000_000);
+    v.last_nav = 30_000_000_000; // 30,000: 3% is 900
+    assert_eq!(insurance_kept_at(&v, 300), 900_000_000);
+    assert_eq!(insurance_kept_at(&v, 0), 100_000_000);
 }

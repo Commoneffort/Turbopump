@@ -217,7 +217,9 @@ export function decodeVault(k: PublicKey, d: Uint8Array): Vault {
     feesHarvested: u64(d, v.total_fees_harvested),
     maxFill: u128(d, v.max_fill_abs),
     maxInventory: u128(d, v.max_inventory_abs),
-    insuranceFloor: u64(d, v.insurance_floor),
+    // What the vault keeps as insurance before harvesting: its floor or 3% of its value
+    // (the program's insurance_kept / INSURANCE_NAV_BPS).
+    insuranceFloor: (() => { const f = u64(d, v.insurance_floor), n = u64(d, v.last_nav) * BigInt(R.insurance_nav_bps ?? 300) / 10_000n; return f > n ? f : n; })(),
     createdSlot: u64(d, v.created_slot),
     canonical: d[v.vault_kind] === 1,
     positionNavBps: u16(d, v.position_nav_bps),
@@ -461,9 +463,22 @@ export function claim(v: Vault, user: PublicKey, epoch: bigint) {
 
 export const OPENER_FEE_BPS = 500;
 /** The fee each side of a trade pays, fixed by the vault program (CANON_TRADE_FEE_BPS). */
-export const TRADE_FEE_BPS = 10;
-/** The fee was 5 bps until this slot (2026-10-09): older fills in a history are shown at that. */
-export const feeBpsAt = (slot: number) => (slot >= (X1 ? 194_112_461 : 509_124_939) ? TRADE_FEE_BPS : 5);
+export const TRADE_FEE_BPS = 5;
+/** Markets whose fee changed while they were live: [from slot, bps], oldest first. Older fills in
+ *  a history are shown at the fee of their time; any other market has always charged TRADE_FEE_BPS. */
+/** Slot at which the devnet market of 2026-10-17 went from 10 to 5 bps (set when it was changed). */
+const DEVNET_FEE_CUT_SLOT = 512_877_475;
+const FEE_HISTORY: Record<string, [number, number][]> = {
+  EmNL4qAvngUBAga4Wv3DWkQbtRAJfXq61NhdpzeGWaoJ: [[0, 5], [194_112_461, 10], [196_635_129, 5]], // X1 market of 2026-10-01
+  "35XfkPtqC3jL2hQEMakwoi6TqtCVnLAkHTghfcz64tb7": [[0, 10], [DEVNET_FEE_CUT_SLOT, 5]], // devnet market of 2026-10-17
+};
+export const feeBpsAt = (slot: number) => {
+  const h = FEE_HISTORY[MARKET.toBase58()];
+  if (!h) return TRADE_FEE_BPS;
+  let bps = h[0][1];
+  for (const [from, b] of h) if (slot >= from) bps = b;
+  return bps;
+};
 export const TRADE_FEE_PCT = `${(TRADE_FEE_BPS / 100).toFixed(2)}%`;
 
 export function claimOpenerFees(v: Vault, opener: PublicKey) {
@@ -553,6 +568,7 @@ export async function marketSnapshot(conn: Connection): Promise<MarketSnapshot> 
     conn.getSlot("confirmed"),
     conn.getProgramAccounts(PERCOLATOR, { commitment: "confirmed", filters: [{ dataSize: PORTFOLIO_LEN }, { memcmp: { offset: 16, bytes: MARKET.toBase58() } }] }),
   ]);
+  await fetchTiers(conn).catch(() => {}); // the margins and liquidation levels below depend on it
   return { market: new Uint8Array(m!.data), slot, portfolios: accs.map(a => ({ pubkey: a.pubkey, data: new Uint8Array(a.account.data) })) };
 }
 
@@ -694,8 +710,10 @@ export async function fetchVault(conn: Connection, vaultKey: PublicKey, user?: P
   if (user) keys.push(ticketAddress(v.key, user), ata(user, MINT), ata(user, v.shareMint), pf!, traderAddress(user));
   const firstOrder = keys.length;
   if (user) for (let i = 0; i < MAX_ORDERS; i++) keys.push(orderAddress(v.key, user, i));
+  keys.push(tiersAddress()); // last: the market's tier record (margins depend on it)
   const [accs, slot] = await Promise.all([conn.getMultipleAccountsInfo(keys, "confirmed"), conn.getSlot("confirmed")]);
   const data = (i: number) => (accs[i] ? new Uint8Array(accs[i]!.data) : undefined);
+  setTiers(data(keys.length - 1));
   const tokenAmount = (d?: Uint8Array) => (d ? u64(d, 64) : 0n);
   const book = data(5) ? decodeBook(data(5)!) : undefined;
   const trader = user && data(10) ? decodeTrader(data(10)!) : undefined;
@@ -711,6 +729,8 @@ export async function fetchVault(conn: Connection, vaultKey: PublicKey, user?: P
     asset: decodeAsset(data(0)!, v.assetIndex),
     lp: decodePortfolio(data(1)!, v.assetIndex, data(0)!),
     closeOnly: closeOnly(data(0)!, v.assetIndex),
+    /** This asset's margins (bps): to open, below which it is liquidated, Percolator's own; and its tier. */
+    levels: levels(data(0)!, v.assetIndex),
     buffer: tokenAmount(data(2)),
     shareSupply: data(3) ? u64(data(3)!, 36) : 0n,
     pyth: data(4) ? decodePrice(data(4)!) : undefined,
@@ -755,8 +775,37 @@ export function accountHealth(market: Uint8Array, portfolio: Uint8Array) {
     if (size !== 0n) positions.push({ asset, size, price, notional: n });
   }
   const equity = u128(portfolio, P.capital) + i128(portfolio, P.pnl);
-  return { equity, notional, settled, positions, liquidatable: settled && notional > 0n && equity * 10_000n < notional * LIQUIDATION_BPS };
+  // Below the sum of each position's notional times its tier's liquidation level (router `liquidatable`).
+  const floor = positions.reduce((t, p) => t + p.notional * levels(market, p.asset).liq, 0n);
+  return { equity, notional, settled, positions, floor: floor / 10_000n, liquidatable: settled && notional > 0n && (equity <= 0n || equity * 10_000n < floor) };
 }
+
+// ---- leverage tiers (the router's `levels`): majors open at 20x, the rest at 10x ----
+export const TIER_DEFAULT = 0, TIER_MAJOR = 1;
+export const MAJOR_FEEDS: string[] = (L.router as any).major_feeds ?? [];
+export const tierOfFeed = (hex: string) => (MAJOR_FEEDS.includes(hex) ? TIER_MAJOR : TIER_DEFAULT);
+export const tiersAddress = () => rpda(Buffer.from("tiers"), MARKET.toBuffer());
+/** The market's tier record as last read with the market (fetchVault, marketSnapshot, fetchTiers). */
+let TIERS: Uint8Array | null = null;
+export const setTiers = (d?: Uint8Array | null) => { TIERS = d && d.length === (L.router as any).tiers_len ? d : null; };
+export async function fetchTiers(conn: Connection) { const a = await conn.getAccountInfo(tiersAddress(), "confirmed"); setTiers(a ? new Uint8Array(a.data) : null); return TIERS; }
+/** bps to open, bps below which it is liquidated, and Percolator's own maintenance margin, for
+ *  `asset`: a mirror of the router's `levels` (never below what Percolator requires; without the
+ *  record, open as the default tier and liquidate as a major). */
+export function levels(market: Uint8Array, asset: number, tiers: Uint8Array | null = TIERS) {
+  const RR = L.router as any;
+  const im = u64(market, RR.im_bps_off), mm = u64(market, RR.mm_bps_off);
+  const generation = u64(market, L.market.slots + asset * L.market.slot_len + L.market.engine + L.market.market_id);
+  const known = tiers && asset < RR.tier_slots && u64(tiers, RR.tiers.generation + asset * 8) === generation ? tiers[RR.tiers.tier + asset] : undefined;
+  const openTier = known ?? TIER_DEFAULT, liqTier = known ?? (tiers ? TIER_DEFAULT : TIER_MAJOR);
+  const lv = (t: number) => (RR.tier_levels[t === TIER_MAJOR ? 1 : 0] as number[]).map(BigInt);
+  const liqOf = (t: number) => { const a = lv(t)[1], b = mm + BigInt(RR.liq_above_engine_bps); return a > b ? a : b; };
+  const ol = liqOf(openTier) + BigInt(RR.open_above_liq_bps);
+  let open = lv(openTier)[0]; if (im > open) open = im; if (ol > open) open = ol;
+  return { open, liq: liqOf(liqTier), mm, tier: known ?? TIER_DEFAULT };
+}
+/** The most leverage a position on `asset` opens at (10_000 / its opening margin). */
+export const maxLeverage = (market: Uint8Array, asset: number) => Number(10_000n * 10n / levels(market, asset).open) / 10;
 
 /** True while a market is close-only: a position on it was reduced unilaterally (the vault's
  *  Unwind, a liquidation), which deleverages the other side, and Percolator then refuses every
@@ -776,30 +825,31 @@ export function openPositions(portfolio: Uint8Array): number {
 }
 
 /** The largest position (absolute, in position units) on `asset` that the router's margin check
- *  at request time accepts for this portfolio: equity must cover initial margin and fees on every
- *  position after a further `stress_bps` price move, plus that move as a loss (the router's
- *  `margin_covers`). A trade that only shrinks a position is always accepted. */
+ *  at request time accepts for this portfolio: equity must cover every position's opening margin
+ *  (its tier's, see `levels`) and fees, after a further `stress_bps` price move, plus that move
+ *  as a loss (the router's `margin_covers`). A trade that only shrinks a position is always accepted. */
 export function marginRoom(market: Uint8Array, portfolio: Uint8Array, asset: number): bigint {
   const R = L.router, P = L.portfolio;
   const price = (a: number) => u64(market, L.market.slots + a * L.market.slot_len + L.market.engine + L.market.effective_price);
-  let other = 0n;
+  const stress = BigInt(R.stress_bps), fee = marketRates(market).feeBps;
+  // A position's need per unit of notional, scaled by 1e8.
+  const perUnit = (a: number) => (10_000n + stress) * (levels(market, a).open + fee) + stress * 10_000n;
+  let otherNeed = 0n;
   for (let i = 0; i < 16; i++) {
     const leg = P.legs + i * P.leg_len;
     if (portfolio[leg + L.leg.active] !== 1) continue;
     const a = u32(portfolio, leg + L.leg.asset_index);
     const q = legPosition(market, portfolio, leg);
-    if (a !== asset) other += (q < 0n ? -q : q) * price(a) / UNIT;
+    if (a !== asset) otherNeed += (q < 0n ? -q : q) * price(a) / UNIT * perUnit(a);
   }
   const equity = u128(portfolio, P.capital) + i128(portfolio, P.pnl);
-  const stress = BigInt(R.stress_bps), rate = u64(market, R.im_bps_off) + marketRates(market).feeBps;
-  // need(total) = total * perUnit / 1e8 + minimum
-  const perUnit = (10_000n + stress) * rate + stress * 10_000n;
-  const total = (equity - u128(market, R.min_im_off)) * 100_000_000n / perUnit - other;
+  const total = ((equity - u128(market, R.min_im_off)) * 100_000_000n - otherNeed) / perUnit(asset);
   const p = price(asset);
   return total > 0n && p > 0n ? total * UNIT * 999n / (p * 1000n) : 0n;
 }
 
-/** The market's trading fee and initial (= maintenance) margin, in basis points of notional. */
+/** The market's trading fee and Percolator's own initial margin, in basis points of notional
+ *  (what a position needs is per asset: `levels`). */
 export const marketRates = (market: Uint8Array) => ({ feeBps: u64(market, L.router.fee_bps_off), marginBps: u64(market, L.router.im_bps_off) });
 
 export const navOf = (s: State) =>
@@ -825,7 +875,9 @@ export const ROUTER_BOND_LAMPORTS = X1 ? 20_000_000 : R.bond_lamports;
  *  kept only if the request expires after its price had arrived. */
 export const EXPIRY_DEPOSIT_BPS: number = R.expiry_deposit_bps;
 export const LAMPORTS_PER_ATOM = X1 ? 5_000 : R.lamports_per_atom;
-export const expiryDeposit = (size: bigint, priceE6: bigint) => (size < 0n ? -size : size) * priceE6 / UNIT * BigInt(EXPIRY_DEPOSIT_BPS) / 10_000n * BigInt(LAMPORTS_PER_ATOM);
+/** The most a request's deposit can be (router `EXPIRY_DEPOSIT_CAP`): 5 XNT on X1, 0.01 SOL on Solana. */
+export const EXPIRY_DEPOSIT_CAP = X1 ? 5_000_000_000n : 10_000_000n;
+export const expiryDeposit = (size: bigint, priceE6: bigint) => { const d = (size < 0n ? -size : size) * priceE6 / UNIT * BigInt(EXPIRY_DEPOSIT_BPS) / 10_000n * BigInt(LAMPORTS_PER_ATOM); return d < EXPIRY_DEPOSIT_CAP ? d : EXPIRY_DEPOSIT_CAP; };
 export const TRADER_LEN = R.trader_len;
 const rpda = (...seeds: (Uint8Array | Buffer)[]) => PublicKey.findProgramAddressSync(seeds, ROUTER)[0];
 export const routerAuthority = () => rpda(Buffer.from("authority"));
@@ -907,7 +959,7 @@ export const cancelOrder = (wallet: PublicKey, vault: PublicKey, index: number) 
 /** Carries a standing order out (anyone may). */
 export const triggerOrder = (payer: PublicKey, o: StandingOrder) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [rw(payer, true), rw(o.key), rw(traderAddress(o.wallet)), rw(o.wallet), ro(o.vault), rw(bookAddress(o.vault)), rw(requestAddress(o.vault, o.wallet)), ro(MARKET), ro(routerPortfolio(o.wallet)), ro(SystemProgram.programId)],
+  keys: [rw(payer, true), rw(o.key), rw(traderAddress(o.wallet)), rw(o.wallet), ro(o.vault), rw(bookAddress(o.vault)), rw(requestAddress(o.vault, o.wallet)), ro(MARKET), ro(routerPortfolio(o.wallet)), ro(SystemProgram.programId), ro(tiersAddress())],
   data: new W().u8(14).done(),
 });
 /** What an order would do at mark price `mark` with the wallet's position `held`, as the router
@@ -973,7 +1025,7 @@ export const openBook = (payer: PublicKey, vault: PublicKey) => new TransactionI
 /** Queues a trade; `id` is the book's next id. It cannot be cancelled. */
 export const requestTrade = (wallet: PublicKey, vault: PublicKey, size: bigint) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [rw(wallet, true), rw(traderAddress(wallet)), ro(vault), rw(bookAddress(vault)), rw(requestAddress(vault, wallet)), ro(MARKET), ro(routerPortfolio(wallet)), ro(SystemProgram.programId)],
+  keys: [rw(wallet, true), rw(traderAddress(wallet)), ro(vault), rw(bookAddress(vault)), rw(requestAddress(vault, wallet)), ro(MARKET), ro(routerPortfolio(wallet)), ro(SystemProgram.programId), ro(tiersAddress())],
   data: new W().u8(4).i128(size).done(),
 });
 /** The router's price account for a feed, written only by the reporter key (`PostPrice`). A
@@ -1029,7 +1081,7 @@ export const syncInventory = (v: Vault) => new TransactionInstruction({
  *  a close-out on a close-only market, or a liquidation of an account below the router's level. */
 export const requestClose = (payer: PublicKey, wallet: PublicKey, vault: PublicKey) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [rw(payer, true), rw(traderAddress(wallet)), ro(wallet), ro(vault), rw(bookAddress(vault)), rw(requestAddress(vault, wallet)), ro(MARKET), ro(SystemProgram.programId), ro(routerPortfolio(wallet))],
+  keys: [rw(payer, true), rw(traderAddress(wallet)), ro(wallet), ro(vault), rw(bookAddress(vault)), rw(requestAddress(vault, wallet)), ro(MARKET), ro(SystemProgram.programId), ro(routerPortfolio(wallet)), ro(tiersAddress())],
   data: new W().u8(8).done(),
 });
 /** Moves a vault's mark to a verified Pyth update (a PriceUpdateV2 account). */
@@ -1041,6 +1093,12 @@ export const advanceMark = (v: Vault, pyth: PublicKey, market: Uint8Array) => {
     data: new W().u8(5).u64(s.nextObservation).u64(s.authorityEpoch).done(),
   });
 };
+/** Records `vault`'s asset tier for the market (anyone may; the router decides it from the feed). */
+export const setTier = (payer: PublicKey, vault: PublicKey) => new TransactionInstruction({
+  programId: ROUTER,
+  keys: [rw(payer, true), rw(tiersAddress()), ro(vault), ro(MARKET), ro(SystemProgram.programId)],
+  data: new W().u8(29).done(),
+});
 /** Fills a request whose target the mark is at. Anyone can; the executor earns the bond. */
 export const fillRequest = (executor: PublicKey, v: Vault, r: RouterRequest) => new TransactionInstruction({
   programId: ROUTER,
@@ -1049,7 +1107,8 @@ export const fillRequest = (executor: PublicKey, v: Vault, r: RouterRequest) => 
     rw(routerPortfolio(r.wallet)), rw(v.lpPortfolio), ro(v.delegate), ro(routerAuthority()), ro(VAULT_PROGRAM), ro(PERCOLATOR),
     // A request queued by a standing order comes with that order.
     ...(r.order !== undefined ? [rw(orderAddress(r.vault, r.wallet, r.order))] : []),
-    // Last: the trader's track record (ignored when the trader has none).
+    // The market's leverage-tier record, then last the trader's track record (ignored when the trader has none).
+    ro(tiersAddress()),
     rw(statsAddress(r.wallet)),
   ],
   data: new W().u8(6).done(),
@@ -1083,7 +1142,8 @@ export const sweepBook = (vault: PublicKey) => new TransactionInstruction({
 });
 export const expireRequest = (caller: PublicKey, r: RouterRequest) => new TransactionInstruction({
   programId: ROUTER,
-  // (A settlement names its vault: it can then go as soon as its epoch has rolled.)
-  keys: [ro(caller, true), rw(r.key), rw(traderAddress(r.wallet)), rw(r.wallet), rw(bookAddress(r.vault)), ...(r.order !== undefined ? [rw(orderAddress(r.vault, r.wallet, r.order))] : r.settle ? [ro(r.vault)] : [])],
+  // (A settlement names its vault: it can then go as soon as its epoch has rolled. A trader's own
+  // request names its vault and the market: if the market was behind, its deposit goes back.)
+  keys: [ro(caller, true), rw(r.key), rw(traderAddress(r.wallet)), rw(r.wallet), rw(bookAddress(r.vault)), ...(r.order !== undefined ? [rw(orderAddress(r.vault, r.wallet, r.order))] : r.settle ? [ro(r.vault)] : [ro(r.vault), ro(MARKET)])],
   data: new W().u8(7).done(),
 });

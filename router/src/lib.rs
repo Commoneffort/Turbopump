@@ -74,7 +74,85 @@ pub const BOND_LAMPORTS: u64 = 2_000_000;
 #[cfg(feature = "x1")]
 pub const BOND_LAMPORTS: u64 = 20_000_000;
 /// Extra price move (bps) the margin check at request time must survive, on every position.
-pub const STRESS_BPS: u128 = 1_000;
+/// None since the per-asset tiers (2026-10-17): a position opens at its tier's margin, as on
+/// other perp exchanges, and a fill the account can no longer afford after the price moved
+/// during the delay trades nothing.
+pub const STRESS_BPS: u128 = 0;
+
+// ---- leverage tiers (per asset) ----
+/// Default tier: up to 10x (10% margin to open), liquidated below 6%.
+pub const TIER_DEFAULT: u8 = 0;
+/// Majors (BTC, ETH): up to 20x (5% to open), liquidated below 3.5%.
+pub const TIER_MAJOR: u8 = 1;
+/// The feeds that are majors (the same ids on Pyth and on X1's reported prices).
+pub const MAJOR_FEEDS: [[u8; 32]; 2] = [
+    hex32("e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43"), // BTC/USD
+    hex32("ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace"), // ETH/USD
+];
+/// The router liquidates at least this far (bps) above Percolator's own maintenance margin, and
+/// a position opens at least this far above the router's liquidation level.
+pub const LIQ_ABOVE_ENGINE_BPS: u64 = 100;
+pub const OPEN_ABOVE_LIQ_BPS: u64 = 150;
+const fn hex_digit(c: u8) -> u8 {
+    match c {
+        b'0'..=b'9' => c - b'0',
+        b'a'..=b'f' => c - b'a' + 10,
+        _ => panic!("hex"),
+    }
+}
+const fn hex32(h: &str) -> [u8; 32] {
+    let b = h.as_bytes();
+    let mut out = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        out[i] = hex_digit(b[2 * i]) * 16 + hex_digit(b[2 * i + 1]);
+        i += 1;
+    }
+    out
+}
+/// (bps to open, bps below which it is liquidated) of a tier.
+pub fn tier_levels(tier: u8) -> (u64, u64) {
+    if tier == TIER_MAJOR { (500, 350) } else { (1_000, 600) }
+}
+/// The tier of a feed: compiled in, so `SetTier` chooses nothing.
+pub fn tier_of_feed(feed: &[u8; 32]) -> u8 {
+    if MAJOR_FEEDS.iter().any(|f| f == feed) { TIER_MAJOR } else { TIER_DEFAULT }
+}
+/// The levels (open, liquidate) that apply to `asset` on this market. Never below what
+/// Percolator itself requires: the router liquidates `LIQ_ABOVE_ENGINE_BPS` above Percolator's
+/// maintenance margin and opens `OPEN_ABOVE_LIQ_BPS` above that, whatever the tier says (on a
+/// market created with 10% margins that is 12.5% to open and 11% to liquidate).
+/// Without the tier record (`tiers` None) the levels are the safe ones for each use: the default
+/// tier to open (never more leverage than is sure), the major tier to liquidate (never an early
+/// liquidation). So leaving the record out can neither buy leverage nor liquidate anyone sooner.
+pub fn levels(market: &[u8], tiers: Option<&state::Tiers>, asset: u16) -> Result<(u64, u64, u64), ProgramError> {
+    let (im, _, _) = perc::margin_params(market)?;
+    let mm = perc::maintenance_margin_bps(market)?;
+    let (generation, _, _) = perc::asset_price(market, asset)?;
+    let known = tiers.and_then(|t| {
+        let i = asset as usize;
+        (i < state::TIER_SLOTS && t.generation[i] == generation).then(|| t.tier[i])
+    });
+    let open_tier = known.unwrap_or(TIER_DEFAULT);
+    let liq_tier = known.unwrap_or(if tiers.is_some() { TIER_DEFAULT } else { TIER_MAJOR });
+    let liq_of = |tier: u8| core::cmp::max(tier_levels(tier).1, mm + LIQ_ABOVE_ENGINE_BPS);
+    let open_liq = liq_of(open_tier);
+    let open = core::cmp::max(core::cmp::max(tier_levels(open_tier).0, im), open_liq + OPEN_ABOVE_LIQ_BPS);
+    Ok((open, liq_of(liq_tier), mm))
+}
+/// The market's tier record among the instruction's accounts, if it was given (found by owner,
+/// size, magic and market: only `SetTier` creates such an account).
+pub fn tiers_in(program_id: &Pubkey, accounts: &[AccountInfo], market: &Pubkey) -> Option<state::Tiers> {
+    accounts.iter().find_map(|a| {
+        if a.owner != program_id || a.data_len() != TIERS_LEN {
+            return None;
+        }
+        let t: state::Tiers = bytemuck::pod_read_unaligned(&a.try_borrow_data().ok()?[..TIERS_LEN]);
+        (t.magic == TIERS_MAGIC && t.market == *market).then_some(t)
+    })
+}
+/// (Before the per-asset tiers: the one liquidation level of every position. Kept for the page's
+/// older builds; the router itself now uses `levels`.)
 /// A trader whose equity is below this share (bps) of the notional of their positions can be
 /// liquidated through the router: anyone queues it, and at the first Pyth price after its target
 /// the position is closed against the vault if the account is still below this level. It sits
@@ -89,6 +167,12 @@ pub const LIQUIDATION_BPS: u128 = 1_500;
 /// market did after it, and a trader who could let such a request lapse for the price of a bond
 /// would hold a free option whenever no executor filled it in time.
 pub const EXPIRY_DEPOSIT_BPS: u128 = 10;
+/// ...except when the market was this many slots behind when the request expired (about a
+/// minute): then nobody could fill it without first paying to bring the market current, which is
+/// the service's failure (an executor down or catching up), not the trader's, and the deposit goes
+/// back. A trader can then still let a request lapse after seeing its price, but only by paying
+/// for that catch-up to fill the ones that suit them.
+pub const BEHIND_REFUND_SLOTS: u64 = 150;
 /// The chain's coin per atom of collateral (a 6-decimal dollar token), in lamports, for that
 /// deposit. A fixed rate, set for SOL near $110 and XNT near $0.20: the deposit is a deterrent,
 /// not a price, so being off by the coin's moves does not matter.
@@ -99,6 +183,8 @@ pub const SOCIAL_FEE_LAMPORTS: u64 = 20_000_000;
 #[cfg(feature = "x1")]
 pub const SOCIAL_FEE_LAMPORTS: u64 = 10_000_000_000;
 pub const COPY_FEE_LAMPORTS: u64 = SOCIAL_FEE_LAMPORTS;
+/// Paid to the copied trader (the leader) when a wallet starts copying them, on top of `COPY_FEE_LAMPORTS`.
+pub const COPY_LEADER_FEE_LAMPORTS: u64 = SOCIAL_FEE_LAMPORTS;
 pub const BADGE_IMAGE_FEE_LAMPORTS: u64 = SOCIAL_FEE_LAMPORTS;
 /// A tenth of that (1 XNT on X1, 0.002 SOL elsewhere): what taking a name costs, what changing
 /// it costs, and what one day in the leaderboard's featured row costs.
@@ -114,11 +200,22 @@ pub const LAMPORTS_PER_ATOM: u64 = 9;
 #[cfg(feature = "x1")]
 pub const LAMPORTS_PER_ATOM: u64 = 5_000;
 
-/// The deposit (lamports) that goes with a request of `size` at `price` (see `EXPIRY_DEPOSIT_BPS`).
+/// The most a request's deposit can be: about a dollar of the chain's coin at the rate above
+/// (0.01 SOL, 5 XNT). With 20x leverage an uncapped 0.1% of notional is 2% of the margin, paid
+/// in the coin: a $1,000 account opening $20,000 would need 100 XNT on X1 (2026-10-17, the crash
+/// drill's bots could not open at the limit). The deposit only has to make lapsing cost
+/// something, and a lapse on a market that was behind refunds it anyway (`BEHIND_REFUND_SLOTS`).
+#[cfg(not(feature = "x1"))]
+pub const EXPIRY_DEPOSIT_CAP: u64 = 10_000_000;
+#[cfg(feature = "x1")]
+pub const EXPIRY_DEPOSIT_CAP: u64 = 5_000_000_000;
+
+/// The deposit (lamports) that goes with a request of `size` at `price` (see `EXPIRY_DEPOSIT_BPS`),
+/// at most `EXPIRY_DEPOSIT_CAP`.
 pub fn expiry_deposit(size: i128, price: u64) -> u64 {
     let notional = size.unsigned_abs().saturating_mul(price as u128) / POS_SCALE;
     let lamports = notional.saturating_mul(EXPIRY_DEPOSIT_BPS) / 10_000 * LAMPORTS_PER_ATOM as u128;
-    u64::try_from(lamports).unwrap_or(u64::MAX)
+    core::cmp::min(u64::try_from(lamports).unwrap_or(u64::MAX), EXPIRY_DEPOSIT_CAP)
 }
 const POS_SCALE: u128 = 1_000_000;
 /// Places in a vault's queue that trades cannot take: they are kept for forced closes
@@ -174,6 +271,7 @@ pub const TAG_SET_BADGE_IMAGE: u8 = 25;
 pub const TAG_WRITE_BADGE_IMAGE: u8 = 26;
 pub const TAG_REMOVE_BADGE_IMAGE: u8 = 27;
 pub const TAG_FEATURE: u8 = 28;
+pub const TAG_SET_TIER: u8 = 29;
 /// Widest trail, in basis points.
 pub const MAX_TRAIL_BPS: u64 = 5_000;
 /// Shortest time between two slices of a TWAP order, and the most slices one can have.
@@ -279,6 +377,7 @@ pub fn process_instruction(program_id: &Pubkey, accounts: &[AccountInfo], data: 
         TAG_WRITE_BADGE_IMAGE => social::write_badge_image(program_id, accounts, rest),
         TAG_REMOVE_BADGE_IMAGE => social::remove_badge_image(program_id, accounts),
         TAG_FEATURE => social::feature(program_id, accounts),
+        TAG_SET_TIER => set_tier(program_id, accounts),
         _ => Err(RouterError::InvalidInstruction.into()),
     }
 }
@@ -592,17 +691,17 @@ fn open_book(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     store(book_ai, &b)
 }
 
-/// Stressed margin check: after the trade, equity must cover initial margin plus fees on every
-/// position with prices `STRESS_BPS` higher, and a `STRESS_BPS` loss on all of them.
-fn margin_covers(market: &[u8], portfolio: &[u8], v: &vstate::VaultState, size: i128) -> Result<bool, ProgramError> {
-    margin_covers_at(market, portfolio, v, size, STRESS_BPS)
+/// Margin check: after the trade, equity must cover every position's opening margin (its tier's,
+/// see `levels`) plus fees, with prices `STRESS_BPS` higher and a `STRESS_BPS` loss on all of them.
+fn margin_covers(market: &[u8], portfolio: &[u8], v: &vstate::VaultState, size: i128, tiers: Option<&state::Tiers>) -> Result<bool, ProgramError> {
+    margin_covers_at(market, portfolio, v, size, STRESS_BPS, tiers)
 }
 
-/// The same check with a price move of `stress_bps` (0: at the current price, which is what
-/// Percolator itself asks for at the fill).
-fn margin_covers_at(market: &[u8], portfolio: &[u8], v: &vstate::VaultState, size: i128, stress_bps: u128) -> Result<bool, ProgramError> {
+/// The same check with a price move of `stress_bps` (0: at the current price, which is what the
+/// fill asks for).
+fn margin_covers_at(market: &[u8], portfolio: &[u8], v: &vstate::VaultState, size: i128, stress_bps: u128, tiers: Option<&state::Tiers>) -> Result<bool, ProgramError> {
     let asset = v.asset_index;
-    let (im_bps, min_im, fee_bps) = perc::margin_params(market)?;
+    let (_, min_im, fee_bps) = perc::margin_params(market)?;
     let (capital, pnl, _) = perc::portfolio_exposure(portfolio)?;
     let legs: Vec<(u16, i128)> = perc::positions(market, portfolio)?.iter().map(|p| (p.asset, p.size)).collect();
     let notional = |a: u16, q: u128| -> Result<u128, ProgramError> {
@@ -617,38 +716,85 @@ fn margin_covers_at(market: &[u8], portfolio: &[u8], v: &vstate::VaultState, siz
     if after == 0 || ((after > 0) == (held > 0) && held != 0 && after.unsigned_abs() < held.unsigned_abs()) {
         return Ok(true);
     }
-    let mut total = notional(asset, after.unsigned_abs())?;
+    let mut each = vec![(asset, notional(asset, after.unsigned_abs())?)];
     for (a, q) in legs {
         if a != asset {
-            total = total.checked_add(notional(a, q.unsigned_abs())?).ok_or(RouterError::Overflow)?;
+            each.push((a, notional(a, q.unsigned_abs())?));
         }
     }
-    let stressed = total * (10_000 + stress_bps) / 10_000;
-    let need = stressed * im_bps as u128 / 10_000
-        + total * stress_bps / 10_000
-        + stressed * fee_bps as u128 / 10_000
-        + min_im;
+    let mut total = 0u128;
+    let mut need = min_im;
+    for (a, n) in each {
+        let (open, _, _) = levels(market, tiers, a)?;
+        let stressed = n * (10_000 + stress_bps) / 10_000;
+        need = need + stressed * open as u128 / 10_000 + stressed * fee_bps as u128 / 10_000;
+        total += n;
+    }
+    need += total * stress_bps / 10_000;
     let equity = (capital as i128).checked_add(pnl).ok_or(RouterError::Overflow)?;
     Ok(equity >= 0 && equity as u128 >= need)
 }
 
 /// True when the account can be liquidated through the router: every position is settled at the
-/// current price (so capital and PnL reflect it) and equity is below `LIQUIDATION_BPS` of the
-/// positions' notional.
-fn liquidatable(market: &[u8], portfolio: &[u8]) -> Result<bool, ProgramError> {
+/// current price (so capital and PnL reflect it) and equity is below the sum of each position's
+/// notional times its tier's liquidation level (see `levels`).
+fn liquidatable(market: &[u8], portfolio: &[u8], tiers: Option<&state::Tiers>) -> Result<bool, ProgramError> {
     let (capital, pnl, _) = perc::portfolio_exposure(portfolio)?;
-    let mut notional = 0u128;
+    let (mut notional, mut floor) = (0u128, 0u128);
     for p in perc::positions(market, portfolio)? {
         if !p.settled {
             return Ok(false);
         }
         let (_, price, _) = perc::asset_price(market, p.asset)?;
-        notional = notional
-            .checked_add(p.size.unsigned_abs().checked_mul(price as u128).ok_or(RouterError::Overflow)? / POS_SCALE)
-            .ok_or(RouterError::Overflow)?;
+        let n = p.size.unsigned_abs().checked_mul(price as u128).ok_or(RouterError::Overflow)? / POS_SCALE;
+        let (_, liq, _) = levels(market, tiers, p.asset)?;
+        notional = notional.checked_add(n).ok_or(RouterError::Overflow)?;
+        floor = floor.checked_add(n.saturating_mul(liq as u128)).ok_or(RouterError::Overflow)?;
     }
     let equity = (capital as i128).checked_add(pnl).ok_or(RouterError::Overflow)?;
-    Ok(notional != 0 && (equity <= 0 || (equity as u128).saturating_mul(10_000) < notional.saturating_mul(LIQUIDATION_BPS)))
+    Ok(notional != 0 && (equity <= 0 || (equity as u128).saturating_mul(10_000) < floor))
+}
+
+/// Records an asset's leverage tier for its market (anyone may send it; the tier comes from the
+/// vault's own feed and the compiled `MAJOR_FEEDS`). Creates the market's record the first time.
+///
+/// Accounts: 0 payer [s, w], 1 tiers record [w], 2 vault, 3 market, 4 system program.
+#[inline(never)]
+fn set_tier(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let payer = acc(accounts, 0)?;
+    let tiers_ai = acc(accounts, 1)?;
+    let vault_ai = acc(accounts, 2)?;
+    let market = acc(accounts, 3)?;
+    let system = acc(accounts, 4)?;
+    signer(payer)?;
+    writable(tiers_ai)?;
+    key_is(system, &system_program::ID)?;
+    let v = load_vault(vault_ai)?;
+    key_is(market, &v.market)?;
+    perc::expect_market(market)?;
+    if v.status != vstate::STATUS_ACTIVE {
+        return Err(RouterError::BadAccount.into());
+    }
+    let (tk, bump) = tiers_address(program_id, market.key);
+    key_is(tiers_ai, &tk)?;
+    if tiers_ai.data_len() == 0 {
+        create_pda(payer, tiers_ai, system, program_id, TIERS_LEN, 0, &[SEED_TIERS, market.key.as_ref(), &[bump]])?;
+        let mut t = state::Tiers::zeroed();
+        t.magic = TIERS_MAGIC;
+        t.market = *market.key;
+        t.bump = bump;
+        store(tiers_ai, &t)?;
+    }
+    let mut t: state::Tiers = load(tiers_ai, program_id, TIERS_MAGIC)?;
+    let i = v.asset_index as usize;
+    if i >= state::TIER_SLOTS {
+        return Err(RouterError::BadAccount.into());
+    }
+    let (generation, _, _) = perc::asset_price(&market.try_borrow_data()?, v.asset_index)?;
+    t.tier[i] = tier_of_feed(&v.oracle_feeds[0]);
+    t.generation[i] = generation;
+    msg!("tier {} {} {}", i, t.tier[i], generation);
+    store(tiers_ai, &t)
 }
 
 /// Queues a trade. It fills at the first Pyth price published at or after its target time, which
@@ -693,7 +839,7 @@ fn request(program_id: &Pubkey, accounts: &[AccountInfo], size: i128) -> Program
     if perc::asset_close_only(&market.try_borrow_data()?, v.asset_index)? {
         return Err(RouterError::CloseOnly.into());
     }
-    if !margin_covers(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, &v, size)? {
+    if !margin_covers(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, &v, size, tiers_in(program_id, accounts, market.key).as_ref())? {
         return Err(RouterError::InsufficientMargin.into());
     }
     // The deposit is counted at the mark (Percolator's price for a book that has none yet).
@@ -720,8 +866,28 @@ fn enqueue<'a>(
     order: Option<u8>,
     deposit: u64,
 ) -> ProgramResult {
+    enqueue_after(program_id, payer, owner, trader, vault_ai, book_ai, b, request_ai, system, size, order, deposit, DELAY_SECS)
+}
+
+/// `enqueue` with its own delay (seconds after the later of now and the mark's publish time).
+#[allow(clippy::too_many_arguments)]
+fn enqueue_after<'a>(
+    program_id: &Pubkey,
+    payer: &AccountInfo<'a>,
+    owner: &Pubkey,
+    trader: Option<(&AccountInfo<'a>, &mut TraderState)>,
+    vault_ai: &AccountInfo<'a>,
+    book_ai: &AccountInfo<'a>,
+    b: &mut Book,
+    request_ai: &AccountInfo<'a>,
+    system: &AccountInfo<'a>,
+    size: i128,
+    order: Option<u8>,
+    deposit: u64,
+    delay: i64,
+) -> ProgramResult {
     let clock = Clock::get()?;
-    let target = clock.unix_timestamp.max(b.mark_publish_time).checked_add(DELAY_SECS).ok_or(RouterError::Overflow)?;
+    let target = clock.unix_timestamp.max(b.mark_publish_time).checked_add(delay).ok_or(RouterError::Overflow)?;
     let id = b.next_id;
     let settlement = trader.is_none();
     let (rk, rbump) = request_address(program_id, vault_ai.key, owner, settlement);
@@ -767,7 +933,7 @@ fn enqueue<'a>(
 ///   so the vault cannot take the other side of a close; the fill reduces the position
 ///   unilaterally instead (Percolator's `RebalanceReduce`). The market only reopens once every
 ///   position on it is closed.
-/// - The trader is below `LIQUIDATION_BPS` (see `liquidatable`). The fill closes the position
+/// - The trader is below its liquidation level (see `liquidatable` and `levels`). The fill closes the position
 ///   against the vault, if the account is still below that level at the fill price.
 ///
 /// Either way it executes at the same price as any request: the first Pyth price published at or
@@ -808,11 +974,13 @@ fn request_close(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
     if !perc::asset_close_only(&market.try_borrow_data()?, v.asset_index)? {
         let portfolio = acc(accounts, 8)?;
         key_is(portfolio, &t.portfolio)?;
-        if !liquidatable(&market.try_borrow_data()?, &portfolio.try_borrow_data()?)? {
+        if !liquidatable(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, tiers_in(program_id, accounts, market.key).as_ref())? {
             return Err(RouterError::NotCloseOnly.into());
         }
     }
-    enqueue(program_id, payer, wallet.key, Some((trader_ai, &mut t)), vault_ai, book_ai, &mut b, request_ai, system, 0, None, 0)
+    // No delay: the trader chooses nothing here, so there is no one to trade ahead of; the close
+    // takes the next price.
+    enqueue_after(program_id, payer, wallet.key, Some((trader_ai, &mut t)), vault_ai, book_ai, &mut b, request_ai, system, 0, None, 0, 1)
 }
 
 // ---- standing orders: stop, take-profit, trailing stop, limit, TWAP ----
@@ -1057,7 +1225,7 @@ fn trigger_order(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
     if perc::asset_close_only(&market.try_borrow_data()?, v.asset_index)? {
         return Err(RouterError::CloseOnly.into());
     }
-    if !margin_covers(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, &v, size)? {
+    if !margin_covers(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, &v, size, tiers_in(program_id, accounts, market.key).as_ref())? {
         return Err(RouterError::InsufficientMargin.into());
     }
     o.queued_id = b.next_id.checked_add(1).ok_or(RouterError::Overflow)?;
@@ -1320,7 +1488,8 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         // close-only, or one the account no longer has the margin for at this price.
         let close_only = perc::asset_close_only(&market.try_borrow_data()?, v.asset_index)?;
         let reduces = before != 0 && (before > 0) != (size > 0) && size.unsigned_abs() <= before.unsigned_abs();
-        if !close_only && liquidatable(&market.try_borrow_data()?, &portfolio.try_borrow_data()?)? {
+        let tiers = tiers_in(program_id, accounts, market.key);
+        if !close_only && liquidatable(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, tiers.as_ref())? {
             // Below the liquidation level at this price: the one thing a fill does for such an
             // account is close its position here, whatever was asked. A trader has one place in
             // the queue, so while a request of its own waits nobody can queue its liquidation;
@@ -1328,7 +1497,7 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             // through the router at all.
             liquidated = before != 0;
             size = before.checked_neg().ok_or(RouterError::Overflow)?;
-        } else if (close_only && !reduces) || !margin_covers_at(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, &v, size, 0)? {
+        } else if (close_only && !reduces) || !margin_covers_at(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, &v, size, 0, tiers.as_ref())? {
             size = 0;
         }
     } else if r.size == 0 {
@@ -1336,7 +1505,7 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         if close_only && before != 0 {
             // Reduce the whole position unilaterally at Percolator's price, which is the mark.
             reduce_unilaterally(trader_ai, market, portfolio, percolator, &t, v.asset_index)?;
-        } else if !close_only && before != 0 && liquidatable(&market.try_borrow_data()?, &portfolio.try_borrow_data()?)? {
+        } else if !close_only && before != 0 && liquidatable(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, tiers_in(program_id, accounts, market.key).as_ref())? {
             // Still below the liquidation level at the fill price: close against the vault.
             size = before.checked_neg().ok_or(RouterError::Overflow)?;
         }
@@ -1538,6 +1707,22 @@ fn settle(program_id: &Pubkey, accounts: &[AccountInfo], frontier: u64) -> Progr
     close(request_ai, BOND_LAMPORTS, executor, wallet)
 }
 
+/// For `expire`: whether the request's market was more than `BEHIND_REFUND_SLOTS` behind, read
+/// from accounts 5 (its vault) and 6 (the Percolator market) when they are given. Without them
+/// the deposit is kept, as before.
+fn market_was_behind(accounts: &[AccountInfo], r: &Request) -> Result<bool, ProgramError> {
+    let (Some(vault_ai), Some(market)) = (accounts.get(5), accounts.get(6)) else { return Ok(false) };
+    if *vault_ai.key != r.vault {
+        return Err(RouterError::BadAccount.into());
+    }
+    let v = vstate::load_vault(vault_ai, &percolator_vault::id())?;
+    if *market.key != v.market || *market.owner != perc::PERCOLATOR_PROGRAM_ID {
+        return Err(RouterError::BadAccount.into());
+    }
+    let (_, _, slot_last) = perc::asset_price(&market.try_borrow_data()?, v.asset_index)?;
+    Ok(Clock::get()?.slot.saturating_sub(slot_last) > BEHIND_REFUND_SLOTS)
+}
+
 /// Removes a request nobody filled within `GRACE_SECS` of its target. Its bond is forfeited
 /// (kept in the book account, which nothing can withdraw); its rent goes back to the trader.
 ///
@@ -1546,7 +1731,9 @@ fn settle(program_id: &Pubkey, accounts: &[AccountInfo], frontier: u64) -> Progr
 ///
 /// Accounts: 0 caller [s], 1 request [w], 2 trader [w], 3 trader wallet [w], 4 book [w],
 /// 5 the standing order [w] (only for a request one queued), or for a settlement, optionally,
-/// its vault (to remove it early once its epoch has rolled).
+/// its vault (to remove it early once its epoch has rolled), or for a trader's own request,
+/// optionally, its vault and 6 the Percolator market (so a market that was behind refunds the
+/// deposit: `BEHIND_REFUND_SLOTS`).
 #[inline(never)]
 fn expire(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let caller = acc(accounts, 0)?;
@@ -1610,7 +1797,7 @@ fn expire(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     // Its price was the mark and it still was not filled: the deposit that came with it stays
     // here with the bond (see `EXPIRY_DEPOSIT_BPS`); only the account's rent goes back. A request
     // whose price never arrived (no oracle price, no executor) lost nothing but its bond.
-    if r.kind == KIND_TRADE && at_mark {
+    if r.kind == KIND_TRADE && at_mark && !market_was_behind(accounts, &r)? {
         let rent = Rent::get()?.minimum_balance(REQUEST_LEN);
         let kept = request_ai.lamports().saturating_sub(rent).max(BOND_LAMPORTS);
         let mut b: Book = load(book_ai, program_id, BOOK_MAGIC)?;

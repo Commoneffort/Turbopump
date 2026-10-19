@@ -73,6 +73,7 @@
     "sequence": 9547
   },
   "router": {
+    "behind_refund_slots": 150,
     "bond_lamports": 2000000,
     "book": {
       "forfeited_bonds": 112,
@@ -89,15 +90,24 @@
     "book_len": 632,
     "delay_secs": 4,
     "expiry_deposit_bps": 10,
+    "expiry_deposit_cap": 10000000,
     "fallback_secs": 20,
     "fee_bps_off": 144,
     "grace_secs": 90,
     "im_bps_off": 558,
+    "insurance_nav_bps": 0,
     "lamports_per_atom": 9,
+    "liq_above_engine_bps": 100,
     "liquidation_bps": 1500,
+    "major_feeds": [
+      "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
+      "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace"
+    ],
     "max_orders": 8,
     "max_pending": 32,
     "min_im_off": 518,
+    "mm_bps_off": 550,
+    "open_above_liq_bps": 150,
     "order": {
       "expiry": 136,
       "index": 72,
@@ -129,7 +139,25 @@
     "request_len": 120,
     "reserve_bps": 1000,
     "stall_secs": 30,
-    "stress_bps": 1000,
+    "stress_bps": 0,
+    "tier_levels": [
+      [
+        1000,
+        600
+      ],
+      [
+        500,
+        350
+      ]
+    ],
+    "tier_slots": 64,
+    "tiers": {
+      "generation": 112,
+      "magic": 0,
+      "market": 8,
+      "tier": 48
+    },
+    "tiers_len": 624,
     "trader": {
       "collateral": 104,
       "has_pending": 137,

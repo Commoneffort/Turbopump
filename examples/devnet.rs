@@ -145,6 +145,10 @@ fn pyth_price_e6(rpc: &RpcClient) -> (u64, i64) {
     (e6 as u64, publish)
 }
 
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
 fn setup_market(rpc: &RpcClient, admin: &Keypair) {
     let mut m = load();
     // Collateral: a test USDC we can mint freely. An existing one (whose authority is the app's
@@ -182,14 +186,19 @@ fn setup_market(rpc: &RpcClient, admin: &Keypair) {
         initial_price: USDC, // asset 0: the USD base unit, pinned at 1.0
         min_nonzero_mm_req: 500,
         min_nonzero_im_req: 600,
-        maintenance_margin_bps: 1_000,
-        initial_margin_bps: 1_000,
+        // 5% to open and 2.5% maintenance (20x at most: the router's tiers decide each asset's
+        // own limit above these, see percolator_router::levels). PERCOLATOR_IM_BPS / _MM_BPS /
+        // _MOVE_BPS override them; the markets made before 2026-10-17 had 10% and 10%.
+        maintenance_margin_bps: env_u64("PERCOLATOR_MM_BPS", 250),
+        initial_margin_bps: env_u64("PERCOLATOR_IM_BPS", 500),
         max_trading_fee_bps: 10_000,
         trade_fee_base_bps: 0,
         liquidation_fee_bps: 5,
         liquidation_fee_cap: 50 * USDC as u128,
         min_liquidation_abs: 0,
-        max_price_move_bps_per_slot: 49,
+        // Percolator requires the most a price may move in one accrual step (this x
+        // max_accrual_dt_slots) plus the liquidation fee to fit in the maintenance margin.
+        max_price_move_bps_per_slot: env_u64("PERCOLATOR_MOVE_BPS", 24),
         max_accrual_dt_slots: 10,
         max_abs_funding_e9_per_slot: 0,
         min_funding_lifetime_slots: 10_000_000,

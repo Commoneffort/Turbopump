@@ -22,6 +22,7 @@ case "$2" in
     sleep 2; "$0" "$1" status ;;
   stop) if running; then kill -- "-$(cat $PID)"; echo "$NAME stopped"; fi; rm -f $PID ;;
   status) if running; then echo "$NAME running (process group $(cat $PID))"; else echo "$NAME not running"; fi ;;
+  sweep) (cd app && NETWORK=$NET RPC=$RPC npx tsx scripts/bots.ts sweep 2>&1 | grep -v "punycode\|trace-deprecation") ;;
   report) (cd app && NETWORK=$NET npx tsx scripts/bots.ts report $3 2>&1 | grep -v "punycode\|trace-deprecation") ;;
   failures) grep -a "CHECK FAILED\|FAIL \|error" deploy/logs/$NAME.log | tail -${3:-40} ;;
   *) echo "usage: $0 x1|devnet start | stop | status | report [hours] | failures"; exit 1 ;;

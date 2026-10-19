@@ -6,7 +6,8 @@ import * as fs from "fs";
 import * as C from "../src/chain";
 
 const conn = new Connection(process.env.RPC ?? C.RPC_URL, { commitment: "confirmed", disableRetryOnRateLimit: true, fetch: C.politeFetch() });
-const manifest = JSON.parse(fs.readFileSync(C.X1 ? "../deploy/x1-testnet.json" : "../deploy/devnet.json", "utf8"));
+// (MANIFEST_JSON: another deployment of the same programs, a local drill say.)
+const manifest = process.env.MANIFEST_JSON ? JSON.parse(process.env.MANIFEST_JSON) : JSON.parse(fs.readFileSync(C.X1 ? "../deploy/x1-testnet.json" : "../deploy/devnet.json", "utf8"));
 const usd = (x: bigint | number) => (Number(x) / 1e6).toFixed(2);
 const u128 = (d: Uint8Array, o: number) => new DataView(d.buffer, d.byteOffset).getBigUint64(o, true) + (new DataView(d.buffer, d.byteOffset).getBigUint64(o + 8, true) << 64n);
 

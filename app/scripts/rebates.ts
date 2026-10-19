@@ -7,12 +7,12 @@
 //   NETWORK=...               npx tsx scripts/rebates.ts start      take the first reading (nothing is owed yet)
 //   NETWORK=...               npx tsx scripts/rebates.ts pay        pay from the treasury's account and take the next reading
 //
-// Rates (src/social.ts `REBATE`): a referrer gets 0.5 basis points of what its wallets traded
-// since the last reading (only wallets that were already referred at that reading); a wallet that
-// traded 100,000 or more in the period gets 0.5 basis points of it back, 1,000,000 or more 1
-// basis point. The platform takes in 2 basis points of volume, and the total paid is cut, in
-// proportion, to three quarters of what the treasury's account actually received in the period:
-// rebates can never cost more than the platform earned.
+// Rates (src/social.ts `REBATE`, shares of the trade fee): a referrer gets 21% of the fees its
+// wallets paid since the last reading (only wallets that were already referred at that reading); a
+// wallet that traded 100,000 or more in the period gets 5% of its own fees back, 1,000,000 or more
+// 10%. The platform takes in a fifth of the fees. Referrals are paid first and volume rebates from
+// what is left; nothing is paid beyond what the treasury's account actually received in the
+// period (both are cut in proportion when they would be): rebates never cost more than it earned.
 //
 // `pay` needs the treasury's key (TREASURY_KEYPAIR, default ~/.config/solana/percolator-treasury.json).
 import { Connection, Keypair, PublicKey, Transaction } from "@solana/web3.js";
@@ -50,24 +50,29 @@ export function owed(then: Reading, now: Reading) {
     if (traded <= 0) continue;
     row(w).volume = traded;
     const tier = S.REBATE.tiers.find(t => traded >= t.weekVolume);
-    if (tier) row(w).own = traded * tier.perMillion / 1e6;
+    if (tier) row(w).own = traded * S.feeSharePerMillion(tier.share) / 1e6;
     const referrer = then.referred[w];
-    if (referrer && referrer !== w) row(referrer).referral += traded * S.REBATE.referrerPerMillion / 1e6;
+    if (referrer && referrer !== w) row(referrer).referral += traded * S.feeSharePerMillion(S.REBATE.referrerShare) / 1e6;
   }
-  // Never more than three quarters of what the treasury took in since the last reading.
+  // Never more than the treasury took in since the last reading: referrals first, then volume rebates.
   const income = Math.max(0, now.balance - then.balance);
-  const total = [...out.values()].reduce((s, r) => s + r.own + r.referral, 0);
+  const rs = [...out.values()];
+  const refTotal = rs.reduce((s, r) => s + r.referral, 0), ownTotal = rs.reduce((s, r) => s + r.own, 0);
+  const total = refTotal + ownTotal;
   const most = income * S.REBATE.mostOfIncome;
-  const scale = total > most && total > 0 ? most / total : 1;
-  for (const r of out.values()) { r.own *= scale; r.referral *= scale; }
+  const refScale = refTotal > most ? most / refTotal : 1;
+  const left = most - refTotal * refScale;
+  const ownScale = ownTotal > left ? (ownTotal > 0 ? left / ownTotal : 0) : 1;
+  for (const r of rs) { r.referral *= refScale; r.own *= ownScale; }
+  const scale = total > 0 ? (refTotal * refScale + ownTotal * ownScale) / total : 1;
   return { rows: out, income, total: total * scale, scale };
 }
 
 if (process.argv[1]?.endsWith("rebates.ts")) (async () => {
   const cmd = process.argv[2] ?? "show";
+  if (cmd === "start" && fs.existsSync(FILE)) throw new Error(`${FILE} exists: there is a reading already`);
   const now = await read();
   if (cmd === "start") {
-    if (fs.existsSync(FILE)) throw new Error(`${FILE} exists: there is a reading already`);
     fs.writeFileSync(FILE, JSON.stringify(now, null, 1));
     console.log(`first reading taken: ${Object.keys(now.volume).length} track records, ${Object.keys(now.referred).length} referrals, treasury holds ${usd(now.balance)}`);
     return;

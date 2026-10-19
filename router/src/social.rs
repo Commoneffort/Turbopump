@@ -305,9 +305,10 @@ pub(crate) fn set_referrer(program_id: &Pubkey, accounts: &[AccountInfo]) -> Pro
 
 /// Starts copying `leader`, or changes the terms (one leader at a time per trading account).
 /// Starting to copy a trader (the first time, again after stopping, or a different one) costs
-/// `COPY_FEE_LAMPORTS`, paid to the platform's treasury; changing the terms costs nothing.
+/// `COPY_FEE_LAMPORTS`, paid to the platform's treasury, plus `COPY_LEADER_FEE_LAMPORTS`, paid to
+/// the leader's wallet; changing the terms costs nothing.
 ///
-/// Accounts: 0 wallet [s, w], 1 copy [w], 2 the wallet's trader account, 3 leader wallet,
+/// Accounts: 0 wallet [s, w], 1 copy [w], 2 the wallet's trader account, 3 leader wallet [w],
 /// 4 leader's trader account, 5 system program, 6 treasury [w].
 /// Data: ratio (u32, bps of the leader's leverage), most notional on one market (u64, 0 = no limit).
 #[inline(never)]
@@ -353,6 +354,8 @@ pub(crate) fn set_copy(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
     };
     if c.leader != *leader.key {
         pay_treasury(wallet, acc(accounts, 6)?, system, COPY_FEE_LAMPORTS)?;
+        writable(leader)?;
+        invoke(&system_instruction::transfer(wallet.key, leader.key, COPY_LEADER_FEE_LAMPORTS), &[wallet.clone(), leader.clone(), system.clone()])?;
         c.leader = *leader.key;
         c.since = now;
         c.triggers = 0;
@@ -481,7 +484,7 @@ pub(crate) fn trigger_copy(program_id: &Pubkey, accounts: &[AccountInfo], data: 
     if perc::asset_close_only(&market.try_borrow_data()?, v.asset_index)? {
         return Err(RouterError::CloseOnly.into());
     }
-    if !margin_covers(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, &v, size)? {
+    if !margin_covers(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, &v, size, tiers_in(program_id, accounts, market.key).as_ref())? {
         return Err(RouterError::InsufficientMargin.into());
     }
     c.triggers = c.triggers.saturating_add(1);

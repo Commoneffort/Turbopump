@@ -305,8 +305,9 @@ fn an_orders_request_is_bound_to_its_order() {
     let u = w.pyth_update(950_000, target, prev);
     w.advance_to(u).unwrap();
     w.converge();
-    // Without the order, or with another order of the same wallet, the fill is refused.
-    expect(w.fill(0, id), RouterError::BadAccount);
+    // Without the order, or with another order of the same wallet, the fill is refused. (Without
+    // it, the account in the order's place is the read-only tier record: refused as not writable.)
+    expect(w.fill(0, id), RouterError::NotWritable);
     let wrong = rclient::fill_order(&w.payer.pubkey(), w.keys.as_ref().unwrap(), &w.traders[&0].1, 1);
     expect(w.send(vec![wrong], &[]), RouterError::BadAccount);
     let right = rclient::fill_order(&w.payer.pubkey(), w.keys.as_ref().unwrap(), &w.traders[&0].1, 0);

@@ -414,17 +414,27 @@ fn a_copy_is_the_followers_to_set_and_to_end() {
     expect(set_copy(&mut w, 1, 0, 0, 0), RouterError::InvalidInstruction);
     expect(set_copy(&mut w, 1, 0, 30_001, 0), RouterError::InvalidInstruction);
     expect(set_copy(&mut w, 1, 1, 10_000, 0), RouterError::InvalidInstruction);
-    // Half the leader's leverage, at most 100 on a market. Starting to copy costs the fee,
-    // paid to the platform's treasury and to nobody else; changing the terms costs nothing.
+    // Half the leader's leverage, at most 100 on a market. Starting to copy costs two fees, one
+    // to the platform's treasury and one to the leader; changing the terms costs nothing.
     let before_fee = treasury(&w);
+    let leader0 = w.traders[&0].1.wallet;
+    let leader2 = w.traders[&2].1.wallet;
+    let bal = |w: &World, k: &Pubkey| w.env.svm.get_balance(k).unwrap_or(0);
+    let (lead0_before, lead2_before) = (bal(&w, &leader0), bal(&w, &leader2));
+    // The leader's wallet must be writable to be paid.
+    let mut readonly_leader = rclient::set_copy(&f, &leader0, 5_000, 100_000_000);
+    readonly_leader.accounts[3].is_writable = false;
+    assert!(w.send(vec![readonly_leader], &[&w.trader_kp(1)]).is_err());
     let kp1 = w.trader_kp(1);
     let mut elsewhere = rclient::set_copy(&f, &w.traders[&0].1.wallet, 5_000, 100_000_000);
     elsewhere.accounts[6].pubkey = f.wallet;
     expect(w.send(vec![elsewhere], &[&kp1]), RouterError::BadAccount);
     set_copy(&mut w, 1, 0, 10_000, 100_000_000).unwrap();
     assert_eq!(treasury(&w) - before_fee, percolator_router::COPY_FEE_LAMPORTS);
+    assert_eq!(bal(&w, &leader0) - lead0_before, percolator_router::COPY_LEADER_FEE_LAMPORTS, "the leader is paid");
     set_copy(&mut w, 1, 0, 5_000, 100_000_000).unwrap();
     assert_eq!(treasury(&w) - before_fee, percolator_router::COPY_FEE_LAMPORTS, "new terms, same trader: no second fee");
+    assert_eq!(bal(&w, &leader0) - lead0_before, percolator_router::COPY_LEADER_FEE_LAMPORTS, "nor a second leader fee");
     w.taker_trade(0, 2_000 * U).unwrap();
     sync(&mut w, 1, 0).unwrap();
     assert_eq!(position(&w, 1), 100 * U, "limited to 100 of notional at 1.00");
@@ -436,6 +446,7 @@ fn a_copy_is_the_followers_to_set_and_to_end() {
     // Another leader: one at a time, and the count starts again.
     set_copy(&mut w, 1, 2, 10_000, 0).unwrap();
     assert_eq!(treasury(&w) - before_fee, 2 * percolator_router::COPY_FEE_LAMPORTS, "a new leader is a new copy");
+    assert_eq!(bal(&w, &leader2) - lead2_before, percolator_router::COPY_LEADER_FEE_LAMPORTS, "and the new leader is paid");
     let c = copy(&w, 1).unwrap();
     assert_eq!((c.leader, { c.triggers }), (w.traders[&2].1.wallet, 0));
     // Trader 2 holds nothing: the follower is brought to nothing.

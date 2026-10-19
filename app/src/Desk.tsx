@@ -157,11 +157,12 @@ function Charts({ sym, price, lines, marks, markets, go }: { sym: string; price:
 function liquidationPrice(state: C.State, posN: number): number | undefined {
   const h = state.health;
   if (!h || posN === 0) return undefined;
-  const level = Number(C.LIQUIDATION_BPS) / 10_000, priceN = num(state.asset.price, 1e6);
+  // Each position has its own liquidation level (its tier's); the others' part of the floor stays.
+  const level = Number(state.levels.liq) / 10_000, priceN = num(state.asset.price, 1e6);
   const heldN = num(state.portfolio?.position ?? 0n, 1e6);
-  const other = num(h.notional, 1e6) - Math.abs(heldN) * priceN;
+  const otherFloor = num(h.floor, 1e6) - Math.abs(heldN) * priceN * level;
   // Equity as it would be with the position marked from the current price.
-  const x = (level * other - num(h.equity, 1e6) + posN * priceN) / (posN - level * Math.abs(posN));
+  const x = (otherFloor - num(h.equity, 1e6) + posN * priceN) / (posN - level * Math.abs(posN));
   return x > 0 && Number.isFinite(x) ? x : undefined;
 }
 
@@ -193,7 +194,7 @@ function MarketBar({ state, markets, day, go }: { state: C.State; markets: Card[
         <button className="msel-btn" onClick={() => setOpen(o => !o)} aria-expanded={open}>
           <Icon symbol={sym} />
           <span className="msel-sym">{sym}-PERP</span>
-          <span className="msel-lev">10×</span>
+          <span className="msel-lev">{fmt(10_000 / Number(state.levels.open), 0)}×</span>
           <svg width="10" height="6" viewBox="0 0 10 6" aria-hidden><path d="M1 1l4 4 4-4" fill="none" stroke="currentColor" strokeWidth="1.5" /></svg>
         </button>
         {open && (
@@ -287,6 +288,18 @@ function VaultDepth({ state, tick }: { state: C.State; tick: number }) {
 
 function Ticket({ state, send, busy }: { state: C.State & { readFor?: string }; send: Send; busy?: string }) {
   const { publicKey } = useWallet();
+  const { connection } = useConnection();
+  // The wallet's coins: an order takes a bond and a deposit (0.1% of its value) in the chain's
+  // coin, and without enough of them the transaction is refused with a bare "0x1".
+  const [coins, setCoins] = useState<number>();
+  useEffect(() => {
+    if (!publicKey) { setCoins(undefined); return; }
+    let live = true;
+    const read = () => connection.getBalance(publicKey).then(b => { if (live) setCoins(b); }).catch(() => {});
+    read();
+    const id = setInterval(read, 15_000);
+    return () => { live = false; clearInterval(id); };
+  }, [publicKey?.toBase58(), busy]);
   const [side, setSide] = useState<1n | -1n>(1n);
   const [text, setText] = useState("");
   const [unit, setUnit] = useState<"coin" | "usd">("coin");
@@ -336,6 +349,8 @@ function Ticket({ state, send, busy }: { state: C.State & { readFor?: string }; 
       : `Filled: ${got > 0n ? "bought" : "sold"} ${units(abs(got))} ${sym}${got !== w.size ? ` of the ${units(abs(w.size))} requested` : ""}.`);
   }, [pendingHere?.id, p?.position]);
 
+  // Deposit + bond + a little for the fee.
+  const coinsNeeded = Number(C.expiryDeposit(sent, state.asset.price)) + C.ROUTER_BOND_LAMPORTS + 1_000_000;
   // The one thing that stops this order, if anything does.
   const blockerBase = !publicKey || !state.trader || !state.book || locked || state.closeOnly || noLiquidity || vaultMax === 0n;
   const blocker = !publicKey ? "Connect a wallet to trade"
@@ -347,6 +362,7 @@ function Ticket({ state, send, busy }: { state: C.State & { readFor?: string }; 
     : vaultMax === 0n ? (reduceOnly ? "The vault is settling an epoch: it only takes orders that reduce its position or close yours" : `The vault is at its limit for ${side > 0n ? "longs" : "shorts"}`)
     : want <= 0n ? "Enter a size"
     : sent > marginMax(side) ? `Your margin covers at most ${units(marginMax(side))} ${sym} here: add margin or lower the size`
+    : coins !== undefined && coins < coinsNeeded ? `This order needs ${(coinsNeeded / 1e9).toFixed(3)} ${C.COIN} in your wallet for its deposit and bond (they come back when it fills); the wallet has ${(coins / 1e9).toFixed(3)}`
     : undefined;
 
   // Leverage is not a setting here: there is one margin account for all markets, and leverage is
@@ -410,7 +426,7 @@ function Ticket({ state, send, busy }: { state: C.State & { readFor?: string }; 
       {state.trader && (
         <div className="lev">
           <div className="lev-l">
-            <span className="hint" title="One margin account covers every market, so leverage is the account's: what all its positions are worth, divided by its equity. The market allows up to 10×; opening a position must leave room for a further 10% price move, which is why the slider stops lower.">Account leverage</span>
+            <span className="hint" title="One margin account covers every market, so leverage is the account's: what all its positions are worth, divided by its equity. Each market has its own maximum (20× on BTC and ETH, 10× on the others); the slider stops at what your margin allows here.">Account leverage</span>
             <b className="mono">{want > 0n ? `${fmt(levNow, 1)}× → ${fmt(levAfter, 1)}×` : `${fmt(levNow, 1)}×`}<i>max {fmt(Math.max(levMax, levNow), 1)}×</i></b>
           </div>
           <input type="range" min={0} max={Math.max(levMax, 0.1)} step={0.1} value={Math.min(want > 0n ? levAfter : levNow, Math.max(levMax, 0.1))} disabled={most === 0n || !!blockerBase} onChange={e => setLeverage(Number(e.target.value))} className={side > 0n ? "up" : "down"} />
@@ -419,7 +435,7 @@ function Ticket({ state, send, busy }: { state: C.State & { readFor?: string }; 
 
       <div className="sum">
         <div><span>Order value</span><b className="mono">{money(notional)}</b></div>
-        <div><span>Margin used (10×)</span><b className="mono">{money(notional / 10)}</b></div>
+        <div><span>Margin used ({fmt(10_000 / Number(state.levels.open), 0)}×)</span><b className="mono">{money(notional * Number(state.levels.open) / 10_000)}</b></div>
         <div><span>Fee ({C.TRADE_FEE_PCT})</span><b className="mono">{money(notional * C.TRADE_FEE_BPS / 10_000)}</b></div>
         <div><span>Position after</span><b className="mono">{after === 0 ? "flat" : `${after > 0 ? "long" : "short"} ${fmt(Math.abs(after), 4).replace(/\.?0+$/, "")} ${sym}`}</b></div>
         <div><span>Est. liquidation price</span><b className="mono">{liqAfter && want > 0n ? fmt(liqAfter, dp) : "—"}</b></div>
@@ -445,7 +461,7 @@ function Ticket({ state, send, busy }: { state: C.State & { readFor?: string }; 
       <p className="fine">
         Orders fill at the first oracle price published {C.ROUTER_DELAY_SECS} seconds after the request lands. Nobody can know that price
         when the order is sent, so nobody can trade ahead of it. An order cannot be cancelled; unfilled after {C.ROUTER_GRACE_SECS} s, it expires.
-        {want > 0n && <> A deposit of {(Number(C.expiryDeposit(sent, state.asset.price)) / 1e9).toFixed(4)} {C.COIN} ({C.EXPIRY_DEPOSIT_BPS / 100}% of the order) goes with it and comes back when it fills; it is kept only if the order's price arrived and the order still expired.</>}
+        {want > 0n && <> A deposit of {(Number(C.expiryDeposit(sent, state.asset.price)) / 1e9).toFixed(4)} {C.COIN} ({C.EXPIRY_DEPOSIT_BPS / 100}% of the order, at most {Number(C.EXPIRY_DEPOSIT_CAP) / 1e9} {C.COIN}) goes with it and comes back when it fills; it is kept only if the order's price arrived and the order still expired while the market was current.</>}
       </p>
     </div>
   );
@@ -601,7 +617,7 @@ function Invite({ me, send, busy, tick }: { me: PublicKey; send: Send; busy?: st
   const link = `${window.location.origin}/?network=${C.NETWORK_PARAM}&ref=${me.toBase58()}`;
   return (
     <div className="fine">
-      Invite traders: you earn {S.REBATE.referrerPerMillion / 100} basis points of what they trade, paid weekly from the platform's share.{" "}
+      Invite traders: you earn {Math.round(S.REBATE.referrerShare * 100)}% of the trading fees they pay, paid weekly by the platform.{" "}
       <a href={link} onClick={e => { e.preventDefault(); navigator.clipboard?.writeText(link).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); }); }}>{copied ? "Copied" : "Copy your link"}</a>
       {by ? <> · Invited by <span className="mono">{short(by)}</span></>
         : by === null && offer && !offer.equals(me) && <> · <a href="#" onClick={e => { e.preventDefault(); if (!busy) send("Confirm invitation", [S.setReferrer(me, offer)]); }}>Confirm you were invited by <span className="mono">{short(offer)}</span></a> (once, it cannot be changed)</>}
@@ -621,9 +637,8 @@ function Account({ state, send, busy }: { state: C.State; send: Send; busy?: str
   const profit = p && p.pnl > 0n && state.openPositions === 0 ? p.pnl : 0n;
   const equity = h?.equity ?? p?.capital ?? 0n;
   const ratio = h && h.notional > 0n ? num(h.equity, 1e6) / num(h.notional, 1e6) : undefined;
-  const level = Number(C.LIQUIDATION_BPS) / 10_000;
-  // How full the margin is: 0 with no position, 100 at the liquidation level.
-  const used = ratio === undefined ? 0 : Math.min(100, Math.max(0, level / ratio * 100));
+  // How full the margin is: 0 with no position, 100 at the liquidation level (each position's own).
+  const used = ratio === undefined || !h ? 0 : Math.min(100, Math.max(0, num(h.floor, 1e6) / Math.max(num(h.equity, 1e6), 1e-9) * 100));
   const ata = (u: PublicKey) => createAssociatedTokenAccountIdempotentInstruction(u, C.ata(u, C.MINT), u, C.MINT);
   return (
     <>
@@ -634,7 +649,7 @@ function Account({ state, send, busy }: { state: C.State; send: Send; busy?: str
           <div className="acct-row"><span>In positions</span><b className="mono">{usd(h?.notional ?? 0n)}</b></div>
           <div className="acct-row"><span>Wallet test USDC</span><b className="mono">{usd(state.userCollateral)}</b></div>
           <div className="health">
-            <div className="health-l"><span>Margin health</span><b className={`mono ${used > 75 ? "down" : ""}`}>{ratio === undefined ? "no position" : `${fmt(ratio * 100, 1)}% · liquidated below ${fmt(level * 100, 1)}%`}</b></div>
+            <div className="health-l"><span>Margin health</span><b className={`mono ${used > 75 ? "down" : ""}`}>{ratio === undefined ? "no position" : `${fmt(ratio * 100, 1)}% · liquidated below ${fmt((h && h.notional > 0n ? num(h.floor, 1e6) / num(h.notional, 1e6) : 0) * 100, 1)}%`}</b></div>
             <div className="health-bar"><i className={used > 75 ? "bad" : ""} style={{ width: `${used}%` }} /></div>
           </div>
           {state.trader && (
@@ -758,11 +773,11 @@ function Bottom({ state, markets, fills, entry, liq, send, busy, go }: {
         {tab === "market" && (
           <div className="mkt">
             <div className="kv">
-              <div><span>Leverage</span><b>up to 10×</b></div>
+              <div><span>Leverage</span><b>up to {fmt(10_000 / Number(state.levels.open), 0)}×</b></div>
               <div><span>Trading fee</span><b>{C.TRADE_FEE_PCT} per trade</b></div>
               <div><span>Price</span><b>{C.X1 ? "exchange median, posted by the router's reporter" : "Pyth, verified on chain"}</b></div>
               <div><span>Fill</span><b>first oracle price {C.ROUTER_DELAY_SECS} s after the request</b></div>
-              <div><span>Liquidation</span><b>below {fmt(Number(C.LIQUIDATION_BPS) / 100, 1)}% margin</b></div>
+              <div><span>Liquidation</span><b>below {fmt(Number(state.levels.liq) / 100, 1)}% margin</b></div>
               <div><span>Funding</span><b>none</b></div>
             </div>
             <div className="kv">

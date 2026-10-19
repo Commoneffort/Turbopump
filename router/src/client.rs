@@ -121,6 +121,7 @@ pub fn request(t: &TraderKeys, vault: &Pubkey, size: i128) -> Instruction {
             ro(t.market),
             ro(t.portfolio),
             ro(system_program::ID),
+            ro(tiers_address(&id(), &t.market).0),
         ],
         data,
     }
@@ -140,6 +141,7 @@ pub fn request_close(payer: &Pubkey, t: &TraderKeys, vault: &Pubkey) -> Instruct
             ro(t.market),
             ro(system_program::ID),
             ro(t.portfolio),
+            ro(tiers_address(&id(), &t.market).0),
         ],
         data: vec![TAG_REQUEST_CLOSE],
     }
@@ -243,7 +245,9 @@ pub fn fill(executor: &Pubkey, k: &VaultKeys, t: &TraderKeys) -> Instruction {
             ro(authority_address(&id()).0),
             ro(percolator_vault::id()),
             ro(perc::PERCOLATOR_PROGRAM_ID),
-            // Last: the trader's track record (ignored when the trader has none).
+            // The market's leverage-tier record (see `levels`), then last the trader's track
+            // record (ignored when the trader has none).
+            ro(tiers_address(&id(), &k.market).0),
             w(stats_address(&id(), &t.market, &t.wallet).0),
         ],
         data: vec![TAG_FILL],
@@ -261,6 +265,30 @@ pub fn expire(caller: &Pubkey, vault: &Pubkey, t: &TraderKeys) -> Instruction {
             w(book_address(&id(), vault).0),
         ],
         data: vec![TAG_EXPIRE],
+    }
+}
+
+/// `expire` for a trader's own request, naming its vault and the Percolator market: a request
+/// whose market was more than `BEHIND_REFUND_SLOTS` behind gets its deposit back.
+pub fn expire_trade(caller: &Pubkey, vault: &Pubkey, market: &Pubkey, t: &TraderKeys) -> Instruction {
+    let mut ix = expire(caller, vault, t);
+    ix.accounts.push(ro(*vault));
+    ix.accounts.push(ro(*market));
+    ix
+}
+
+/// Records the leverage tier of `vault`'s asset for its market (anyone may; see `SetTier`).
+pub fn set_tier(payer: &Pubkey, vault: &Pubkey, market: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: id(),
+        accounts: vec![
+            AccountMeta::new(*payer, true),
+            w(tiers_address(&id(), market).0),
+            ro(*vault),
+            ro(*market),
+            ro(system_program::ID),
+        ],
+        data: vec![crate::TAG_SET_TIER],
     }
 }
 
@@ -350,6 +378,7 @@ pub fn trigger_order(payer: &Pubkey, t: &TraderKeys, vault: &Pubkey, index: u8) 
             ro(t.market),
             ro(t.portfolio),
             ro(system_program::ID),
+            ro(tiers_address(&id(), &t.market).0),
         ],
         data: vec![TAG_TRIGGER_ORDER],
     }
@@ -446,7 +475,7 @@ pub fn set_copy(t: &TraderKeys, leader: &Pubkey, ratio_bps: u32, max_notional: u
             AccountMeta::new(t.wallet, true),
             w(copy_address(&id(), &t.market, &t.wallet).0),
             ro(t.trader),
-            ro(*leader),
+            w(*leader),
             ro(trader_address(&id(), &t.market, leader).0),
             ro(system_program::ID),
             w(percolator_vault::processor::TREASURY),
@@ -516,6 +545,7 @@ pub fn trigger_copy(payer: &Pubkey, t: &TraderKeys, leader: &Pubkey, vault: &Pub
             ro(l.trader),
             ro(l.portfolio),
             ro(system_program::ID),
+            ro(tiers_address(&id(), &t.market).0),
         ],
         data,
     }

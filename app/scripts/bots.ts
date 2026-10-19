@@ -7,7 +7,8 @@
 //   random      opens, flips and closes at random
 //   max         always asks for the largest position its margin allows, and closes now and then
 //   edge-long   holds the largest long its margin allows and never closes: the account that is
-//   edge-short  liquidated first when the price moves about 9% against it (and the same, short)
+//   edge-short  liquidated first when the price moves against it (about 1.5% at 20x on BTC/ETH,
+//               about 4% at 10x on the others), and the same, short
 //   orders      places every kind of standing order (take-profit, limit, TWAP, stop, trailing
 //               stop) in a fixed routine and checks what each one does
 //   lp          a liquidity provider: deposits into a vault, withdraws, claims, and checks that
@@ -16,6 +17,14 @@
 //   cross       holds positions on every market at once and checks the largest order the page
 //               would offer is exactly what the program accepts
 //   scalper     opens and closes small positions back to back (each fill's cost is checked)
+//   gambler     the largest position its margin allows on EVERY market at once, never closes:
+//               the account a broad move liquidates on several markets in one go
+//   stopper     the largest position on one market, with a stop halfway to its liquidation price
+//               and a 1% trailing stop: the stop must always come before the liquidation
+//   whale       a liquidity provider that puts in half a vault's value, then takes it all out:
+//               the vault has to wind its position down (reduce-only, then unwind), and the whale's
+//               own position on that market must still close while it does (every WHALE_HOURS)
+//   crowd       (the burst wallets, every other turn) standing orders that all come due at once
 //   adversary   tries what must be refused: filling or expiring someone's request early,
 //               cancelling someone else's order, closing a healthy account, moving a price
 //               back. Only simulated, so it costs nothing and touches nobody
@@ -71,8 +80,8 @@ function check(ok: boolean, what: string, more: Record<string, unknown> = {}) {
   return ok;
 }
 
-type Kind = "trend" | "fade" | "random" | "max" | "edge-long" | "edge-short" | "orders" | "lp" | "burst" | "cross" | "scalper" | "adversary";
-const ROUTINES: Kind[] = ["orders", "lp", "burst", "cross", "adversary"]; // run on their own, not in the trading loop
+type Kind = "trend" | "fade" | "random" | "max" | "edge-long" | "edge-short" | "orders" | "lp" | "burst" | "cross" | "scalper" | "adversary" | "gambler" | "stopper" | "whale";
+const ROUTINES: Kind[] = ["orders", "lp", "burst", "cross", "adversary", "gambler", "stopper", "whale"]; // run on their own, not in the trading loop
 type Bot = { name: string; kind: Kind; usdc: number; kp: Keypair };
 const BOTS: { name: string; kind: Kind; usdc: number }[] = [
   { name: "bot-trend", kind: "trend", usdc: 1_500 },
@@ -86,6 +95,9 @@ const BOTS: { name: string; kind: Kind; usdc: number }[] = [
   { name: "bot-cross", kind: "cross", usdc: 600 },
   { name: "bot-scalper", kind: "scalper", usdc: 500 },
   { name: "bot-adversary", kind: "adversary", usdc: 20 },
+  { name: "bot-gambler", kind: "gambler", usdc: 250 },
+  { name: "bot-stopper", kind: "stopper", usdc: 300 },
+  { name: "bot-whale", kind: "whale", usdc: 200 },
   ...[1, 2, 3, 4, 5].map(i => ({ name: `bot-burst-${i}`, kind: "burst" as Kind, usdc: 150 })),
 ];
 const wallet = (name: string) => {
@@ -142,18 +154,21 @@ const deployer = () => read(process.env.KEYPAIR ?? `${process.env.HOME}/.config/
 // Every order carries a bond that goes to whoever fills it (our own executor, so it comes back
 // to the wallet that pays this). A bot is topped up for about thirty orders at a time.
 const GAS_LOW = C.ROUTER_BOND_LAMPORTS * 4, GAS_FILL = C.ROUTER_BOND_LAMPORTS * 30;
+const ACCOUNT_RENT = 0.12 * LAMPORTS_PER_SOL; // a trading account, its portfolio and track record, with room
 // A request also carries a deposit (0.1% of its size, in the chain's coin) that comes back when
 // it fills: each bot keeps enough for the largest order its money allows (about 5x of it).
 const floats = new Map<string, number>();
+// (The liquidity provider and the adversary send no trade requests: no float.)
+const NO_FLOAT: Kind[] = ["lp", "adversary"];
 function depositFloat(pk: PublicKey) {
-  if (!floats.size) for (const b of BOTS) floats.set(wallet(b.name).publicKey.toBase58(), Number(C.expiryDeposit(BigInt(b.usdc * 5) * C.UNIT, 1_000_000n)));
+  if (!floats.size) for (const b of BOTS) floats.set(wallet(b.name).publicKey.toBase58(), NO_FLOAT.includes(b.kind) ? 0 : Number(C.expiryDeposit(BigInt(b.usdc * 5) * C.UNIT, 1_000_000n)));
   return floats.get(pk.toBase58()) ?? Number(C.expiryDeposit(2_000n * C.UNIT, 1_000_000n));
 }
 // Below this the paying wallet is reported on every pass (PAYER_WARN to change it): about a day
 // of what the services were measured to spend (X1 ~270 XNT a day with 19 markets, devnet ~1 SOL).
 const PAYER_WARN = Number(process.env.PAYER_WARN ?? (C.X1 ? 300 : 1.5));
-async function gas(kp: Keypair) {
-  const float = depositFloat(kp.publicKey);
+async function gas(kp: Keypair, extra = 0) {
+  const float = depositFloat(kp.publicKey) + extra;
   const have = await conn.getBalance(kp.publicKey);
   if (have >= GAS_LOW + float) return;
   const from = deployer();
@@ -177,6 +192,8 @@ async function fund(b: Bot) {
     return;
   }
   if (await conn.getAccountInfo(C.traderAddress(b.kp.publicKey))) return;
+  // A new trading account (a new market, say) costs its rent too: about 0.07 of the coin.
+  await gas(b.kp, ACCOUNT_RENT);
   if ((await mint(b.kp, b.usdc)) !== true) return;
   await send(`open trading account ${b.name}`, b.kp, [C.openTradingAccount(b.kp.publicKey), C.routerDeposit(b.kp.publicKey, BigInt(b.usdc * C.USDC))]);
 }
@@ -335,7 +352,8 @@ async function marketChecks() {
       } else if (now - was.since > LATE_SECS * 1000) check(false, `an account below the liquidation level is closed within ${LATE_SECS} s`, { portfolio: k, wallet: who, secs: Math.round((now - was.since) / 1000), equity: h.equity, notional: h.notional });
       // Percolator's own level is the backstop (it makes the market close-only): the router's
       // liquidation is meant to come first.
-      if (BigInt(ratio) < rates.marginBps) check(false, "the router liquidates before Percolator's own level is reached", { portfolio: k, ratioBps: ratio, percolatorBps: rates.marginBps });
+      const engineMm = C.levels(snap.market, h.positions[0]?.asset ?? 0).mm;
+      if (BigInt(ratio) < engineMm) check(false, "the router liquidates before Percolator's own level is reached", { portfolio: k, ratioBps: ratio, percolatorBps: engineMm });
     } else if (was) {
       under.delete(k);
       const reduced = h.notional < was.notional;
@@ -343,7 +361,7 @@ async function marketChecks() {
       say(`account ${k.slice(0, 6)}: ${reduced ? "liquidated" : "back above the level"} after ${Math.round((now - was.since) / 1000)} s; $${usd(h.equity)} left on $${usd(h.notional)}`);
     }
   }
-  note({ type: "accounts", thinnestBps: thinnest === 1e9 ? null : thinnest, liquidatable, outOfDate: unsettled.size, liquidationBps: C.LIQUIDATION_BPS });
+  note({ type: "accounts", thinnestBps: thinnest === 1e9 ? null : thinnest, liquidatable, outOfDate: unsettled.size, liquidationBps: traded[0] ? C.levels(snap.market, traded[0].assetIndex).liq : C.LIQUIDATION_BPS });
 
   // 4. Standing orders, anyone's: one whose condition holds is carried out (or removed) soon.
   const chainNow = Math.floor(now / 1000);
@@ -444,7 +462,7 @@ async function act(bot: Bot, m: Market, feeBps: bigint) {
       if (code !== "0x13" && code !== "rpc") say("CHECK FAILED", bot.name, "a withdrawal with a position open answered", code);
     }
     // Nobody can force a healthy account closed (the market is not close-only here).
-    if (held !== 0n && s.health && !s.health.liquidatable && s.health.equity * 10_000n > s.health.notional * (C.LIQUIDATION_BPS + 100n)) {
+    if (held !== 0n && s.health && !s.health.liquidatable && s.health.equity > s.health.floor + s.health.notional / 100n) {
       const code = await wouldFail(kp, [C.requestClose(kp.publicKey, kp.publicKey, m.vault)]);
       if (code !== "rpc") note({ type: "refusal", bot: bot.name, what: "forced close of a healthy account", code, ok: code === "0x5710" });
       if (code !== "0x5710" && code !== "rpc") say("CHECK FAILED", bot.name, "a forced close of a healthy account answered", code);
@@ -497,7 +515,10 @@ async function act(bot: Bot, m: Market, feeBps: bigint) {
   // The vault cuts an order to what it takes at the fill, which is measured against its value
   // and the price then: a cut is any fill on the right side, smaller than asked, near that room.
   const cut = got !== 0n && (got > 0n) === (want > 0n) && abs(got) < abs(want) && abs(got) * 50n <= vaultRoom * 51n;
-  const outcome = got === 0n ? "expired" : got === want ? "filled" : cut ? "cut to the vault's room" : "UNEXPECTED SIZE";
+  // The fill of any request of an account below the liquidation level closes its position instead
+  // (the router's rule, so a trader cannot dodge a liquidation by keeping its queue place busy).
+  const liquidated = held !== 0n && got === -held && want !== -held && !!s.health && (after.portfolio?.position ?? 0n) === 0n;
+  const outcome = got === 0n ? "expired" : got === want ? "filled" : cut ? "cut to the vault's room" : liquidated ? "closed: the account was below the liquidation level" : "UNEXPECTED SIZE";
   const lev = after.health && after.health.equity > 0n ? Number(after.health.notional) / Number(after.health.equity) : 0;
   note({ type: "order", bot: bot.name, symbol: m.symbol, want, got, outcome, secs: Math.round((Date.now() - sentAt) / 1000), price: after.asset.price, equityBefore: s.health?.equity, equityAfter: after.health?.equity, leverage: +lev.toFixed(2), ok: outcome !== "UNEXPECTED SIZE" });
   say(`${bot.name}: ${Number(want) / 1e6} ${m.symbol} -> ${outcome}; position ${Number(after.portfolio?.position ?? 0n) / 1e6}, ${lev.toFixed(1)}x`);
@@ -771,7 +792,10 @@ async function crossRoutine(bot: Bot, feeBps: bigint) {
     const room = C.depth(s), cap = s.margin ?? 0n;
     const side = held >= 0n ? 1n : -1n;
     const most = cap > abs(held) ? cap - abs(held) : 0n;
-    if (most > stepOf(s.asset.price) * 100n && most * 14n / 10n < (side > 0n ? room.long : room.short)) {
+    // (Skipped when the wallet's coins do not cover the order's deposit: then the answer is the
+    // system program's "insufficient funds", which says nothing about the margin rule.)
+    const coinsOk = (await conn.getBalance(me)) >= Number(C.expiryDeposit(most * 97n / 100n, s.asset.price)) + C.ROUTER_BOND_LAMPORTS + 1_000_000;
+    if (coinsOk && most > stepOf(s.asset.price) * 100n && most * 14n / 10n < (side > 0n ? room.long : room.short)) {
       const under = await wouldFail(kp, [C.requestTrade(me, m.vault, side * most * 97n / 100n)]);
       const over = await wouldFail(kp, [C.requestTrade(me, m.vault, side * (most * 13n / 10n + 1_000_000n))]);
       if (under !== "rpc" && over !== "rpc") check(under === "ok" && over === "0x5706", "with positions on several markets, the largest order shown is what the program accepts", { symbol: m.symbol, positions: s.openPositions, most, under, over });
@@ -871,7 +895,7 @@ async function adversaryRoutine(bot: Bot) {
     const d = snap.portfolios.find(p => p.pubkey.equals(t.portfolio))?.data;
     if (!d) continue;
     const h = C.accountHealth(snap.market, d);
-    if (!h.settled || h.positions.length === 0 || h.equity * 10_000n < h.notional * (C.LIQUIDATION_BPS + 200n)) continue;
+    if (!h.settled || h.positions.length === 0 || h.equity < h.floor + h.notional * 2n / 100n) continue;
     const v = vaults.find(x => x.assetIndex === h.positions[0].asset);
     if (!v || C.closeOnly(snap.market, v.assetIndex)) continue;
     expect(await wouldFail(kp, [C.requestClose(me, t.wallet, v.key)]), ["0x5710", "0x5705"], "forcing a healthy account closed", { wallet: t.wallet.toBase58() });
@@ -880,6 +904,202 @@ async function adversaryRoutine(bot: Bot) {
   const over = await wouldFail(kp, [createAssociatedTokenAccountIdempotentInstruction(me, C.ata(me, C.MINT), me, C.MINT), C.routerWithdraw(me, 1_000_000_000_000n)]);
   if (over !== "rpc") note({ type: "refusal", bot: bot.name, what: "withdrawing more than the account holds", code: over, ok: over !== "ok" });
   if (over === "ok") check(false, "refused: withdrawing more than the account holds", { code: over });
+}
+
+// ---- the gambler: as much as the margin allows, on every market at once, never closed ----
+let gamblerSide = 1n;
+async function gamblerRoutine(bot: Bot) {
+  const kp = bot.kp, me = kp.publicKey;
+  await gas(kp);
+  const states = [];
+  for (const m of traded) {
+    const s = await C.fetchVault(conn, m.vault, me);
+    if (!s.trader) { await fund(bot); return; }
+    states.push({ m, s });
+  }
+  const first = states[0].s;
+  if (states.some(x => x.s.trader!.hasPending)) return;
+  // Flat (it was liquidated, or it is new): margin back if it lost most of it, and the next run
+  // goes the other way, so both a long and a short book get liquidated over time.
+  if (first.openPositions === 0) { if (await refill(bot, first)) { gamblerSide = -gamblerSide; return; } }
+  const h = first.health;
+  if (h && h.notional > 0n) note({ type: "gambler", ratioBps: Number(h.equity * 10_000n / h.notional), positions: first.openPositions, equity: h.equity, notional: h.notional });
+  // Open what is not open yet, sharing the margin out: a third, then half of what is left, then all.
+  const open = states.filter(x => (x.s.portfolio?.position ?? 0n) === 0n && !x.s.closeOnly);
+  if (!open.length) return;
+  const { m } = open[0];
+  const s = await C.fetchVault(conn, m.vault, me); // fresh: the margin left depends on the others
+  const cap = s.margin ?? 0n, step = stepOf(s.asset.price);
+  const share = open.length >= 3 ? cap / 3n : open.length === 2 ? cap / 2n : cap * 97n / 100n;
+  const room = C.depth(s, 0n), side = gamblerSide;
+  let want = side * (share < (side > 0n ? room.long : room.short) ? share : (side > 0n ? room.long : room.short)) / step * step;
+  if (want === 0n) return;
+  const r = await trade(`${bot.name} ${Number(want) / 1e6} ${m.symbol}`, kp, m.vault, want);
+  if (r !== true) { note({ type: "order", bot: bot.name, symbol: m.symbol, want, outcome: "not accepted", error: r, ok: false }); return; }
+  const after = await settledState(kp, m.vault, []);
+  const got = (after?.portfolio?.position ?? 0n);
+  const lev = after?.health && after.health.equity > 0n ? Number(after.health.notional) / Number(after.health.equity) : 0;
+  note({ type: "order", bot: bot.name, symbol: m.symbol, want, got, outcome: !after ? "STILL QUEUED after 150 s" : got === want ? "filled" : got === 0n ? "expired" : "cut to the vault's room", leverage: +lev.toFixed(2), positions: after?.openPositions, ok: !!after });
+  say(`${bot.name}: ${Number(want) / 1e6} ${m.symbol} -> ${got === want ? "filled" : got === 0n ? "expired" : "cut"}; ${after?.openPositions ?? "?"} market(s), ${lev.toFixed(1)}x`);
+}
+
+// ---- the stopper: the largest position, protected by a stop before the liquidation price ----
+let stopperSide = 1n;
+const stopperState = new Map<string, { stopAt: bigint; liqAt: bigint; since: number }>();
+async function stopperRoutine(bot: Bot, m: Market) {
+  const kp = bot.kp, me = kp.publicKey;
+  await gas(kp);
+  const s = await C.fetchVault(conn, m.vault, me);
+  if (!s.trader) { await fund(bot); return; }
+  if (!s.book || !s.portfolio || s.trader.hasPending) return;
+  const held = s.portfolio.position, h = s.health;
+  const k = m.vault.toBase58(), was = stopperState.get(k);
+  const stop = s.orders.find(o => o.index === 4), trail = s.orders.find(o => o.index === 3);
+  if (held !== 0n && h) {
+    // Below the liquidation level while its stop is on the book: the stop came too late.
+    if (h.liquidatable && stop) check(false, "a stop placed before the liquidation price closes the position first", { symbol: m.symbol, stopAt: stop.trigger, mark: s.book.markPrice, ratioBps: Number(h.equity * 10_000n / h.notional) });
+    if (!stop && !trail) {
+      // Nothing protects it (just opened): a stop halfway to the liquidation price, and a 1% trail.
+      const e = Number(h.equity) / Number(h.notional), lb = Number(h.floor) / Number(h.notional);
+      const long = held > 0n;
+      const x = long ? (e - lb) / (1 - lb) : (e - lb) / (1 + lb); // the move that reaches the level
+      if (x <= 0.002) return; // already at the level: let the liquidation have it
+      const mark = Number(s.book.markPrice);
+      const stopAt = BigInt(Math.round(mark * (long ? 1 - x / 2 : 1 + x / 2))), liqAt = BigInt(Math.round(mark * (long ? 1 - x : 1 + x)));
+      const r = await send(`${bot.name} stop and trail ${m.symbol}`, kp, [C.placeOrder(me, m.vault, { index: 4, kind: C.ORDER.STOP, size: 0n, trigger: stopAt }), C.placeOrder(me, m.vault, { index: 3, kind: C.ORDER.TRAIL, size: 0n, trigger: 100n })]);
+      check(r === true, "a stop and a trailing stop can be put on a position at the margin limit", { symbol: m.symbol, error: r === true ? undefined : r });
+      if (r === true) { stopperState.set(k, { stopAt, liqAt, since: Date.now() }); say(`${bot.name}: ${m.symbol} ${Number(held) / 1e6} at ${(Number(h.notional) / Number(h.equity)).toFixed(1)}x, stop ${Number(stopAt) / 1e6}, liquidation near ${Number(liqAt) / 1e6}`); }
+    }
+    return;
+  }
+  // Flat. If it held a protected position before, it was closed by one of its orders (and not by
+  // a liquidation: its equity must be well above what is left after one).
+  if (was) {
+    stopperState.delete(k);
+    const left = s.orders.filter(o => !o.queued).length;
+    note({ type: "stopper", symbol: m.symbol, what: "closed", secs: Math.round((Date.now() - was.since) / 1000), stopAt: was.stopAt, liqAt: was.liqAt, equity: h?.equity, ordersLeft: left });
+    say(`${bot.name}: ${m.symbol} position closed after ${Math.round((Date.now() - was.since) / 1000)} s; $${usd(h?.equity ?? 0n)} left`);
+    if (left) { const swept = await (async () => { for (let i = 0; i < 36; i++) { await sleep(5000); const x = await C.fetchVault(conn, m.vault, me).catch(() => null); if (x && !x.orders.some(o => !o.queued)) return true; } return false; })(); check(swept, "the orders left over when a protected position closed are removed", { symbol: m.symbol }); }
+    stopperSide = -stopperSide;
+    return;
+  }
+  for (const o of s.orders) if (!o.queued) await send(`${bot.name} clear an old order`, kp, [C.cancelOrder(me, m.vault, o.index)]);
+  if (await refill(bot, s)) return;
+  if (s.closeOnly) return;
+  const cap = s.margin ?? 0n, room = C.depth(s, 0n), step = stepOf(s.asset.price);
+  const most = cap * 95n / 100n, side = stopperSide;
+  const want = side * (most < (side > 0n ? room.long : room.short) ? most : (side > 0n ? room.long : room.short)) / step * step;
+  if (want === 0n) return;
+  const r = await trade(`${bot.name} ${Number(want) / 1e6} ${m.symbol}`, kp, m.vault, want);
+  if (r !== true) note({ type: "order", bot: bot.name, symbol: m.symbol, want, outcome: "not accepted", error: r, ok: false });
+}
+
+// ---- the whale: half a vault's value in, then all of it out, which makes the vault wind down ----
+const WHALE_HOURS = Number(process.env.WHALE_HOURS ?? 8);
+const WHALE_STATE = LOG.replace(/\.jsonl$/, "") + "-whale.json";
+type Whale = { phase: "idle" | "deposited" | "invested" | "withdrawing"; vault?: string; symbol?: string; at: number; deposit?: number; nextAt: number; n: number; reduceOnlySeen?: boolean; closed?: boolean };
+const whaleWrite = (w: Whale) => fs.writeFileSync(WHALE_STATE, JSON.stringify(w));
+// (The first start is saved, so the wait before the first run is counted once.)
+const whaleRead = (): Whale => { try { return JSON.parse(fs.readFileSync(WHALE_STATE, "utf8")); } catch { const w: Whale = { phase: "idle", at: 0, nextAt: Date.now() + Number(process.env.WHALE_FIRST_MIN ?? 30) * 60_000, n: 0 }; whaleWrite(w); return w; } };
+async function whaleRoutine(bot: Bot) {
+  const kp = bot.kp, me = kp.publicKey;
+  await gas(kp);
+  if (!(await conn.getAccountInfo(C.traderAddress(me)))) { await fund(bot); return; }
+  const w = whaleRead();
+  if (w.phase === "idle") {
+    if (Date.now() < w.nextAt) return;
+    const m = traded[w.n % traded.length];
+    const s = await C.fetchVault(conn, m.vault, me);
+    if (s.vault.needsFlat || s.vault.frozenUntil * 1000 >= Date.now() - 5_000 || s.ticket && (s.ticket.deposit > 0n || s.ticket.withdraw > 0n)) return;
+    const amount = Math.min(20_000, Math.max(500, Math.round(Number(s.vault.lastNav) / 1e6 / 2)));
+    const have = Number(s.userCollateral) / 1e6;
+    if (have < amount && (await mint(kp, Math.ceil(amount - have) + 10)) !== true) return;
+    const r = await send(`${bot.name} deposit ${amount} into ${m.symbol}`, kp, [C.requestDeposit(s.vault, me, BigInt(amount) * 1_000_000n)]);
+    note({ type: "whale", symbol: m.symbol, what: "deposit", amount, nav: s.vault.lastNav, ok: r === true, error: r === true ? undefined : r });
+    if (r === true) { whaleWrite({ ...w, phase: "deposited", vault: m.vault.toBase58(), symbol: m.symbol, at: Date.now(), deposit: amount, reduceOnlySeen: false, closed: false }); say(`${bot.name}: deposited $${amount} into ${m.symbol} (vault worth $${usd(s.vault.lastNav)})`); }
+    return;
+  }
+  const vault = new PublicKey(w.vault!), sym = w.symbol!;
+  const s = await C.fetchVault(conn, vault, me);
+  const v = s.vault, t = s.ticket;
+  // Claims what an epoch that rolled owes it (shares for the deposit, money for the withdrawal).
+  if (t && (t.deposit > 0n || t.withdraw > 0n) && t.epoch < v.epoch) {
+    const r = await send(`${bot.name} claim ${sym} epoch ${t.epoch}`, kp, [createAssociatedTokenAccountIdempotentInstruction(me, C.ata(me, v.shareMint), me, v.shareMint), C.claim(v, me, t.epoch)]);
+    if (r !== true) { check(false, "a liquidity provider can claim after its epoch rolled", { symbol: sym, epoch: t.epoch, error: r }); return; }
+    if (w.phase === "deposited") { whaleWrite({ ...w, phase: "invested", at: Date.now() }); say(`${bot.name}: ${sym} shares claimed`); return; }
+    if (w.phase === "withdrawing" && t.withdraw > 0n) {
+      const after = await C.fetchVault(conn, vault, me);
+      if (after.ticket && after.ticket.withdraw > 0n) return; // part was queued for a later epoch
+      const got = Number(after.userCollateral) / 1e6, back = got / w.deposit!;
+      note({ type: "whale", symbol: sym, what: "paid out", got, deposit: w.deposit, secs: Math.round((Date.now() - w.at) / 1000), reduceOnlySeen: w.reduceOnlySeen });
+      // A vault's value moves with its traders' gains and losses: a whale's money comes back within
+      // a few percent of what it put in, over a few hours.
+      check(back > 0.9 && back < 1.1, "a large withdrawal is paid in full (within 10% of the deposit, after the vault's gains or losses)", { symbol: sym, deposit: w.deposit, got: +got.toFixed(2), hours: +((Date.now() - w.at) / 3.6e6).toFixed(1) });
+      say(`${bot.name}: ${sym} withdrawal paid $${got.toFixed(2)} for a $${w.deposit} deposit${w.reduceOnlySeen ? " (the vault went reduce-only on the way)" : ""}`);
+      whaleWrite({ phase: "idle", at: Date.now(), nextAt: Date.now() + WHALE_HOURS * 3.6e6, n: w.n + 1 });
+      return;
+    }
+  }
+  if (w.phase === "invested") {
+    // A small position of its own on that market first, to close while the vault is reduce-only.
+    if (!s.portfolio || s.trader?.hasPending) return;
+    if (s.portfolio.position === 0n && !w.closed) {
+      const step = stepOf(s.asset.price), q = (50_000_000n * 1_000_000n / s.asset.price) / step * step;
+      if (q > 0n) await trade(`${bot.name} ${Number(q) / 1e6} ${sym}`, kp, vault, (w.n % 2 ? -1n : 1n) * q);
+      return;
+    }
+    if (v.needsFlat || v.frozenUntil * 1000 >= Date.now() - 5_000) return;
+    const r = await send(`${bot.name} withdraw everything from ${sym}`, kp, [C.requestWithdraw(v, me, s.userShares)]);
+    note({ type: "whale", symbol: sym, what: "withdraw all", shares: s.userShares, nav: v.lastNav, ok: r === true, error: r === true ? undefined : r });
+    if (r === true) { whaleWrite({ ...w, phase: "withdrawing", at: Date.now() }); say(`${bot.name}: asked to withdraw everything from ${sym}`); }
+    return;
+  }
+  if (w.phase === "withdrawing") {
+    if (v.needsFlat && !w.reduceOnlySeen) { w.reduceOnlySeen = true; whaleWrite(w); note({ type: "whale", symbol: sym, what: "vault is reduce-only" }); say(`${bot.name}: ${sym} vault is now reduce-only (closing its position to pay the withdrawal)`); }
+    // While the vault is reduce-only, the whale's own close must still fill.
+    if (v.needsFlat && s.portfolio && s.portfolio.position !== 0n && !s.trader?.hasPending) {
+      const held = s.portfolio.position;
+      const r = await trade(`${bot.name} close ${sym} while reduce-only`, kp, vault, -held);
+      const after = r === true ? await settledState(kp, vault, []) : undefined;
+      const ok = !!after && (after.portfolio?.position ?? held) === 0n;
+      check(ok, "a trader can close while the vault is reduce-only", { symbol: sym, held, after: after?.portfolio?.position, error: r === true ? undefined : r });
+      if (ok) { w.closed = true; whaleWrite(w); }
+    }
+    if (Date.now() - w.at > 6 * 3.6e6) check(false, "a large withdrawal is paid within six hours", { symbol: sym, hours: +((Date.now() - w.at) / 3.6e6).toFixed(1), needsFlat: v.needsFlat, ticketWithdraw: t?.withdraw });
+  }
+}
+
+// ---- the crowd: standing orders from five wallets that all come due at the same moment ----
+async function crowdRoutine(group: Bot[], m: Market) {
+  const before = await Promise.all(group.map(b => C.fetchVault(conn, m.vault, b.kp.publicKey)));
+  if (before.some(s => !s.trader || s.trader.hasPending || !s.book || s.orders.length) || before[0].closeOnly) return;
+  const px = before[0].asset.price, step = stepOf(px), mark = before[0].book!.markPrice;
+  const unit = (30_000_000n * 1_000_000n / px) / step * step;
+  if (unit === 0n) return;
+  // Whoever holds a position puts a take-profit on all of it, the others a limit to open one; each
+  // at a price the mark is already past, so all of them are due at once.
+  const ixs = before.map((s, i) => {
+    const held = s.portfolio!.position, me = group[i].kp.publicKey;
+    if (held !== 0n) return C.placeOrder(me, m.vault, { index: 6, kind: C.ORDER.TAKE, size: 0n, trigger: mark * (held > 0n ? 9_990n : 10_010n) / 10_000n });
+    const side = i % 2 ? -1n : 1n;
+    return C.placeOrder(me, m.vault, { index: 6, kind: C.ORDER.LIMIT, size: side * unit, trigger: mark * (side > 0n ? 10_100n : 9_900n) / 10_000n });
+  });
+  const t0 = Date.now();
+  const sent = await Promise.all(group.map((b, i) => send(`${b.name} crowd order ${m.symbol}`, b.kp, [ixs[i]], [], 1)));
+  const placed = sent.filter(r => r === true).length;
+  let after = before;
+  for (let i = 0; i < 60; i++) {
+    await sleep(4000);
+    after = await Promise.all(group.map(b => C.fetchVault(conn, m.vault, b.kp.publicKey)));
+    if (after.every((s, k) => sent[k] !== true || (!s.orders.some(o => o.index === 6) && !s.trader!.hasPending))) break;
+  }
+  const secs = Math.round((Date.now() - t0) / 1000);
+  const done = after.filter((s, k) => sent[k] === true && !s.orders.some(o => o.index === 6) && s.portfolio!.position !== before[k].portfolio!.position).length;
+  check(done === placed, "standing orders that come due together are all carried out", { symbol: m.symbol, placed, done, secs });
+  note({ type: "crowd", symbol: m.symbol, placed, done, secs });
+  say(`crowd on ${m.symbol}: ${done} of ${placed} standing orders carried out in ${secs} s`);
+  // Leftovers (one refused for margin, say) are cleared so the next turn starts clean.
+  for (const [k, s] of after.entries()) for (const o of s.orders) if (!o.queued) await send(`${group[k].name} clear crowd order`, group[k].kp, [C.cancelOrder(group[k].kp.publicKey, m.vault, o.index)]);
 }
 
 function report() {
@@ -914,7 +1134,23 @@ function report() {
   for (const [sym, ms] of bySymbol) console.log(`${sym} vault: epoch ${ms[0].epoch} -> ${ms[ms.length - 1].epoch} | value $${(ms[0].nav / 1e6).toFixed(2)} -> $${(ms[ms.length - 1].nav / 1e6).toFixed(2)} | position now ${ms[ms.length - 1].vaultPosition / 1e6}`);
 }
 
+/** Sends each bot's coins above what it needs (a top-up's worth of bonds, its deposit float, and
+ *  a margin of a fifth) back to the paying wallet. */
+async function sweep() {
+  const to = deployer().publicKey;
+  let total = 0;
+  for (const b of BOTS) {
+    const kp = wallet(b.name), have = await conn.getBalance(kp.publicKey);
+    const keep = Math.round((GAS_FILL + depositFloat(kp.publicKey)) * 1.2) + 5_000_000;
+    if (have - keep < 0.05 * LAMPORTS_PER_SOL) continue;
+    const r = await send(`sweep ${b.name}`, kp, [SystemProgram.transfer({ fromPubkey: kp.publicKey, toPubkey: to, lamports: have - keep })]);
+    if (r === true) { total += have - keep; say(`${b.name}: ${((have - keep) / LAMPORTS_PER_SOL).toFixed(3)} ${C.COIN} back, ${(keep / LAMPORTS_PER_SOL).toFixed(3)} kept`); }
+  }
+  say(`swept ${(total / LAMPORTS_PER_SOL).toFixed(3)} ${C.COIN} to ${to.toBase58()}`);
+}
+
 if (process.argv[2] === "report") report();
+else if (process.argv[2] === "sweep") await sweep();
 else if (process.argv[2] === "run") {
   const bots: Bot[] = BOTS.map(b => ({ ...b, kp: wallet(b.name) }));
   // The first reads are retried: a public RPC that throttles or drops a connection at that
@@ -952,7 +1188,11 @@ else if (process.argv[2] === "run") {
   })();
   const one = (k: Kind) => bots.find(b => b.kind === k)!;
   every(PACE, 40, "lp", n => lpRoutine(one("lp"), traded[n % traded.length]));
-  every(PACE * 2, 70, "burst", n => burstRoutine(bots.filter(b => b.kind === "burst"), traded[n % traded.length]));
+  // The burst wallets take turns: market orders at the same moment, then standing orders due together.
+  every(PACE, 70, "burst", n => (n % 2 ? crowdRoutine : burstRoutine)(bots.filter(b => b.kind === "burst"), traded[(n >> 1) % traded.length]));
+  every(Math.max(60, PACE / 2), 160, "gambler", () => gamblerRoutine(one("gambler")));
+  every(Math.max(45, PACE / 4), 190, "stopper", () => stopperRoutine(one("stopper"), traded[1 % traded.length]));
+  every(60, 220, "whale", () => whaleRoutine(one("whale")));
   every(PACE * 1.5, 100, "cross", () => crossRoutine(one("cross"), feeBps));
   every(PACE, 130, "adversary", () => adversaryRoutine(one("adversary")));
 

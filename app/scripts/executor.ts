@@ -61,7 +61,13 @@ const enter = (s: string) => { stage = s; stageAt = Date.now(); };
 // A rate-limited RPC call must not take the executor down: log it and carry on next pass.
 process.on("unhandledRejection", e => log("rpc", String((e as any)?.message ?? e).split("\n")[0].slice(0, 120)));
 
-const JACK = process.env.JACK_URL ?? "http://jack0.x1.xyz:8090";
+// Price services, first = preferred: jack0 (the X1 team's), then our own copy
+// (scripts/price-service.ts, run by deploy/x1-services.sh on 127.0.0.1:8091). Each one's stream is
+// recorded on its own; prices are taken from the first one whose stream is live (a message in the
+// last LIVE_SECS). jack0 was down for two days in October 2026 and X1 had no price at all.
+const JACKS = (process.env.JACK_URLS ?? process.env.JACK_URL ?? "http://jack0.x1.xyz:8090,http://127.0.0.1:8091").split(",").map(s => s.trim()).filter(Boolean);
+const JACK = JACKS.join(" then ");
+const LIVE_SECS = 15;
 const JACK_SYMBOL: Record<string, string> = { XAU: "GOLD", XAG: "SILVER" };
 const IDLE_JUMP = process.env.IDLE_JUMP === "1";
 const IDLE_MARK_SECS = Number(process.env.IDLE_MARK_SECS ?? 600);
@@ -92,25 +98,31 @@ function settledNow(market: Uint8Array, assets: number[]) {
 // seldom, so the passes that fill trades are not refused for want of requests.
 const SLOW_JOBS_MS = Number(process.env.SLOW_JOBS_SECS ?? (C.X1 ? 0 : 15)) * 1000;
 const SWEEP_MIN = C.X1 ? 1e9 : 0.02e9; // lamports: below this a sweep is not worth its fee
-let sweptAt = 0, bookRent = 0;
+let sweptAt = 0, bookRent = 0, tiersAt = 0;
 const URGENT_MARK_MOVE = 0.01; // a move this large on a market with positions is posted even while trades are queued elsewhere
 const reporter = (() => {
   const p = process.env.REPORTER_KEY ?? "../keys/reporter-keypair.json";
   return fs.existsSync(p) ? Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(p, "utf8")))) : null;
 })();
 type Sample = { t: number; price: number }; // t: unix seconds of the freshest quote used
-const samples = new Map<string, Sample[]>();
-let jackSymbols = "";
+// One record per service: url -> symbol -> samples, and when its stream last said anything.
+const samplesBy = new Map<string, Map<string, Sample[]>>(JACKS.map(u => [u, new Map()]));
+const heardAt = new Map<string, number>();
+let jackSymbols = "", disagreeAt = 0;
 
-/** Keeps a ten-minute record of the service's stream for `symbols` (reconnects by itself). */
+/** Keeps a ten-minute record of every service's stream for `symbols` (each reconnects by itself). */
 async function recordJack(symbols: string[]) {
   const want = [...new Set(symbols.map(s => JACK_SYMBOL[s] ?? s))].sort().join(",");
   if (!want || want === jackSymbols) return;
   jackSymbols = want;
+  await Promise.all(JACKS.map(u => recordOne(u, want)));
+}
+async function recordOne(url: string, want: string) {
+  const samples = samplesBy.get(url)!;
   for (;;) {
     if (jackSymbols !== want) return; // the set of markets changed: a newer recorder took over
     try {
-      const r = await fetch(`${JACK}/v1/stream/prices?symbols=${want.toLowerCase()}`);
+      const r = await fetch(`${url}/v1/stream/prices?symbols=${want.toLowerCase()}`);
       if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
       const reader = r.body.getReader();
       const dec = new TextDecoder();
@@ -124,6 +136,7 @@ async function recordJack(symbols: string[]) {
           const line = buf.slice(0, i).split("\n").find(l => l.startsWith("data: "));
           buf = buf.slice(i + 2);
           if (!line) continue;
+          heardAt.set(url, Date.now());
           for (const x of JSON.parse(line.slice(6)).data ?? []) {
             if (x.status !== "ok" || !(x.price > 0)) continue; // only prices enough exchanges agree on
             const list = samples.get(x.symbol) ?? samples.set(x.symbol, []).get(x.symbol)!;
@@ -135,22 +148,49 @@ async function recordJack(symbols: string[]) {
         }
       }
     } catch (e: any) {
-      log("price service stream:", String(e?.message ?? e).slice(0, 80));
+      log(`price service ${url} stream:`, String(e?.message ?? e).slice(0, 80));
     }
     await new Promise(r => setTimeout(r, 3000));
   }
 }
 
+/** The samples of `symbol` from the first service whose stream is live (said anything in the
+ *  last LIVE_SECS) and that has a price for it. Not by the age of the symbol's own last price:
+ *  jack0 only sends a symbol when its price changes, and a quiet minute is no outage. A switch is
+ *  logged. Nothing (no price) while two live services disagree by more than 1%. */
+const usingBy = new Map<string, string>();
+function jackSamples(symbol: string): Sample[] {
+  const sym = JACK_SYMBOL[symbol] ?? symbol;
+  const now = Date.now();
+  const live = JACKS.filter(u => now - (heardAt.get(u) ?? 0) < LIVE_SECS * 1000)
+    .map(u => ({ u, list: samplesBy.get(u)!.get(sym) ?? [] }))
+    .filter(x => x.list.length);
+  if (!live.length) return [];
+  // Two live services more than 1% apart: one of them is wrong, and nobody can tell which, so no
+  // price is posted for this symbol until they agree again (the reporter key would otherwise put
+  // a wrong price on chain, and fills and liquidations would follow it).
+  if (live.length > 1) {
+    const a = live[0].list[live[0].list.length - 1].price, b = live[1].list[live[1].list.length - 1].price;
+    if (Math.abs(a / b - 1) > 0.01) {
+      if (now - disagreeAt > 60_000) { disagreeAt = now; log(`price services disagree on ${sym} by more than 1%, no price posted: ${live[0].u} ${a}, ${live[1].u} ${b}`); }
+      return [];
+    }
+  }
+  const was = usingBy.get(sym);
+  if (live[0].u !== was) { if (was) log(`${sym} prices now from ${live[0].u} (was ${was})`); usingBy.set(sym, live[0].u); }
+  return live[0].list;
+}
+
 /** The first recorded price with a timestamp at or after `t`, and the timestamp of the one
  *  before it (which is before `t`), or null if the record does not cover `t` yet. */
 function jackFirstAtOrAfter(symbol: string, t: number): { price: bigint; publish: number; prev: number } | null {
-  const list = samples.get(JACK_SYMBOL[symbol] ?? symbol) ?? [];
+  const list = jackSamples(symbol);
   const i = list.findIndex(x => x.t >= t);
   if (i <= 0) return null; // nothing at or after t yet, or no earlier sample to bound it
   return { price: BigInt(Math.round(list[i].price * 1e6)), publish: list[i].t, prev: list[i - 1].t };
 }
 function jackLatest(symbol: string) {
-  const list = samples.get(JACK_SYMBOL[symbol] ?? symbol) ?? [];
+  const list = jackSamples(symbol);
   return list.length >= 2 ? { price: BigInt(Math.round(list[list.length - 1].price * 1e6)), publish: list[list.length - 1].t, prev: list[list.length - 2].t } : null;
 }
 
@@ -524,6 +564,19 @@ async function watch(vaults: C.Vault[], market: Uint8Array, full: boolean) {
     if (s.book.pending.length && (await requestsOf(v, s.book)).some(r => r.settle)) continue;
     if (C.canSettleOpen(s)) sent = (await send(`queue settlement of ${v.feed?.symbol} epoch ${cur.epoch}`, [C.requestSettle(payer.publicKey, v.key)], true)) || sent;
     else await send(`require flat ${v.feed?.symbol} (withdrawals exceed the vault's cash)`, [C.requireFlat(v)]);
+  }
+  // Each listed asset's leverage tier is on record (SetTier; anyone may send it, the router
+  // decides the tier from the vault's feed). A new listing, or a slot reused by another asset,
+  // would otherwise open at the default tier and be liquidated only at the major level.
+  if (Date.now() - tiersAt > 600_000) {
+    tiersAt = Date.now();
+    const rec = await C.fetchTiers(conn).catch(() => null);
+    const L2 = (await import("../src/layout.json")).default as any;
+    for (const v of vaults) {
+      const gen = C.decodeAsset(snap.market, v.assetIndex).marketId;
+      const ok = rec && v.assetIndex < L2.router.tier_slots && new DataView(rec.buffer, rec.byteOffset).getBigUint64(L2.router.tiers.generation + v.assetIndex * 8, true) === gen;
+      if (!ok) await send(`record the leverage tier of ${v.feed?.symbol}`, [C.setTier(payer.publicKey, v.key)]);
+    }
   }
   const queue = (v: C.Vault, wallet: PublicKey, why: string) =>
     send(`queue ${why} ${v.feed?.symbol} for ${wallet.toBase58().slice(0, 6)}`, [C.requestClose(payer.publicKey, wallet, v.key)], true);

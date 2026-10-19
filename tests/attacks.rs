@@ -175,6 +175,45 @@ fn roll_needs_flat_portfolio_and_reduce_only_gets_there() {
     assert_eq!({ w.vault_state().epoch }, 2);
 }
 
+/// A withdrawal that forces the vault flat pays `EXIT_FEE_BPS` of what it takes out, and that
+/// stays in the vault; one paid from the cash reserve pays nothing.
+#[test]
+fn a_withdrawal_that_forces_the_vault_flat_pays_the_exit_fee() {
+    use percolator_vault::processor::EXIT_FEE_BPS;
+    assert_eq!(EXIT_FEE_BPS, 50);
+    let (mut w, alice) = funded();
+    w.taker_trade(0, TEN_M).unwrap();
+    let shares = w.tokens(alice.shares);
+    let half = shares / 2;
+    w.withdraw(&alice, half).unwrap();
+    w.advance(EPOCH_LEN, INITIAL_PRICE);
+    w.require_flat().unwrap();
+    w.taker_trade(0, -TEN_M).unwrap();
+    assert_eq!({ w.vault_state().inventory }, 0);
+    let nav = w.nav();
+    let fair = (nav as u128 * half as u128 / shares as u128) as u64;
+    w.roll().unwrap();
+    let before = w.tokens(alice.collateral);
+    w.claim(&alice, 1).unwrap();
+    let paid = w.tokens(alice.collateral) - before;
+    let want = fair - fair * EXIT_FEE_BPS / 10_000;
+    assert!(paid <= want + 2 && paid + fair / 1_000 >= want, "paid {paid}, fair {fair}, less the fee {want}");
+    assert!(w.nav() >= nav - paid, "the fee stayed in the vault");
+
+    // A small withdrawal next epoch is paid from the cash reserve: no fee.
+    let rest = w.tokens(alice.shares);
+    let small = rest / 50;
+    let nav = w.nav();
+    let fair = (nav as u128 * small as u128 / rest as u128) as u64;
+    w.withdraw(&alice, small).unwrap();
+    w.advance(EPOCH_LEN, INITIAL_PRICE);
+    w.roll().unwrap();
+    let before = w.tokens(alice.collateral);
+    w.claim(&alice, 2).unwrap();
+    let paid = w.tokens(alice.collateral) - before;
+    assert!(paid + 2 >= fair && paid <= fair + 2, "paid {paid}, fair {fair}");
+}
+
 #[test]
 fn a_trader_can_always_close_while_the_vault_is_reduce_only() {
     let (mut w, alice) = funded();

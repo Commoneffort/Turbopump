@@ -104,27 +104,33 @@ export const decodeReferral = (d: Uint8Array): Referral => ({ wallet: key(d, 8),
 export const setReferrer = (wallet: PublicKey, referrer: PublicKey) => new TransactionInstruction({
   programId: C.ROUTER, keys: [rw(wallet, true), rw(referralAddress(wallet)), ro(referrer), ro(SystemProgram.programId)], data: Buffer.from([24]),
 });
-/** What the platform gives back out of its own share of the fees (a fifth of what traders pay,
- *  2 basis points of what they trade), in millionths of the volume (100 = one basis point). A referrer earns
- *  on what the wallets it referred trade; a wallet that trades a lot in a week earns on its own. */
+/** What the platform gives back out of the treasury's income, as shares of the fee traders pay
+ *  (`C.TRADE_FEE_BPS` of what they trade). The platform's own share of a trade is a fifth of that
+ *  fee, so a referral (21%) is more than the platform earns on the referred trade itself: it is
+ *  paid out of the treasury's income from all trading, before any volume rebate, and never more
+ *  than that income. A referrer earns on what the wallets it referred trade; a wallet that
+ *  trades a lot in a week earns on its own. */
 export const REBATE = {
-  referrerPerMillion: 50, // 0.5 basis points of the referred wallet's volume
-  tiers: [{ weekVolume: 1_000_000, perMillion: 100 }, { weekVolume: 100_000, perMillion: 50 }], // 1 and 0.5 basis points
-  mostOfIncome: 0.75, // never more than three quarters of what the treasury took in
+  referrerShare: 0.21, // 21% of the fee the referred wallet paid
+  tiers: [{ weekVolume: 1_000_000, share: 0.10 }, { weekVolume: 100_000, share: 0.05 }], // 10% / 5% of its own fees
+  mostOfIncome: 1, // never more than what the treasury took in; referrals are paid first
 };
+/** A share of the trade fee as millionths of the volume (100 = one basis point). */
+export const feeSharePerMillion = (share: number) => share * C.TRADE_FEE_BPS * 100;
 
 export const unfollow = (wallet: PublicKey, leader: PublicKey) => new TransactionInstruction({
   programId: C.ROUTER, keys: [rw(wallet, true), rw(followAddress(wallet, leader))], data: Buffer.from([18]),
 });
 /** Starts copying `leader`, or changes the terms: `ratioBps` of the leader's leverage, and at
  *  most `maxNotional` (collateral atoms, 0 = no limit) on any one market. Starting to copy a
- *  trader costs `SOCIAL_FEE` (router `COPY_FEE_LAMPORTS`), paid to the treasury; new terms do not. */
+ *  trader costs `SOCIAL_FEE` to the treasury (router `COPY_FEE_LAMPORTS`) plus `SOCIAL_FEE` to the
+ *  leader (`COPY_LEADER_FEE_LAMPORTS`); new terms cost nothing. */
 export const setCopy = (wallet: PublicKey, leader: PublicKey, ratioBps: number, maxNotional: bigint) => {
   const data = Buffer.alloc(13);
   data[0] = 19; data.writeUInt32LE(ratioBps, 1); data.writeBigUInt64LE(maxNotional, 5);
   return new TransactionInstruction({
     programId: C.ROUTER,
-    keys: [rw(wallet, true), rw(copyAddress(wallet)), ro(C.traderAddress(wallet)), ro(leader), ro(C.traderAddress(leader)), ro(SystemProgram.programId), rw(C.TREASURY)],
+    keys: [rw(wallet, true), rw(copyAddress(wallet)), ro(C.traderAddress(wallet)), rw(leader), ro(C.traderAddress(leader)), ro(SystemProgram.programId), rw(C.TREASURY)],
     data,
   });
 };
@@ -137,6 +143,7 @@ export const triggerCopy = (payer: PublicKey, c: Copy, vault: PublicKey, size = 
   keys: [
     rw(payer, true), rw(c.key), rw(C.traderAddress(c.follower)), ro(c.follower), ro(vault), rw(C.bookAddress(vault)), rw(C.requestAddress(vault, c.follower)),
     ro(C.MARKET), ro(C.routerPortfolio(c.follower)), ro(C.traderAddress(c.leader)), ro(C.routerPortfolio(c.leader)), ro(SystemProgram.programId),
+    ro(C.tiersAddress()),
   ],
   data: Buffer.concat([Buffer.from([21]), i128le(size)]),
 });
@@ -147,6 +154,12 @@ export const triggerCopy = (payer: PublicKey, c: Copy, vault: PublicKey, size = 
  *  `SOCIAL_FEE_LAMPORTS`): 10 XNT on X1, 0.02 SOL on devnet. Paid to the platform's treasury. */
 export const SOCIAL_FEE = C.X1 ? 10_000_000_000n : 20_000_000n;
 export const SOCIAL_FEE_TEXT = C.X1 ? "10 XNT" : "0.02 SOL";
+/** Whether this network's router pays the copied trader too (`COPY_LEADER_FEE_LAMPORTS`): both
+ *  routers do since 2026-10-19. */
+export const LEADER_PAID = true;
+/** Starting to copy a trader: `SOCIAL_FEE` to the treasury plus the same to the trader copied. */
+export const COPY_FEE = LEADER_PAID ? 2n * SOCIAL_FEE : SOCIAL_FEE;
+export const COPY_FEE_TEXT = LEADER_PAID ? (C.X1 ? "20 XNT" : "0.04 SOL") : SOCIAL_FEE_TEXT;
 /** A tenth of that: a name (taking one, or changing it), and one day in the leaderboard's
  *  featured row (router `NAME_FEE_LAMPORTS`, `FEATURE_FEE_LAMPORTS`). */
 export const NAME_FEE = SOCIAL_FEE / 10n, FEATURE_FEE = SOCIAL_FEE / 10n;

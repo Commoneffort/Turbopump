@@ -25,7 +25,7 @@ What is in here:
 - **Standing orders** (router tags 12 to 14): limit, stop loss, take profit, trailing stop (up to 50% back from the best price) and TWAP (2 to 500 slices, at least 10 seconds apart). Signed once, carried out by anyone, and filled like any trade, so they cannot be front-run either. Up to 8 per wallet per market.
 - **Track records and copy trading** (router tags 15 to 21): profit, volume and fills booked by the router itself; names and badges; following; copying a trader's leverage at a chosen ratio.
 - **Liquidation and settlement that keep markets open**: accounts below 15% are closed against the vault before the engine's own liquidation at 10%; epochs settle while the vault holds a position.
-- **Fees**: 0.10% per trade, fixed by the program; opener's share; a platform share that vaults under 5,000 USDC do not pay; weekly volume rebates and referrals (`app/scripts/rebates.ts`, router tag 24).
+- **Fees**: 0.05% per trade (5 bps, about Hyperliquid's 4.5 bps taker fee), fixed by the program; opener's share; a platform share that vaults under 5,000 USDC do not pay; weekly volume rebates and referrals (`app/scripts/rebates.ts`, router tag 24).
 - **Safety rails**: a price band on the mark (2% plus 0.5% per second), a deposit that makes letting an order lapse cost something, four places in each queue kept for liquidations and settlements, deposits frozen while a settlement is queued.
 - **A second price source and a second network**: reported prices as a fallback for Pyth, and a full deployment on X1, which has no Pyth.
 - **Services** (`app/scripts/executor.ts`, the keeper in `examples/`): anyone can run them, on Pyth's free plan and public RPC.
@@ -101,7 +101,7 @@ So the natural liquidity provider on Percolator is the operator of a market, not
 | 32 | `PushMark` | router only | Moves the asset's mark (the router passes only verified Pyth prices) |
 | 33 | `ArmFill` | router only | Arms the one fill the matcher accepts in this slot |
 | 36 | `FreezeRequests` | router only | Stops new deposit and withdrawal requests while an epoch's settlement is queued |
-| 37 | `SetTradeFee` | anyone | Sets a market's trade fee to the program's constant (0.10%) |
+| 37 | `SetTradeFee` | anyone | Sets a market's trade fee to the program's constant (0.05%) |
 
 ### Router program
 

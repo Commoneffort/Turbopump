@@ -1,5 +1,6 @@
 import { MANIFEST as M } from "./chain";
-import { CANON_EPOCH_LEN_SLOTS, ROUTER, ROUTER_DELAY_SECS, ROUTER_GRACE_SECS, X1, slotSeconds } from "./chain";
+import { CANON_EPOCH_LEN_SLOTS, ROUTER, ROUTER_DELAY_SECS, ROUTER_GRACE_SECS, TRADE_FEE_PCT, X1, slotSeconds } from "./chain";
+import { COPY_FEE_TEXT, LEADER_PAID, REBATE } from "./social";
 
 const ex = (k: string) => (X1 ? `https://explorer.testnet.x1.xyz/address/${k}` : `https://explorer.solana.com/address/${k}?cluster=devnet`);
 const A = ({ k }: { k: string }) => <a className="mono" href={ex(k)} target="_blank" rel="noreferrer">{k}</a>;
@@ -231,7 +232,7 @@ export default function Docs() {
           <li><b>A badge picture, 10 XNT.</b> A wallet can pay to show a picture of its own instead of a shape (10 XNT on X1, 0.02 SOL on devnet, to the platform's treasury, each time a picture is saved). The page cuts it to a 64 by 64 JPEG and the router stores those bytes under the wallet: at most 2,048, only a JPEG, only that wallet can write them. The page never follows a link for a picture, decodes the bytes as a JPEG and nothing else, shows only a picture of exactly that size, and draws it again itself before it reaches the screen.</li>
           <li><b>Following.</b> A list of traders you watch. Their fills on a market are marked on your chart with their badge: under the candle for a buy, over it for a sell.</li>
           <li><b>Copying.</b> You sign once: keep my account at this trader's leverage on every market, times a ratio you choose, and never more than a limit per market. When they open, add, cut or close, anyone (the executors do) can queue the trade that brings you in line. The router computes its size from the two accounts; the caller cannot make it bigger or turn it round. It then fills like any order, at the first oracle price after its target time, so a copy can be front-run no more than a trade can.</li>
-          <li><b>What a copy cannot do.</b> It cannot withdraw, and it cannot trade more than the margin rule allows. A trader you copy who loses loses your money too, in proportion: a good record is not a promise. Starting to copy a trader costs 10 XNT (0.02 SOL on devnet), paid to the platform once; changing the terms is free. Each copy trade pays the usual 0.10% fee; small differences (under 10% of the target) are left alone so you do not pay it on every tick. While you copy, positions you open yourself are brought back in line. Stop at any time: your positions stay as they are.</li>
+          <li><b>What a copy cannot do.</b> It cannot withdraw, and it cannot trade more than the margin rule allows. A trader you copy who loses loses your money too, in proportion: a good record is not a promise. Starting to copy a trader costs {COPY_FEE_TEXT}, once{LEADER_PAID ? ": half to the trader you copy, half to the platform" : ", paid to the platform"}; changing the terms is free. Each copy trade pays the usual {TRADE_FEE_PCT} fee; small differences (under 10% of the target) are left alone so you do not pay it on every tick. While you copy, positions you open yourself are brought back in line. Stop at any time: your positions stay as they are.</li>
         </ul>
 
         <h2 id="lifecycle">Market lifecycle</h2>
@@ -259,7 +260,7 @@ export default function Docs() {
             <tr><td>Insurance floor</td><td>100 USDC kept in insurance for traders; only fees above it are harvested</td></tr>
             <tr><td>Price</td><td>Verified Pyth prices only, moved forward by the router; listing needs a price at most 300 seconds old</td></tr>
             <tr><td>Execution</td><td>The first Pyth price published at or after {ROUTER_DELAY_SECS} seconds after the request landed</td></tr>
-            <tr><td>Leverage and fee</td><td>10× (10% initial margin) and a 0.10% fee per side, fixed by the program</td></tr>
+            <tr><td>Leverage and fee</td><td>20× on BTC and ETH, 10× on the rest, and a {TRADE_FEE_PCT} fee per side, fixed by the program</td></tr>
             <tr><td>Opener's share</td><td>5% of harvested fees (a tenth of what traders pay), forever, with no other powers</td></tr>
             <tr><td>Matcher approval</td><td>216,000 slots (about {Math.round(216_000 * slotSeconds() / 3600)} hours), renewed at every roll; anyone can renew it with <code>RefreshMatcher</code></td></tr>
           </tbody>
@@ -281,10 +282,10 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
 
         <h2 id="fees">Fees, rebates and referrals</h2>
         <ul>
-          <li>Every trade pays the market's fee (0.10%) on both sides into the asset's insurance. On a trade against the vault, the vault pays its side too, and gets both back when fees are harvested.</li>
+          <li>Every trade pays the market's fee ({TRADE_FEE_PCT}) on both sides into the asset's insurance. On a trade against the vault, the vault pays its side too, and gets both back when fees are harvested.</li>
           <li>Harvested fees above the 100 USDC floor are split 85% to depositors (by raising the share price), 5% to the opener and 10% to the platform's treasury, which pays for price updates, re-valuations and liquidations. Half of what is harvested is the vault's own payments coming back, so of what traders paid, depositors keep 70%, the opener gets 10% and the platform 20% (claimable with <code>ClaimOpenerFees</code>).</li>
           <li>A vault worth less than 5,000 USDC at its last roll pays the platform nothing: its depositors keep that part too, so a new market's first providers earn the most.</li>
-          <li><b>Rebates.</b> The platform pays part of its own share back, weekly: a wallet that traded 100,000 USDC or more in the week gets 0.5 basis points of it back, 1,000,000 or more gets 1 basis point. Whoever invited a wallet (the wallet confirms it once, on chain, and it can never be changed) gets 0.5 basis points of what it trades. Rebates are never more than three quarters of what the treasury took in that week, and they cost depositors and openers nothing.</li>
+          <li><b>Referrals and rebates.</b> Paid weekly by the platform. Whoever invited a wallet (the wallet confirms it once, on chain, and it can never be changed) gets {Math.round(REBATE.referrerShare * 100)}% of the trading fees it pays. A wallet that traded 100,000 USDC or more in the week gets {Math.round(REBATE.tiers[1].share * 100)}% of its own fees back, 1,000,000 or more {Math.round(REBATE.tiers[0].share * 100)}%. Referrals are paid first; together they are never more than what the treasury took in that week, and they cost depositors and openers nothing.</li>
           <li>The vault is the counterparty to traders, so its result is <b>fees + what traders lose − what traders win</b>. Fees are the compensation for that exposure. Each market's liquidity panel shows what a share was worth at its last rolls.</li>
         </ul>
 
@@ -296,7 +297,7 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           <li><b>Price band.</b> A new mark may differ from the one before it by at most 2% plus 0.5% for each second between the two prices. A broken feed or a wrong price is refused; a real move that large is accepted once enough time has passed.</li>
           <li><b>Orders that cannot fill do not block the market.</b> A request whose price the mark has held for 30 seconds without a fill can be removed, so the requests behind it, liquidations included, move on.</li>
           <li><b>Deposits freeze before a settlement.</b> Once an epoch's settlement is queued, the vault takes no new deposit or withdrawal for that epoch, because the settlement price is public seconds before it executes.</li>
-          <li><b>One fee for every market.</b> The trade fee is a constant of the program (0.10%); anyone can set a market back to it, and nobody can set anything else.</li>
+          <li><b>One fee for every market.</b> The trade fee is a constant of the program ({TRADE_FEE_PCT}); anyone can set a market back to it, and nobody can set anything else.</li>
           <li><b>Leftovers are swept.</b> Money left behind by expired requests can be sent to the treasury by anyone; it cannot go anywhere else.</li>
         </ul>
 
@@ -366,7 +367,7 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
             <tr><td>32</td><td>PushMark</td><td>router only</td><td>Moves the asset's mark (the router passes only verified Pyth prices)</td></tr>
             <tr><td>33</td><td>ArmFill</td><td>router only</td><td>Arms the one fill the matcher accepts in this slot</td></tr>
             <tr><td>36</td><td>FreezeRequests</td><td>router only</td><td>Stops new deposit and withdrawal requests while an epoch's settlement is queued</td></tr>
-            <tr><td>37</td><td>SetTradeFee</td><td>anyone</td><td>Sets a market's trade fee to the program's constant (0.10%)</td></tr>
+            <tr><td>37</td><td>SetTradeFee</td><td>anyone</td><td>Sets a market's trade fee to the program's constant ({TRADE_FEE_PCT})</td></tr>
           </tbody>
         </table>
         <p>Router program (trading, orders, records):</p>

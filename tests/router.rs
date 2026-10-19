@@ -29,7 +29,10 @@ fn expect(r: Result<u64, String>, code: String) {
 
 /// A listed, funded vault (50 USDC of NAV) on the devnet-like market, rolled live.
 fn live() -> World {
-    let mut w = World::with_config(devnet_like_config());
+    live_at(devnet_like_config())
+}
+fn live_at(config: MarketConfig) -> World {
+    let mut w = World::with_config(config);
     w.env.set_clock(5, 1_000);
     w.operate();
     let alice = w.new_user(100_000_000);
@@ -179,8 +182,8 @@ fn a_request_needs_margin_for_a_stressed_price_move() {
 #[test]
 fn a_trade_that_only_shrinks_a_position_is_not_refused_for_margin() {
     let mut w = live();
-    // A trader with 1.5 USDC of margin: enough for 6 units at 1.00 under the stressed check
-    // (about 0.21 per unit), not for 9.
+    // A trader with 1.5 USDC of margin: enough for 6 units at 1.00 (12.5% each on this market,
+    // see `levels`), not for 15.
     let u = w.new_user(100_000_000);
     let t = rclient::TraderKeys::new(w.env.market, u.kp.pubkey());
     let mint = w.env.mint;
@@ -191,8 +194,8 @@ fn a_trade_that_only_shrinks_a_position_is_not_refused_for_margin() {
     let size = 6 * UNIT as i128;
     w.taker_trade(7, size).unwrap();
     // Growing or flipping the position is refused.
-    expect(w.request(7, size / 2), router_code(RouterError::InsufficientMargin));
-    expect(w.request(7, -(size + 9 * UNIT as i128)), router_code(RouterError::InsufficientMargin));
+    expect(w.request(7, 9 * UNIT as i128), router_code(RouterError::InsufficientMargin));
+    expect(w.request(7, -(size + 13 * UNIT as i128)), router_code(RouterError::InsufficientMargin));
     // Reducing and closing are accepted and fill, although the old and the new position
     // together would not pass the check.
     w.taker_trade(7, -size / 3).unwrap();
@@ -438,13 +441,13 @@ fn position(w: &World, taker: usize) -> i128 {
 fn a_trader_below_the_liquidation_level_is_closed_against_the_vault() {
     let mut w = live();
     leveraged_long(&mut w);
-    // Healthy (25% of notional), then 16.7% at 0.90: a forced close is refused.
+    // Healthy (25% of notional), then 11.8% at 0.85: a forced close is refused.
     expect(w.close_out(7), router_code(RouterError::NotCloseOnly));
-    w.move_price(20, 900_000);
-    expect(w.close_out(7), router_code(RouterError::NotCloseOnly));
-    // At 0.85 the account holds 2 USDC against 17 of notional: 11.8%, below the router's 12.5%
-    // and still above Percolator's own 10% maintenance margin.
     w.move_price(20, 850_000);
+    expect(w.close_out(7), router_code(RouterError::NotCloseOnly));
+    // At 0.84 the account holds 1.8 USDC against 16.8 of notional: 10.7%, below the router's 11%
+    // on this market (1% above Percolator's own 10%) and still above that 10%.
+    w.move_price(20, 840_000);
     assert_eq!(position(&w, 7), 20 * UNIT as i128, "Percolator has not liquidated it");
     // Anyone queues the liquidation; it closes the position against the vault at the next price.
     w.close_out(7).unwrap();
@@ -454,7 +457,7 @@ fn a_trader_below_the_liquidation_level_is_closed_against_the_vault() {
     // Nothing was deleveraged, so the market stays open, and the trader keeps what was left.
     let a = asset_state(&w);
     assert_eq!((a.a_long, a.a_short), (percolator::ADL_ONE, percolator::ADL_ONE));
-    assert!(equity(&w, 7) > 1_900_000 && equity(&w, 7) <= 2_000_000, "equity {}", equity(&w, 7));
+    assert!(equity(&w, 7) > 1_700_000 && equity(&w, 7) <= 1_800_000, "equity {}", equity(&w, 7));
     w.taker_trade(1, UNIT as i128).unwrap();
 }
 
@@ -464,8 +467,10 @@ fn a_trader_below_the_liquidation_level_is_closed_against_the_vault() {
 /// the request lapse must not be free).
 #[test]
 fn a_request_that_lapses_after_its_price_arrived_loses_its_deposit() {
-    use percolator_router::{expiry_deposit, EXPIRY_DEPOSIT_BPS, LAMPORTS_PER_ATOM};
-    assert_eq!(expiry_deposit(-(1_000 * UNIT as i128), 2_000_000), 2_000_000_000 * EXPIRY_DEPOSIT_BPS as u64 / 10_000 * LAMPORTS_PER_ATOM);
+    use percolator_router::{expiry_deposit, EXPIRY_DEPOSIT_BPS, EXPIRY_DEPOSIT_CAP, LAMPORTS_PER_ATOM};
+    assert_eq!(expiry_deposit(-(500 * UNIT as i128), 2_000_000), 1_000_000_000 * EXPIRY_DEPOSIT_BPS as u64 / 10_000 * LAMPORTS_PER_ATOM);
+    // A large order's deposit stops at the cap (about a dollar of the coin).
+    assert_eq!(expiry_deposit(1_000_000 * UNIT as i128, 2_000_000), EXPIRY_DEPOSIT_CAP);
     let mut w = live();
     let t = w.trader(0);
     let kp = w.trader_kp(0);
@@ -530,22 +535,145 @@ fn a_request_that_lapses_after_its_price_arrived_loses_its_deposit() {
     assert!(w.send(vec![rclient::sweep(&w.vault)], &[]).is_err());
 }
 
-/// The router liquidates below 15% of the positions' notional (it was 12.5%): further from
-/// Percolator's own 10%, whose liquidation closes the whole market to new positions.
+/// The deposit goes back when the request lapsed because the market was behind (an executor
+/// down or catching up: nobody could fill it without first paying to bring the market current).
+/// The same lapse on a market that was current keeps it, and a wrong vault or market is refused.
 #[test]
-fn the_router_liquidates_below_fifteen_percent() {
-    assert_eq!(percolator_router::LIQUIDATION_BPS, 1_500);
+fn a_request_that_lapses_on_a_market_that_was_behind_gets_its_deposit_back() {
+    use percolator_router::{expiry_deposit, BEHIND_REFUND_SLOTS};
     let mut w = live();
+    let t = w.trader(0);
+    let size = 100 * UNIT as i128;
+    let rent = w.env.svm.minimum_balance_for_rent_exemption(rstate::REQUEST_LEN);
+    let deposit = expiry_deposit(size, 1_000_000);
+    let bal = |w: &World, k: &Pubkey| w.env.svm.get_balance(k).unwrap();
+    let market = w.env.market;
+    let book = percolator_router::state::book_address(&percolator_router::id(), &w.vault).0;
+    // Queues a request and makes its price the mark; returns the wallet's balance after queueing
+    // and when the mark was set.
+    let queue_at_mark = |w: &mut World| {
+        w.tick(1);
+        let id = w.request(0, size).unwrap();
+        let queued = w.env.svm.get_balance(&t.wallet).unwrap();
+        let target = w.request_target(id);
+        at(w, target + 1);
+        let prev = w.pyth_time;
+        w.pyth_time = target + 1;
+        let u = w.pyth_update(w.price, target + 1, prev);
+        w.advance_to(u).unwrap();
+        (queued, w.clock_ts())
+    };
+
+    // Current market: the deposit stays, as before, with the new accounts named too.
+    let (queued, set) = queue_at_mark(&mut w);
+    at(&mut w, set + STALL_SECS + 1);
+    let before = bal(&w, &book);
+    w.send(vec![rclient::expire_trade(&w.payer.pubkey(), &w.vault, &market, &t)], &[]).unwrap();
+    assert_eq!(bal(&w, &book) - before, BOND_LAMPORTS + deposit);
+    assert!(bal(&w, &t.wallet) <= queued + rent);
+
+    // The market fell more than BEHIND_REFUND_SLOTS behind before the lapse: the deposit goes back.
+    let (queued, set) = queue_at_mark(&mut w);
+    let slot = w.env.current_slot() + BEHIND_REFUND_SLOTS + 1;
+    w.env.set_clock(slot, set + STALL_SECS + 1);
+    let mut wrong = rclient::expire_trade(&w.payer.pubkey(), &w.vault, &market, &t);
+    wrong.accounts[6] = AccountMeta::new_readonly(w.payer.pubkey(), false);
+    assert!(w.send(vec![wrong], &[]).is_err(), "not the vault's market");
+    let before = bal(&w, &book);
+    w.send(vec![rclient::expire_trade(&w.payer.pubkey(), &w.vault, &market, &t)], &[]).unwrap();
+    assert_eq!(bal(&w, &book) - before, BOND_LAMPORTS, "only the bond is kept");
+    assert_eq!(bal(&w, &t.wallet), queued + rent + deposit);
+}
+
+/// The router liquidates 1% above Percolator's own maintenance margin at least, and opens 1.5%
+/// above that, whatever the asset's tier says: on this market (10% margins) that is 11% and 12.5%.
+#[test]
+fn the_router_liquidates_above_percolators_own_level() {
+    let mut w = live();
+    let market = w.env.svm.get_account(&w.env.market).unwrap().data;
+    assert_eq!(percolator_router::levels(&market, None, w.asset()).unwrap(), (1_250, 1_100, 1_000));
     leveraged_long(&mut w);
-    // 20 long on 5 USDC. At 0.89 the account holds 2.8 against 17.8: 15.7%, and stays.
-    w.move_price(20, 890_000);
+    // 20 long on 5 USDC. At 0.845 the account holds 1.9 against 16.9: 11.2%, and stays.
+    w.move_price(20, 845_000);
     expect(w.close_out(7), router_code(RouterError::NotCloseOnly));
-    // At 0.88: 2.6 against 17.6 is 14.8%, and it is closed against the vault.
-    w.move_price(20, 880_000);
+    // At 0.84: 1.8 against 16.8 is 10.7%, and it is closed against the vault.
+    w.move_price(20, 840_000);
     w.close_out(7).unwrap();
     assert_eq!(position(&w, 7), 0);
     let a = asset_state(&w);
     assert_eq!((a.a_long, a.a_short), (percolator::ADL_ONE, percolator::ADL_ONE));
+}
+
+/// A market created with 5% and 2.5% margins: the default tier opens at 10x and is liquidated
+/// below 6%; a major (BTC, ETH) opens at 20x and is liquidated below 3.5%. Without the tier
+/// record a position opens at the default tier and is liquidated only at the major level.
+#[test]
+fn leverage_follows_the_assets_tier() {
+    use percolator_router::{levels, tier_of_feed, MAJOR_FEEDS, TIER_DEFAULT, TIER_MAJOR};
+    assert_eq!(tier_of_feed(&MAJOR_FEEDS[0]), TIER_MAJOR);
+    assert_eq!(tier_of_feed(&MAJOR_FEEDS[1]), TIER_MAJOR);
+    assert_eq!(tier_of_feed(&common::FEED), TIER_DEFAULT);
+    let mut w = live_at(MarketConfig { maintenance_margin_bps: 250, initial_margin_bps: 500, max_price_move_bps_per_slot: 24, ..devnet_like_config() });
+    let asset = w.asset();
+    let market = w.env.market;
+    let data = w.env.svm.get_account(&market).unwrap().data;
+    assert_eq!(levels(&data, None, asset).unwrap(), (1_000, 350, 250), "no record: open as default, liquidate as major");
+
+    // SetTier writes the default tier for this vault's feed, with the asset's generation.
+    let (tk, _) = rstate::tiers_address(&percolator_router::id(), &market);
+    let set = rclient::set_tier(&w.payer.pubkey(), &w.vault, &market);
+    w.send(vec![set.clone()], &[]).unwrap();
+    let t: rstate::Tiers = bytemuck::pod_read_unaligned(&w.env.svm.get_account(&tk).unwrap().data);
+    assert_eq!(t.tier[asset as usize], TIER_DEFAULT);
+    assert_eq!(levels(&data, Some(&t), asset).unwrap(), (1_000, 600, 250));
+    w.send(vec![set], &[]).unwrap(); // again: harmless
+
+    // 10x on the default tier: 8x passes, 12x is refused (0.5 USDC of margin; the vault holds
+    // 50 and takes at most 30 units, so the sizes stay small).
+    let trader = |w: &mut World, i: usize, usdc: u64| {
+        let u = w.new_user(100_000_000);
+        let t = rclient::TraderKeys::new(w.env.market, u.kp.pubkey());
+        let mint = w.env.mint;
+        w.send(vec![rclient::open_account(&t, &mint), rclient::deposit(&t, &u.collateral, &w.env.vault, usdc)], &[&u.kp]).unwrap();
+        w.traders.insert(i, (u, t));
+    };
+    trader(&mut w, 7, 500_000);
+    expect(w.request(7, 6 * UNIT as i128), router_code(RouterError::InsufficientMargin));
+    w.taker_trade(7, 4 * UNIT as i128).unwrap();
+
+    // The same asset recorded as a major (as SetTier writes for BTC or ETH): 20x.
+    let mut major = t;
+    major.tier[asset as usize] = TIER_MAJOR;
+    let mut acct = w.env.svm.get_account(&tk).unwrap();
+    acct.data = bytemuck::bytes_of(&major).to_vec();
+    w.env.svm.set_account(tk, acct).unwrap();
+    assert_eq!(levels(&data, Some(&major), asset).unwrap(), (500, 350, 250));
+    trader(&mut w, 8, 500_000);
+    expect(w.request(8, 11 * UNIT as i128), router_code(RouterError::InsufficientMargin));
+    w.taker_trade(8, 9 * UNIT as i128).unwrap();
+    assert_eq!(position(&w, 8), 9 * UNIT as i128, "18x");
+    // Without the record the 20x account cannot add (it would open at the default tier)...
+    let t8 = w.trader(8);
+    let kp8 = w.trader_kp(8);
+    let mut bare = rclient::request(&t8, &w.vault, UNIT as i128);
+    assert_eq!(bare.accounts.pop().unwrap().pubkey, tk, "the builders name the record last");
+    expect(w.send(vec![bare], &[&kp8]), router_code(RouterError::InsufficientMargin));
+    // ...and is liquidated below 3.5% either way. 9 long on 0.5: at 0.985 it holds 0.365 against
+    // 8.87 (4.1%), not yet; at 0.98, 0.32 against 8.82 (3.6%), not yet; at 0.977, 0.293 against
+    // 8.79 (3.3%), and it is closed. (Percolator's own 2.5% is not reached.)
+    let close = rclient::request_close(&w.payer.pubkey(), &t8, &w.vault);
+    let mut close_bare = close.clone();
+    close_bare.accounts.pop();
+    w.move_price(20, 985_000);
+    expect(w.send(vec![close.clone()], &[]), router_code(RouterError::NotCloseOnly));
+    w.move_price(20, 980_000);
+    expect(w.send(vec![close.clone()], &[]), router_code(RouterError::NotCloseOnly));
+    expect(w.send(vec![close_bare.clone()], &[]), router_code(RouterError::NotCloseOnly));
+    w.move_price(20, 977_000);
+    w.close_out(8).unwrap();
+    assert_eq!(position(&w, 8), 0, "closed against the vault");
+    let a = asset_state(&w);
+    assert_eq!((a.a_long, a.a_short), (percolator::ADL_ONE, percolator::ADL_ONE), "before Percolator's own liquidation");
 }
 
 /// The mark's circuit breaker: a price further from the mark than a market moves in the time
@@ -587,7 +715,7 @@ fn a_price_too_far_from_the_mark_for_the_time_passed_is_refused() {
 fn a_trader_below_the_liquidation_level_cannot_hide_behind_its_own_requests() {
     let mut w = live();
     leveraged_long(&mut w);
-    w.move_price(20, 850_000);
+    w.move_price(20, 840_000);
     assert_eq!(position(&w, 7), 20 * UNIT as i128);
     // It asks to sell one unit of its twenty. While that waits, the liquidation cannot be queued.
     let id = w.request(7, -(UNIT as i128)).unwrap();
@@ -612,7 +740,7 @@ fn a_trader_below_the_liquidation_level_cannot_hide_behind_its_own_requests() {
 fn trades_cannot_fill_the_queue_and_keep_a_liquidation_out() {
     let mut w = live();
     leveraged_long(&mut w);
-    w.move_price(20, 850_000);
+    w.move_price(20, 840_000);
     let room = rstate::MAX_PENDING - percolator_router::RESERVED_PENDING;
     for i in 0..room {
         w.request(100 + i, UNIT as i128 / 100).unwrap();
@@ -629,7 +757,7 @@ fn trades_cannot_fill_the_queue_and_keep_a_liquidation_out() {
 fn a_liquidation_does_nothing_if_the_trader_recovered_by_its_fill_price() {
     let mut w = live();
     leveraged_long(&mut w);
-    w.move_price(20, 850_000);
+    w.move_price(20, 840_000);
     let t = w.trader(7);
     let id = w.book().next_id;
     let payer = w.payer.pubkey();

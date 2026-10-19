@@ -44,6 +44,17 @@ pub const CANON_EPOCH_LEN_SLOTS: u64 = 20;
 pub const CANON_INSURANCE_FLOOR: u64 = 100_000_000; // 100 units of a 6-decimal collateral
 #[cfg(not(feature = "devnet"))]
 pub const CANON_INSURANCE_FLOOR: u64 = 10_000;
+/// What the withdrawals of an epoch that had to make the vault flat pay (bps), kept by the vault:
+/// a large exit closes every trader's position on the market and holds the vault reduce-only,
+/// and the providers who stay bear that. Ordinary withdrawals, paid from the cash reserve, pay
+/// nothing.
+pub const EXIT_FEE_BPS: u64 = 50;
+/// Share of a live vault's value kept as its asset's insurance (see `insurance_kept`). The test
+/// build keeps only the floor, like its other small constants, so the fee tests see fees harvested.
+#[cfg(feature = "devnet")]
+pub const INSURANCE_NAV_BPS: u64 = 300;
+#[cfg(not(feature = "devnet"))]
+pub const INSURANCE_NAV_BPS: u64 = 0;
 /// Share of the vault's value kept as cash outside Percolator when it redeploys at a roll, so
 /// that ordinary withdrawals can be paid without closing the vault's position first.
 pub const RESERVE_BPS: u64 = 1_000;
@@ -167,7 +178,7 @@ pub const TAG_SET_TRADE_FEE: u8 = 37;
 /// takes it from both sides, so a vault pays it too and gets its own part back when fees are
 /// harvested: what providers earn is the traders' half. It is the only fee the engine applies to
 /// a trade against a vault, whatever the caller passes.
-pub const CANON_TRADE_FEE_BPS: u64 = 10;
+pub const CANON_TRADE_FEE_BPS: u64 = 5;
 
 /// A market with no liquidity providers can be retired this many epochs after it was listed.
 pub const RETIRE_IDLE_EPOCHS: u64 = 3;
@@ -1149,6 +1160,9 @@ fn roll_epoch(program_id: &Pubkey, accounts: &[AccountInfo], frontier: u64) -> P
     let base_out = math::assets_for_shares(w, nav_low, supply)?;
     let with_fees = math::assets_for_shares(w, nav_low.saturating_add(pending_fees), supply)?;
     let assets_out = with_fees.min(base_out.max(cash));
+    // Withdrawals that forced the vault flat (`RequireFlat`) pay `EXIT_FEE_BPS`, which stays with
+    // those who remain: they were made reduce-only, and closed out after the grace, for them.
+    let assets_out = if v.needs_flat == 1 { assets_out - assets_out * EXIT_FEE_BPS / 10_000 } else { assets_out };
     let supply_after_burn = sub(supply, w)?;
     let nav_after_out_low = sub(nav_low, assets_out)?;
     let nav_high = nav_after_out_low
@@ -1595,8 +1609,20 @@ fn insurance_excess(market: &AccountInfo, v: &VaultState) -> Result<u64, VaultEr
     if id != v.asset_market_id {
         return Err(VaultError::UnknownAsset);
     }
-    let excess = remaining.saturating_sub(v.insurance_floor as u128);
+    let excess = remaining.saturating_sub(insurance_kept(v) as u128);
     Ok(u64::try_from(excess).unwrap_or(u64::MAX))
+}
+
+/// The insurance a live vault keeps on its asset before any fee is harvested: its floor, or
+/// `INSURANCE_NAV_BPS` of the vault's value when that is more. A fixed floor stayed at $100 while
+/// vaults grew to $30,000, and a 30% gap (crash drill, 2026-10-17) left ~$110 of losses on one
+/// market: the pot has to grow with what it protects. It is filled from trading fees only.
+pub fn insurance_kept(v: &VaultState) -> u64 {
+    insurance_kept_at(v, INSURANCE_NAV_BPS)
+}
+pub fn insurance_kept_at(v: &VaultState, nav_bps: u64) -> u64 {
+    let by_value = (v.last_nav as u128 * nav_bps as u128 / 10_000) as u64;
+    core::cmp::max(v.insurance_floor, by_value)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

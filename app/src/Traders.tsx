@@ -360,7 +360,7 @@ function useActions(me: Me, send: Send, reload: () => void) {
     unfollow: (leader: string, name: string) => publicKey && run(`Unfollow ${name}`, [S.unfollow(publicKey, new PublicKey(leader))]),
     /** One click: a trading account and its track record if the wallet has none yet, a follow
      *  (so the trader's fills show on the chart), and the copy itself. */
-    copy: (leader: string, name: string, ratioBps = 10_000, maxNotional = 0n) => publicKey && run(me.copy?.leader.toBase58() === leader ? `New terms for copying ${name}` : `Copy ${name} (${S.SOCIAL_FEE_TEXT})`, [
+    copy: (leader: string, name: string, ratioBps = 10_000, maxNotional = 0n) => publicKey && run(me.copy?.leader.toBase58() === leader ? `New terms for copying ${name}` : `Copy ${name} (${S.COPY_FEE_TEXT})`, [
       ...setup(publicKey, me),
       ...(me.following.has(leader) ? [] : [S.follow(publicKey, new PublicKey(leader))]),
       S.setCopy(publicKey, new PublicKey(leader), ratioBps, maxNotional),
@@ -416,7 +416,7 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
       <div className="traders-head">
         <div>
           <h2>Leaderboard</h2>
-          <p className="muted small">Every trader's record is kept by the router program itself: profit is the account's value minus what was paid in, so it cannot be dressed up. Follow a trader to see their trades on your chart, or copy one ({S.SOCIAL_FEE_TEXT}, once) and your account mirrors theirs.</p>
+          <p className="muted small">Every trader's record is kept by the router program itself: profit is the account's value minus what was paid in, so it cannot be dressed up. Follow a trader to see their trades on your chart, or copy one ({S.COPY_FEE_TEXT}, once{S.LEADER_PAID ? ": half goes to the trader you copy" : ""}) and your account mirrors theirs.</p>
         </div>
         <Search board={board} go={go} />
       </div>
@@ -495,7 +495,7 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
                   </div>
                   {!isMe && publicKey && (copying
                     ? <button className="btn tiny" disabled={!!busy} onClick={() => act.stop()}>Stop copying</button>
-                    : <button className="btn tiny primary" disabled={!!busy} onClick={() => act.copy(r.wallet, name)}>Copy · {S.SOCIAL_FEE_TEXT}</button>)}
+                    : <button className="btn tiny primary" disabled={!!busy} onClick={() => act.copy(r.wallet, name)}>Copy · {S.COPY_FEE_TEXT}</button>)}
                 </div>
               );
             })}
@@ -532,7 +532,7 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
                         : <button className="btn tiny ghost" disabled={!!busy} onClick={() => act.follow(r.wallet, name)}>Follow</button>)}
                       {!isMe && publicKey && (copying
                         ? <button className="btn tiny" disabled={!!busy} onClick={() => act.stop()}>Stop</button>
-                        : <button className="btn tiny primary" disabled={!!busy} title={`Your account mirrors this trader's positions, at the same leverage. One signature. Starting to copy costs ${S.SOCIAL_FEE_TEXT}, once.`} onClick={() => act.copy(r.wallet, name)}>Copy · {S.SOCIAL_FEE_TEXT}</button>)}
+                        : <button className="btn tiny primary" disabled={!!busy} title={`Your account mirrors this trader's positions, at the same leverage. One signature. Starting to copy costs ${S.COPY_FEE_TEXT}, once${S.LEADER_PAID ? ": half goes to this trader" : ""}.`} onClick={() => act.copy(r.wallet, name)}>Copy · {S.COPY_FEE_TEXT}</button>)}
                     </div></td>
                   </tr>
                 );
@@ -643,18 +643,18 @@ export function TraderPage({ wallet, send, busy, tick, go }: { wallet: string; s
                   <div><span>Yours would be</span><b className="mono">{fmt(r!.leverage * ratioBps / 10_000, 1)}×</b></div>
                   <div><span>Your margin</span><b className="mono">${fmt(myEquity)}</b></div>
                   <div><span>Fee</span><b className="mono">{C.TRADE_FEE_PCT} per trade</b></div>
-                  <div><span>To start copying</span><b className="mono">{copying ? "paid" : `${S.SOCIAL_FEE_TEXT}, once`}</b></div>
+                  <div><span>To start copying</span><b className="mono">{copying ? "paid" : `${S.COPY_FEE_TEXT}, once`}</b></div>
                 </div>
                 {!publicKey ? <div className="why">Connect a wallet to copy.</div> : (
                   <>
-                    <button className="submit neutral" disabled={!!busy || (!!copying && copying.ratioBps === ratioBps && copying.maxNotional === capAtoms)} onClick={() => act.copy(wallet, name, ratioBps, capAtoms)}>{busy ? `${busy}…` : copying ? "Change terms" : `Copy ${name} · ${S.SOCIAL_FEE_TEXT}`}</button>
+                    <button className="submit neutral" disabled={!!busy || (!!copying && copying.ratioBps === ratioBps && copying.maxNotional === capAtoms)} onClick={() => act.copy(wallet, name, ratioBps, capAtoms)}>{busy ? `${busy}…` : copying ? "Change terms" : `Copy ${name} · ${S.COPY_FEE_TEXT}`}</button>
                     {copying && <button className="closepos" disabled={!!busy} onClick={() => act.stop()}>Stop copying</button>}
                     {myEquity <= 0 && <div className="why">Your trading account holds no margin yet: deposit on the Trade page and the copy starts with their next trade.</div>}
                   </>
                 )}
                 <p className="fine">
                   You sign once. From then on your account is kept at this trader's leverage on every market, times the setting above: when they open, add, cut or close, a trade for your account is queued and fills at the next oracle price, like any order.
-                  Starting to copy a trader costs {S.SOCIAL_FEE_TEXT}, paid to the platform once; changing the terms later costs nothing, and copying someone else, or the same trader again after stopping, is a new start.
+                  Starting to copy a trader costs {S.COPY_FEE_TEXT} once{S.LEADER_PAID ? ": half to this trader, half to the platform" : ", paid to the platform"}; changing the terms later costs nothing, and copying someone else, or the same trader again after stopping, is a new start.
                   While you copy, positions you open yourself are brought back in line. Stopping leaves your positions as they are. Nobody can withdraw from your account or choose the size of a copy trade: the router computes it from both accounts.
                   {copying && ` Brought in line ${copying.triggers} time${copying.triggers === 1 ? "" : "s"} so far.`}
                 </p>
