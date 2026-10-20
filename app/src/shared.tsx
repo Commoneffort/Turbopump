@@ -228,7 +228,7 @@ function describe(tx: any, v: C.Vault): string {
       if (data[0] === 7) return "Queued trade expired unfilled";
       if (data[0] === 8) return "Forced close queued (liquidation or close-out)";
       if (data[0] === 9) return "Epoch settlement queued";
-      if (data[0] === 10) return "Epoch settled at the Pyth price";
+      if (data[0] === 10) return C.X1 ? "Epoch settled at the oracle price" : "Epoch settled at the Pyth price";
     }
     if (program.equals(C.PERCOLATOR) && data[0] === 5) crank = true; // a fill carries cranks in front: keep looking
   }

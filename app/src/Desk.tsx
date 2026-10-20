@@ -223,7 +223,7 @@ function MarketBar({ state, markets, day, go }: { state: C.State; markets: Card[
         <Cell label="24h low" value={d ? fmt(Math.min(d.low, price), dp) : "—"} />
         <Cell label="Open interest" value={money(oiUsd, 0)} sub={`${units(state.asset.oiLong)} ${sym}`} />
         <Cell label="Vault liquidity" value={usd(C.navOf(state), 0)} />
-        <Cell label="Oracle" value={C.X1 ? "Exchange median" : "Pyth"} sub={age !== undefined ? ago(age) : undefined} />
+        <Cell label="Oracle" value={C.X1 ? "Jack's oracle" : "Pyth"} sub={age !== undefined ? ago(age) : undefined} />
         <Cell label="Fee" value={C.TRADE_FEE_PCT} sub="no spread, no price impact" />
         <Cell label={`Liquidity epoch ${v.epoch}`} value={left > 0n ? `${Math.max(1, Math.ceil(Number(left) * C.slotSeconds() / 60))} min left` : v.pendingDeposit > 0n || v.pendingWithdraw > 0n ? "settling" : "no requests"} />
       </div>

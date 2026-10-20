@@ -573,3 +573,12 @@ h3 { margin: 0 0 12px; font-size: 15px; font-weight: 600; }
 .spot-check { margin: 0 0 12px; line-height: 1.4; align-items: flex-start; }
 
 @media (max-width: 860px) { .desk.spot .tape { max-height: 340px; } }
+
+/* weekly contest box on the leaderboard */
+.contest { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); padding: 14px 16px; margin: 14px 0; display: flex; flex-direction: column; gap: 10px; }
+.contest-head { display: flex; flex-direction: column; gap: 4px; }
+.contest-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.contest-list li { display: grid; grid-template-columns: minmax(0, 1fr) 80px 90px 60px; gap: 10px; align-items: center; font-size: 13px; }
+.contest-list li > span { text-align: right; }
+.contest-list li > button { justify-self: start; text-align: left; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 560px) { .contest-list li { grid-template-columns: minmax(0, 1fr) 70px 60px; } .contest-list li > span:nth-child(3) { display: none; } }

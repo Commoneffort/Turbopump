@@ -8,6 +8,7 @@ import * as C from "./chain";
 import { readDirect, view } from "./view";
 import Desk from "./Desk";
 import Docs from "./Docs";
+import HealthPage from "./Health";
 import SpotDesk from "./Spot";
 import { TraderPage, TradersPage } from "./Traders";
 import { Card, Faucet, Icon, Send, Stat, Toast, ago, explorer, fmt, px, short, units, usd, useCards } from "./shared";
@@ -131,6 +132,7 @@ export default function App() {
           <a className={tab(page === "markets")} href="#/markets">Markets</a>
           <a className={tab(page === "launch")} href="#/launch">Open a market</a>
           <a className={tab(page === "traders" || page === "trader" || page === "leaderboard")} href="#/leaderboard">Leaderboard</a>
+          <a className={tab(page === "health")} href="#/health">Health</a>
           <a className={tab(page === "how" || page === "docs")} href="#/docs">Docs</a>
         </nav>
         <div className="top-right">
@@ -151,12 +153,14 @@ export default function App() {
           {C.X1 && (
             <p className="muted small net-note">
               X1 testnet: the same programs as on Solana devnet, with test USDC as collateral. X1 has no Pyth, so prices here are posted by the
-              router's reporter key from an exchange-median price service. Use the burner wallet, or a wallet that can sign for X1; you need a
-              little test XNT for fees ("Get test USDC" sends some).
+              router's reporter key from Jack's oracle (jack0.x1.xyz), with our exchange median as backup. Use Backpack or X1 Wallet (both show in "Select
+              Wallet" when installed), or the burner wallet; you need a little test XNT for fees ("Get test USDC" sends some). See <a href="#/health">Health</a> for live solvency.
             </p>
           )}
           {page === "launch" ? (
             <LaunchPage key={route[1] ?? ""} send={send} busy={busy} go={go} initial={route[1]} />
+          ) : page === "health" ? (
+            <HealthPage tick={tick} />
           ) : page === "how" || page === "docs" ? (
             <Docs />
           ) : page === "traders" || page === "leaderboard" ? (

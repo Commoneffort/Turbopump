@@ -370,6 +370,44 @@ function useActions(me: Me, send: Send, reload: () => void) {
   };
 }
 
+// ---------------------------------------------------------------- the weekly contest
+
+function ContestBox({ rows, me, go }: { rows: S.TraderRow[]; me?: string; go: (to: string) => void }) {
+  const week = S.contestWeek();
+  // Our own test and demo accounts take no place (contest.ts pays nobody among them either).
+  const standings = useMemo(() => S.contestStandings(rows.filter(r => r.stats && !tagOf(r.wallet)).map(r => ({ wallet: r.wallet, stats: r.stats! })), week), [rows, week.start]);
+  const byWallet = new Map(rows.map(r => [r.wallet, r]));
+  const left = week.end - Date.now() / 1000;
+  const mine = me ? standings.findIndex(r => r.wallet === me) : -1;
+  const pool = S.CONTEST.prizes.reduce((a, b) => a + b, 0);
+  return (
+    <section className="contest">
+      <div className="contest-head">
+        <div>
+          <b>Weekly contest</b>
+          <span className="muted small"> · ${pool.toLocaleString()} in prizes · ends in {Math.floor(left / 86_400)} d {Math.floor(left % 86_400 / 3600)} h (Sunday 24:00 UTC)</span>
+        </div>
+        <span className="muted small">Best return this week, among accounts (not our test bots) funded with ${S.CONTEST.minBase}+ that made {S.CONTEST.minTrades}+ trades this week. Prizes: {S.CONTEST.prizes.map(p => `$${p}`).join(" · ")}, paid from the treasury after the week.</span>
+      </div>
+      {standings.length === 0 ? <div className="quiet small">Nobody qualifies yet this week. Make {S.CONTEST.minTrades} trades to enter.</div> : (
+        <ol className="contest-list">
+          {standings.slice(0, S.CONTEST.prizes.length).map((r, i) => (
+            <li key={r.wallet}>
+              <button className="link" onClick={() => go(`/trader/${r.wallet}`)}>
+                <span className="mono muted">{i + 1}.</span> {nameOf(r.wallet, byWallet.get(r.wallet)?.profile)}
+              </button>
+              <span className={`mono ${tone(r.ret)}`}>{pct(r.ret)}</span>
+              <span className="mono muted">{signed(r.pnl)}</span>
+              <span className="mono">${S.CONTEST.prizes[i]}</span>
+            </li>
+          ))}
+        </ol>
+      )}
+      {me && <div className="muted small">{mine >= 0 ? `You are ${mine + 1} of ${standings.length} (${pct(standings[mine].ret)}).` : `You are not ranked yet this week.`}</div>}
+    </section>
+  );
+}
+
 // ---------------------------------------------------------------- the board
 
 type Sort = "pnl" | "roi" | "days" | "volume" | "copiers";
@@ -432,6 +470,7 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
               </div>
               <button className="btn tiny" onClick={() => setEditing(true)}>{me.profile ? "Edit name, badge and picture" : "Set a name and badge"}</button>
               <button className="btn tiny ghost" onClick={() => go(`/trader/${me.wallet}`)}>My record</button>
+              {C.X1 && <a className="btn tiny ghost" href={`https://t.me/Turbopump_bot?start=${me.wallet}`} target="_blank" rel="noreferrer" title="Telegram messages on each fill, when your margin runs thin, and on a liquidation. The bot only reads the chain.">Alerts on Telegram</a>}
               {me.profile && <button className="btn tiny ghost" disabled={!!busy || Math.max(myUntil, nowSecs) + S.FEATURE_SECS > nowSecs + S.FEATURE_MAX_AHEAD_SECS}
                 title={`Shows you in the Featured row above the leaderboard for a day, marked as paid. ${S.SMALL_FEE_TEXT} a day, to the platform; paying again adds a day, up to 30 ahead.`}
                 onClick={() => act.feature()}>{myUntil > nowSecs ? `Featured, ${left(myUntil)} left · add a day · ${S.SMALL_FEE_TEXT}` : `Get featured · ${S.SMALL_FEE_TEXT} a day`}</button>}
@@ -447,6 +486,8 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
           </>
         )}
       </section>
+
+      {board && <ContestBox rows={board.rows} me={me.wallet} go={go} />}
 
       <div className="traders-bar">
         <div className="seg-tf">

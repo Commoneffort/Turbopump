@@ -115,6 +115,37 @@ export const REBATE = {
   tiers: [{ weekVolume: 1_000_000, share: 0.10 }, { weekVolume: 100_000, share: 0.05 }], // 10% / 5% of its own fees
   mostOfIncome: 1, // never more than what the treasury took in; referrals are paid first
 };
+/** New wallets' first month: their own trade fees back, in full, up to `capPerWeek` each, paid
+ *  weekly by scripts/rebates.ts out of a budget the treasury sets aside (`weekBudget`), not out of
+ *  that week's income (which is a fifth of the fees, so it could not pay all of them back). */
+export const NEW_WALLET = { days: 30, share: 1, capPerWeek: 50, weekBudget: 2_000 };
+
+/** The weekly trading contest, Monday 00:00 to Sunday 24:00 UTC: ranked by return over the week
+ *  (profit of the week's trading days over what the account was funded with), among accounts
+ *  funded with at least `minBase` that traded at least `minTrades` times in the week. The top
+ *  places win `prizes` (USDC), paid by scripts/contest.ts from the treasury after the week. */
+export const CONTEST = { prizes: [500, 250, 100, 50, 50], minTrades: 5, minBase: 100 };
+const DAY = 86_400;
+/** The contest week containing `secs` (unix): its first day number and its end (unix secs). */
+export function contestWeek(secs = Date.now() / 1000) {
+  const day = Math.floor(secs / DAY);
+  const monday = day - ((new Date(day * DAY * 1000).getUTCDay() + 6) % 7);
+  return { firstDay: monday, start: monday * DAY, end: (monday + 7) * DAY };
+}
+export type ContestRow = { wallet: string; pnl: number; base: number; ret: number; trades: number };
+/** The week's standings from track records (`stats` keyed by wallet), best first. */
+export function contestStandings(stats: { wallet: string; stats: Stats }[], week = contestWeek()): ContestRow[] {
+  const out: ContestRow[] = [];
+  for (const { wallet, stats: s } of stats) {
+    const base = s.startEquity + s.deposited;
+    const trades = s.fills.filter(f => f.time >= week.start && f.time < week.end).length;
+    if (base < CONTEST.minBase || trades < CONTEST.minTrades) continue;
+    const pnl = s.days.filter(d => d.day >= week.firstDay && d.day < week.firstDay + 7).reduce((t, d) => t + d.pnl, 0);
+    out.push({ wallet, pnl, base, ret: pnl / base, trades });
+  }
+  return out.sort((a, b) => b.ret - a.ret);
+}
+
 /** A share of the trade fee as millionths of the volume (100 = one basis point). */
 export const feeSharePerMillion = (share: number) => share * C.TRADE_FEE_BPS * 100;
 
