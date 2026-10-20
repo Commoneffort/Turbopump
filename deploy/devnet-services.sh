@@ -6,7 +6,7 @@
 # A service that exits (a crash, or the executor's own watchdog) is started again after 5 s;
 # `stop` ends the restart loop with it.
 cd "$(dirname "$0")/.."
-RPC=${DEVNET_RPC:-https://api.devnet.solana.com}
+RPC=${DEVNET_RPC:-$(cat ~/.config/percolator/devnet-rpc 2>/dev/null || echo https://api.devnet.solana.com)}
 mkdir -p deploy/logs
 running() { [ -f "deploy/logs/$1.pid" ] && kill -0 -- "-$(cat "deploy/logs/$1.pid")" 2>/dev/null; }
 stop() { if running $1; then kill -- "-$(cat deploy/logs/$1.pid)"; echo "$1 stopped"; fi; rm -f deploy/logs/$1.pid; }

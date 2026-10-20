@@ -63,6 +63,8 @@ pub struct World {
     pub pyth_time: i64,
     pub price: u64,
     /// Router trading accounts of the harness takers, by taker index.
+    /// X1 builds: the witness confirms every reported price the harness posts (on by default).
+    pub auto_witness: bool,
     pub traders: HashMap<usize, (User, TraderKeys)>,
 }
 
@@ -168,7 +170,13 @@ impl World {
     #[cfg(feature = "x1")]
     pub fn pyth_update(&mut self, price_e6: u64, publish_time: i64, prev_publish_time: i64) -> Pubkey {
         let reporter = self.reporter();
-        self.post_report(&reporter, price_e6, publish_time, prev_publish_time).expect("post reported price")
+        let key = self.post_report(&reporter, price_e6, publish_time, prev_publish_time).expect("post reported price");
+        // The witness confirms it (its own account; a test of the witness posts its own prices).
+        if self.auto_witness {
+            let witness = self.witness();
+            self.post_report(&witness, price_e6, publish_time, prev_publish_time).expect("witness post");
+        }
+        key
     }
 
     /// A Pyth update account, whatever the build's price source is.
@@ -231,7 +239,12 @@ impl World {
     /// Router `Advance` to a Pyth update.
     pub fn advance_ix(&self, pyth: &Pubkey) -> Instruction {
         let seq = self.env.primary_control_sequences(self.asset() as usize);
-        rclient::advance(self.keys.as_ref().unwrap(), pyth, seq.oracle_observation + 1, seq.authority_epoch)
+        let mut ix = rclient::advance(self.keys.as_ref().unwrap(), pyth, seq.oracle_observation + 1, seq.authority_epoch);
+        // X1 builds: a reported price needs the witness's account for the feed.
+        if cfg!(feature = "x1") && *pyth == percolator_vault::reporter::report_address(&FEED).0 {
+            ix.accounts.push(AccountMeta::new_readonly(percolator_vault::reporter::witness_address(&FEED).0, false));
+        }
+        ix
     }
 
     pub fn advance_to(&mut self, pyth: Pubkey) -> Result<u64, String> {
@@ -459,11 +472,27 @@ impl World {
         kp
     }
 
+    /// The test build's witness key (seed `[43; 32]`).
+    pub fn witness(&mut self) -> Keypair {
+        let kp = solana_sdk::signer::keypair::keypair_from_seed(&[43; 32]).unwrap();
+        assert_eq!(kp.pubkey(), percolator_vault::reporter::WITNESS);
+        if self.env.svm.get_balance(&kp.pubkey()).unwrap_or(0) == 0 {
+            self.env.svm.airdrop(&kp.pubkey(), 1_000_000_000).unwrap();
+        }
+        kp
+    }
+
     /// Posts a reported price for the vault's feed, signed by `signer`; returns its account.
     pub fn post_report(&mut self, signer: &Keypair, price_e6: u64, publish_time: i64, prev_publish_time: i64) -> Result<Pubkey, String> {
         let mut ix = rclient::post_price(&signer.pubkey(), &FEED, price_e6, publish_time, prev_publish_time);
         ix.accounts[0].pubkey = signer.pubkey();
+        if signer.pubkey() == percolator_vault::reporter::WITNESS {
+            ix.accounts[1].pubkey = percolator_vault::reporter::witness_address(&FEED).0;
+        }
         self.send(vec![ix], &[signer])?;
+        if signer.pubkey() == percolator_vault::reporter::WITNESS {
+            return Ok(percolator_vault::reporter::witness_address(&FEED).0);
+        }
         Ok(percolator_vault::reporter::report_address(&FEED).0)
     }
 
@@ -643,6 +672,7 @@ impl World {
             pyth_time: 1_000,
             price: INITIAL_PRICE,
             traders: HashMap::new(),
+            auto_witness: true,
         }
     }
 

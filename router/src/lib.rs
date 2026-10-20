@@ -335,6 +335,9 @@ pub enum RouterError {
     BadImage,
     /// `Swap` delivered less than its `min_out` to the output account.
     Slippage,
+    /// X1: a reported price the witness has not confirmed (no recent witness price for the feed,
+    /// or one too far from it).
+    WitnessDisagrees,
 }
 
 impl From<RouterError> for ProgramError {
@@ -1270,7 +1273,9 @@ fn post_price(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pro
     signer(reporter_ai)?;
     writable(report_ai)?;
     key_is(system, &system_program::ID)?;
-    if *reporter_ai.key != reporter::REPORTER {
+    // The reporter and the witness each write their own account for the feed.
+    let witness = *reporter_ai.key == reporter::WITNESS;
+    if *reporter_ai.key != reporter::REPORTER && !witness {
         return Err(RouterError::NotReporter.into());
     }
     if data.len() != 56 {
@@ -1285,7 +1290,8 @@ fn post_price(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pro
     if price == 0 || price > i64::MAX as u64 || prev >= publish || publish > Clock::get()?.unix_timestamp.saturating_add(5) {
         return Err(RouterError::BadOracle.into());
     }
-    let (key, bump) = reporter::report_address(&feed);
+    let (key, bump) = if witness { reporter::witness_address(&feed) } else { reporter::report_address(&feed) };
+    let seed = if witness { reporter::SEED_WITNESS } else { reporter::SEED_REPORT };
     key_is(report_ai, &key)?;
     if report_ai.owner == program_id {
         let stored = reporter::decode(&report_ai.try_borrow_data()?).map_err(|_| RouterError::BadOracle)?;
@@ -1293,7 +1299,7 @@ fn post_price(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pro
             return Err(RouterError::WrongUpdate.into());
         }
     } else {
-        create_pda(reporter_ai, report_ai, system, program_id, reporter::REPORT_LEN, 0, &[reporter::SEED_REPORT, &feed, &[bump]])?;
+        create_pda(reporter_ai, report_ai, system, program_id, reporter::REPORT_LEN, 0, &[seed, &feed, &[bump]])?;
     }
     let mut d = report_ai.try_borrow_mut_data()?;
     d[..8].copy_from_slice(&reporter::REPORT_MAGIC.to_le_bytes());
@@ -1347,6 +1353,14 @@ fn advance(program_id: &Pubkey, accounts: &[AccountInfo], observation_sequence: 
     // A reported price is the reporter's word. Where Pyth exists it only rescues a queued request
     // that Pyth has not served for `FALLBACK_SECS` after its target, and only as that request's
     // price. In an X1 build it is the price source and follows the same rules as a Pyth update.
+    // In an X1 build the witness must confirm it (account 7): recent, and within its band.
+    if reported && cfg!(feature = "x1") {
+        let w = accounts.get(7).ok_or(RouterError::WitnessDisagrees)?;
+        let wu = reporter::read_witness(w, &v.oracle_feeds[0]).map_err(|_| RouterError::WitnessDisagrees)?;
+        if !reporter::witness_agrees(&u, &wu) {
+            return Err(RouterError::WitnessDisagrees.into());
+        }
+    }
     if reported && !cfg!(feature = "x1") {
         let now = Clock::get()?.unix_timestamp;
         let rescues = b.earliest_target().is_some_and(|t| now >= t.saturating_add(reporter::FALLBACK_SECS) && u.is_first_at_or_after(t));

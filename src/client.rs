@@ -371,3 +371,53 @@ pub fn retire_market(k: &VaultKeys, asset_authority_epoch: u64, market_authority
         data,
     }
 }
+
+pub fn cover_address(k: &VaultKeys) -> Pubkey {
+    state::child_address(&k.program, state::SEED_COVER, &k.vault).0
+}
+pub fn cover_tokens_address(k: &VaultKeys) -> Pubkey {
+    state::child_address(&k.program, state::SEED_COVER_TOKENS, &k.vault).0
+}
+
+pub fn top_up_margin(k: &VaultKeys) -> Instruction {
+    Instruction {
+        program_id: k.program,
+        accounts: vec![ro(k.vault), w(k.market), w(k.portfolio), w(k.buffer), w(k.percolator_vault), ro(spl_token::ID), ro(perc::PERCOLATOR_PROGRAM_ID)],
+        data: vec![processor::TAG_TOP_UP_MARGIN],
+    }
+}
+
+pub fn init_cover(k: &VaultKeys, payer: &Pubkey, collateral_mint: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: k.program,
+        accounts: vec![
+            AccountMeta::new(*payer, true),
+            ro(k.vault),
+            w(cover_address(k)),
+            w(cover_tokens_address(k)),
+            ro(*collateral_mint),
+            ro(k.share_mint),
+            ro(spl_token::ID),
+            ro(system_program::ID),
+        ],
+        data: vec![processor::TAG_INIT_COVER],
+    }
+}
+
+pub fn cover_loss(k: &VaultKeys) -> Instruction {
+    Instruction {
+        program_id: k.program,
+        accounts: vec![ro(k.vault), w(cover_address(k)), w(cover_tokens_address(k)), w(k.buffer), ro(k.share_mint), ro(spl_token::ID)],
+        data: vec![processor::TAG_COVER_LOSS],
+    }
+}
+
+pub fn withdraw_cover(k: &VaultKeys, treasury: &Pubkey, dest: &Pubkey, amount: u64) -> Instruction {
+    let mut data = vec![processor::TAG_WITHDRAW_COVER];
+    data.extend_from_slice(&amount.to_le_bytes());
+    Instruction {
+        program_id: k.program,
+        accounts: vec![AccountMeta::new_readonly(*treasury, true), ro(k.vault), w(cover_tokens_address(k)), w(*dest), ro(spl_token::ID)],
+        data,
+    }
+}

@@ -19,6 +19,47 @@ use crate::{error::VaultError, pyth::PriceUpdate, ROUTER_PROGRAM_ID};
 pub const REPORTER: Pubkey = solana_program::pubkey!("9KhhASTNPmDGy1M2TeLRhEEbFUzy8wgTz9g4cijViXuk");
 #[cfg(not(feature = "devnet"))]
 pub const REPORTER: Pubkey = solana_program::pubkey!("2iXtA8oeZqUU5pofxK971TCEvFGfems2AcDRaZHKD2pQ");
+/// The witness: a second key, run apart from the reporter with its own price source, that posts
+/// its own price for each feed. In an X1 build a reported price only moves a mark when the
+/// witness's price for that feed is recent (`WITNESS_SECS`) and agrees (`WITNESS_BPS`), so
+/// neither one key nor one price source can move a market alone. Test builds use the key of seed
+/// `[43; 32]`.
+#[cfg(feature = "devnet")]
+pub const WITNESS: Pubkey = solana_program::pubkey!("DQA2FE6ZSPHCRxLVgi4G4fb5X61D9s2phbF589TDdvvZ");
+#[cfg(not(feature = "devnet"))]
+pub const WITNESS: Pubkey = solana_program::pubkey!("5eUm8K9YiCqAxtyZgmmN1NGhmD3D2C9Azp2Za7nxwhiN");
+/// Most seconds between the witness's publish time and the reported price's.
+pub const WITNESS_SECS: i64 = 30;
+/// Most the two prices may differ, in bps of the reported one.
+pub const WITNESS_BPS: u64 = 150;
+pub const SEED_WITNESS: &[u8] = b"witness";
+
+/// The witness's price account for a feed (same layout as the reporter's).
+pub fn witness_address(feed: &[u8; 32]) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[SEED_WITNESS, feed], &ROUTER_PROGRAM_ID)
+}
+
+/// Reads the witness's price for `feed`.
+pub fn read_witness(ai: &AccountInfo, feed: &[u8; 32]) -> Result<PriceUpdate, VaultError> {
+    if *ai.owner != ROUTER_PROGRAM_ID || *ai.key != witness_address(feed).0 {
+        return Err(VaultError::BadOracle);
+    }
+    let u = decode(&ai.try_borrow_data().map_err(|_| VaultError::BadOracle)?)?;
+    if u.feed_id != *feed {
+        return Err(VaultError::BadOracle);
+    }
+    Ok(u)
+}
+
+/// True when the witness's price `w` confirms the reported price `u`.
+pub fn witness_agrees(u: &PriceUpdate, w: &PriceUpdate) -> bool {
+    if (u.publish_time - w.publish_time).abs() > WITNESS_SECS || u.price <= 0 || w.price <= 0 {
+        return false;
+    }
+    let (a, b) = (u.price as u128, w.price as u128);
+    a.abs_diff(b) * 10_000 <= a * WITNESS_BPS as u128
+}
+
 /// How long a queued request's target must have passed without a Pyth price before a reported
 /// price may serve it (Solana builds).
 pub const FALLBACK_SECS: i64 = 20;

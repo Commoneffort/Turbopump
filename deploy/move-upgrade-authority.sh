@@ -18,7 +18,7 @@ echo "new upgrade authority: $NEW"
 for net in x1 devnet; do
   case $net in
     x1)     RPC=https://rpc.testnet.x1.xyz; KEY=$HOME/.config/solana/percolator-x1/deployer.json ;;
-    devnet) RPC=https://api.devnet.solana.com; KEY=$HOME/.config/solana/percolator-test/deployer.json ;;
+    devnet) RPC=${DEVNET_RPC:-$(cat ~/.config/percolator/devnet-rpc 2>/dev/null || echo https://api.devnet.solana.com)}; KEY=$HOME/.config/solana/percolator-test/deployer.json ;;
   esac
   for p in DkK9TSMpVXLq26HeqxTXLysXyRKDYHTKU94SLFDWgjw3 BSync6F8gtJs3Wj4w8L6H3ZtS397w2XoCYGEAJGmeYX 8o3uV87X2CvPYfPwM1sxeaYYE7sGWsTUiEy7SskEMM3P; do
     now=$(solana program show -u $RPC $p | sed -n 's/^Authority: //p')

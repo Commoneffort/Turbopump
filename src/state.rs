@@ -174,6 +174,24 @@ pub struct EpochRecord {
 }
 pub const EPOCH_RECORD_LEN: usize = core::mem::size_of::<EpochRecord>();
 
+pub const COVER_MAGIC: u64 = u64::from_le_bytes(*b"PLCOVER1");
+
+/// A vault's loss cover (`InitCover`): the highest share price seen (12 extra decimals) and the
+/// last epoch whose roll it was applied to. Its money is in the cover token account.
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+#[repr(C, packed)]
+pub struct Cover {
+    pub magic: u64,
+    pub vault: Pubkey,
+    pub high_price: u128,
+    pub covered_epoch: u64,
+    pub total_covered: u64,
+    pub bump: u8,
+    pub tokens_bump: u8,
+    pub _pad: [u8; 6],
+}
+pub const COVER_LEN: usize = core::mem::size_of::<Cover>();
+
 fn load<T: Pod>(ai: &AccountInfo, off: usize) -> Result<T, ProgramError> {
     let d = ai.try_borrow_data()?;
     let len = core::mem::size_of::<T>();
@@ -248,6 +266,8 @@ pub const SEED_EPOCH: &[u8] = b"epoch";
 /// The market-level authority (`marketauth`) of markets the vault program governs. The program
 /// uses it for one thing only: retiring an idle, empty market so its slot can be reused.
 pub const SEED_GOVERNOR: &[u8] = b"governor";
+pub const SEED_COVER: &[u8] = b"cover";
+pub const SEED_COVER_TOKENS: &[u8] = b"cover_tokens";
 
 pub fn governor_address(program_id: &Pubkey, market: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[SEED_GOVERNOR, market.as_ref()], program_id)
@@ -286,4 +306,19 @@ pub fn epoch_address(program_id: &Pubkey, vault: &Pubkey, epoch: u64) -> (Pubkey
         &[SEED_EPOCH, vault.as_ref(), &epoch.to_le_bytes()],
         program_id,
     )
+}
+
+pub fn load_cover(ai: &AccountInfo, program_id: &Pubkey) -> Result<Cover, ProgramError> {
+    if ai.owner != program_id || ai.data_len() != COVER_LEN {
+        return Err(VaultError::BadAccount.into());
+    }
+    let c: Cover = load(ai, 0)?;
+    if c.magic != COVER_MAGIC {
+        return Err(VaultError::BadAccount.into());
+    }
+    Ok(c)
+}
+
+pub fn store_cover(ai: &AccountInfo, c: &Cover) -> Result<(), ProgramError> {
+    store(ai, 0, c)
 }

@@ -161,6 +161,13 @@ pub fn post_price(reporter: &Pubkey, feed: &[u8; 32], price_e6: u64, publish_tim
     }
 }
 
+/// The witness's `PostPrice` for a feed (its own account).
+pub fn post_witness_price(witness: &Pubkey, feed: &[u8; 32], price_e6: u64, publish_time: i64, prev_publish_time: i64) -> Instruction {
+    let mut ix = post_price(witness, feed, price_e6, publish_time, prev_publish_time);
+    ix.accounts[1].pubkey = percolator_vault::reporter::witness_address(feed).0;
+    ix
+}
+
 /// Queues the settlement of a vault's epoch at the first Pyth price after its target time.
 pub fn request_settle(payer: &Pubkey, vault: &Pubkey) -> Instruction {
     Instruction {
@@ -226,6 +233,13 @@ pub fn advance(k: &VaultKeys, pyth: &Pubkey, observation_sequence: u64, authorit
         ],
         data,
     }
+}
+
+/// `advance` with a reported price in an X1 build: the witness's account for the feed goes last.
+pub fn advance_reported(k: &VaultKeys, feed: &[u8; 32], observation_sequence: u64, authority_epoch: u64) -> Instruction {
+    let mut ix = advance(k, &percolator_vault::reporter::report_address(feed).0, observation_sequence, authority_epoch);
+    ix.accounts.push(ro(percolator_vault::reporter::witness_address(feed).0));
+    ix
 }
 
 pub fn fill(executor: &Pubkey, k: &VaultKeys, t: &TraderKeys) -> Instruction {

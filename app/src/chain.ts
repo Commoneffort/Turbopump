@@ -1033,6 +1033,16 @@ export const requestTrade = (wallet: PublicKey, vault: PublicKey, size: bigint) 
  *  request that Pyth has not served for `REPORT_FALLBACK_SECS`; in an X1 build it is the source. */
 export const reportAddress = (feedHex: string) => rpda(Buffer.from("report"), Buffer.from(feedHex, "hex"));
 export const REPORT_FALLBACK_SECS = R.fallback_secs;
+/** The witness's price account for a feed: a second key's price, which must agree with the
+ *  reporter's (within WITNESS_BPS, WITNESS_SECS apart) for a reported price to move an X1 mark. */
+export const witnessAddress = (feedHex: string) => rpda(Buffer.from("witness"), Buffer.from(feedHex, "hex"));
+export const WITNESS_SECS = 30;
+export const WITNESS_BPS = 150;
+export const postWitnessPrice = (witness: PublicKey, feedHex: string, priceE6: bigint, publish: number, prev: number) => new TransactionInstruction({
+  programId: ROUTER,
+  keys: [rw(witness, true), rw(witnessAddress(feedHex)), ro(SystemProgram.programId)],
+  data: Buffer.concat([new W().u8(11).done(), Buffer.from(feedHex, "hex"), new W().u64(priceE6).u64(BigInt(publish)).u64(BigInt(prev)).done()]),
+});
 export const postPrice = (reporter: PublicKey, feedHex: string, priceE6: bigint, publish: number, prev: number) => new TransactionInstruction({
   programId: ROUTER,
   keys: [rw(reporter, true), rw(reportAddress(feedHex)), ro(SystemProgram.programId)],
@@ -1070,6 +1080,40 @@ export function canSettleOpen(s: State): boolean {
   const owed = s.shareSupply > 0n ? v.pendingWithdraw * navLow / s.shareSupply : 0n;
   return owed <= cash + v.pendingDeposit;
 }
+/** Moves the vault's cash reserve into its Percolator margin when that runs thin (equity there
+ *  under TOPUP_BELOW_BPS of the vault's value; vault program TopUpMargin, tag 38). Anyone may. */
+export const TOPUP_BELOW_BPS = 4_000n;
+export const topUpMargin = (v: Vault) => new TransactionInstruction({
+  programId: VAULT_PROGRAM,
+  keys: [ro(v.key), rw(MARKET), rw(v.lpPortfolio), rw(v.buffer), rw(PERC_VAULT), ro(TOKEN_PROGRAM_ID), ro(PERCOLATOR)],
+  data: new W().u8(38).done(),
+});
+/** Whether `TopUpMargin` would be accepted now. */
+export const marginThin = (s: State) => s.lp.position !== 0n && (s.lp.capital + s.lp.pnl) * 10_000n < s.vault.lastNav * TOPUP_BELOW_BPS && s.buffer - s.vault.reserved - s.vault.pendingDeposit > 0n;
+
+/** A vault's loss cover: treasury money that pays back a fall of the share price below its
+ *  highest, once after each roll (vault program InitCover 39 / CoverLoss 40 / WithdrawCover 41). */
+export const coverAddress = (vault: PublicKey) => childAddress("cover", vault);
+export const coverTokensAddress = (vault: PublicKey) => childAddress("cover_tokens", vault);
+export type Cover = { highPrice: bigint; coveredEpoch: bigint; totalCovered: bigint };
+/** magic 8, vault 32, high_price u128, covered_epoch u64, total_covered u64, bumps. */
+export const decodeCover = (d: Uint8Array): Cover => ({ highPrice: u64(d, 48) + (u64(d, 56) << 64n), coveredEpoch: u64(d, 64), totalCovered: u64(d, 72) });
+export const initCover = (v: Vault, payer: PublicKey) => new TransactionInstruction({
+  programId: VAULT_PROGRAM,
+  keys: [rw(payer, true), ro(v.key), rw(coverAddress(v.key)), rw(coverTokensAddress(v.key)), ro(MINT), ro(v.shareMint), ro(TOKEN_PROGRAM_ID), ro(SystemProgram.programId)],
+  data: new W().u8(39).done(),
+});
+export const coverLoss = (v: Vault) => new TransactionInstruction({
+  programId: VAULT_PROGRAM,
+  keys: [ro(v.key), rw(coverAddress(v.key)), rw(coverTokensAddress(v.key)), rw(v.buffer), ro(v.shareMint), ro(TOKEN_PROGRAM_ID)],
+  data: new W().u8(40).done(),
+});
+export const withdrawCover = (v: Vault, treasury: PublicKey, dest: PublicKey, amount: bigint) => new TransactionInstruction({
+  programId: VAULT_PROGRAM,
+  keys: [ro(treasury, true), ro(v.key), rw(coverTokensAddress(v.key)), rw(dest), ro(TOKEN_PROGRAM_ID)],
+  data: new W().u8(41).u64(amount).done(),
+});
+
 /** Sets a vault's tracked position to what its portfolio holds (after Percolator changed it
  *  outside a fill: a liquidation or a close-out on the other side). Anyone can send it. */
 export const syncInventory = (v: Vault) => new TransactionInstruction({
@@ -1089,7 +1133,9 @@ export const advanceMark = (v: Vault, pyth: PublicKey, market: Uint8Array) => {
   const s = controlSequences(market, v.assetIndex);
   return new TransactionInstruction({
     programId: ROUTER,
-    keys: [ro(routerAuthority()), ro(v.key), rw(bookAddress(v.key)), rw(MARKET), ro(pyth), ro(VAULT_PROGRAM), ro(PERCOLATOR)],
+    keys: [ro(routerAuthority()), ro(v.key), rw(bookAddress(v.key)), rw(MARKET), ro(pyth), ro(VAULT_PROGRAM), ro(PERCOLATOR),
+      // X1: a reported price is only taken with the witness's price for the feed (router WitnessDisagrees otherwise).
+      ...(X1 && v.feed && pyth.equals(reportAddress(v.feed.id)) ? [ro(witnessAddress(v.feed.id))] : [])],
     data: new W().u8(5).u64(s.nextObservation).u64(s.authorityEpoch).done(),
   });
 };

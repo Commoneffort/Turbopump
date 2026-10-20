@@ -1,6 +1,6 @@
 #!/bin/bash
 # Starts, stops or shows the X1 testnet services: our backup price service (127.0.0.1:8091, the
-# executor's second source after jack0.x1.xyz), the watchdog (alerts, scripts/watchdog.ts), the
+# executor's second source after jack0.x1.xyz), the price witness, the watchdog (alerts, scripts/watchdog.ts), the
 # executor and the keeper. Each one's process
 # group id is kept in deploy/logs/, so stopping never has to search the process list by name.
 #   deploy/x1-services.sh start | stop | status
@@ -17,6 +17,11 @@ case "$1" in
     if ! running price-service; then
       (cd app && PORT=8091 SYMBOLS=${PRICE_SYMBOLS:-BTC,ETH,SOL} setsid sh -c 'echo $$ > ../deploy/logs/price-service.pid; while :; do npx tsx scripts/price-service.ts; echo "$(date -u +%T) restart: price-service exited with status $?, starting it again in 5 s"; sleep 5; done' >> ../deploy/logs/price-service.log 2>&1 < /dev/null &)
     fi
+    # The price witness (scripts/witness.ts): its own key and price source; the router takes an
+    # X1 mark only with its price. Better run on another machine (set NO_WITNESS=1 here then).
+    if [ -z "$NO_WITNESS" ] && ! running x1-witness; then
+      (cd app && NETWORK=x1-testnet RPC=$RPC setsid sh -c 'echo $$ > ../deploy/logs/x1-witness.pid; while :; do npx tsx scripts/witness.ts; echo "$(date -u +%T) restart: x1-witness exited with status $?, starting it again in 5 s"; sleep 5; done' >> ../deploy/logs/x1-witness.log 2>&1 < /dev/null &)
+    fi
     if ! running x1-watchdog; then
       (cd app && NETWORK=x1-testnet RPC=$RPC KEYPAIR=$KEY setsid sh -c 'echo $$ > ../deploy/logs/x1-watchdog.pid; while :; do npx tsx scripts/watchdog.ts; echo "$(date -u +%T) restart: x1-watchdog exited with status $?, starting it again in 30 s"; sleep 30; done' >> ../deploy/logs/x1-watchdog.log 2>&1 < /dev/null &)
     fi
@@ -31,13 +36,13 @@ case "$1" in
     "$0" status
     ;;
   stop)
-    for s in price-service x1-watchdog x1-executor x1-keeper; do
+    for s in price-service x1-witness x1-watchdog x1-executor x1-keeper; do
       if running $s; then kill -- "-$(cat deploy/logs/$s.pid)"; echo "$s stopped"; fi
       rm -f deploy/logs/$s.pid
     done
     ;;
   status)
-    for s in price-service x1-watchdog x1-executor x1-keeper; do
+    for s in price-service x1-witness x1-watchdog x1-executor x1-keeper; do
       if running $s; then echo "$s running (process group $(cat deploy/logs/$s.pid))"; else echo "$s not running"; fi
     done
     ;;

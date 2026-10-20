@@ -41,6 +41,10 @@ pub enum VaultError {
     /// A deposit or withdrawal request while this epoch's settlement is queued: its price is
     /// already fixed. The request is accepted again once the epoch has rolled.
     SettlementQueued,
+    /// `TopUpMargin`: the vault is flat, or its margin in Percolator is not thin.
+    MarginNotThin,
+    /// `CoverLoss`: already done for this roll.
+    CoverNotDue,
 }
 
 impl From<VaultError> for ProgramError {

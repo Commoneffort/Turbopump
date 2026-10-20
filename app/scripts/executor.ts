@@ -819,6 +819,19 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
   return reqs.length > 0;
 }
 
+// ---- loss covers and margin top-ups ----
+let coverAt = 0;
+async function serviceCovers(vaults: C.Vault[]) {
+  enter("serviceCovers");
+  const covers = await conn.getMultipleAccountsInfo(vaults.map(v => C.coverAddress(v.key)));
+  for (const [i, v] of vaults.entries()) {
+    const c = covers[i];
+    const s = await C.fetchVault(conn, v.key);
+    if (c && C.decodeCover(new Uint8Array(c.data)).coveredEpoch < s.vault.epoch) await send(`apply the loss cover of ${v.feed?.symbol} for epoch ${s.vault.epoch}`, [C.coverLoss(s.vault)]);
+    if (C.marginThin(s)) await send(`top up ${v.feed?.symbol}'s margin from its cash reserve`, [C.topUpMargin(s.vault)]);
+  }
+}
+
 // ---- standing orders ----
 const orderRetry = new Map<string, number>(); // order address -> not before (ms)
 let ordersAt = 0;
@@ -1124,6 +1137,12 @@ setInterval(() => {
           const spare = (accs[2 + 2 * i]?.lamports ?? 0) - bookRent;
           if (accs[2 + 2 * i] && spare >= SWEEP_MIN) await send(`sweep ${(spare / 1e9).toFixed(3)} ${C.X1 ? "XNT" : "SOL"} left by expired requests on ${v.feed?.symbol} to the treasury`, [C.sweepBook(v.key)]);
         }
+      }
+      // Every 30 s, with nothing queued: pay out a vault's loss cover after its roll, and move its
+      // cash reserve into its margin if that ran thin.
+      if (!queued && Date.now() - coverAt > 30_000) {
+        coverAt = Date.now();
+        await serviceCovers(vaults).catch(e => log("error", "covers", String(e?.message ?? e).slice(0, 140)));
       }
       await serviceOrders(vaults, books, market, now, slot).catch(e => log("error", "orders", String(e?.message ?? e).slice(0, 140)));
       await serviceCopies(vaults, books, market).catch(e => log("error", "copies", String(e?.message ?? e).slice(0, 140)));

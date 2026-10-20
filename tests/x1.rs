@@ -111,6 +111,8 @@ fn a_reported_price_moves_the_mark_with_nothing_queued() {
     let now = w.clock_ts().max(w.pyth_time) + 30;
     at(&mut w, now);
     let report = w.post_report(&reporter_kp, 1_050_000, now, w.pyth_time).unwrap();
+    let witness = w.witness();
+    w.post_report(&witness, 1_050_000, now, w.pyth_time).unwrap();
     w.advance_to(report).unwrap();
     assert_eq!({ w.book().mark_price }, 1_050_000);
     // The same report cannot be applied twice.
@@ -133,6 +135,8 @@ fn a_trade_fills_at_the_first_reported_price_after_its_target_and_nothing_else()
 
     // A price published before the target can still move the mark, but cannot fill the request.
     at(&mut w, target - 1);
+    let witness = w.witness();
+    w.post_report(&witness, 1_100_000, target - 1, last).unwrap();
     let early = w.post_report(&reporter_kp, 1_100_000, target - 1, last).unwrap();
     w.advance_to(early).unwrap();
     w.pyth_time = target - 1;
@@ -141,10 +145,12 @@ fn a_trade_fills_at_the_first_reported_price_after_its_target_and_nothing_else()
 
     // A price after the target that says it is not the first one after it is refused.
     at(&mut w, target + 3);
+    w.post_report(&witness, 1_300_000, target + 3, target - 1).unwrap();
     let late = w.post_report(&reporter_kp, 1_300_000, target + 3, target + 1).unwrap();
     expect(w.advance_to(late), router_code(RouterError::WrongUpdate));
 
     // The first price at or after the target is the fill price.
+    w.post_report(&witness, 1_140_000, target + 4, target + 3).unwrap();
     let first = w.post_report(&reporter_kp, 1_140_000, target + 4, target - 1).unwrap();
     w.advance_to(first).unwrap();
     w.price = 1_140_000;
@@ -246,8 +252,49 @@ fn liquidation_and_epoch_settlement_work_on_reported_prices() {
 
 #[test]
 fn the_reporter_key_is_not_the_test_key_in_a_deployment_build() {
+    assert_eq!(reporter::WITNESS, solana_sdk::signer::keypair::keypair_from_seed(&[43; 32]).unwrap().pubkey());
     // This build is the test one (x1 without devnet): its reporter is the fixed test key. A
     // deployment adds `devnet`, which compiles in the operator's reporter key and Percolator id.
     assert_eq!(reporter::REPORTER, solana_sdk::signer::keypair::keypair_from_seed(&[42; 32]).unwrap().pubkey());
     let _ = Pubkey::default();
+}
+
+#[test]
+fn a_reported_price_needs_the_witness() {
+    let mut w = live();
+    let reporter_kp = w.reporter();
+    let witness = w.witness();
+    let start = w.clock_ts().max(w.pyth_time) + 1;
+    at(&mut w, start);
+    // The witness posts to its own account; a stranger cannot.
+    let mallory = Keypair::new();
+    w.env.svm.airdrop(&mallory.pubkey(), 1_000_000_000).unwrap();
+    expect(w.post_report(&mallory, 1_010_000, start, start - 1).map(|_| 0), router_code(RouterError::NotReporter));
+    let wacc = w.post_report(&witness, 1_010_000, start, start - 1).unwrap();
+    assert_eq!(wacc, reporter::witness_address(&FEED).0);
+    // Agrees (within 1.5%, a few seconds apart): the mark moves.
+    let t1 = start + 4;
+    at(&mut w, t1);
+    let report = w.post_report(&reporter_kp, 1_020_000, t1, w.pyth_time).unwrap();
+    w.pyth_time = t1;
+    w.advance_to(report).unwrap();
+    assert_eq!({ w.book().mark_price }, 1_020_000);
+    // A reported price 3% away from the witness's: refused.
+    let t2 = t1 + 4;
+    at(&mut w, t2);
+    let report = w.post_report(&reporter_kp, 1_041_000, t2, t1).unwrap();
+    expect(w.advance_to(report), router_code(RouterError::WitnessDisagrees));
+    // The witness silent for more than WITNESS_SECS: refused even at its price.
+    let t3 = start + reporter::WITNESS_SECS + 5;
+    at(&mut w, t3);
+    let report = w.post_report(&reporter_kp, 1_010_000, t3, t2).unwrap();
+    expect(w.advance_to(report), router_code(RouterError::WitnessDisagrees));
+    // Without the witness account at all: refused.
+    w.post_report(&witness, 1_010_000, t3, start).unwrap();
+    let mut ix = w.advance_ix(&report);
+    ix.accounts.pop();
+    expect(w.send(vec![ix], &[]), router_code(RouterError::WitnessDisagrees));
+    // With it, the same price is accepted.
+    w.advance_to(report).unwrap();
+    assert_eq!({ w.book().mark_price }, 1_010_000);
 }

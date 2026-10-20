@@ -759,10 +759,11 @@ async function burstRoutine(group: Bot[], m: Market) {
   const sentAt = Date.now();
   const sent = await Promise.all(group.map((b, i) => send(`${b.name} ${Number(sizes[i]) / 1e6} ${m.symbol}`, b.kp, [C.requestTrade(b.kp.publicKey, m.vault, sizes[i])], [], 1)));
   check(sent.every(r => r === true), "orders sent to one market at the same moment are all accepted", { symbol: m.symbol, accepted: sent.filter(r => r === true).length, of: group.length, errors: sent.filter(r => r !== true).slice(0, 2) });
-  let after = before;
+  let after = before, flatSeen = false;
   for (let i = 0; i < 60; i++) {
     await sleep(4000);
     after = await Promise.all(group.map(b => C.fetchVault(conn, m.vault, b.kp.publicKey)));
+    if (after[0].vault.needsFlat) flatSeen = true;
     if (after.every(s => !s.trader!.hasPending)) break;
   }
   const secs = Math.round((Date.now() - sentAt) / 1000);
@@ -997,7 +998,7 @@ async function stopperRoutine(bot: Bot, m: Market) {
 // ---- the whale: half a vault's value in, then all of it out, which makes the vault wind down ----
 const WHALE_HOURS = Number(process.env.WHALE_HOURS ?? 8);
 const WHALE_STATE = LOG.replace(/\.jsonl$/, "") + "-whale.json";
-type Whale = { phase: "idle" | "deposited" | "invested" | "withdrawing"; vault?: string; symbol?: string; at: number; deposit?: number; nextAt: number; n: number; reduceOnlySeen?: boolean; closed?: boolean };
+type Whale = { phase: "idle" | "deposited" | "invested" | "withdrawing"; vault?: string; symbol?: string; at: number; deposit?: number; left?: number; nextAt: number; n: number; reduceOnlySeen?: boolean; closed?: boolean };
 const whaleWrite = (w: Whale) => fs.writeFileSync(WHALE_STATE, JSON.stringify(w));
 // (The first start is saved, so the wait before the first run is counted once.)
 const whaleRead = (): Whale => { try { return JSON.parse(fs.readFileSync(WHALE_STATE, "utf8")); } catch { const w: Whale = { phase: "idle", at: 0, nextAt: Date.now() + Number(process.env.WHALE_FIRST_MIN ?? 30) * 60_000, n: 0 }; whaleWrite(w); return w; } };
@@ -1016,7 +1017,9 @@ async function whaleRoutine(bot: Bot) {
     if (have < amount && (await mint(kp, Math.ceil(amount - have) + 10)) !== true) return;
     const r = await send(`${bot.name} deposit ${amount} into ${m.symbol}`, kp, [C.requestDeposit(s.vault, me, BigInt(amount) * 1_000_000n)]);
     note({ type: "whale", symbol: m.symbol, what: "deposit", amount, nav: s.vault.lastNav, ok: r === true, error: r === true ? undefined : r });
-    if (r === true) { whaleWrite({ ...w, phase: "deposited", vault: m.vault.toBase58(), symbol: m.symbol, at: Date.now(), deposit: amount, reduceOnlySeen: false, closed: false }); say(`${bot.name}: deposited $${amount} into ${m.symbol} (vault worth $${usd(s.vault.lastNav)})`); }
+    // What stays in the wallet after the deposit is not part of the payout measured later.
+    const left = r === true ? Number((await C.fetchVault(conn, m.vault, me)).userCollateral) / 1e6 : 0;
+    if (r === true) { whaleWrite({ ...w, phase: "deposited", vault: m.vault.toBase58(), symbol: m.symbol, at: Date.now(), deposit: amount, left, reduceOnlySeen: false, closed: false }); say(`${bot.name}: deposited $${amount} into ${m.symbol} (vault worth $${usd(s.vault.lastNav)})`); }
     return;
   }
   const vault = new PublicKey(w.vault!), sym = w.symbol!;
@@ -1030,7 +1033,7 @@ async function whaleRoutine(bot: Bot) {
     if (w.phase === "withdrawing" && t.withdraw > 0n) {
       const after = await C.fetchVault(conn, vault, me);
       if (after.ticket && after.ticket.withdraw > 0n) return; // part was queued for a later epoch
-      const got = Number(after.userCollateral) / 1e6, back = got / w.deposit!;
+      const got = Number(after.userCollateral) / 1e6 - (w.left ?? 0), back = got / w.deposit!;
       note({ type: "whale", symbol: sym, what: "paid out", got, deposit: w.deposit, secs: Math.round((Date.now() - w.at) / 1000), reduceOnlySeen: w.reduceOnlySeen });
       // A vault's value moves with its traders' gains and losses: a whale's money comes back within
       // a few percent of what it put in, over a few hours.
@@ -1072,7 +1075,7 @@ async function whaleRoutine(bot: Bot) {
 // ---- the crowd: standing orders from five wallets that all come due at the same moment ----
 async function crowdRoutine(group: Bot[], m: Market) {
   const before = await Promise.all(group.map(b => C.fetchVault(conn, m.vault, b.kp.publicKey)));
-  if (before.some(s => !s.trader || s.trader.hasPending || !s.book || s.orders.length) || before[0].closeOnly) return;
+  if (before.some(s => !s.trader || s.trader.hasPending || !s.book || s.orders.length) || before[0].closeOnly || before[0].vault.needsFlat) return;
   const px = before[0].asset.price, step = stepOf(px), mark = before[0].book!.markPrice;
   const unit = (30_000_000n * 1_000_000n / px) / step * step;
   if (unit === 0n) return;
@@ -1087,16 +1090,18 @@ async function crowdRoutine(group: Bot[], m: Market) {
   const t0 = Date.now();
   const sent = await Promise.all(group.map((b, i) => send(`${b.name} crowd order ${m.symbol}`, b.kp, [ixs[i]], [], 1)));
   const placed = sent.filter(r => r === true).length;
-  let after = before;
+  let after = before, flatSeen = false;
   for (let i = 0; i < 60; i++) {
     await sleep(4000);
     after = await Promise.all(group.map(b => C.fetchVault(conn, m.vault, b.kp.publicKey)));
+    if (after[0].vault.needsFlat) flatSeen = true;
     if (after.every((s, k) => sent[k] !== true || (!s.orders.some(o => o.index === 6) && !s.trader!.hasPending))) break;
   }
   const secs = Math.round((Date.now() - t0) / 1000);
   const done = after.filter((s, k) => sent[k] === true && !s.orders.some(o => o.index === 6) && s.portfolio!.position !== before[k].portfolio!.position).length;
-  check(done === placed, "standing orders that come due together are all carried out", { symbol: m.symbol, placed, done, secs });
-  note({ type: "crowd", symbol: m.symbol, placed, done, secs });
+  // A vault that went reduce-only meanwhile holds back the limits that open a position (by design).
+  if (!flatSeen) check(done === placed, "standing orders that come due together are all carried out", { symbol: m.symbol, placed, done, secs });
+  note({ type: "crowd", symbol: m.symbol, placed, done, secs, flatSeen });
   say(`crowd on ${m.symbol}: ${done} of ${placed} standing orders carried out in ${secs} s`);
   // Leftovers (one refused for margin, say) are cleared so the next turn starts clean.
   for (const [k, s] of after.entries()) for (const o of s.orders) if (!o.queued) await send(`${group[k].name} clear crowd order`, group[k].kp, [C.cancelOrder(group[k].kp.publicKey, m.vault, o.index)]);

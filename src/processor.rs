@@ -56,8 +56,20 @@ pub const INSURANCE_NAV_BPS: u64 = 300;
 #[cfg(not(feature = "devnet"))]
 pub const INSURANCE_NAV_BPS: u64 = 0;
 /// Share of the vault's value kept as cash outside Percolator when it redeploys at a roll, so
-/// that ordinary withdrawals can be paid without closing the vault's position first.
+/// that ordinary withdrawals can be paid without closing the vault's position first. Percolator
+/// only pays capital out of a flat account, so this cash is all a withdrawal can use while the
+/// vault holds a position; at 10% the test networks' vaults went reduce-only about once an hour.
+/// The 70% left in Percolator still margins a position of 3x the vault's value many times over
+/// (initial margin 5%), and `TopUpMargin` moves the reserve in if the vault's margin runs thin.
+/// The test build keeps 10%, which its numbers are written for.
+#[cfg(feature = "devnet")]
+pub const RESERVE_BPS: u64 = 3_000;
+#[cfg(not(feature = "devnet"))]
 pub const RESERVE_BPS: u64 = 1_000;
+/// `TopUpMargin`: allowed when the vault's equity in Percolator (capital plus PnL) is below this
+/// share of its value, and fills it back up to `TOPUP_TO_BPS` from the cash reserve.
+pub const TOPUP_BELOW_BPS: u64 = 4_000;
+pub const TOPUP_TO_BPS: u64 = 6_000;
 /// A canonical vault's quoted spread. It has no effect on what a trade costs: Percolator trades
 /// at its own price whatever the matcher quotes, and charges a trade against a matcher the
 /// market's base fee only (the caller's fee is ignored there). What providers earn is that base
@@ -173,6 +185,10 @@ pub const TAG_SYNC_INVENTORY: u8 = 34;
 pub const TAG_REQUIRE_FLAT: u8 = 35;
 pub const TAG_FREEZE_REQUESTS: u8 = 36;
 pub const TAG_SET_TRADE_FEE: u8 = 37;
+pub const TAG_TOP_UP_MARGIN: u8 = 38;
+pub const TAG_INIT_COVER: u8 = 39;
+pub const TAG_COVER_LOSS: u8 = 40;
+pub const TAG_WITHDRAW_COVER: u8 = 41;
 
 /// The fee every canonical market charges on a trade, in basis points of its size. The engine
 /// takes it from both sides, so a vault pays it too and gets its own part back when fees are
@@ -595,6 +611,19 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
                 u64::from_le_bytes(rest[8..].try_into().unwrap()),
             )
         }
+        TAG_TOP_UP_MARGIN => {
+            no_args(rest)?;
+            top_up_margin(program_id, accounts)
+        }
+        TAG_INIT_COVER => {
+            no_args(rest)?;
+            init_cover(program_id, accounts)
+        }
+        TAG_COVER_LOSS => {
+            no_args(rest)?;
+            cover_loss(program_id, accounts)
+        }
+        TAG_WITHDRAW_COVER => withdraw_cover(program_id, accounts, arg_u64(rest)?),
         _ => Err(VaultError::InvalidInstruction.into()),
     }
 }
@@ -2312,6 +2341,199 @@ fn claim_opener_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramRe
     invoke_signed(
         &spl_token::instruction::transfer(&spl_token::ID, buffer.key, dest.key, vault_ai.key, &[], amount)?,
         &[buffer.clone(), dest.clone(), vault_ai.clone(), token.clone()],
+        &[vault_seeds!(v, bump)],
+    )
+}
+
+/// Moves cash from the vault's reserve into its Percolator portfolio when the vault's margin
+/// there runs thin: its equity (capital plus PnL) below `TOPUP_BELOW_BPS` of its value at the last
+/// roll. It fills the equity back up to `TOPUP_TO_BPS`, as far as the cash goes. Anyone can call
+/// it; it only moves the vault's own money, one way, and only when the vault has lost a large part
+/// of what it deployed, so it cannot be used to empty the reserve that pays withdrawals.
+///
+/// Accounts: 0 vault, 1 market [w], 2 LP portfolio [w], 3 buffer [w], 4 Percolator collateral
+/// vault [w], 5 token program, 6 Percolator program.
+fn top_up_margin(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let vault_ai = acc(accounts, 0)?;
+    let market = acc(accounts, 1)?;
+    let portfolio = acc(accounts, 2)?;
+    let buffer = acc(accounts, 3)?;
+    let perc_vault = acc(accounts, 4)?;
+    let token = acc(accounts, 5)?;
+    let percolator = acc(accounts, 6)?;
+    for w in [market, portfolio, buffer, perc_vault] {
+        writable(w)?;
+    }
+    programs(percolator, token)?;
+    let v = state::load_vault(vault_ai, program_id)?;
+    if v.status != STATUS_ACTIVE {
+        return Err(VaultError::NotActive.into());
+    }
+    key_is(market, &v.market)?;
+    key_is(portfolio, &v.lp_portfolio)?;
+    check_vault_token_account(buffer, &v.buffer, &v.collateral_mint, vault_ai.key)?;
+    let view = perc::read_portfolio(portfolio, market.key, vault_ai.key)?;
+    if view.flat {
+        return Err(VaultError::MarginNotThin.into());
+    }
+    let equity = i128::try_from(view.capital).map_err(|_| VaultError::Overflow)?.saturating_add(view.pnl);
+    let nav = v.last_nav as i128;
+    if equity >= nav * TOPUP_BELOW_BPS as i128 / 10_000 {
+        return Err(VaultError::MarginNotThin.into());
+    }
+    let want = u64::try_from(nav * TOPUP_TO_BPS as i128 / 10_000 - equity).unwrap_or(u64::MAX);
+    let cash = sub(token_amount(buffer)?, v.reserved_assets)?.saturating_sub(v.pending_deposit_assets);
+    let amount = want.min(cash);
+    if amount == 0 {
+        return Err(VaultError::ZeroAmount.into());
+    }
+    let bump = v.vault_bump;
+    invoke_signed(
+        &perc::deposit(vault_ai.key, market.key, portfolio.key, buffer.key, perc_vault.key, view.portfolio_id, view.sequence, amount as u128),
+        &[vault_ai.clone(), market.clone(), portfolio.clone(), buffer.clone(), perc_vault.clone(), token.clone(), percolator.clone()],
+        &[vault_seeds!(v, bump)],
+    )
+}
+
+/// Share prices in the loss cover are kept with 12 extra decimals.
+const COVER_PRICE_SCALE: u128 = 1_000_000_000_000;
+
+fn share_price(v: &VaultState, supply: u64) -> u128 {
+    if supply == 0 {
+        return 0;
+    }
+    v.last_nav as u128 * COVER_PRICE_SCALE / supply as u128
+}
+
+/// Creates a vault's loss cover: an account recording the highest share price seen, and a token
+/// account the vault owns that anyone may fund with collateral (a plain token transfer). The
+/// platform's treasury puts money there so that the first providers of a market do not bear its
+/// first losses. Anyone can create it, once per vault.
+///
+/// Accounts: 0 payer [s, w], 1 vault, 2 cover [w], 3 cover tokens [w], 4 collateral mint,
+/// 5 share mint, 6 token program, 7 system program.
+fn init_cover(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let payer = acc(accounts, 0)?;
+    let vault_ai = acc(accounts, 1)?;
+    let cover_ai = acc(accounts, 2)?;
+    let tokens = acc(accounts, 3)?;
+    let mint = acc(accounts, 4)?;
+    let share_mint = acc(accounts, 5)?;
+    let token = acc(accounts, 6)?;
+    let system = acc(accounts, 7)?;
+    signer(payer)?;
+    for w in [payer, cover_ai, tokens] {
+        writable(w)?;
+    }
+    key_is(token, &spl_token::ID)?;
+    key_is(system, &system_program::ID)?;
+    let v = state::load_vault(vault_ai, program_id)?;
+    if v.status != STATUS_ACTIVE {
+        return Err(VaultError::NotActive.into());
+    }
+    key_is(mint, &v.collateral_mint)?;
+    key_is(share_mint, &v.share_mint)?;
+    let vault_key = *vault_ai.key;
+    let (cover_key, cover_bump) = child_address(program_id, SEED_COVER, &vault_key);
+    let (tokens_key, tokens_bump) = child_address(program_id, SEED_COVER_TOKENS, &vault_key);
+    key_is(cover_ai, &cover_key)?;
+    key_is(tokens, &tokens_key)?;
+    create_pda_account(payer, tokens, system, &spl_token::ID, TokenAccount::LEN, &[SEED_COVER_TOKENS, vault_key.as_ref(), &[tokens_bump]])?;
+    invoke(
+        &spl_token::instruction::initialize_account3(&spl_token::ID, &tokens_key, mint.key, &vault_key)?,
+        &[tokens.clone(), mint.clone()],
+    )?;
+    create_pda_account(payer, cover_ai, system, program_id, COVER_LEN, &[SEED_COVER, vault_key.as_ref(), &[cover_bump]])?;
+    let price = share_price(&v, mint_supply(share_mint)?);
+    state::store_cover(
+        cover_ai,
+        &Cover { magic: COVER_MAGIC, vault: vault_key, high_price: price, covered_epoch: v.epoch, total_covered: 0, bump: cover_bump, tokens_bump, _pad: [0; 6] },
+    )
+}
+
+/// Once per epoch, after the roll: if the vault's share price at that roll is below the highest
+/// one the cover has seen, pays the difference (for all shares) from the cover into the vault's
+/// cash, as far as the cover goes. That cash is in the vault's value at the next roll, so the
+/// epoch's withdrawals are paid with it and its deposits priced with it. A price above the
+/// highest raises it. Anyone can call it; the executor does right after each roll.
+///
+/// Accounts: 0 vault, 1 cover [w], 2 cover tokens [w], 3 buffer [w], 4 share mint, 5 token program.
+fn cover_loss(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let vault_ai = acc(accounts, 0)?;
+    let cover_ai = acc(accounts, 1)?;
+    let tokens = acc(accounts, 2)?;
+    let buffer = acc(accounts, 3)?;
+    let share_mint = acc(accounts, 4)?;
+    let token = acc(accounts, 5)?;
+    for w in [cover_ai, tokens, buffer] {
+        writable(w)?;
+    }
+    key_is(token, &spl_token::ID)?;
+    let v = state::load_vault(vault_ai, program_id)?;
+    if v.status != STATUS_ACTIVE {
+        return Err(VaultError::NotActive.into());
+    }
+    let vault_key = *vault_ai.key;
+    key_is(share_mint, &v.share_mint)?;
+    check_vault_token_account(buffer, &v.buffer, &v.collateral_mint, &vault_key)?;
+    key_is(cover_ai, &child_address(program_id, SEED_COVER, &vault_key).0)?;
+    check_vault_token_account(tokens, &child_address(program_id, SEED_COVER_TOKENS, &vault_key).0, &v.collateral_mint, &vault_key)?;
+    let mut c = state::load_cover(cover_ai, program_id)?;
+    if c.vault != vault_key {
+        return Err(VaultError::BadAccount.into());
+    }
+    // The vault's value is fixed at each roll; paying twice for one roll would pay the same loss
+    // twice.
+    if c.covered_epoch >= v.epoch {
+        return Err(VaultError::CoverNotDue.into());
+    }
+    c.covered_epoch = v.epoch;
+    let supply = mint_supply(share_mint)?;
+    let price = share_price(&v, supply);
+    let mut paid = 0;
+    if price >= c.high_price || supply == 0 {
+        c.high_price = c.high_price.max(price);
+    } else {
+        let deficit = u64::try_from((c.high_price - price) * supply as u128 / COVER_PRICE_SCALE).unwrap_or(u64::MAX);
+        paid = deficit.min(token_amount(tokens)?);
+    }
+    c.total_covered = add(c.total_covered, paid)?;
+    state::store_cover(cover_ai, &c)?;
+    if paid > 0 {
+        let bump = v.vault_bump;
+        invoke_signed(
+            &spl_token::instruction::transfer(&spl_token::ID, tokens.key, buffer.key, &vault_key, &[], paid)?,
+            &[tokens.clone(), buffer.clone(), vault_ai.clone(), token.clone()],
+            &[vault_seeds!(v, bump)],
+        )?;
+    }
+    Ok(())
+}
+
+/// The treasury takes money back out of a vault's cover.
+/// Accounts: 0 treasury [s], 1 vault, 2 cover tokens [w], 3 destination [w], 4 token program.
+/// Data: amount.
+fn withdraw_cover(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -> ProgramResult {
+    let treasury = acc(accounts, 0)?;
+    let vault_ai = acc(accounts, 1)?;
+    let tokens = acc(accounts, 2)?;
+    let dest = acc(accounts, 3)?;
+    let token = acc(accounts, 4)?;
+    signer(treasury)?;
+    key_is(treasury, &TREASURY)?;
+    writable(tokens)?;
+    writable(dest)?;
+    key_is(token, &spl_token::ID)?;
+    let v = state::load_vault(vault_ai, program_id)?;
+    let vault_key = *vault_ai.key;
+    check_vault_token_account(tokens, &child_address(program_id, SEED_COVER_TOKENS, &vault_key).0, &v.collateral_mint, &vault_key)?;
+    if amount == 0 {
+        return Err(VaultError::ZeroAmount.into());
+    }
+    let bump = v.vault_bump;
+    invoke_signed(
+        &spl_token::instruction::transfer(&spl_token::ID, tokens.key, dest.key, &vault_key, &[], amount)?,
+        &[tokens.clone(), dest.clone(), vault_ai.clone(), token.clone()],
         &[vault_seeds!(v, bump)],
     )
 }

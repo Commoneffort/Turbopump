@@ -1,11 +1,11 @@
 {
   "admin": "AGrJS23h2GHm99BXLChQgANAUxZpsGkQBhU3zzKgU8hD",
   "collateral_mint": "7jpUVrakCqTm68aatnDHYe7qhSF7Zq39PWoSKM1u2Aaw",
-  "market": "EmNL4qAvngUBAga4Wv3DWkQbtRAJfXq61NhdpzeGWaoJ",
+  "market": "281YHBA8J4DyU8yiyjZJgWE7FaA5G1ax4F5iPeB3WSZn",
   "network": "x1-testnet",
   "percolator_program": "8o3uV87X2CvPYfPwM1sxeaYYE7sGWsTUiEy7SskEMM3P",
-  "percolator_vault": "7jW5wY2RC8LNnQ8b8MqW4Y5toMwrJtY6aXkDhYkHySeS",
-  "percolator_vault_authority": "9F9e3rqUkH7DeXfFVE3jZDrwwK3B62Pdx8v2U428vdtu",
-  "vault_program": "BSync6F8gtJs3Wj4w8L6H3ZtS397w2XoCYGEAJGmeYX",
-  "treasury_collateral": "988vce6AvgTavKziyncia22MY7p2Lwm7znhPpX6BGTzM"
+  "percolator_vault": "8VerPJUzTqWmxTRAtxEVzdn5UMtHtYTDTMd8ENArDphe",
+  "percolator_vault_authority": "DxmcgpA3TjL67b9itQC55Z8xYTbhaKoY9w47iuxKDBMQ",
+  "treasury_collateral": "988vce6AvgTavKziyncia22MY7p2Lwm7znhPpX6BGTzM",
+  "vault_program": "BSync6F8gtJs3Wj4w8L6H3ZtS397w2XoCYGEAJGmeYX"
 }

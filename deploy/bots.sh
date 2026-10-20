@@ -8,7 +8,7 @@
 cd "$(dirname "$0")/.."
 case "$1" in
   x1)     NET=x1-testnet; NAME=x1-bots; RPC=${X1_RPC:-https://rpc.testnet.x1.xyz}; SYMBOLS=${BOT_SYMBOLS:-SOL,BTC,ETH}; PACE=${BOT_PACE_SECS:-240} ;;
-  devnet) NET=devnet; NAME=devnet-bots; RPC=${DEVNET_RPC:-https://api.devnet.solana.com}; SYMBOLS=${BOT_SYMBOLS:-SOL,BTC,ETH}; PACE=${BOT_PACE_SECS:-600} ;;
+  devnet) NET=devnet; NAME=devnet-bots; RPC=${DEVNET_RPC:-$(cat ~/.config/percolator/devnet-rpc 2>/dev/null || echo https://api.devnet.solana.com)}; SYMBOLS=${BOT_SYMBOLS:-SOL,BTC,ETH}; PACE=${BOT_PACE_SECS:-600} ;;
   *) echo "usage: $0 x1|devnet start | stop | status | report [hours] | failures"; exit 1 ;;
 esac
 mkdir -p deploy/logs

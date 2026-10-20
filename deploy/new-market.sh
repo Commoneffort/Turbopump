@@ -17,7 +17,7 @@ cd "$(dirname "$0")/.."
 NET=$1; SEED=${2:-10000}
 case "$NET" in
   x1)     N=x1-testnet; RPC=${X1_RPC:-https://rpc.testnet.x1.xyz}; KEY=$HOME/.config/solana/percolator-x1/deployer.json; MAN=deploy/x1-testnet.json; TOOL=deploy/x1-tool; FAUCET=keys/x1-faucet.json; SVC=deploy/x1-services.sh ;;
-  devnet) N=devnet; RPC=${DEVNET_RPC:-https://api.devnet.solana.com}; KEY=$HOME/.config/solana/percolator-test/deployer.json; MAN=deploy/devnet.json; TOOL=deploy/devnet-tool; FAUCET=keys/faucet.json; SVC=deploy/devnet-services.sh ;;
+  devnet) N=devnet; RPC=${DEVNET_RPC:-$(cat ~/.config/percolator/devnet-rpc 2>/dev/null || echo https://api.devnet.solana.com)}; KEY=$HOME/.config/solana/percolator-test/deployer.json; MAN=deploy/devnet.json; TOOL=deploy/devnet-tool; FAUCET=keys/faucet.json; SVC=deploy/devnet-services.sh ;;
   *) echo "usage: $0 x1|devnet [seed USDC]"; exit 1 ;;
 esac
 say() { echo "$(date -u +%T) $*"; }

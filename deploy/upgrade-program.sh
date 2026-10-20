@@ -20,7 +20,7 @@ set -e
 cd "$(dirname "$0")/.."
 case "$2" in
   x1)     RPC=${X1_RPC:-https://rpc.testnet.x1.xyz}; KEY=$HOME/.config/solana/percolator-x1/deployer.json; FEATURES=devnet,x1; OUT=target/deploy-x1 ;;
-  devnet) RPC=${DEVNET_RPC:-https://api.devnet.solana.com}; KEY=$HOME/.config/solana/percolator-test/deployer.json; FEATURES=devnet; OUT=target/deploy-devnet ;;
+  devnet) RPC=${DEVNET_RPC:-$(cat ~/.config/percolator/devnet-rpc 2>/dev/null || echo https://api.devnet.solana.com)}; KEY=$HOME/.config/solana/percolator-test/deployer.json; FEATURES=devnet; OUT=target/deploy-devnet ;;
   *) echo "usage: $0 router|vault|engine x1|devnet"; exit 1 ;;
 esac
 case "$1" in
