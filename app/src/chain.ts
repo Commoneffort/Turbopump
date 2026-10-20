@@ -1096,8 +1096,8 @@ export const marginThin = (s: State) => s.lp.position !== 0n && (s.lp.capital + 
 export const coverAddress = (vault: PublicKey) => childAddress("cover", vault);
 export const coverTokensAddress = (vault: PublicKey) => childAddress("cover_tokens", vault);
 export type Cover = { highPrice: bigint; coveredEpoch: bigint; totalCovered: bigint };
-/** magic 8, vault 32, high_price u128, covered_epoch u64, total_covered u64, bumps. */
-export const decodeCover = (d: Uint8Array): Cover => ({ highPrice: u64(d, 48) + (u64(d, 56) << 64n), coveredEpoch: u64(d, 64), totalCovered: u64(d, 72) });
+/** magic 8 (0), vault 32 (8), high_price u128 (40), covered_epoch u64 (56), total_covered u64 (64), bumps. */
+export const decodeCover = (d: Uint8Array): Cover => ({ highPrice: u64(d, 40) + (u64(d, 48) << 64n), coveredEpoch: u64(d, 56), totalCovered: u64(d, 64) });
 export const initCover = (v: Vault, payer: PublicKey) => new TransactionInstruction({
   programId: VAULT_PROGRAM,
   keys: [rw(payer, true), ro(v.key), rw(coverAddress(v.key)), rw(coverTokensAddress(v.key)), ro(MINT), ro(v.shareMint), ro(TOKEN_PROGRAM_ID), ro(SystemProgram.programId)],
