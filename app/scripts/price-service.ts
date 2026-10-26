@@ -13,6 +13,9 @@
 // counts when it is under 5 s old and within 1% of the median of all fresh quotes; a price is "ok"
 // with at least 3 such quotes.
 // Run: PORT=8091 npx tsx scripts/price-service.ts   (listens on 127.0.0.1 only)
+// EXCHANGES=coinbase,kraken,... keeps only those exchanges. deploy/x1-services.sh runs two copies
+// on separate exchanges: one for the executor's reporter key (8091), one for the witness (8092),
+// so the two keys never read the same prices (each still needs 3 exchanges to agree).
 import * as http from "http";
 
 const PORT = Number(process.env.PORT ?? 8091);
@@ -40,7 +43,7 @@ const put = (ex: string, symbol: string, price: number, inUsdt: boolean) => {
 // Each source: how often, and how to read every wanted symbol from it.
 type Source = { name: string; every: number; poll: (symbols: string[]) => Promise<void> };
 const each = (f: (s: string) => Promise<void>) => async (symbols: string[]) => { await Promise.all(symbols.map(s => f(s).catch(() => {}))); };
-const SOURCES: Source[] = [
+const ALL_SOURCES: Source[] = [
   { name: "coinbase", every: 1000, poll: each(async s => put("coinbase", s, Number((await get(`https://api.exchange.coinbase.com/products/${s}-USD/ticker`)).price), false)) },
   // (one pair per request: Kraken fails a whole list for one unknown pair)
   { name: "kraken", every: 2000, poll: each(async s => put("kraken", s, Number((Object.values<any>((await get(`https://api.kraken.com/0/public/Ticker?pair=${s === "BTC" ? "XBT" : s}USD`)).result ?? {})[0])?.c?.[0]), false)) },
@@ -55,6 +58,9 @@ const SOURCES: Source[] = [
   { name: "kucoin", every: 1000, poll: each(async s => put("kucoin", s, Number((await get(`https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=${s}-USDT`)).data?.price), true)) },
   { name: "mexc", every: 1000, poll: each(async s => put("mexc", s, Number((await get(`https://api.mexc.com/api/v3/ticker/price?symbol=${s}USDT`)).price), true)) },
 ];
+const only = (process.env.EXCHANGES ?? "").split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+const SOURCES = only.length ? ALL_SOURCES.filter(s => only.includes(s.name)) : ALL_SOURCES;
+if (only.length && SOURCES.length < MIN_SOURCES) throw new Error(`EXCHANGES names ${SOURCES.length} known exchanges; a price needs ${MIN_SOURCES}`);
 
 /** USDT/USD from two USD venues (median of what answered). */
 async function pollUsdt() {

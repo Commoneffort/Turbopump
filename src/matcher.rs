@@ -89,17 +89,26 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     v.armed_size = 0;
     v.armed_slot = 0;
     v.armed_closing = 0;
+    v.armed_nav = 0;
     let ro = reduce_only(&v, now) && !taker_closes;
     let taker_buys = req.req_size > 0;
     // The vault takes the other side: a taker buy moves the vault short.
     let lp_sign: i8 = if taker_buys { -1 } else { 1 };
     // Caps are the tighter of the fixed limits and, when configured, multiples of the vault's
     // NAV at the price of this request. An empty vault therefore quotes nothing.
+    // The value used is the lower of the one fixed at the last roll and the one the router read
+    // when it armed this fill (`armed_nav`, 0 when not read): a vault that has lost since its
+    // last roll quotes for what it is worth now. The limits are also no looser than the feed's
+    // tier allows (see `feeds`), whatever the vault was created with.
     let (mut max_fill, mut max_inventory) = (v.max_fill_abs, v.max_inventory_abs);
     if v.position_nav_bps != 0 {
-        let nav = v.last_nav;
-        max_inventory = max_inventory.min(math::nav_cap(nav, v.position_nav_bps, req.oracle_price_e6));
-        max_fill = max_fill.min(math::nav_cap(nav, v.fill_nav_bps, req.oracle_price_e6));
+        let nav = if v.armed_nav != 0 { v.last_nav.min(v.armed_nav) } else { v.last_nav };
+        let tier = crate::feeds::cap_tier(&v.oracle_feeds[0]);
+        let pos_bps = v.position_nav_bps.min(crate::feeds::position_nav_bps(tier));
+        let fill_bps = v.fill_nav_bps.min(crate::feeds::fill_nav_bps(tier));
+        let (f, i) = math::fill_caps(nav, pos_bps, fill_bps, req.oracle_price_e6, v.inventory, lp_sign, taker_closes);
+        max_inventory = max_inventory.min(i);
+        max_fill = max_fill.min(f);
     }
     let fill = math::allowed_fill(
         req.req_size.unsigned_abs(),

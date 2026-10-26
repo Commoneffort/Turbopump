@@ -1,6 +1,8 @@
 // The X1 price witness. A second key (keys/witness-keypair.json, the router's `WITNESS`) posts
-// its own price for each traded feed every few seconds, read from a price service other than
-// the executor's first one (default: our 9-exchange median on 127.0.0.1:8091). The router moves
+// its own price for each traded feed every few seconds, read from a price service that shares no
+// exchange with the executor's (default: our price service on 127.0.0.1:8092, which reads
+// Bitstamp, Gemini, Bitfinex and MEXC; the executor reads jack0.x1.xyz, then 127.0.0.1:8091 on
+// Coinbase, Kraken, OKX, Bybit and KuCoin: deploy/x1-services.sh). The router moves
 // an X1 mark to the reporter's price only when this price is at most WITNESS_SECS apart and
 // within WITNESS_BPS of it, so one key or one price source alone cannot move a market.
 //
@@ -16,7 +18,7 @@ import * as C from "../src/chain";
 
 const conn = new Connection(process.env.RPC ?? C.RPC_URL, { commitment: "confirmed" });
 const key = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(process.env.WITNESS_KEY ?? "../keys/witness-keypair.json", "utf8"))));
-const SOURCE = process.env.WITNESS_PRICES ?? "http://127.0.0.1:8091";
+const SOURCE = process.env.WITNESS_PRICES ?? "http://127.0.0.1:8092";
 const SYMBOLS = (process.env.WITNESS_SYMBOLS ?? "BTC,ETH,SOL").split(",").map(s => s.trim()).filter(Boolean);
 const EVERY = Number(process.env.WITNESS_EVERY_SECS ?? 8) * 1000;
 const log = (...a: unknown[]) => console.log(new Date().toISOString().slice(11, 19), ...a);

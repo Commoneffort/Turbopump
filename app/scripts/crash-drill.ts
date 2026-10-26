@@ -117,7 +117,8 @@ async function scenario(name: string, run: () => Promise<void>, settle: number, 
   const liq = r.filter(x => x.type === "liquidation");
   // The executor's own word for each liquidation it queued (the bots look only every 20 s and
   // miss one that is closed in between).
-  const queued = ex.filter(l => /ok queue liquidation/.test(l)).map(l => { const m = l.match(/equity (-?[\d.]+) on ([\d.]+) notional\) (\w+) for (\w+)/); return m ? { equity: Number(m[1]), notional: Number(m[2]), sym: m[3], who: m[4] } : null; }).filter(Boolean) as { equity: number; notional: number; sym: string; who: string }[];
+  // (The executor queues a market's liquidations several to a transaction: "queue 3 liquidations: (...) SOL for ab12cd; ...".)
+  const queued = ex.filter(l => /ok queue (\d+ )?liquidation/.test(l)).flatMap(l => [...l.matchAll(/equity (-?[\d.]+) on ([\d.]+) notional\) (\w+) for (\w+)/g)].map(m => ({ equity: Number(m[1]), notional: Number(m[2]), sym: m[3], who: m[4] })));
   const failed = r.filter(x => x.type === "check" && !x.ok);
   const problems = expect(r, ex);
   const byWhat = new Map<string, number>(); for (const f of failed) byWhat.set(f.what, (byWhat.get(f.what) ?? 0) + 1);
@@ -140,7 +141,7 @@ async function setAll(f: number) { const p = await prices(); for (const [s, v] o
 
 async function run() {
   await scenario("1. slide: -8% over 2 minutes", () => moveAll(-8, 120), 300, (r, ex) => {
-    const went = r.filter(x => x.type === "liquidation" && x.stage === "below the level").length + ex.filter(l => /ok queue liquidation/.test(l)).length;
+    const went = r.filter(x => x.type === "liquidation" && x.stage === "below the level").length + ex.filter(l => /ok queue (\d+ )?liquidation/.test(l)).length;
     return went ? [] : ["nobody went below the liquidation level: the positions were too small for the test"];
   });
   await scenario("2. squeeze: +10% over 2 minutes", () => moveAll(10, 120), 300, () => []);

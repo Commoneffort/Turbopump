@@ -30,7 +30,7 @@ cp target/debug/examples/devnet deploy/x1-tool.new && mv deploy/x1-tool.new depl
 deploy() { # <program key> <binary>
   id=$(solana-keygen pubkey "$1")
   tmp=$(mktemp)
-  if solana program dump -u "$RPC" "$id" "$tmp" >/dev/null 2>&1 && [ "$(head -c "$(stat -c %s "$2")" "$tmp" | sha256sum | cut -d' ' -f1)" = "$(sha256sum "$2" | cut -d' ' -f1)" ]; then
+  if solana program dump -k "$KEY" -u "$RPC" "$id" "$tmp" >/dev/null 2>&1 && [ "$(head -c "$(stat -c %s "$2")" "$tmp" | sha256sum | cut -d' ' -f1)" = "$(sha256sum "$2" | cut -d' ' -f1)" ]; then
     echo "   $id is up to date"
   else
     echo "   deploying $2 to $id"

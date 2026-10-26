@@ -21,9 +21,17 @@ for net in x1 devnet; do
     devnet) RPC=${DEVNET_RPC:-$(cat ~/.config/percolator/devnet-rpc 2>/dev/null || echo https://api.devnet.solana.com)}; KEY=$HOME/.config/solana/percolator-test/deployer.json ;;
   esac
   for p in DkK9TSMpVXLq26HeqxTXLysXyRKDYHTKU94SLFDWgjw3 BSync6F8gtJs3Wj4w8L6H3ZtS397w2XoCYGEAJGmeYX 8o3uV87X2CvPYfPwM1sxeaYYE7sGWsTUiEy7SskEMM3P; do
-    now=$(solana program show -u $RPC $p | sed -n 's/^Authority: //p')
+    now=$(solana program show -k "$KEY" -u $RPC $p | sed -n 's/^Authority: //p')
     if [ "$now" = "$NEW" ]; then echo "$net $p: already $NEW"; continue; fi
-    solana program set-upgrade-authority -u $RPC -k "$KEY" $p --upgrade-authority "$KEY" --new-upgrade-authority "$U" >/dev/null
-    echo "$net $p: $(solana program show -u $RPC $p | sed -n 's/^Authority: //p')"
+    # X1's RPC often answers "Blockhash not found" for a transaction sent right after it fetched
+    # one: try again a few times, and check what the chain says after each try.
+    for try in 1 2 3 4 5 6; do
+      solana program set-upgrade-authority -u $RPC -k "$KEY" $p --upgrade-authority "$KEY" --new-upgrade-authority "$U" >/dev/null 2>&1 || true
+      now=$(solana program show -k "$KEY" -u $RPC $p | sed -n 's/^Authority: //p')
+      [ "$now" = "$NEW" ] && break
+      echo "$net $p: not yet (try $try), again in 5 s"; sleep 5
+    done
+    [ "$now" = "$NEW" ] || { echo "$net $p: still $now after 6 tries; run this again later"; exit 1; }
+    echo "$net $p: $now"
   done
 done

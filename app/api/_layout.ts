@@ -74,6 +74,7 @@ export default {
     "sequence": 9547
   },
   "router": {
+    "batch_secs": 2,
     "behind_refund_slots": 150,
     "bond_lamports": 2000000,
     "book": {
@@ -94,9 +95,19 @@ export default {
     "expiry_deposit_cap": 10000000,
     "fallback_secs": 20,
     "fee_bps_off": 144,
+    "funding_canon_cap_e9": 0,
+    "funding_cap_off": 622,
+    "funding_free_bps": 2000,
+    "funding_max_e9": 30,
+    "funding_seq_off_in_slot": 424,
+    "funding_tau_slots": 9000,
     "grace_secs": 90,
     "im_bps_off": 558,
-    "insurance_nav_bps": 0,
+    "insurance_nav_bps": [
+      800,
+      300,
+      800
+    ],
     "lamports_per_atom": 9,
     "liq_above_engine_bps": 100,
     "liquidation_bps": 1500,
@@ -106,6 +117,7 @@ export default {
     ],
     "max_orders": 8,
     "max_pending": 32,
+    "min_fill_bps": 1000,
     "min_im_off": 518,
     "mm_bps_off": 550,
     "open_above_liq_bps": 150,
@@ -138,9 +150,27 @@ export default {
       "wallet": 40
     },
     "request_len": 120,
-    "reserve_bps": 1000,
+    "reserve_bps": 3000,
     "stall_secs": 30,
+    "stock_feeds": [
+      "6d1cb9acc057a81bbf43ce459ce7bdfc3db1a040b25718158bf6d9936025838f",
+      "d0316d5ef0f1e4bbcf08c8ec72444bf005412a87c5368e130feac8afd862d6c8",
+      "2a4b5bcc3a1a7b6633350fb2f75cc514c57a19071277b992cf4eef17bc20b69e",
+      "c98e089b103f2766952e1490d902cb3a811c700e0064d4cee7c2ba6abef37ce6",
+      "55fe35fea9478cdac31cff1c57883213faab338a84d1dca3d3b9ca8b91fe7e70",
+      "fb1093c2bfb0c40661d0d6b7731d08cab10bf111a77103e05ff3567ad18d969a",
+      "665db1539de0d2082e2c2aa72f62317b6f9a2e3d72fe7f9b041b93e31d7ac2f4",
+      "7e2e57832cf14dd0ac3bc79fd2560cfe86f388ade5d9a4d00d1528b75456abec",
+      "66020da42582157facbf93cc3d944e51c4f15c8a4effec7edf4a18b72c846a71",
+      "38853158dfc20e282627dbc05fc728756ba7e9d5f1d483a8aeccf0123e072372",
+      "2f9cfc1fca7825bbffe689fcbadd465aecbf42be88e090f0acd23ed427d57dfd"
+    ],
     "stress_bps": 0,
+    "tier_fill_nav_bps": [
+      2500,
+      7500,
+      2500
+    ],
     "tier_levels": [
       [
         1000,
@@ -149,7 +179,16 @@ export default {
       [
         500,
         350
+      ],
+      [
+        2000,
+        1200
       ]
+    ],
+    "tier_position_nav_bps": [
+      10000,
+      30000,
+      10000
     ],
     "tier_slots": 64,
     "tiers": {
@@ -159,6 +198,7 @@ export default {
       "tier": 48
     },
     "tiers_len": 624,
+    "trade_room_bps": 8000,
     "trader": {
       "collateral": 104,
       "has_pending": 137,

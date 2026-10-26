@@ -1,9 +1,10 @@
 // Drawing tools the chart library does not ship: a Fibonacci retracement with a colour per level,
 // a measure tool, and a text note. Registered once, then started by name like the built-in ones.
 import { registerFigure, registerOverlay } from "klinecharts";
+import { T, rgbOf } from "./theme";
 
 const FONT = '"JetBrains Mono", ui-monospace, monospace';
-const GREEN = "72,225,96", CORAL = "225,90,72", WHITE = "244,244,244", GREY = "138,138,138";
+const GREEN = rgbOf(T.green), CORAL = rgbOf(T.red), WHITE = rgbOf(T.textPrimary), GREY = rgbOf(T.textSecondary);
 const rgba = (c: string, a: number) => `rgba(${c},${a})`;
 const label = (color: string) => ({ color, size: 10.5, family: FONT, backgroundColor: "transparent", borderColor: "transparent", paddingLeft: 4, paddingRight: 4, paddingTop: 2, paddingBottom: 2 });
 
@@ -59,7 +60,7 @@ export function registerChartTools() {
       ctx.save();
       ctx.beginPath();
       ctx.arc(a.x, a.y, a.r, 0, Math.PI * 2);
-      ctx.fillStyle = "#1C1C1C";
+      ctx.fillStyle = T.bgElevated;
       ctx.fill();
       if (image && image.complete && image.naturalWidth) {
         ctx.save();
@@ -73,7 +74,7 @@ export function registerChartTools() {
         ctx.beginPath();
         a.points.forEach(([px, py], i) => { const X = a.x - side / 2 + px * side, Y = a.y - side / 2 + py * side; if (i) ctx.lineTo(X, Y); else ctx.moveTo(X, Y); });
         ctx.closePath();
-        ctx.fillStyle = a.color ?? "#8A8A8A";
+        ctx.fillStyle = a.color ?? T.textSecondary;
         ctx.fill();
       }
       ctx.beginPath();
@@ -105,7 +106,32 @@ export function registerChartTools() {
         { type: "polygon", ignoreEvent: true, attrs: { coordinates: [{ x, y: y + dir * 1 }, { x: x - 4, y: y + dir * 7 }, { x: x + 4, y: y + dir * 7 }] }, styles: { style: "fill", color: rgba(side, 1) } },
         { type: "traderBadge", attrs: { x, y: cy, r, src: m.picture, points: m.points, color: m.color }, styles: { borderColor: rgba(side, 1) } },
       ];
-      if (m.hover && m.label) figures.push({ type: "text", ignoreEvent: true, attrs: { x: x + r + 6, y: cy, text: m.label, baseline: "middle" }, styles: { ...label(rgba(WHITE, 1)), size: 14, weight: 600, backgroundColor: "rgba(28,28,28,0.92)", borderColor: rgba(side, 0.9), borderSize: 1, borderRadius: 3, paddingLeft: 7, paddingRight: 7, paddingTop: 4, paddingBottom: 4 } });
+      if (m.hover && m.label) figures.push({ type: "text", ignoreEvent: true, attrs: { x: x + r + 6, y: cy, text: m.label, baseline: "middle" }, styles: { ...label(rgba(WHITE, 1)), size: 14, weight: 600, backgroundColor: `rgba(${rgbOf(T.bgElevated)},0.95)`, borderColor: rgba(side, 0.9), borderSize: 1, borderRadius: 3, paddingLeft: 7, paddingRight: 7, paddingTop: 4, paddingBottom: 4 } });
+      return figures;
+    },
+  });
+
+  // A large fill by anyone (the chart's "Whales" box): a bubble sized by the trade's value, under
+  // the price for a buy and over it for a sell. Who and how much show while the pointer is on it.
+  registerOverlay({
+    name: "whaleMark",
+    totalStep: 2,
+    needDefaultPointFigure: false,
+    needDefaultXAxisFigure: false,
+    needDefaultYAxisFigure: false,
+    createPointFigures: ({ coordinates, overlay, bounding }) => {
+      const m = overlay.extendData as { r: number; buy: boolean; label: string; hover?: boolean } | undefined;
+      if (!coordinates.length || !m) return [];
+      const { x, y } = coordinates[0];
+      const side = m.buy ? GREEN : CORAL, dir = m.buy ? 1 : -1, r = m.r;
+      const cy = y + dir * (6 + r);
+      const figures: any[] = [
+        { type: "line", ignoreEvent: true, attrs: { coordinates: [{ x, y }, { x, y: y + dir * 6 }] }, styles: { color: rgba(side, 0.8), size: 1 } },
+        { type: "circle", attrs: { x, y: cy, r }, styles: { style: "stroke_fill", color: rgba(side, m.hover ? 0.5 : 0.28), borderColor: rgba(side, 0.95), borderSize: 1.5 } },
+      ];
+      // The label goes left of the bubble when there is no room for it on the right.
+      const left = x + r + 20 + m.label.length * 7.6 > bounding.width;
+      if (m.hover && m.label) figures.push({ type: "text", ignoreEvent: true, attrs: { x: left ? x - r - 6 : x + r + 6, y: cy, text: m.label, baseline: "middle", align: left ? "right" : "left" }, styles: { ...label(rgba(WHITE, 1)), size: 13, weight: 600, backgroundColor: `rgba(${rgbOf(T.bgElevated)},0.95)`, borderColor: rgba(side, 0.9), borderSize: 1, borderRadius: 3, paddingLeft: 7, paddingRight: 7, paddingTop: 4, paddingBottom: 4 } });
       return figures;
     },
   });
@@ -132,8 +158,35 @@ export function registerChartTools() {
         { type: "polygon", attrs: { coordinates: [{ x, y }, { x: x + w, y }, { x: x + w, y: y + h }, { x, y: y + h }] }, styles: { style: "fill", color: rgba(c, 0.12) } },
         { type: "line", ignoreEvent: true, attrs: { coordinates: [{ x: midX, y: a.y }, { x: midX, y: b.y }] }, styles: { color: rgba(c, 1), size: 1 } },
         { type: "line", ignoreEvent: true, attrs: { coordinates: [{ x: a.x, y: y + h / 2 }, { x: b.x, y: y + h / 2 }] }, styles: { color: rgba(c, 1), size: 1 } },
-        { type: "text", ignoreEvent: true, attrs: { x: midX, y: up ? y - 6 : y + h + 6, text, align: "center", baseline: up ? "bottom" : "top" }, styles: { ...label("#121212"), backgroundColor: rgba(c, 1), borderRadius: 3 } },
+        { type: "text", ignoreEvent: true, attrs: { x: midX, y: up ? y - 6 : y + h + 6, text, align: "center", baseline: up ? "bottom" : "top" }, styles: { ...label(T.bgPrimary), backgroundColor: rgba(c, 1), borderRadius: 3 } },
       ];
+    },
+  });
+
+  // A position, or one of its levels (liquidation, TP, SL): a dashed line across the chart with its
+  // label in a badge at the plot's left edge, clear of the newest candles (all of it readable: "▲ ETH LONG 0.42 · +$1.20 (+0.1%)"), and
+  // the price in the axis. extendData: { text, color }.
+  registerOverlay({
+    name: "positionLine",
+    totalStep: 1,
+    needDefaultPointFigure: false,
+    needDefaultXAxisFigure: false,
+    needDefaultYAxisFigure: false,
+    createPointFigures: ({ coordinates, bounding, overlay }) => {
+      if (!coordinates.length) return [];
+      const { text, color } = (overlay.extendData ?? {}) as { text: string; color: string };
+      const y = coordinates[0].y;
+      return [
+        { type: "line", ignoreEvent: true, attrs: { coordinates: [{ x: 0, y }, { x: bounding.width, y }] }, styles: { color, size: 1, style: "dashed", dashedValue: [4, 3] } },
+        { type: "text", ignoreEvent: true, attrs: { x: 10, y, text, align: "left", baseline: "middle" }, styles: { color: T.bgPrimary, size: 11.5, weight: 600, family: FONT, backgroundColor: color, borderColor: color, borderRadius: 3, paddingLeft: 6, paddingRight: 6, paddingTop: 3, paddingBottom: 3 } },
+      ];
+    },
+    createYAxisFigures: ({ coordinates, bounding, overlay, yAxis }) => {
+      if (!coordinates.length) return [];
+      const { color } = (overlay.extendData ?? {}) as { text: string; color: string };
+      const value = overlay.points[0]?.value ?? 0;
+      const text = (yAxis as any)?.convertFromPixel ? value.toFixed(value >= 100 ? 2 : value >= 1 ? 4 : 6) : String(value);
+      return [{ type: "text", ignoreEvent: true, attrs: { x: 0, y: coordinates[0].y, text, align: "left", baseline: "middle" }, styles: { color: T.bgPrimary, size: 11, family: FONT, backgroundColor: color, borderColor: color, borderRadius: 2, paddingLeft: 4, paddingRight: 4, paddingTop: 2, paddingBottom: 2 } }];
     },
   });
 
@@ -145,7 +198,7 @@ export function registerChartTools() {
     needDefaultYAxisFigure: false,
     createPointFigures: ({ coordinates, overlay }) => {
       if (!coordinates.length) return [];
-      return [{ type: "text", attrs: { x: coordinates[0].x + 8, y: coordinates[0].y, text: String(overlay.extendData ?? "Note"), baseline: "middle" }, styles: { color: rgba(WHITE, 1), size: 12, family: "Inter, system-ui, sans-serif", backgroundColor: "rgba(42,42,42,0.9)", borderColor: "#4A4A4A", borderSize: 1, borderRadius: 3, paddingLeft: 6, paddingRight: 6, paddingTop: 4, paddingBottom: 4 } }];
+      return [{ type: "text", attrs: { x: coordinates[0].x + 8, y: coordinates[0].y, text: String(overlay.extendData ?? "Note"), baseline: "middle" }, styles: { color: rgba(WHITE, 1), size: 12, family: "Inter, system-ui, sans-serif", backgroundColor: `rgba(${rgbOf(T.bgElevated)},0.92)`, borderColor: T.borderPrimary, borderSize: 1, borderRadius: 3, paddingLeft: 6, paddingRight: 6, paddingTop: 4, paddingBottom: 4 } }];
     },
   });
 }

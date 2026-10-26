@@ -243,6 +243,12 @@ export type Fill = { sig: string; slot: number; vault: string; size: number; pri
  *  in the trading account's transaction history and cached in this browser. Only a few new
  *  transactions are fetched per refresh (the public RPC is rate-limited). */
 export function useFills(wallet: PublicKey | null, vault: PublicKey, tick: bigint): Fill[] {
+  const fills = useWalletFills(wallet, tick);
+  return useMemo(() => fills.filter(f => f.vault === vault.toBase58()), [fills, vault.toBase58()]);
+}
+
+/** This wallet's fills on every market (see `useFills`). */
+export function useWalletFills(wallet: PublicKey | null, tick: bigint): Fill[] {
   const { connection } = useConnection();
   const key = wallet ? `pv:fills:${C.ROUTER.toBase58().slice(0, 8)}:${wallet.toBase58()}` : "";
   const [fills, setFills] = useState<Fill[]>([]);
@@ -255,7 +261,8 @@ export function useFills(wallet: PublicKey | null, vault: PublicKey, tick: bigin
       setFills(cache.fills);
       try {
         const sigs = await connection.getSignaturesForAddress(C.traderAddress(wallet), { limit: 40 }, "confirmed");
-        const fresh = sigs.filter(x => !x.err && !cache.seen.includes(x.signature)).reverse().slice(0, 5);
+        // (X1's RPC is not rate-limited: a first visit there reads the whole recent history at once.)
+        const fresh = sigs.filter(x => !x.err && !cache.seen.includes(x.signature)).reverse().slice(0, C.X1 ? 20 : 5);
         for (const x of fresh) {
           const tx = await connection.getTransaction(x.signature, { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
           if (!tx) continue;
@@ -276,7 +283,38 @@ export function useFills(wallet: PublicKey | null, vault: PublicKey, tick: bigin
     })();
     return () => { live = false; };
   }, [key, tick]);
-  return useMemo(() => fills.filter(f => f.vault === vault.toBase58()), [fills, vault.toBase58()]);
+  return fills;
+}
+
+/** Each fill with the profit or loss it booked (average-cost method, per market, before fees):
+ *  a fill that shrinks or flips a position books (price - average entry) x the size it closed;
+ *  one that opens or adds books nothing. The fills on record may not go back to when a position
+ *  was opened, so the position before each fill is worked out backwards from the position held
+ *  now (`now`, by vault), and a market's PnL is only counted from a fill that started from flat:
+ *  `known` is false before that, and nothing is guessed. */
+export function realizedPnl(fills: Fill[], now: Map<string, number>): (Fill & { realized: number; known: boolean })[] {
+  const before = new Array<number>(fills.length);
+  const after = new Map(now);
+  for (let i = fills.length - 1; i >= 0; i--) {
+    const f = fills[i], a = after.get(f.vault) ?? 0;
+    before[i] = Math.abs(a - f.size) < 1e-9 ? 0 : a - f.size;
+    after.set(f.vault, before[i]);
+  }
+  const book = new Map<string, { pos: number; avg: number; known: boolean }>();
+  return fills.map((f, i) => {
+    const b = book.get(f.vault) ?? { pos: 0, avg: 0, known: false };
+    if (!b.known && before[i] === 0) { b.known = true; b.pos = 0; }
+    let realized = 0;
+    if (b.known) {
+      const next = b.pos + f.size;
+      if (b.pos !== 0 && Math.sign(f.size) !== Math.sign(b.pos)) realized = (f.price - b.avg) * Math.min(Math.abs(f.size), Math.abs(b.pos)) * Math.sign(b.pos);
+      if (b.pos === 0 || Math.sign(next) !== Math.sign(b.pos)) b.avg = f.price;
+      else if (Math.abs(next) > Math.abs(b.pos)) b.avg = (b.avg * Math.abs(b.pos) + f.price * Math.abs(f.size)) / Math.abs(next);
+      b.pos = Math.abs(next) < 1e-9 ? 0 : next;
+    }
+    book.set(f.vault, b);
+    return { ...f, realized, known: b.known };
+  });
 }
 
 /** Average entry price of the open position implied by a wallet's fills on one market, or

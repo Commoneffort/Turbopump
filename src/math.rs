@@ -94,6 +94,24 @@ pub fn allowed_fill(
     closes + core::cmp::min(core::cmp::min(requested_abs - closes, max_fill_abs), room)
 }
 
+/// The two limits a fill is held to (`allowed_fill`'s `max_fill_abs` and `max_inventory_abs`),
+/// in position units, for a vault worth `nav` at `price_e6`, on a feed whose tier allows a
+/// position of `position_bps` and a fill of `fill_bps` of `nav` in notional:
+/// - an ordinary trade may only use `feeds::TRADE_ROOM_BPS` of the position limit; a trade that
+///   closes the trader's own position (liquidations too) may use all of it;
+/// - a fill that adds to the vault's position gets less the fuller the vault already is.
+pub fn fill_caps(nav: u64, position_bps: u16, fill_bps: u16, price_e6: u64, inventory: i128, lp_delta_sign: i8, closing: bool) -> (u128, u128) {
+    let full = nav_cap(nav, position_bps, price_e6);
+    let limit = if closing { full } else { full * crate::feeds::TRADE_ROOM_BPS / BPS };
+    let mut max_fill = nav_cap(nav, fill_bps, price_e6);
+    let grows = inventory == 0 || (inventory > 0) == (lp_delta_sign > 0);
+    if grows && full > 0 {
+        let left = full.saturating_sub(inventory.unsigned_abs()) * BPS / full;
+        max_fill = max_fill * core::cmp::max(left, crate::feeds::MIN_FILL_BPS) / BPS;
+    }
+    (max_fill, limit)
+}
+
 /// A size cap (in position units) worth `bps` of `nav` in notional at `price_e6`:
 /// `nav * bps / 10_000` collateral atoms, divided by atoms per unit. Rounded down.
 pub fn nav_cap(nav: u64, bps: u16, price_e6: u64) -> u128 {
@@ -171,6 +189,26 @@ mod tests {
         assert_eq!(allowed_fill(500, 30, 80, -1, 100, false), 110);
         assert_eq!(allowed_fill(500, 30, 80, -1, 100, true), 80);
         assert_eq!(allowed_fill(500, 30, -80, 1, 100, true), 80);
+    }
+
+    #[test]
+    fn fill_caps_by_tier_room_and_crowding() {
+        use crate::feeds::{fill_nav_bps, position_nav_bps, TIER_DEFAULT, TIER_MAJOR, TIER_STOCK};
+        let (nav, price) = (10_000_000u64, 1_000_000u64); // 10 USDC at 1.00
+        let d = |inv: i128, sign: i8, closing: bool| fill_caps(nav, position_nav_bps(TIER_DEFAULT), fill_nav_bps(TIER_DEFAULT), price, inv, sign, closing);
+        // Default tier, flat: 2.5 units a fill, ordinary trades up to 8 of the 10-unit limit.
+        assert_eq!(d(0, 1, false), (2_500_000, 8_000_000));
+        // A trade that closes a trader's position (a liquidation) may use the whole limit.
+        assert_eq!(d(0, 1, true).1, 10_000_000);
+        // Half full on the side the fill grows: half the per-fill cap.
+        assert_eq!(d(5_000_000, 1, false).0, 1_250_000);
+        // Never under a tenth of it, however full.
+        assert_eq!(d(9_900_000, 1, false).0, 250_000);
+        // A fill that shrinks the vault's position is not scaled.
+        assert_eq!(d(5_000_000, -1, false).0, 2_500_000);
+        // Majors keep 3x and 0.75x; stocks get the default's.
+        assert_eq!(fill_caps(nav, position_nav_bps(TIER_MAJOR), fill_nav_bps(TIER_MAJOR), price, 0, 1, true), (7_500_000, 30_000_000));
+        assert_eq!(position_nav_bps(TIER_STOCK), position_nav_bps(TIER_DEFAULT));
     }
 
     proptest! {

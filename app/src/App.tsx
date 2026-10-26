@@ -12,6 +12,7 @@ import HealthPage from "./Health";
 import SpotDesk from "./Spot";
 import { TraderPage, TradersPage } from "./Traders";
 import { Card, Faucet, Icon, Send, Stat, Toast, ago, explorer, fmt, px, short, units, usd, useCards } from "./shared";
+import logo from "./turbopump-logo.png";
 
 // ---------------------------------------------------------------- routing
 
@@ -120,11 +121,7 @@ export default function App() {
     <div className={desk ? "app on-desk" : "app"}>
       <header className="top">
         <a className="brand" href="#/">
-          <svg className="logo" width="22" height="22" viewBox="0 0 22 22" aria-hidden>
-            <path d="M11 1.5 20.5 11 11 20.5 1.5 11Z" fill="none" stroke="currentColor" strokeWidth="1.6" />
-            <path d="M11 6.5 15.5 11 11 15.5 6.5 11Z" fill="currentColor" />
-          </svg>
-          <span className="brand-name">Turbopump</span>
+          <img className="brand-logo" src={logo} alt="Turbopump" width={142} height={16} />
         </a>
         <nav className="tabs">
           <a className={tab(desk && !spot)} href="#/">Trade</a>

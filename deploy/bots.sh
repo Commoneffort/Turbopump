@@ -5,10 +5,13 @@
 # which our own executor earns back). The bots top themselves up from the deploy wallet.
 #   deploy/bots.sh x1|devnet start | stop | status | report [hours] | failures
 #   BOT_PACE_SECS=240 to change the pace, BOT_SYMBOLS=SOL,BTC to change the markets traded
+#   BOT_SKIP=bot-a,bot-b to leave bots out. On X1 the max-leverage bots are left out by default: their
+#   orders mostly expire, and each expired order forfeits up to 5 XNT (about 90% of X1 bot spending).
+#   BOT_SKIP= (empty) runs them all.
 cd "$(dirname "$0")/.."
 case "$1" in
-  x1)     NET=x1-testnet; NAME=x1-bots; RPC=${X1_RPC:-https://rpc.testnet.x1.xyz}; SYMBOLS=${BOT_SYMBOLS:-SOL,BTC,ETH}; PACE=${BOT_PACE_SECS:-240} ;;
-  devnet) NET=devnet; NAME=devnet-bots; RPC=${DEVNET_RPC:-$(cat ~/.config/percolator/devnet-rpc 2>/dev/null || echo https://api.devnet.solana.com)}; SYMBOLS=${BOT_SYMBOLS:-SOL,BTC,ETH}; PACE=${BOT_PACE_SECS:-600} ;;
+  x1)     NET=x1-testnet; NAME=x1-bots; RPC=${X1_RPC:-https://rpc.testnet.x1.xyz}; SYMBOLS=${BOT_SYMBOLS:-SOL,BTC,ETH}; PACE=${BOT_PACE_SECS:-240}; SKIP=${BOT_SKIP-bot-edge-long,bot-edge-short,bot-max} ;;
+  devnet) NET=devnet; NAME=devnet-bots; RPC=${DEVNET_RPC:-$(cat ~/.config/percolator/devnet-rpc 2>/dev/null || echo https://api.devnet.solana.com)}; SYMBOLS=${BOT_SYMBOLS:-SOL,BTC,ETH}; PACE=${BOT_PACE_SECS:-600}; SKIP=${BOT_SKIP-} ;;
   *) echo "usage: $0 x1|devnet start | stop | status | report [hours] | failures"; exit 1 ;;
 esac
 mkdir -p deploy/logs
@@ -20,7 +23,7 @@ srunning() { [ -f $SPID ] && kill -0 -- "-$(cat $SPID)" 2>/dev/null; }
 case "$2" in
   start)
     if ! running; then
-      (cd app && NETWORK=$NET RPC=$RPC BOT_PACE_SECS=$PACE setsid sh -c "echo \$\$ > ../$PID; while :; do npx tsx scripts/bots.ts run $SYMBOLS; echo \"\$(date -u +%T) restart: $NAME exited with status \$?, starting them again in 30 s\"; sleep 30; done" >> ../deploy/logs/$NAME.log 2>&1 < /dev/null &)
+      (cd app && NETWORK=$NET RPC=$RPC BOT_PACE_SECS=$PACE BOT_SKIP=$SKIP setsid sh -c "echo \$\$ > ../$PID; while :; do npx tsx scripts/bots.ts run $SYMBOLS; echo \"\$(date -u +%T) restart: $NAME exited with status \$?, starting them again in 30 s\"; sleep 30; done" >> ../deploy/logs/$NAME.log 2>&1 < /dev/null &)
     fi
     if ! srunning; then
       (cd app && NETWORK=$NET RPC=$RPC setsid sh -c "echo \$\$ > ../$SPID; while :; do npx tsx scripts/swap-bots.ts run; echo \"\$(date -u +%T) restart: $SNAME exited with status \$?, starting them again in 30 s\"; sleep 30; done" >> ../deploy/logs/$SNAME.log 2>&1 < /dev/null &)

@@ -31,26 +31,57 @@ case "$1" in
   engine) ID=8o3uV87X2CvPYfPwM1sxeaYYE7sGWsTUiEy7SskEMM3P; PKEY=keys/percolator-devnet-keypair.json; SO=${PERCOLATOR_SO:-../percolator-prog/target/deploy/percolator_prog.so} ;;
   *) echo "usage: $0 router|vault|engine x1|devnet"; exit 1 ;;
 esac
+# Already live (a rerun after a step that failed further on): nothing to upload.
+live=$(mktemp)
+if solana program dump -k "$KEY" -u "$RPC" $ID "$live" >/dev/null 2>&1 && [ "$(head -c "$(stat -c %s "$SO")" "$live" | sha256sum | cut -d' ' -f1)" = "$(sha256sum "$SO" | cut -d' ' -f1)" ]; then
+  rm -f "$live"; echo "$1 on $2: this build is already live"; exit 0
+fi
+rm -f "$live"
 UPGRADE=${UPGRADE_KEY:-$HOME/.config/solana/percolator-upgrade.json}
-AUTH=$(solana program show -u "$RPC" $ID | sed -n 's/^Authority: //p')
+AUTH=$(solana program show -k "$KEY" -u "$RPC" $ID | sed -n 's/^Authority: //p')
+# (Every solana call names a key: this server has no default ~/.config/solana/id.json any more,
+# and without one the lookup above came back empty and the wrong key signed.)
+[ -n "$AUTH" ] || { echo "could not read the upgrade authority of $ID on $RPC"; exit 1; }
 if [ -f "$UPGRADE" ] && [ "$AUTH" = "$(solana-keygen pubkey "$UPGRADE")" ]; then SIGNER=$UPGRADE; else SIGNER=$KEY; fi
-have=$(solana program show -u "$RPC" $ID | sed -n 's/^Data Length: \([0-9]*\).*/\1/p')
+have=$(solana program show -k "$KEY" -u "$RPC" $ID | sed -n 's/^Data Length: \([0-9]*\).*/\1/p')
 need=$(stat -c %s "$SO")
 echo "$1 on $RPC: $have bytes deployed, the new build is $need (upgrade signed by $(solana-keygen pubkey "$SIGNER"))"
+SIGNER_PK=$(solana-keygen pubkey "$SIGNER")
 if [ "$need" -gt "$have" ]; then
-  # (Solana refuses to extend a program by less than 10,240 bytes.)
+  # (Solana refuses to extend a program by less than 10,240 bytes.) The extension is signed by the
+  # program's upgrade authority and paid by it: give it the rent first when it is not the deploy
+  # wallet (the upgrade key holds nothing of its own).
   more=$((need - have + 8192)); [ "$more" -lt 10240 ] && more=10240
-  solana program extend -u "$RPC" -k "$KEY" $ID $more
+  if [ "$SIGNER" != "$KEY" ]; then
+    rent=$(solana rent -k "$KEY" -u "$RPC" $more 2>/dev/null | sed -n 's/^Rent-exempt minimum: \([0-9.]*\).*/\1/p')
+    solana transfer -u "$RPC" -k "$KEY" --allow-unfunded-recipient "$SIGNER_PK" "$(python3 -c "print(round(${rent:-0.1} + 0.01, 6))")" >/dev/null
+  fi
+  solana program extend -u "$RPC" -k "$SIGNER" $ID $more
 fi
-# Through plain RPC (the CLI's direct send path is refused by the public devnet RPC), and into a
-# buffer whose key is kept until the upgrade went through: an upload cut off half-way (devnet
-# rate limits) resumes where it stopped when this is run again, instead of stranding its rent.
+# Through plain RPC (the CLI's direct send path is refused by the public devnet RPC), into a buffer
+# whose key is kept until the upgrade went through: an upload cut off half-way (devnet rate limits)
+# resumes where it stopped when this is run again, instead of stranding its rent. The deploy wallet
+# pays for the buffer; the buffer's authority is the program's upgrade authority, which the loader
+# requires for the upgrade (a buffer left from before the authority moved is handed over first).
 BUF=deploy/logs/upgrade-buffer-$1-$2.json
 mkdir -p deploy/logs
 [ -f "$BUF" ] || solana-keygen new --no-bip39-passphrase --silent -o "$BUF" >/dev/null
-solana program deploy -u "$RPC" -k "$KEY" --use-rpc --max-sign-attempts 50 --buffer "$BUF" --program-id "$PKEY" --upgrade-authority "$SIGNER" "$SO"
+BUF_PK=$(solana-keygen pubkey "$BUF")
+buf_auth=$(solana program show -k "$KEY" -u "$RPC" "$BUF_PK" 2>/dev/null | sed -n 's/^Authority: //p')
+if [ -n "$buf_auth" ] && [ "$buf_auth" != "$SIGNER_PK" ]; then
+  solana program set-buffer-authority -u "$RPC" -k "$KEY" "$BUF_PK" --buffer-authority "$KEY" --new-buffer-authority "$SIGNER_PK" >/dev/null
+fi
+if [ "$2" = devnet ] && [ -z "$FAST_UPLOAD" ]; then
+  # The public devnet RPC blocks this server for minutes after the CLI's burst of uploads: a
+  # throttled upload instead (only missing pieces are sent; rerun it until the buffer matches).
+  (cd app && RPC=$RPC npx tsx scripts/write-buffer.ts "../$BUF" "../$SO" "$SIGNER") | tail -3
+  (cd app && RPC=$RPC npx tsx scripts/write-buffer.ts "../$BUF" "../$SO" "$SIGNER") | grep -q "buffer matches binary" || { echo "upload not finished: run this again to continue"; exit 1; }
+else
+  solana program write-buffer -u "$RPC" -k "$KEY" --use-rpc --max-sign-attempts 50 --buffer "$BUF" --buffer-authority "$SIGNER" "$SO"
+fi
+solana program upgrade -u "$RPC" -k "$KEY" "$BUF_PK" $ID --upgrade-authority "$SIGNER"
 rm -f "$BUF"
 tmp=$(mktemp)
-solana program dump -u "$RPC" $ID "$tmp" >/dev/null
+solana program dump -k "$KEY" -u "$RPC" $ID "$tmp" >/dev/null
 if [ "$(head -c "$need" "$tmp" | sha256sum | cut -d' ' -f1)" = "$(sha256sum "$SO" | cut -d' ' -f1)" ]; then echo "on chain = $SO"; else echo "WARNING: what is on chain differs from $SO"; fi
 rm -f "$tmp"

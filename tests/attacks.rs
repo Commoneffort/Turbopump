@@ -131,7 +131,9 @@ fn foreign_lp_cannot_route_fills_through_the_vault() {
 
 #[test]
 fn inventory_cap_limits_fills() {
-    // 10 USDC of NAV at 1.00: each fill up to 7.5 units (0.75x NAV), position up to 30 (3x).
+    // 10 USDC of NAV at 1.00, on the test feed (a major in test builds): a fill adds up to 7.5
+    // units (0.75x NAV) when the vault is flat, less the fuller it is; ordinary trades stop at 24
+    // units (80% of the 3x position limit), the rest is kept for trades that close a position.
     // 10% margin, so the vault's own caps bind before Percolator's margin check.
     let mut w = World::with_config(devnet_like_config());
     w.env.warp_to_slot(5);
@@ -140,18 +142,24 @@ fn inventory_cap_limits_fills() {
     w.deposit(&alice, 10_000_000).unwrap();
     w.advance(EPOCH_LEN, INITIAL_PRICE);
     w.roll().unwrap();
-    let per_fill = 7_500_000i128;
+    let (full, room, per_fill) = (30 * UNIT as i128, 24 * UNIT as i128, 7_500_000i128);
     w.taker_trade(0, 10 * UNIT as i128).unwrap();
-    assert_eq!({ w.vault_state().inventory }, -per_fill, "per-fill cap");
-    for _ in 0..3 {
+    assert_eq!({ w.vault_state().inventory }, -per_fill, "per-fill cap, flat vault");
+    // Each further buy gets the per-fill cap times the share of the limit still free.
+    let mut expect = -per_fill;
+    for _ in 0..40 {
+        let left = ((full + expect) * 10_000 / full).max(1_000);
+        let fill = (per_fill * left / 10_000).min(room + expect);
         w.taker_trade(0, 10 * UNIT as i128).unwrap();
+        expect -= fill;
+        assert_eq!({ w.vault_state().inventory }, expect, "smaller fills on the crowded side");
     }
-    assert_eq!({ w.vault_state().inventory }, -30 * UNIT as i128, "position cap");
+    assert_eq!(expect, -room, "ordinary trades stop at 80% of the limit");
     w.taker_trade(0, 10 * UNIT as i128).unwrap();
-    assert_eq!({ w.vault_state().inventory }, -30 * UNIT as i128, "nothing past the position cap");
+    assert_eq!({ w.vault_state().inventory }, -room, "nothing past it");
     // Selling back (reducing the vault's short) is always allowed.
     w.taker_trade(0, -5 * UNIT as i128).unwrap();
-    assert_eq!({ w.vault_state().inventory }, -25 * UNIT as i128);
+    assert_eq!({ w.vault_state().inventory }, -room + 5 * UNIT as i128);
 }
 
 #[test]
@@ -409,8 +417,15 @@ fn creation_rejects_bad_params_duplicates_and_wrong_mint() {
     // A second creation for the same feed fails.
     assert!(w.create_vault(operate_params(1)).is_err());
 
-    // Wrong collateral mint.
+    // A feed that is not on the build's list cannot be opened at all.
     let mut p = InitParams { oracle_feeds: [[8; 32], [0; 32], [0; 32]], ..operate_params(2) };
+    p.asset_generation_frontier = w.frontier();
+    let ix = w.init_ix(&p);
+    let creator = w.creator.insecure_clone();
+    expect_err(w.send(vec![ix], &[&creator]), VaultError::FeedNotListable);
+
+    // Wrong collateral mint.
+    let mut p = InitParams { oracle_feeds: [percolator_vault::feeds::MAJOR_FEEDS[0], [0; 32], [0; 32]], ..operate_params(2) };
     p.asset_generation_frontier = w.frontier();
     let mut ix = w.init_ix(&p);
     let fake_mint = Pubkey::new_unique();

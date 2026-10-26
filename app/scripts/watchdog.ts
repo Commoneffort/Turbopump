@@ -75,6 +75,30 @@ async function problem(key: string, bad: boolean, text: string) {
 }
 
 // ---- the checks ----
+// The X1 price witness (scripts/witness.ts) spends ~4 XNT a day and may run on another machine:
+// it is refilled here by address (no key needed) from the paying wallet, and its prices on chain
+// must stay under the router's WITNESS_SECS (30 s) or X1 marks stop moving. Returns what was sent.
+const WITNESS = "DQA2FE6ZSPHCRxLVgi4G4fb5X61D9s2phbF589TDdvvZ";
+async function witness(): Promise<number> {
+  const w = new (await import("@solana/web3.js")).PublicKey(WITNESS);
+  let sent = 0;
+  const bal = await conn.getBalance(w);
+  if (bal < 4 * LAMPORTS_PER_SOL) {
+    const amount = 15 * LAMPORTS_PER_SOL - bal;
+    try {
+      const sig = await conn.sendTransaction(new Transaction().add(SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: w, lamports: amount })), [payer]);
+      await conn.confirmTransaction(sig, "confirmed");
+      sent = amount;
+      await send(`refilled the price witness ${WITNESS.slice(0, 8)}… with ${coin(amount)} (it had ${coin(bal)})`);
+    } catch (e: any) { say("witness refill failed:", String(e?.message ?? e).slice(0, 120)); }
+  }
+  const accs = await conn.getMultipleAccountsInfo(C.FEEDS.map(f => C.witnessAddress(f.id)));
+  const now = Math.floor(Date.now() / 1000);
+  const stale = C.FEEDS.filter((_, i) => !accs[i] || now - C.decodeReport(new Uint8Array(accs[i]!.data)).publish > 60).map(f => f.symbol);
+  await problem("witness silent", stale.length > 0, `the price witness has posted nothing for over 60 s on ${stale.join(", ")}: X1 prices there are frozen. Check the witness machine (journalctl -u witness) or deploy/logs/x1-witness.log.`);
+  return sent;
+}
+
 async function wallet() {
   let have = await conn.getBalance(payer.publicKey);
   const tk = fs.existsSync(TREASURY_KEY) ? read(TREASURY_KEY) : null;
@@ -93,6 +117,7 @@ async function wallet() {
       } catch (e: any) { say("treasury refill failed:", String(e?.message ?? e).slice(0, 120)); }
     }
   }
+  if (C.X1) have -= await witness();
   const hours = C.X1 ? have / LAMPORTS_PER_SOL / 11 : have / LAMPORTS_PER_SOL / 0.05 * 24;
   await problem("paying wallet empty", have < T.alarm * LAMPORTS_PER_SOL, `🚨 paying wallet ${payer.publicKey.toBase58()} has ${coin(have)} left (about ${hours.toFixed(1)} h). Everything stops when it is empty. Send ${C.COIN} to it.`);
   await problem("paying wallet low", have >= T.alarm * LAMPORTS_PER_SOL && have < T.warn * LAMPORTS_PER_SOL, `paying wallet ${payer.publicKey.toBase58()} has ${coin(have)} left (about ${hours.toFixed(1)} h), and the treasury has nothing above its reserve to refill it.`);

@@ -8,6 +8,7 @@ import { SEED_WALLETS } from "../api/_config";
 import * as C from "./chain";
 import * as S from "./social";
 import { view } from "./view";
+import { T } from "./theme";
 import { Send, ago, explorer, fmt, priceDp, short, useCards } from "./shared";
 
 // ---------------------------------------------------------------- badges
@@ -31,13 +32,16 @@ export const BADGES: { name: string; points: [number, number][] }[] = [
   { name: "Burst", points: ring(8, 0.52, -Math.PI / 2, 0.34) },
 ];
 /** Badge colours: the palette's, nothing else. */
-export const BADGE_COLORS = ["#F4F4F4", "#48E160", "#E15A48", "#8A8A8A"];
+/** (A badge stores the index: these restyle every badge with the palette.) */
+export const BADGE_COLORS = [T.textPrimary, T.green, T.red, T.textSecondary];
+/** The colour of a badge whose wallet has not chosen one. */
+const UNSET = T.textMuted;
 /** The badge a wallet shows: its profile's, or one derived from its address until it sets one. */
 export function badgeOf(wallet: string, profile?: S.Profile): { shape: number; color: string } {
   if (profile) return { shape: profile.badge % BADGES.length, color: BADGE_COLORS[profile.color % BADGE_COLORS.length] };
   let h = 0;
   for (const ch of wallet) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
-  return { shape: h % BADGES.length, color: "#4A4A4A" };
+  return { shape: h % BADGES.length, color: UNSET };
 }
 // ---- badge pictures
 //
@@ -114,8 +118,9 @@ export const nameOf = (wallet: string, profile?: S.Profile) => profile?.name ?? 
 
 let cache: { net: string; board: S.Board } | undefined;
 let loading: Promise<S.Board> | undefined;
-/** The board, shared by every part of the page that shows it and re-read every 20 seconds. */
-export function useBoard(tick: number): { board?: S.Board; err?: string; reload: () => void } {
+/** The board, shared by every part of the page that shows it and re-read every 20 seconds (or every
+ *  `every` ms: the Trade page reads it faster for its live trades, queue and liquidations). */
+export function useBoard(tick: number, every = 20_000): { board?: S.Board; err?: string; reload: () => void } {
   const connection = view;
   const [board, setBoard] = useState<S.Board | undefined>(cache?.net === C.NETWORK ? cache.board : undefined);
   const [err, setErr] = useState<string>();
@@ -123,14 +128,14 @@ export function useBoard(tick: number): { board?: S.Board; err?: string; reload:
   useEffect(() => {
     let live = true;
     const load = (force: boolean) => {
-      if (!force && cache?.net === C.NETWORK && Date.now() - cache.board.at < 15_000) return setBoard(cache.board);
+      if (!force && cache?.net === C.NETWORK && Date.now() - cache.board.at < Math.min(15_000, every - 1_000)) return setBoard(cache.board);
       loading ??= S.loadBoard(connection).finally(() => { loading = undefined; });
       loading.then(b => { cache = { net: C.NETWORK, board: b }; takePictures(b.pictures); if (live) { setBoard(b); setErr(undefined); } }).catch(e => live && setErr(String(e?.message ?? e)));
     };
     load(n > 0);
-    const id = setInterval(() => document.hidden || load(false), 20_000);
+    const id = setInterval(() => document.hidden || load(false), every);
     return () => { live = false; clearInterval(id); };
-  }, [connection, tick, n]);
+  }, [connection, tick, n, every]);
   return { board, err, reload: () => setN(x => x + 1) };
 }
 
@@ -174,10 +179,10 @@ function DayBars({ days, height = 22, width = 96 }: { days: S.Day[]; height?: nu
   const most = Math.max(...days.map(d => Math.abs(d.pnl)), 1e-9), w = width / 30, mid = height / 2;
   return (
     <svg className="daybars" width={width} height={height} aria-hidden>
-      <line x1="0" x2={width} y1={mid} y2={mid} stroke="#2A2A2A" />
+      <line x1="0" x2={width} y1={mid} y2={mid} stroke={T.borderPrimary} />
       {days.map((d, i) => {
         const h = Math.max(1, Math.abs(d.pnl) / most * (mid - 1));
-        return <rect key={d.day} x={(30 - days.length + i) * w + 0.5} width={Math.max(1, w - 1)} y={d.pnl >= 0 ? mid - h : mid} height={h} fill={d.pnl >= 0 ? "#48E160" : "#E15A48"} />;
+        return <rect key={d.day} x={(30 - days.length + i) * w + 0.5} width={Math.max(1, w - 1)} y={d.pnl >= 0 ? mid - h : mid} height={h} fill={d.pnl >= 0 ? T.green : T.red} />;
       })}
     </svg>
   );
@@ -387,23 +392,23 @@ function ContestBox({ rows, me, go }: { rows: S.TraderRow[]; me?: string; go: (t
           <b>Weekly contest</b>
           <span className="muted small"> · ${pool.toLocaleString()} in prizes · ends in {Math.floor(left / 86_400)} d {Math.floor(left % 86_400 / 3600)} h (Sunday 24:00 UTC)</span>
         </div>
-        <span className="muted small">Best return this week, among accounts (not our test bots) funded with ${S.CONTEST.minBase}+ that made {S.CONTEST.minTrades}+ trades this week. Prizes: {S.CONTEST.prizes.map(p => `$${p}`).join(" · ")}, paid from the treasury after the week.</span>
+        <span className="muted small">Most profit this week, among accounts (not our test bots) funded with ${S.CONTEST.minBase.toLocaleString()}+, open {S.CONTEST.minAgeDays}+ days, that made {S.CONTEST.minTrades}+ trades this week. Prizes: {S.CONTEST.prizes.map(p => `$${p}`).join(" · ")}, paid from the treasury after the week once the winners are checked, one prize per owner.</span>
       </div>
-      {standings.length === 0 ? <div className="quiet small">Nobody qualifies yet this week. Make {S.CONTEST.minTrades} trades to enter.</div> : (
+      {standings.length === 0 ? <div className="quiet small">Nobody qualifies yet this week. To enter: ${S.CONTEST.minBase.toLocaleString()} in the account, a record {S.CONTEST.minAgeDays} days old, {S.CONTEST.minTrades} trades this week.</div> : (
         <ol className="contest-list">
           {standings.slice(0, S.CONTEST.prizes.length).map((r, i) => (
             <li key={r.wallet}>
               <button className="link" onClick={() => go(`/trader/${r.wallet}`)}>
                 <span className="mono muted">{i + 1}.</span> {nameOf(r.wallet, byWallet.get(r.wallet)?.profile)}
               </button>
-              <span className={`mono ${tone(r.ret)}`}>{pct(r.ret)}</span>
-              <span className="mono muted">{signed(r.pnl)}</span>
+              <span className={`mono ${tone(r.pnl)}`}>{signed(r.pnl)}</span>
+              <span className="mono muted">{pct(r.ret)}</span>
               <span className="mono">${S.CONTEST.prizes[i]}</span>
             </li>
           ))}
         </ol>
       )}
-      {me && <div className="muted small">{mine >= 0 ? `You are ${mine + 1} of ${standings.length} (${pct(standings[mine].ret)}).` : `You are not ranked yet this week.`}</div>}
+      {me && <div className="muted small">{mine >= 0 ? `You are ${mine + 1} of ${standings.length} (${signed(standings[mine].pnl)}).` : `You are not ranked yet this week.`}</div>}
     </section>
   );
 }
@@ -717,7 +722,7 @@ export function marksFor(board: S.Board | undefined, leaders: Iterable<string>, 
     const r = board?.rows.find(x => x.wallet === w);
     if (!r?.stats) continue;
     const b = badgeOf(w, r.profile), picture = shown.get(w)?.img;
-    for (const f of r.stats.fills) if (f.asset === asset) out.push({ key: `${w}:${f.time}:${f.size}${picture ? ":p" : ""}`, time: f.time, price: f.price, size: f.size, name: nameOf(w, r.profile), shape: b.shape, color: b.color === "#4A4A4A" ? "#8A8A8A" : b.color, picture });
+    for (const f of r.stats.fills) if (f.asset === asset) out.push({ key: `${w}:${f.time}:${f.size}${picture ? ":p" : ""}`, time: f.time, price: f.price, size: f.size, name: nameOf(w, r.profile), shape: b.shape, color: b.color === UNSET ? T.textSecondary : b.color, picture });
   }
   return out.sort((a, b) => a.time - b.time);
 }

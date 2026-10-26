@@ -18,16 +18,20 @@ case "$1" in
     if ! running devnet-watchdog; then
       (cd app && NETWORK=devnet RPC=$RPC setsid sh -c 'echo $$ > ../deploy/logs/devnet-watchdog.pid; while :; do npx tsx scripts/watchdog.ts; echo "$(date -u +%T) restart: devnet-watchdog exited with status $?, starting it again in 30 s"; sleep 30; done' >> ../deploy/logs/devnet-watchdog.log 2>&1 < /dev/null &)
     fi
+    # Every fill of every account, kept for the weekly payouts (scripts/fills-log.ts).
+    if ! running devnet-fills-log; then
+      (cd app && NETWORK=devnet RPC=$RPC setsid sh -c 'echo $$ > ../deploy/logs/devnet-fills-log.pid; while :; do npx tsx scripts/fills-log.ts; echo "$(date -u +%T) restart: devnet-fills-log exited with status $?, starting it again in 30 s"; sleep 30; done' >> ../deploy/logs/devnet-fills-log.log 2>&1 < /dev/null &)
+    fi
     if ! running devnet-keeper; then
       (DEVNET_RPC=$RPC setsid sh -c 'echo $$ > deploy/logs/devnet-keeper.pid; while :; do deploy/devnet-tool keeper; echo "$(date -u +%T) restart: devnet-keeper exited with status $?, starting it again in 5 s"; sleep 5; done' >> deploy/logs/keeper.log 2>&1 < /dev/null &)
     fi
     sleep 2
     "$0" status
     ;;
-  stop) stop devnet-executor; stop devnet-keeper; stop devnet-watchdog ;;
+  stop) stop devnet-executor; stop devnet-keeper; stop devnet-watchdog; stop devnet-fills-log ;;
   restart-executor) stop devnet-executor; sleep 1; "$0" start ;;
   status)
-    for s in devnet-executor devnet-keeper devnet-watchdog; do
+    for s in devnet-executor devnet-keeper devnet-watchdog devnet-fills-log; do
       if running $s; then echo "$s running (process group $(cat deploy/logs/$s.pid))"; else echo "$s not running"; fi
     done
     ;;

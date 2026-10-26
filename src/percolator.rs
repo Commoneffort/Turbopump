@@ -93,6 +93,8 @@ const TAG_UPDATE_AUTHORITY: u8 = 32;
 const TAG_UPDATE_TRADE_FEE_POLICY: u8 = 55;
 const TAG_CONFIGURE_AUTH_MARK: u8 = 62;
 const TAG_PUSH_AUTH_MARK: u8 = 63;
+const TAG_PUSH_AUTH_FUNDING: u8 = 71;
+const TAG_UPDATE_FUNDING_CAP: u8 = 72;
 const TAG_REBALANCE_REDUCE: u8 = 44;
 const TAG_TRADE_CPI: u8 = 10;
 
@@ -133,6 +135,7 @@ pub fn expect_market(ai: &AccountInfo) -> Result<(), ProgramError> {
 // ---- market config and asset price (offsets pinned to Percolator's types in tests/vault.rs) ----
 pub const MARKET_CONFIG_OFF: usize = 464 + 32;
 pub const CONFIG_INITIAL_MARGIN_BPS: usize = 62;
+pub const CONFIG_MAX_ABS_FUNDING_E9: usize = 126;
 pub const CONFIG_MAINTENANCE_MARGIN_BPS: usize = 54;
 pub const CONFIG_MIN_NONZERO_IM_REQ: usize = 22;
 pub const CONFIG_MAX_TRADING_FEE_BPS: usize = 70;
@@ -695,6 +698,73 @@ pub fn update_trade_fee_policy(authority: &Pubkey, market: &Pubkey, fee_bps: u64
         accounts: vec![AccountMeta::new_readonly(*authority, true), AccountMeta::new(*market, false)],
         data,
     }
+}
+
+/// Sets an `AuthMark` asset's funding rate (e9 per slot, positive = longs pay). Signed by the
+/// asset's oracle authority (the vault); accepted while the asset is accrued to the current slot.
+#[allow(clippy::too_many_arguments)]
+pub fn auth_funding(authority: &Pubkey, market: &Pubkey, asset_index: u16, market_id: u64, now_slot: u64, rate_e9: i64, observation_sequence: u64, authority_epoch: u64) -> Instruction {
+    let mut data = vec![TAG_PUSH_AUTH_FUNDING];
+    data.extend_from_slice(&asset_index.to_le_bytes());
+    data.extend_from_slice(&market_id.to_le_bytes());
+    data.extend_from_slice(&now_slot.to_le_bytes());
+    data.extend_from_slice(&rate_e9.to_le_bytes());
+    data.extend_from_slice(&observation_sequence.to_le_bytes());
+    data.extend_from_slice(&authority_epoch.to_le_bytes());
+    Instruction {
+        program_id: PERCOLATOR_PROGRAM_ID,
+        accounts: vec![AccountMeta::new_readonly(*authority, true), AccountMeta::new(*market, false)],
+        data,
+    }
+}
+
+/// Sets the market's bound on every funding rate. Signed by the market authority.
+pub fn update_funding_cap(authority: &Pubkey, market: &Pubkey, cap_e9: u64, sequence: u64, authority_epoch: u64) -> Instruction {
+    let mut data = vec![TAG_UPDATE_FUNDING_CAP];
+    data.extend_from_slice(&cap_e9.to_le_bytes());
+    data.extend_from_slice(&sequence.to_le_bytes());
+    data.extend_from_slice(&authority_epoch.to_le_bytes());
+    Instruction {
+        program_id: PERCOLATOR_PROGRAM_ID,
+        accounts: vec![AccountMeta::new_readonly(*authority, true), AccountMeta::new(*market, false)],
+        data,
+    }
+}
+
+/// The market's bound on funding rates (e9 per slot); 0 = no funding.
+pub fn max_abs_funding_e9(d: &[u8]) -> Result<u64, ProgramError> {
+    rd_u64(d, MARKET_CONFIG_OFF + CONFIG_MAX_ABS_FUNDING_E9)
+}
+
+/// Where an asset's control sequences are: after its 424-byte oracle profile, in the 512-byte
+/// wrapper part of its slot. Lanes (u64 each): oracle observation, backing fee, authority epoch,
+/// then on assets >= 1 the funding rate (i64 bits), its generation and its slot (see Percolator's
+/// `authority_funding_rate_view`).
+const SLOT_SEQUENCES: usize = 424;
+fn sequences_base(asset_index: u16) -> usize {
+    MARKET_SLOTS_OFF + asset_index as usize * MARKET_ASSET_SLOT_LEN + SLOT_SEQUENCES
+}
+/// An asset's (current oracle observation sequence, authority epoch).
+pub fn asset_sequences(d: &[u8], asset_index: u16) -> Result<(u64, u64), ProgramError> {
+    let b = sequences_base(asset_index);
+    Ok((rd_u64(d, b)?, rd_u64(d, b + 16)?))
+}
+/// Asset 0's trade-fee policy sequence (shared with the funding cap update).
+pub fn policy_sequence(d: &[u8]) -> Result<u64, ProgramError> {
+    rd_u64(d, sequences_base(0) + 24)
+}
+/// An asset's funding as its authority set it: (rate e9 per slot, slot it was set at). Zero rate
+/// when never set or set for another generation of the asset slot.
+pub fn authority_funding(d: &[u8], asset_index: u16) -> Result<(i64, u64), ProgramError> {
+    if asset_index == 0 {
+        return Ok((0, 0));
+    }
+    let b = sequences_base(asset_index);
+    let generation = rd_u64(d, MARKET_SLOTS_OFF + asset_index as usize * MARKET_ASSET_SLOT_LEN + SLOT_MARKET_ID)?;
+    if rd_u64(d, b + 32)? != generation || generation == 0 {
+        return Ok((0, 0));
+    }
+    Ok((rd_u64(d, b + 24)? as i64, rd_u64(d, b + 40)?))
 }
 
 /// The market's base trade fee, in basis points.

@@ -76,10 +76,23 @@ pub fn read(ai: &AccountInfo, feed: &[u8; 32]) -> Result<PriceUpdate, VaultError
         return Err(VaultError::BadOracle);
     }
     let u = decode(&ai.try_borrow_data().map_err(|_| VaultError::BadOracle)?)?;
-    if u.feed_id != *feed {
+    if u.feed_id != *feed || !u.confident() {
         return Err(VaultError::BadOracle);
     }
     Ok(u)
+}
+
+/// The widest confidence interval accepted, as basis points of the price. Pyth publishes how
+/// far its publishers' prices spread; a wide spread means a thin or disorderly market, whose
+/// price should neither fill a trade nor move a mark. Such an update is refused like a broken
+/// one: the mark waits for the next price, and a request whose price it was expires unfilled.
+pub const MAX_CONF_BPS: u128 = 100;
+
+impl PriceUpdate {
+    /// True when the confidence interval is within `MAX_CONF_BPS` of the price.
+    pub fn confident(&self) -> bool {
+        self.price > 0 && (self.conf as u128) * 10_000 <= (self.price as u128) * MAX_CONF_BPS
+    }
 }
 
 #[cfg(test)]
@@ -115,6 +128,14 @@ mod tests {
         assert!(!u.is_first_at_or_after(106));
     }
 
+    #[test]
+    fn wide_confidence_is_refused() {
+        let mut d = update(10_000, 0, 1, 0);
+        d[81..89].copy_from_slice(&100u64.to_le_bytes()); // 1%: accepted
+        assert!(decode(&d).unwrap().confident());
+        d[81..89].copy_from_slice(&101u64.to_le_bytes());
+        assert!(!decode(&d).unwrap().confident());
+    }
     #[test]
     fn rejects_partial_verification() {
         let mut d = update(1, 0, 1, 0);

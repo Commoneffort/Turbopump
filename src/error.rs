@@ -45,6 +45,8 @@ pub enum VaultError {
     MarginNotThin,
     /// `CoverLoss`: already done for this roll.
     CoverNotDue,
+    /// `InitVault` on a feed that is not in this build's list (`feeds::LISTABLE`).
+    FeedNotListable,
 }
 
 impl From<VaultError> for ProgramError {

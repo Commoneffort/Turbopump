@@ -335,6 +335,15 @@ pub fn set_trade_fee(program: &Pubkey, market: &Pubkey, authority_epoch: u64, se
     }
 }
 
+/// Sets a governed market's funding cap to the program's constant (anyone may send it).
+pub fn set_funding_cap(program: &Pubkey, market: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: *program,
+        accounts: vec![ro(state::governor_address(program, market).0), w(*market), ro(perc::PERCOLATOR_PROGRAM_ID)],
+        data: vec![processor::TAG_SET_FUNDING_CAP],
+    }
+}
+
 /// Hands the market's `marketauth` to the program's governor PDA (signed by the current one).
 pub fn accept_governance(program: &Pubkey, current: &Pubkey, market: &Pubkey, authority_epoch: u64) -> Instruction {
     Instruction {

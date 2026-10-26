@@ -641,9 +641,15 @@ fn devnet_like_market_trades_at_realistic_size() {
     println!("vault after SOL +$1 on 2 SOL short: {:?}", w.portfolio_view());
 }
 
-/// Writes the vault account layout for the frontend decoder (app/src/layout.json).
+/// Writes the vault account layout for the frontend decoder (app/src/layout.json). Values that
+/// differ between builds (cash reserve, insurance) are the deployed builds' ones, not this test
+/// build's; the vault's limits per tier come from `percolator_vault::feeds` (see `math::fill_caps`).
 #[test]
 fn export_layout_for_frontend() {
+    let tier_insurance = [0u8, 1, 2].map(percolator_vault::feeds::insurance_nav_bps);
+    let tier_position = [0u8, 1, 2].map(percolator_vault::feeds::position_nav_bps);
+    let tier_fill = [0u8, 1, 2].map(percolator_vault::feeds::fill_nav_bps);
+    let stock_feeds = percolator_router::STOCK_FEEDS.iter().map(|f| f.iter().map(|b| format!("{b:02x}")).collect::<String>()).collect::<Vec<_>>();
     use percolator_vault::state::{EpochRecord, Ticket, VaultState as V};
     use std::mem::{offset_of, size_of};
     let o = state::VAULT_STATE_OFF;
@@ -694,12 +700,13 @@ fn export_layout_for_frontend() {
             "trader_len": size_of::<percolator_router::state::TraderState>(),
             "max_pending": percolator_router::state::MAX_PENDING,
             "delay_secs": percolator_router::DELAY_SECS,
+            "batch_secs": percolator_router::BATCH_SECS,
             "grace_secs": percolator_router::GRACE_SECS,
             "stall_secs": percolator_router::STALL_SECS,
             "stress_bps": percolator_router::STRESS_BPS as u64,
             "liquidation_bps": percolator_router::LIQUIDATION_BPS as u64,
-            "reserve_bps": percolator_vault::processor::RESERVE_BPS,
-            "insurance_nav_bps": percolator_vault::processor::INSURANCE_NAV_BPS,
+            "reserve_bps": percolator_vault::processor::DEPLOYED_RESERVE_BPS,
+            "insurance_nav_bps": tier_insurance,
             "behind_refund_slots": percolator_router::BEHIND_REFUND_SLOTS,
             "fallback_secs": percolator_vault::reporter::FALLBACK_SECS,
             "im_bps_off": perc::MARKET_CONFIG_OFF + perc::CONFIG_INITIAL_MARGIN_BPS,
@@ -713,8 +720,19 @@ fn export_layout_for_frontend() {
             "tiers": f!(percolator_router::state::Tiers, 0, magic, market, tier, generation),
             "tiers_len": size_of::<percolator_router::state::Tiers>(),
             "tier_slots": percolator_router::state::TIER_SLOTS,
-            "tier_levels": [percolator_router::tier_levels(0), percolator_router::tier_levels(1)],
+            "tier_levels": [percolator_router::tier_levels(0), percolator_router::tier_levels(1), percolator_router::tier_levels(2)],
             "major_feeds": percolator_router::MAJOR_FEEDS.iter().map(|f| f.iter().map(|b| format!("{b:02x}")).collect::<String>()).collect::<Vec<_>>(),
+            "stock_feeds": stock_feeds,
+            "tier_position_nav_bps": tier_position,
+            "tier_fill_nav_bps": tier_fill,
+            "trade_room_bps": percolator_vault::feeds::TRADE_ROOM_BPS as u64,
+            "funding_cap_off": perc::MARKET_CONFIG_OFF + perc::CONFIG_MAX_ABS_FUNDING_E9,
+            "funding_seq_off_in_slot": 424,
+            "funding_max_e9": percolator_router::funding::FUNDING_MAX_E9,
+            "funding_free_bps": percolator_router::funding::FUNDING_FREE_BPS as u64,
+            "funding_tau_slots": percolator_router::funding::FUNDING_TAU_SLOTS,
+            "funding_canon_cap_e9": percolator_vault::processor::CANON_MAX_FUNDING_E9,
+            "min_fill_bps": percolator_vault::feeds::MIN_FILL_BPS as u64,
             "liq_above_engine_bps": percolator_router::LIQ_ABOVE_ENGINE_BPS,
             "open_above_liq_bps": percolator_router::OPEN_ABOVE_LIQ_BPS
         },
@@ -809,17 +827,18 @@ fn canonical_vaults_are_unique_per_feed_and_scale_with_nav() {
     w.taker_trade_asset(0, asset, 5 * UNIT as i128).unwrap();
     assert_eq!({ w.vault_state().inventory }, 0, "no NAV, no fills");
 
-    // 20 USDC of NAV at $1: fills up to 15 units (0.75x), position up to 60 units (3x).
+    // 20 USDC of NAV at $1 (the test feed has a major's limits): fills up to 15 units (0.75x) when
+    // flat and less the fuller the vault is; ordinary trades stop at 48 units (80% of 3x).
     w.deposit(&alice, 20_000_000).unwrap();
     w.advance_oracle(pyth, EPOCH_LEN, &mut ts, 100_000_000);
     w.roll().unwrap();
     w.taker_trade_asset(0, asset, 40 * UNIT as i128).unwrap();
     assert_eq!({ w.vault_state().inventory }, -15 * UNIT as i128, "per-fill cap is 0.75x NAV");
-    for _ in 0..4 {
+    for _ in 0..40 {
         w.advance_oracle(pyth, 1, &mut ts, 100_000_000);
         w.taker_trade_asset(0, asset, 40 * UNIT as i128).unwrap();
     }
-    assert_eq!({ w.vault_state().inventory }, -60 * UNIT as i128, "position cap is 3x NAV");
+    assert_eq!({ w.vault_state().inventory }, -48 * UNIT as i128, "ordinary trades use 80% of the 3x limit");
 }
 
 // ---------------------------------------------------------------- retiring idle markets

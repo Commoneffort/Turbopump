@@ -9,6 +9,7 @@
 #[cfg(not(target_os = "solana"))]
 pub mod client;
 pub mod error;
+pub mod feeds;
 pub mod math;
 pub mod matcher;
 pub mod percolator;

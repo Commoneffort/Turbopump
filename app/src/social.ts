@@ -95,36 +95,30 @@ export const setProfile = (wallet: PublicKey, name: string, oldName: string | un
 export const follow = (wallet: PublicKey, leader: PublicKey) => new TransactionInstruction({
   programId: C.ROUTER, keys: [rw(wallet, true), rw(followAddress(wallet, leader)), ro(leader), ro(SystemProgram.programId)], data: Buffer.from([17]),
 });
-// ---- referrals ----
-export const REFERRAL_LEN = 104;
-export const referralAddress = (wallet: PublicKey) => rpda(Buffer.from("referral"), wallet.toBuffer());
-export type Referral = { wallet: PublicKey; referrer: PublicKey; since: number };
-export const decodeReferral = (d: Uint8Array): Referral => ({ wallet: key(d, 8), referrer: key(d, 40), since: Number(i64(d, 72)) });
-/** Records who referred `wallet`: once, never changed, and it moves no money. */
-export const setReferrer = (wallet: PublicKey, referrer: PublicKey) => new TransactionInstruction({
-  programId: C.ROUTER, keys: [rw(wallet, true), rw(referralAddress(wallet)), ro(referrer), ro(SystemProgram.programId)], data: Buffer.from([24]),
-});
+// ---- rebates ----
+// (Referrals were removed on 2026-10-20: a second wallet could refer the first, and earn on
+// volume whose fees the first-month refund already paid back. The router's `SetReferrer`, tag
+// 24, still exists on chain; nothing reads what it writes.)
 /** What the platform gives back out of the treasury's income, as shares of the fee traders pay
- *  (`C.TRADE_FEE_BPS` of what they trade). The platform's own share of a trade is a fifth of that
- *  fee, so a referral (21%) is more than the platform earns on the referred trade itself: it is
- *  paid out of the treasury's income from all trading, before any volume rebate, and never more
- *  than that income. A referrer earns on what the wallets it referred trade; a wallet that
- *  trades a lot in a week earns on its own. */
+ *  (`C.TRADE_FEE_BPS` of what they trade): a wallet that trades a lot in a week earns part of its
+ *  own fees back, never more in total than the treasury took in that week. */
 export const REBATE = {
-  referrerShare: 0.21, // 21% of the fee the referred wallet paid
   tiers: [{ weekVolume: 1_000_000, share: 0.10 }, { weekVolume: 100_000, share: 0.05 }], // 10% / 5% of its own fees
-  mostOfIncome: 1, // never more than what the treasury took in; referrals are paid first
+  mostOfIncome: 1, // never more than what the treasury took in
 };
 /** New wallets' first month: their own trade fees back, in full, up to `capPerWeek` each, paid
  *  weekly by scripts/rebates.ts out of a budget the treasury sets aside (`weekBudget`), not out of
  *  that week's income (which is a fifth of the fees, so it could not pay all of them back). */
 export const NEW_WALLET = { days: 30, share: 1, capPerWeek: 50, weekBudget: 2_000 };
 
-/** The weekly trading contest, Monday 00:00 to Sunday 24:00 UTC: ranked by return over the week
- *  (profit of the week's trading days over what the account was funded with), among accounts
- *  funded with at least `minBase` that traded at least `minTrades` times in the week. The top
- *  places win `prizes` (USDC), paid by scripts/contest.ts from the treasury after the week. */
-export const CONTEST = { prizes: [500, 250, 100, 50, 50], minTrades: 5, minBase: 100 };
+/** The weekly trading contest, Monday 00:00 to Sunday 24:00 UTC: ranked by the dollar profit of
+ *  the week's trading days, among accounts funded with at least `minBase` whose track record was
+ *  opened at least `minAgeDays` before the week ended and that traded at least `minTrades` times
+ *  in the week. The top places win `prizes` (USDC), paid by scripts/contest.ts from the treasury
+ *  after the week, once someone has looked at the winners and approved them, and to one wallet
+ *  per funder (scripts/funders.ts). Ranking by profit, not return, means many small accounts
+ *  betting both ways cannot buy a winner: a prize takes real money at risk. */
+export const CONTEST = { prizes: [500, 250, 100, 50, 50], minTrades: 5, minBase: 1_000, minAgeDays: 7 };
 const DAY = 86_400;
 /** The contest week containing `secs` (unix): its first day number and its end (unix secs). */
 export function contestWeek(secs = Date.now() / 1000) {
@@ -139,11 +133,11 @@ export function contestStandings(stats: { wallet: string; stats: Stats }[], week
   for (const { wallet, stats: s } of stats) {
     const base = s.startEquity + s.deposited;
     const trades = s.fills.filter(f => f.time >= week.start && f.time < week.end).length;
-    if (base < CONTEST.minBase || trades < CONTEST.minTrades) continue;
+    if (base < CONTEST.minBase || trades < CONTEST.minTrades || week.end - s.startTime < CONTEST.minAgeDays * DAY) continue;
     const pnl = s.days.filter(d => d.day >= week.firstDay && d.day < week.firstDay + 7).reduce((t, d) => t + d.pnl, 0);
     out.push({ wallet, pnl, base, ret: pnl / base, trades });
   }
-  return out.sort((a, b) => b.ret - a.ret);
+  return out.sort((a, b) => b.pnl - a.pnl);
 }
 
 /** A share of the trade fee as millionths of the volume (100 = one basis point). */
@@ -271,6 +265,8 @@ export type TraderRow = {
   leverage: number;
   followers: number; copiers: number;
   copying?: string;
+  /** Below its liquidation level right now (anyone may close it through the router). */
+  liquidatable: boolean;
 };
 export type Board = {
   rows: TraderRow[]; follows: Follow[]; copies: Copy[]; profiles: Map<string, Profile>;
@@ -339,5 +335,6 @@ function row(wallet: string, s: Stats | undefined, profile: Profile | undefined,
     positions: (h?.positions ?? []).map(p => ({ asset: p.asset, size: Number(p.size) / 1e6, notional: Number(p.notional) / C.USDC })),
     leverage: equity > 0 ? notional / equity : 0,
     followers, copiers, copying,
+    liquidatable: !!h?.liquidatable,
   };
 }

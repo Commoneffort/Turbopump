@@ -4,21 +4,41 @@
 // There is no order book to show: every order fills against the market's vault at the first
 // oracle price published a few seconds after the request. What stands in its place is the vault's
 // capacity: how much it can take on each side right now.
-import { useEffect, useMemo, useRef, useState } from "react";
+import { CSSProperties, useEffect, useMemo, useRef, useState } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
 import { PublicKey } from "@solana/web3.js";
 import { createAssociatedTokenAccountIdempotentInstruction } from "@solana/spl-token";
 import * as C from "./chain";
+import { T } from "./theme";
 import Chart, { DayStats, useDayStats } from "./Chart";
 import * as S from "./social";
 import { Mark, marksFor, useBoard, useMe, usePictures } from "./Traders";
-import { Card, Faucet, Icon, LiquidityPanel, OpenerPanel, Send, ago, capUnits, entryPrice, explorer, fmt, num, priceDp, px, short, units, usd, useActivity, useCards, useFills, useVault } from "./shared";
+import { Crowd, Liquidations, PULSE, PULSE_BOARD_MS, Queue, Trades, Whale, marketFills } from "./Pulse";
+import { Card, Faucet, Fill, Icon, LiquidityPanel, OpenerPanel, Send, ago, capUnits, entryPrice, explorer, fmt, num, priceDp, px, realizedPnl, short, units, usd, useActivity, useCards, useVault, useWalletFills } from "./shared";
 
-const UP = "#48E160", DOWN = "#E15A48";
+const UP = T.green, DOWN = T.red;
 const pct = (x: number, dp = 2) => `${x >= 0 ? "+" : "−"}${fmt(Math.abs(x) * 100, dp)}%`;
 const money = (x: number, dp = 2) => `$${fmt(x, dp)}`;
 const signedMoney = (x: number) => `${x >= 0 ? "+" : "−"}$${fmt(Math.abs(x))}`;
+/** An up or down arrow for a gain or a loss. */
+const arrow = (x: number) => (x > 0 ? "▲" : x < 0 ? "▼" : "•");
+
+/** One open position with what it is up or down: entry from the wallet's fills on record (its
+ *  transaction history, else the last fills its track record keeps), PnL against the mark. */
+export type Held = { asset: number; sym: string; size: number; mark: number; value: number; entry?: number; pnl?: number; ret?: number };
+function heldPositions(state: C.State, markets: Card[], fills: Fill[], row: S.TraderRow | undefined): Held[] {
+  return (state.health?.positions ?? []).map(x => {
+    const c = markets.find(m => m.v.assetIndex === x.asset && (m.v.canonical || m.v.key.equals(state.vault.key)));
+    const sym = c?.v.feed?.symbol ?? `asset ${x.asset}`;
+    const size = num(x.size, 1e6), mark = num(x.price, 1e6);
+    const mine = c ? fills.filter(f => f.vault === c.v.key.toBase58()) : [];
+    const recent: Fill[] = (row?.stats?.fills ?? []).filter(f => f.asset === x.asset).map(f => ({ sig: "", slot: f.time, vault: "", size: f.size, price: f.price }));
+    const entry = entryPrice(mine, size) ?? entryPrice(recent, size);
+    const pnl = entry !== undefined ? (mark - entry) * size : undefined;
+    return { asset: x.asset, sym, size, mark, value: num(x.notional, 1e6), entry, pnl, ret: pnl !== undefined && entry ? pnl / (Math.abs(size) * entry) : undefined };
+  });
+}
 const abs = (q: bigint) => (q < 0n ? -q : q);
 const e6 = (x: number) => BigInt(Math.round(x * 1e6));
 const ORDER_NAME = ["Stop loss", "Take profit", "Trailing stop", "Limit", "TWAP"];
@@ -56,15 +76,18 @@ function DeskInner({ vaultKey, markets, day, send, busy, tick, go }: { vaultKey:
   const { state, err, reload } = useVault(vaultKey, tick);
   const [panel, setPanel] = useState<"trade" | "earn">("trade");
   const wrapped: Send = async (l, ixs) => { const r = await send(l, ixs); reload(); return r; };
-  const fills = useFills(publicKey, vaultKey, state?.portfolio?.position ?? 0n);
+  const allFills = useWalletFills(publicKey, state?.portfolio?.position ?? 0n);
+  const fills = useMemo(() => allFills.filter(f => f.vault === vaultKey.toBase58()), [allFills, vaultKey.toBase58()]);
   // The traders this wallet follows or copies: their fills on this market are marked on the chart.
-  const { board } = useBoard(tick);
+  const { board } = useBoard(tick, Object.values(PULSE).some(Boolean) ? PULSE_BOARD_MS : undefined);
   const me = useMe(board, tick);
   const leaders = useMemo(() => [...new Set([...me.following, ...(me.copy ? [me.copy.leader.toBase58()] : [])])].sort(), [me]);
   const asset = state?.vault.assetIndex ?? -1;
   // (Badge pictures are checked and loaded a moment after the board arrives: the marks follow.)
   const pictures = usePictures();
   const marks = useMemo(() => marksFor(board, leaders, asset), [board, leaders.join(","), asset, pictures]);
+  // Every fill on this market by anyone: the trades list, the queue's fills and the chart's whales.
+  const marketTrades = useMemo(() => marketFills(board, asset), [board, asset]);
 
   if (err && !state) return <div className="desk-msg">{err}</div>;
   if (!state) return <div className="desk-msg">Loading market…</div>;
@@ -72,30 +95,41 @@ function DeskInner({ vaultKey, markets, day, send, busy, tick, go }: { vaultKey:
   const v = state.vault, sym = v.feed?.symbol ?? "?";
   const price = num(state.asset.price, 1e6);
   const posN = num(state.portfolio?.position ?? 0n, 1e6);
-  const entry = entryPrice(fills, posN);
+  const myRow = publicKey ? board?.rows.find(r => r.wallet === publicKey.toBase58()) : undefined;
+  const held = heldPositions(state, markets, allFills, myRow);
+  const here = held.find(h => h.asset === v.assetIndex);
+  const entry = here?.entry;
   const liq = liquidationPrice(state, posN);
+  // The position's line on a chart: market, side, size and what it is up or down.
+  const posLine = (h: Held) => ({
+    price: h.entry!,
+    title: `${arrow(h.pnl ?? 0)} ${h.sym} ${h.size > 0 ? "LONG" : "SHORT"} ${fmt(Math.abs(h.size), 4).replace(/\.?0+$/, "")} · ${h.pnl === undefined ? "" : `${signedMoney(h.pnl)} (${pct(h.ret ?? 0)})`}`,
+    color: (h.pnl ?? 0) >= 0 ? UP : DOWN,
+  });
+  const linesOf = (s: string) => held.filter(h => h.sym === s && h.entry).map(posLine);
   const lines = [
-    ...(entry ? [{ price: entry, title: "Entry", color: "#F4F4F4" }] : []),
+    ...(here?.entry ? [posLine(here)] : []),
     ...(liq ? [{ price: liq, title: "Liq.", color: DOWN }] : []),
     ...state.orders.filter(o => o.kind !== C.ORDER.TWAP).map(o => o.kind === C.ORDER.TRAIL
       ? { price: num(o.peak, 1e6) * (1 - o.side * Number(o.trigger) / 10_000), title: "Trail", color: DOWN }
-      : { price: num(o.trigger, 1e6), title: o.kind === C.ORDER.STOP ? "SL" : o.kind === C.ORDER.TAKE ? "TP" : o.size > 0n ? "Buy" : "Sell", color: o.kind === C.ORDER.STOP ? DOWN : o.kind === C.ORDER.TAKE ? UP : "#8A8A8A" }),
+      : { price: num(o.trigger, 1e6), title: o.kind === C.ORDER.STOP ? "SL" : o.kind === C.ORDER.TAKE ? "TP" : o.size > 0n ? "Buy" : "Sell", color: o.kind === C.ORDER.STOP ? DOWN : o.kind === C.ORDER.TAKE ? UP : T.textSecondary }),
   ];
 
   return (
     <main className="desk">
       <MarketBar state={state} markets={markets} day={day} go={go} />
-      <section className="desk-chart panel"><Charts sym={sym} price={price} lines={lines} marks={marks} markets={markets} go={go} /></section>
-      <section className="desk-book panel"><VaultDepth state={state} tick={tick} /></section>
+      <section className="desk-chart panel"><Charts sym={sym} price={price} lines={lines} linesOf={linesOf} marks={marks} whales={PULSE.whales ? marketTrades : undefined} markets={markets} go={go} /></section>
+      <section className="desk-book panel"><VaultDepth state={state} tick={tick} board={board} fills={marketTrades} go={go} /></section>
+      {PULSE.liqs && <Liquidations board={board} markets={markets} go={go} />}
       <section className="desk-ticket panel">
         <div className="ptabs">
           <button className={panel === "trade" ? "on" : ""} onClick={() => setPanel("trade")}>Trade</button>
           <button className={panel === "earn" ? "on" : ""} onClick={() => setPanel("earn")}>Earn</button>
         </div>
         {panel === "trade" ? <Ticket state={state} send={wrapped} busy={busy} /> : <div className="earn"><LiquidityPanel state={state} send={wrapped} busy={busy} /></div>}
+        <div className="ticket-acct"><Account state={state} send={wrapped} busy={busy} held={held} row={myRow} /></div>
       </section>
-      <section className="desk-bottom panel"><Bottom state={state} markets={markets} fills={fills} entry={entry} liq={liq} send={wrapped} busy={busy} go={go} /></section>
-      <section className="desk-account panel"><Account state={state} send={wrapped} busy={busy} /></section>
+      <section className="desk-bottom panel"><Bottom state={state} markets={markets} fills={allFills} held={held} liq={liq} send={wrapped} busy={busy} go={go} /></section>
     </main>
   );
 }
@@ -110,7 +144,7 @@ const LAYOUTS: [id: string, label: string, panes: number, icon: string][] = [
   ["2v", "Two charts, one over the other", 2, "M2.5 2.5h11v11h-11zM2.5 8h11"],
   ["4", "Four charts", 4, "M2.5 2.5h11v11h-11zM8 2.5v11M2.5 8h11"],
 ];
-function Charts({ sym, price, lines, marks, markets, go }: { sym: string; price: number; lines: { price: number; title: string; color: string }[]; marks: Mark[]; markets: Card[]; go: (to: string) => void }) {
+function Charts({ sym, price, lines, linesOf, marks, whales, markets, go }: { sym: string; price: number; lines: { price: number; title: string; color: string }[]; linesOf: (sym: string) => { price: number; title: string; color: string }[]; marks: Mark[]; whales?: Whale[]; markets: Card[]; go: (to: string) => void }) {
   const [layout, setLayout] = useState(() => { const l = localStorage.getItem("pv:chart-layout"); return LAYOUTS.some(x => x[0] === l) ? l! : "1"; });
   const [others, setOthers] = useState<string[]>(() => { try { const v = JSON.parse(localStorage.getItem("pv:chart-panes") ?? "[]"); return Array.isArray(v) ? v : []; } catch { return []; } });
   const n = LAYOUTS.find(l => l[0] === layout)?.[2] ?? 1;
@@ -136,11 +170,11 @@ function Charts({ sym, price, lines, marks, markets, go }: { sym: string; price:
   );
   return (
     <div className={`charts l-${layout}`}>
-      <Chart symbol={sym} price={price} lines={lines} marks={marks} dense={n > 1} head={<>{picker}{n > 1 && <div className="pane-sym main"><b>{sym}</b></div>}</>} />
+      <Chart symbol={sym} price={price} lines={lines} marks={marks} whales={whales} dense={n > 1} head={<>{picker}{n > 1 && <div className="pane-sym main"><b>{sym}</b></div>}</>} />
       {Array.from({ length: n - 1 }, (_, k) => {
         const i = k + 1, s = paneSym(i);
         return (
-          <Chart key={i} slot={i} compact dense symbol={s} price={priceOf(s)} lines={[]} head={
+          <Chart key={i} slot={i} compact dense symbol={s} price={priceOf(s)} lines={linesOf(s)} head={
             <div className="pane-sym">
               <select value={s} aria-label="Market in this window" onChange={e => setPane(i, e.target.value)}>{syms.map(x => <option key={x} value={x}>{x}-PERP</option>)}</select>
               <button title={`Trade ${s}`} onClick={() => go(`/trade/${s}`)}>Trade</button>
@@ -225,11 +259,32 @@ function MarketBar({ state, markets, day, go }: { state: C.State; markets: Card[
         <Cell label="Vault liquidity" value={usd(C.navOf(state), 0)} />
         <Cell label="Oracle" value={C.X1 ? "Jack's oracle" : "Pyth"} sub={age !== undefined ? ago(age) : undefined} />
         <Cell label="Fee" value={C.TRADE_FEE_PCT} sub="no spread, no price impact" />
+        <FundingCell state={state} />
         <Cell label={`Liquidity epoch ${v.epoch}`} value={left > 0n ? `${Math.max(1, Math.ceil(Number(left) * C.slotSeconds() / 60))} min left` : v.pendingDeposit > 0n || v.pendingWithdraw > 0n ? "settling" : "no requests"} />
       </div>
     </header>
   );
 }
+
+/** Funding: who pays now, how much an hour, and where the rate is heading. The crowded side pays
+ *  the other (the vault included, which holds the opposite side), every slot, inside Percolator. */
+function FundingCell({ state }: { state: C.State }) {
+  const f = state.funding, v = state.vault;
+  if (f.capE9 === 0n) return <Cell label="Funding" value="off" sub="switched off on every market for now (see Docs)" />;
+  const perHour = C.fundingPerHour(f.rateE9);
+  const price = state.asset.price;
+  const limit = price > 0n ? C.liveNav(state) * BigInt(C.tierPositionBps(C.tierOfFeed(v.feedHex))) / 10_000n * C.UNIT / price : 0n;
+  const target = C.fundingTarget(v.inventory, limit);
+  const who = f.rateE9 > 0n ? "longs pay" : f.rateE9 < 0n ? "shorts pay" : "nobody pays";
+  const heading = target === f.rateE9 ? "" : ` · heading to ${fmt(Math.abs(C.fundingPerHour(target)) * 100, 4)}%/h${target === 0n ? "" : target > 0n ? " (longs)" : " (shorts)"}`;
+  return (
+    <div className="cell" title={`Paid every slot by the side the market is crowded on, to the other side (the vault holds the other side of every trade). It follows how full the vault is on one side: nothing under ${(Number((L_FUNDING.free ?? 2000)) / 100)}% of its limit, up to ${fmt(C.fundingPerHour(BigInt(L_FUNDING.max ?? 30)) * 100, 3)}% an hour at the whole limit, and it moves there over about an hour, so one trade cannot set it. It is part of every position's value, so it counts toward margin and liquidation.`}>
+      <div className="cell-l">Funding</div>
+      <div className={`cell-v mono ${f.rateE9 === 0n ? "" : "down"}`}>{f.rateE9 === 0n ? "0%" : `${fmt(Math.abs(perHour) * 100, 4)}%/h`}<span className="cell-s">{who}, every slot{heading}</span></div>
+    </div>
+  );
+}
+const L_FUNDING = { free: (C.LAYOUT.router as any).funding_free_bps as number | undefined, max: (C.LAYOUT.router as any).funding_max_e9 as number | undefined };
 
 function Cell({ label, value, sub, tone }: { label: string; value: string; sub?: string; tone?: "up" | "down" }) {
   return (
@@ -242,7 +297,9 @@ function Cell({ label, value, sub, tone }: { label: string; value: string; sub?:
 
 // ---------------------------------------------------------------- vault capacity and tape
 
-function VaultDepth({ state, tick }: { state: C.State; tick: number }) {
+/** The vault's side of the market (in the bottom panel's "Vault capacity" tab): the largest
+ *  orders it takes each way now, where its position sits between its limits, and what it can absorb. */
+function VaultCapacity({ state }: { state: C.State }) {
   const v = state.vault, sym = v.feed?.symbol ?? "";
   const price = num(state.asset.price, 1e6);
   const room = C.depth(state);
@@ -253,27 +310,44 @@ function VaultDepth({ state, tick }: { state: C.State; tick: number }) {
   const val = (q: bigint) => money(num(q, 1e6) * price, 0);
   // Where the vault's position sits between its two limits (0 = fully short, 100 = fully long).
   const at = limit > 0n ? Math.min(100, Math.max(0, 50 + Number(v.inventory * 50n / limit))) : 50;
-  const rows = useActivity(v, tick);
   return (
-    <>
-      <div className="ph">
-        <h3>Vault capacity</h3>
-        <span className="hint" title="Every order fills against this market's vault at the oracle price, so there is no order book. These are the largest orders the vault takes right now.">no order book</span>
-      </div>
+    <div className="vcap">
       <div className="depth">
+        <div className="vcap-h"><b>Largest order now</b><span className="hint" title="Every order fills against this market's vault at the oracle price, so there is no order book. These are the largest orders the vault takes right now.">no order book</span></div>
         <div className="depth-head"><span>Side</span><span>Size ({sym})</span><span>Value</span></div>
         <div className="depth-row up"><i style={{ width: `${bar(room.long)}%` }} /><span>Buy / long</span><span className="mono">{units(room.long)}</span><span className="mono">{val(room.long)}</span></div>
         <div className="depth-mid mono">{fmt(price, priceDp(price))}<span>oracle price · same both ways</span></div>
         <div className="depth-row down"><i style={{ width: `${bar(room.short)}%` }} /><span>Sell / short</span><span className="mono">{units(room.short)}</span><span className="mono">{val(room.short)}</span></div>
       </div>
+      <div className="vcap-side">
       <div className="skew">
         <div className="skew-l"><span>Vault position</span><b className="mono">{v.inventory === 0n ? "flat" : `${v.inventory > 0n ? "long" : "short"} ${units(abs(v.inventory))} ${sym}`}</b></div>
         <div className="skew-track"><i style={{ left: `${at}%` }} /><em /></div>
-        <div className="skew-ends mono"><span>−{units(limit)}</span><span>limit 3× liquidity</span><span>+{units(limit)}</span></div>
+        <div className="skew-ends mono"><span>−{units(limit)}</span><span title={`Its limit is ${v.positionNavBps ? fmt(Number(v.positionNavBps) / 10_000, 2).replace(/\.?0+$/, "") : "3"}× the vault's liquidity (3× for BTC and ETH, 1× for the rest). Near 100% used, it only takes trades that bring it back.`}>{PULSE.crowd && limit > 0n ? `${fmt(Math.min(100, Number(abs(v.inventory) * 1000n / limit) / 10), 1)}% of limit used` : `limit ${v.positionNavBps ? fmt(Number(v.positionNavBps) / 10_000, 2).replace(/\.?0+$/, "") : "3"}× liquidity`}</span><span>+{units(limit)}</span></div>
       </div>
-      <div className="ph tape-h"><h3>Market activity</h3></div>
+      <Stress state={state} />
+      </div>
+    </div>
+  );
+}
+
+/** The middle column: the long/short crowd, the queue, and the trades tape. */
+function VaultDepth({ state, tick, board, fills, go }: { state: C.State; tick: number; board?: S.Board; fills: Whale[]; go: (to: string) => void }) {
+  const v = state.vault, sym = v.feed?.symbol ?? "";
+  const rows = useActivity(v, tick);
+  const [list, setList] = useState<"trades" | "vault">(PULSE.tape ? "trades" : "vault");
+  return (
+    <>
+      {PULSE.crowd && <Crowd state={state} board={board} />}
+      {PULSE.queue && <Queue state={state} fills={fills} board={board} go={go} />}
+      {PULSE.tape ? (
+        <div className="ph tape-h tape-tabs">
+          <button className={list === "trades" ? "on" : ""} onClick={() => setList("trades")}>Trades</button>
+          <button className={list === "vault" ? "on" : ""} onClick={() => setList("vault")}>Vault events</button>
+        </div>
+      ) : <div className="ph tape-h"><h3>Market activity</h3></div>}
       <div className="tape">
-        {!rows ? <div className="quiet">Loading…</div> : rows.length === 0 ? <div className="quiet">No activity yet.</div> : rows.map(r => (
+        {list === "trades" ? <Trades fills={fills} board={board} sym={sym} go={go} /> : !rows ? <div className="quiet">Loading…</div> : rows.length === 0 ? <div className="quiet">No activity yet.</div> : rows.map(r => (
           <a key={r.sig} className="tape-row" href={explorer("tx", r.sig)} target="_blank" rel="noreferrer">
             <span className={/^Long/.test(r.what) ? "up" : /^Short/.test(r.what) ? "down" : ""}>{r.what.replace(" vs vault", "")}</span>
             <span className="mono">{r.when ? ago(Date.now() / 1000 - r.when) : ""}</span>
@@ -281,6 +355,24 @@ function VaultDepth({ state, tick }: { state: C.State; tick: number }) {
         ))}
       </div>
     </>
+  );
+}
+
+/** What the vault can actually absorb, next to what it lets traders open: its value now, its
+ *  insurance, and what it would lose on a move of 10, 20 or 30% against the position it holds. */
+function Stress({ state }: { state: C.State }) {
+  const v = state.vault;
+  const value = num(C.liveNav(state), 1e6), insurance = num(v.insuranceFloor, 1e6);
+  const moves = [0.1, 0.2, 0.3];
+  // A long vault loses when the price falls, a short one when it rises.
+  const loss = (m: number) => Math.abs(C.stress(state, m));
+  const tier = C.tierOfFeed(v.feedHex);
+  return (
+    <div className="stress" title={`The vault's value now (its money in Percolator plus its cash), and what it would lose if the price moved against the position it holds now. Its insurance pays traders' bad debt first. This market's tier: ${C.TIER_NAME[tier]} (the vault holds at most ${C.tierPositionBps(tier) / 10_000}x its value).`}>
+      <div className="stress-l"><span>Can absorb</span><b className="mono">{money(value, 0)}<em> + {money(insurance, 0)} insurance</em></b></div>
+      <div className="stress-l"><span>Loss on a move against it</span><b className="mono">{v.inventory === 0n ? "none (flat)" : moves.map(m => `${m * 100}%: ${money(loss(m), 0)}`).join(" · ")}</b></div>
+      {v.inventory !== 0n && value > 0 && loss(0.3) >= value * 0.5 && <div className="stress-warn">A 30% move would cost the vault {fmt(loss(0.3) / value * 100, 0)}% of its value.</div>}
+    </div>
   );
 }
 
@@ -321,7 +413,11 @@ function Ticket({ state, send, busy }: { state: C.State & { readFor?: string }; 
   const held = p?.position ?? 0n, cap = state.margin ?? 0n;
   const room = C.depth(state, held);
   const marginMax = (s: 1n | -1n) => (held === 0n || (held > 0n) === (s > 0n) ? (cap > abs(held) ? cap - abs(held) : 0n) : abs(held) + cap);
-  const vaultMax = side > 0n ? room.long : room.short;
+  // An order that only shrinks the trader's own position may use the vault's whole limit (the
+  // last 20% is kept for such closes and for liquidations); anything else uses 80% of it.
+  const shrinks = held !== 0n && (held > 0n) !== (side > 0n) && want <= abs(held);
+  const closeRoom = shrinks ? C.depth(state, held, true) : room;
+  const vaultMax = side > 0n ? closeRoom.long : closeRoom.short;
   const most = marginMax(side) < vaultMax ? marginMax(side) : vaultMax;
   const sent = want > vaultMax ? vaultMax : want; // an order above what the vault takes is cut to it
   // (No shares outstanding and no position: every deposit was withdrawn. Such a market is not serviced, so an
@@ -349,6 +445,43 @@ function Ticket({ state, send, busy }: { state: C.State & { readFor?: string }; 
       : `Filled: ${got > 0n ? "bought" : "sold"} ${units(abs(got))} ${sym}${got !== w.size ? ` of the ${units(abs(w.size))} requested` : ""}.`);
   }, [pendingHere?.id, p?.position]);
 
+  // Leverage is chosen per order, as on other exchanges: the order's value is the margin you put
+  // behind it times the leverage. Percolator itself only asks for the market's opening margin
+  // (5% on BTC and ETH: 20×), so a lower leverage just means using less of what the account could
+  // open. One margin account covers every market: the liquidation price shown is the account's.
+  const openRate = Number(state.levels.open) / 10_000, maxLev = Math.max(1, Math.floor(1 / openRate));
+  const savedLev = () => { let x = 0; try { x = Number(localStorage.getItem(`pv:lev:${sym}`)); } catch { /* storage unavailable */ } return x >= 1 ? x : Math.min(5, maxLev); };
+  const [share, setShareState] = useState<number>(); // the last quick share chosen, re-applied when the leverage changes
+  const [levPick, setLevPick] = useState<number>(savedLev);
+  useEffect(() => { setLevPick(savedLev()); setShareState(undefined); }, [sym]);
+  const lev = Math.min(Math.max(1, Math.round(levPick)), maxLev);
+  const sameSide = held === 0n || (held > 0n) === (side > 0n);
+  const reduces = !sameSide; // an order against the position shrinks it first
+  // Margin free for new positions, in dollars: what the margin rule leaves at the market's maximum leverage.
+  const newRoom = sameSide ? (cap > abs(held) ? cap - abs(held) : 0n) : cap;
+  const freeMargin = num(newRoom, 1e6) * priceN * openRate;
+  const orderMargin = notional / lev;
+  const h = state.health;
+  const equityN = num(h?.equity ?? p?.capital ?? 0n, 1e6);
+  const otherN = num(h?.notional ?? 0n, 1e6) - num(abs(held), 1e6) * priceN;
+  const levOf = (posUnits: number) => (equityN > 0 ? (Math.abs(posUnits) * priceN + otherN) / equityN : 0);
+  const levNow = levOf(num(held, 1e6)), levAfter = levOf(after);
+  const sizeFor = (f: number, l: number) => (reduces ? num(abs(held), 1e6) * f : Math.min(num(most, 1e6), freeMargin * f * l / Math.max(priceN, 1e-12)));
+  const setShare = (f: number) => {
+    setShareState(f);
+    const q = sizeFor(f, lev);
+    setUnit("coin");
+    setText(q > 0 ? String(+q.toFixed(6)) : "");
+  };
+  const chooseLev = (x: number) => {
+    const l = Math.min(Math.max(1, Math.round(x)), maxLev);
+    setLevPick(l);
+    try { localStorage.setItem(`pv:lev:${sym}`, String(l)); } catch { /* storage unavailable */ }
+    if (share !== undefined && !reduces) { const q = sizeFor(share, l); setUnit("coin"); setText(q > 0 ? String(+q.toFixed(6)) : ""); }
+  };
+  // An opening order whose margin at the chosen leverage is more than the account has free.
+  const overLev = !reduces && want > 0n && !shrinks && orderMargin > freeMargin * 1.0001 && lev < maxLev;
+
   // Deposit + bond + a little for the fee.
   const coinsNeeded = Number(C.expiryDeposit(sent, state.asset.price)) + C.ROUTER_BOND_LAMPORTS + 1_000_000;
   // The one thing that stops this order, if anything does.
@@ -362,31 +495,10 @@ function Ticket({ state, send, busy }: { state: C.State & { readFor?: string }; 
     : vaultMax === 0n ? (reduceOnly ? "The vault is settling an epoch: it only takes orders that reduce its position or close yours" : `The vault is at its limit for ${side > 0n ? "longs" : "shorts"}`)
     : want <= 0n ? "Enter a size"
     : sent > marginMax(side) ? `Your margin covers at most ${units(marginMax(side))} ${sym} here: add margin or lower the size`
+    : overLev ? `At ${lev}× this order needs ${money(orderMargin)} of margin and ${money(freeMargin)} is free: raise the leverage or lower the size`
     : coins !== undefined && coins < coinsNeeded ? `This order needs ${(coinsNeeded / 1e9).toFixed(3)} ${C.COIN} in your wallet for its deposit and bond (they come back when it fills); the wallet has ${(coins / 1e9).toFixed(3)}`
     : undefined;
 
-  // Leverage is not a setting here: there is one margin account for all markets, and leverage is
-  // what its positions are worth against its equity. The slider picks the order that brings the
-  // account to a chosen leverage; the top of its range is the most the margin rule allows.
-  const h = state.health;
-  const equityN = num(h?.equity ?? p?.capital ?? 0n, 1e6);
-  const otherN = num(h?.notional ?? 0n, 1e6) - num(abs(held), 1e6) * priceN;
-  const levOf = (posUnits: number) => (equityN > 0 ? (Math.abs(posUnits) * priceN + otherN) / equityN : 0);
-  const sameSide = held === 0n || (held > 0n) === (side > 0n);
-  const reach = num(sameSide ? abs(held) + most : most > abs(held) ? most - abs(held) : 0n, 1e6); // largest position on this side
-  const levMax = levOf(reach), levNow = levOf(num(held, 1e6)), levAfter = levOf(after);
-  const setLeverage = (x: number) => {
-    const target = Math.max(0, (x * equityN - otherN) / priceN);          // position size on this side
-    const order = sameSide ? target - num(abs(held), 1e6) : target + num(abs(held), 1e6);
-    setUnit("coin");
-    setText(order > 0 ? String(Math.min(+order.toFixed(4), num(most, 1e6))) : "");
-  };
-
-  const setShare = (bps: bigint) => {
-    const q = most * bps / 10_000n;
-    setUnit("coin");
-    setText(q > 0n ? String(Number(q) / 1e6) : "");
-  };
   const submit = () => {
     if (!publicKey || !state.book || blocker) return;
     send(`${side > 0n ? "Long" : "Short"} ${units(sent)} ${sym}`, [C.requestTrade(publicKey, v.key, sent * side)]);
@@ -416,32 +528,42 @@ function Ticket({ state, send, busy }: { state: C.State & { readFor?: string }; 
 
       <label className="inp">
         <span>Size</span>
-        <input value={text} onChange={e => setText(e.target.value.replace(/[^0-9.]/g, ""))} placeholder="0.00" inputMode="decimal" />
+        <input value={text} onChange={e => { setShareState(undefined); setText(e.target.value.replace(/[^0-9.]/g, "")); }} placeholder="0.00" inputMode="decimal" />
         <button className="unit" onClick={() => { setText(typed > 0 && priceN > 0 ? String(unit === "coin" ? +(typed * priceN).toFixed(2) : +(typed / priceN).toFixed(6)) : ""); setUnit(unit === "coin" ? "usd" : "coin"); }} title="Switch between the asset and dollars">{unit === "coin" ? sym : "USD"}</button>
       </label>
-      <div className="quick">
-        {[2_500n, 5_000n, 7_500n, 10_000n].map(b => <button key={String(b)} disabled={most === 0n} onClick={() => setShare(b)}>{b === 10_000n ? "Max" : `${b / 100n}%`}</button>)}
-      </div>
-
-      {state.trader && (
+      {state.trader && !reduces && (
         <div className="lev">
           <div className="lev-l">
-            <span className="hint" title="One margin account covers every market, so leverage is the account's: what all its positions are worth, divided by its equity. Each market has its own maximum (20× on BTC and ETH, 10× on the others); the slider stops at what your margin allows here.">Account leverage</span>
-            <b className="mono">{want > 0n ? `${fmt(levNow, 1)}× → ${fmt(levAfter, 1)}×` : `${fmt(levNow, 1)}×`}<i>max {fmt(Math.max(levMax, levNow), 1)}×</i></b>
+            <span className="hint" title={`How many times the margin you put behind this order it is worth. ${maxLev}× is the most this market allows. A lower leverage uses less of your free margin for the same size: the quick buttons size the order from your free margin times this leverage.`}>Leverage</span>
+            <b className="mono">{lev}×<i>max {maxLev}×</i></b>
           </div>
-          <input type="range" min={0} max={Math.max(levMax, 0.1)} step={0.1} value={Math.min(want > 0n ? levAfter : levNow, Math.max(levMax, 0.1))} disabled={most === 0n || !!blockerBase} onChange={e => setLeverage(Number(e.target.value))} className={side > 0n ? "up" : "down"} />
+          <div className="lev-track" style={{ "--fill": `${maxLev > 1 ? (lev - 1) / (maxLev - 1) * 100 : 100}%`, "--now": "0%" } as CSSProperties}>
+            <input type="range" min={1} max={maxLev} step={1} value={lev} onChange={e => chooseLev(Number(e.target.value))} className={side > 0n ? "up" : "down"} aria-label="Leverage" />
+            <div className="lev-ticks abs mono">{[...new Set((maxLev >= 20 ? [1, 5, 10, maxLev] : [1, 2, 5, maxLev]).filter(x => x <= maxLev))].map(x => <button key={x} type="button" className={x === lev ? "on" : ""} style={{ left: `${maxLev > 1 ? (x - 1) / (maxLev - 1) * 100 : 0}%` }} onClick={() => chooseLev(x)}>{x}×</button>)}</div>
+          </div>
         </div>
       )}
+      <div className="quick">
+        {[0.25, 0.5, 0.75, 1].map(f => <button key={f} disabled={reduces ? held === 0n : most === 0n} onClick={() => setShare(f)} title={reduces ? `${f * 100}% of your ${held > 0n ? "long" : "short"}` : `${f * 100}% of your free margin (${money(freeMargin)}) at ${lev}×`}>{f === 1 ? (reduces ? "Close" : "Max") : `${f * 100}%`}</button>)}
+      </div>
+      {state.trader && reduces && <div className="fine">You hold a {held > 0n ? "long" : "short"} of {units(abs(held))} {sym}: this {side > 0n ? "buy" : "sell"} reduces it first. The buttons pick a share of the position.</div>}
 
       <div className="sum">
         <div><span>Order value</span><b className="mono">{money(notional)}</b></div>
-        <div><span>Margin used ({fmt(10_000 / Number(state.levels.open), 0)}×)</span><b className="mono">{money(notional * Number(state.levels.open) / 10_000)}</b></div>
+        {!reduces && <div title={`The order's value divided by your leverage (${lev}×), out of ${money(freeMargin)} of free margin`}><span>Margin for this order ({lev}×)</span><b className={`mono ${overLev ? "down" : ""}`}>{money(orderMargin)}<i className="muted"> of {money(freeMargin)} free</i></b></div>}
+        {state.trader && <div title="What all your positions are worth divided by your equity, now and after this order (one account covers every market)"><span>Account leverage</span><b className="mono">{want > 0n ? `${fmt(levNow, 1)}× → ${fmt(levAfter, 1)}×` : `${fmt(levNow, 1)}×`}</b></div>}
         <div><span>Fee ({C.TRADE_FEE_PCT})</span><b className="mono">{money(notional * C.TRADE_FEE_BPS / 10_000)}</b></div>
         <div><span>Position after</span><b className="mono">{after === 0 ? "flat" : `${after > 0 ? "long" : "short"} ${fmt(Math.abs(after), 4).replace(/\.?0+$/, "")} ${sym}`}</b></div>
         <div><span>Est. liquidation price</span><b className="mono">{liqAfter && want > 0n ? fmt(liqAfter, dp) : "—"}</b></div>
+        {state.funding.capE9 > 0n && (() => {
+          // What the position after this order pays (or receives) in funding a day, at today's rate.
+          const day = C.fundingCostPerHour(state.funding.rateE9, after, Math.abs(after) * num(state.asset.price, 1e6)) * 24;
+          return <div title="At the current rate, which follows how one-sided the market is and can change"><span>Funding a day (est.)</span><b className={`mono ${day > 0 ? "down" : day < 0 ? "up" : ""}`}>{after === 0 || day === 0 ? "—" : `${day > 0 ? "you pay " : "you receive "}${money(Math.abs(day), 2)}`}</b></div>;
+        })()}
         <div><span>Largest order now</span><b className="mono">{state.trader ? `${units(most)} ${sym}` : `${units(vaultMax)} ${sym}`}</b></div>
       </div>
 
+      <div className="ticket-go">
       {!publicKey ? <div className="connect"><WalletMultiButton /></div>
         : !mine ? <button className="submit neutral" disabled>Reading your account…</button>
         : !state.trader ? <button className="submit neutral" disabled={!!busy} onClick={() => send("Create trading account", [C.openTradingAccount(publicKey), S.openStats(publicKey, publicKey)])}>Create trading account</button>
@@ -452,6 +574,7 @@ function Ticket({ state, send, busy }: { state: C.State & { readFor?: string }; 
         </button>
       )}
       {blocker && publicKey && <div className="why">{blocker}</div>}
+      </div>
       {!blocker && want > vaultMax && <div className="why">The vault takes {units(vaultMax)} {sym} on this side right now, so the order is cut to that.</div>}
       {!state.trader && publicKey && mine && <div className="why">One account covers every market. It belongs to a program address derived from your wallet: only the router can trade it, and withdrawals only go back to this wallet. About 0.07 test {C.COIN} of rent.</div>}
 
@@ -459,7 +582,7 @@ function Ticket({ state, send, busy }: { state: C.State & { readFor?: string }; 
       {pendingHere && <Pending r={pendingHere} sym={sym} send={send} busy={busy} />}
       {!pendingHere && outcome && <div className="outcome" onClick={() => setOutcome(undefined)}>{outcome}</div>}
       <p className="fine">
-        Orders fill at the first oracle price published {C.ROUTER_DELAY_SECS} seconds after the request lands. Nobody can know that price
+        Orders fill at the first oracle price published at least {C.ROUTER_DELAY_SECS} seconds after the request lands, on the next {C.ROUTER_BATCH_SECS}-second mark (orders sent close together share that price). Nobody can know that price
         when the order is sent, so nobody can trade ahead of it. An order cannot be cancelled; unfilled after {C.ROUTER_GRACE_SECS} s, it expires.
         {want > 0n && <> A deposit of {(Number(C.expiryDeposit(sent, state.asset.price)) / 1e9).toFixed(4)} {C.COIN} ({C.EXPIRY_DEPOSIT_BPS / 100}% of the order, at most {Number(C.EXPIRY_DEPOSIT_CAP) / 1e9} {C.COIN}) goes with it and comes back when it fills; it is kept only if the order's price arrived and the order still expired while the market was current.</>}
       </p>
@@ -593,39 +716,7 @@ function Pending({ r, sym, send, busy }: { r: C.RouterRequest; sym: string; send
 
 // ---------------------------------------------------------------- account
 
-/** The invitation that brought this visitor, kept from the link (`?ref=<wallet>`) until it is confirmed. */
-const invitedBy = (): PublicKey | undefined => {
-  try {
-    const q = new URLSearchParams(window.location.search).get("ref");
-    if (q) localStorage.setItem("pv:ref", q);
-    const r = localStorage.getItem("pv:ref");
-    return r ? new PublicKey(r) : undefined;
-  } catch { return undefined; }
-};
-
-/** A wallet's invitation link, and the one-time confirmation of who invited it. */
-function Invite({ me, send, busy, tick }: { me: PublicKey; send: Send; busy?: string; tick: number }) {
-  const { connection } = useConnection();
-  const [by, setBy] = useState<PublicKey | null>();
-  const [copied, setCopied] = useState(false);
-  useEffect(() => {
-    let on = true;
-    connection.getAccountInfo(S.referralAddress(me)).then(a => on && setBy(a && a.data.length === S.REFERRAL_LEN ? S.decodeReferral(new Uint8Array(a.data)).referrer : null)).catch(() => undefined);
-    return () => { on = false; };
-  }, [connection, me.toBase58(), tick]);
-  const offer = invitedBy();
-  const link = `${window.location.origin}/?network=${C.NETWORK_PARAM}&ref=${me.toBase58()}`;
-  return (
-    <div className="fine">
-      Invite traders: you earn {Math.round(S.REBATE.referrerShare * 100)}% of the trading fees they pay, paid weekly by the platform.{" "}
-      <a href={link} onClick={e => { e.preventDefault(); navigator.clipboard?.writeText(link).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); }); }}>{copied ? "Copied" : "Copy your link"}</a>
-      {by ? <> · Invited by <span className="mono">{short(by)}</span></>
-        : by === null && offer && !offer.equals(me) && <> · <a href="#" onClick={e => { e.preventDefault(); if (!busy) send("Confirm invitation", [S.setReferrer(me, offer)]); }}>Confirm you were invited by <span className="mono">{short(offer)}</span></a> (once, it cannot be changed)</>}
-    </div>
-  );
-}
-
-function Account({ state, send, busy }: { state: C.State; send: Send; busy?: string }) {
+function Account({ state, send, busy, held, row }: { state: C.State; send: Send; busy?: string; held: Held[]; row?: S.TraderRow }) {
   const { publicKey } = useWallet();
   const [amount, setAmount] = useState("100");
   const p = state.portfolio, h = state.health;
@@ -647,6 +738,21 @@ function Account({ state, send, busy }: { state: C.State; send: Send; busy?: str
         <div className="acct">
           <div className="acct-row"><span>Equity</span><b className="mono">{usd(equity)}</b></div>
           <div className="acct-row"><span>In positions</span><b className="mono">{usd(h?.notional ?? 0n)}</b></div>
+          {(() => {
+            // What the open positions are up or down now, today's result and the account's whole
+            // record (equity against everything paid in and out: fees and closed trades included).
+            const open = held.filter(x => x.pnl !== undefined), unknown = held.length - open.length;
+            const upNow = open.reduce((t, x) => t + x.pnl!, 0);
+            const today = row?.days.length && row.days[row.days.length - 1].day === Math.floor(Date.now() / 86_400_000) ? row.days[row.days.length - 1].pnl : undefined;
+            const big = (x: number) => <b className={`mono pnl ${x > 0 ? "up" : x < 0 ? "down" : ""}`}>{arrow(x)} {signedMoney(x)}</b>;
+            return (
+              <>
+                {held.length > 0 && <div className="acct-row" title={unknown ? `${unknown} position(s) without a known entry price are left out` : "Against the average entry price of each open position, before fees"}><span>Open PnL{unknown ? " *" : ""}</span>{big(upNow)}</div>}
+                {today !== undefined && <div className="acct-row" title="Today's change in equity (UTC day), from the account's track record"><span>Today</span>{big(today)}</div>}
+                {row?.stats && <div className="acct-row" title={`Equity now minus everything deposited, plus everything withdrawn, since ${new Date(row.stats.startTime * 1000).toLocaleDateString()}: closed and open trades, after fees`}><span>All-time PnL</span>{big(row.pnl)}</div>}
+              </>
+            );
+          })()}
           <div className="acct-row"><span>Wallet test USDC</span><b className="mono">{usd(state.userCollateral)}</b></div>
           <div className="health">
             <div className="health-l"><span>Margin health</span><b className={`mono ${used > 75 ? "down" : ""}`}>{ratio === undefined ? "no position" : `${fmt(ratio * 100, 1)}% · liquidated below ${fmt((h && h.notional > 0n ? num(h.floor, 1e6) / num(h.notional, 1e6) : 0) * 100, 1)}%`}</b></div>
@@ -661,7 +767,6 @@ function Account({ state, send, busy }: { state: C.State; send: Send; busy?: str
               </div>
               {locked ? <div className="fine">Withdrawals are paused while an order is queued.</div>
                 : state.openPositions > 0 && <div className="fine">Margin can be withdrawn once no position is open on any market. Deposits always work.</div>}
-              <Invite me={publicKey} send={send} busy={busy} tick={Math.floor(Number(state.slot) / 300)} />
             </>
           )}
         </div>
@@ -672,13 +777,13 @@ function Account({ state, send, busy }: { state: C.State; send: Send; busy?: str
 
 // ---------------------------------------------------------------- positions, history, market
 
-function Bottom({ state, markets, fills, entry, liq, send, busy, go }: {
-  state: C.State; markets: Card[]; fills: ReturnType<typeof useFills>; entry?: number; liq?: number; send: Send; busy?: string; go: (to: string) => void;
+function Bottom({ state, markets, fills, held, liq, send, busy, go }: {
+  state: C.State; markets: Card[]; fills: Fill[]; held: Held[]; liq?: number; send: Send; busy?: string; go: (to: string) => void;
 }) {
   const { publicKey } = useWallet();
-  const [tab, setTab] = useState<"positions" | "orders" | "history" | "market">("positions");
+  const [tab, setTab] = useState<"positions" | "orders" | "history" | "vault" | "market">("positions");
   const v = state.vault, sym = v.feed?.symbol ?? "";
-  const positions = state.health?.positions ?? [];
+  const positions = held;
   const byAsset = new Map(markets.filter(c => c.v.canonical || c.v.key.equals(v.key)).map(c => [c.v.assetIndex, c]));
   const locked = !!state.trader?.hasPending;
   const close = () => {
@@ -695,6 +800,7 @@ function Bottom({ state, markets, fills, entry, liq, send, busy, go }: {
         <button className={tab === "positions" ? "on" : ""} onClick={() => setTab("positions")}>Positions{positions.length ? <em>{positions.length}</em> : null}</button>
         <button className={tab === "orders" ? "on" : ""} onClick={() => setTab("orders")}>Open orders{state.orders.length ? <em>{state.orders.length}</em> : null}</button>
         <button className={tab === "history" ? "on" : ""} onClick={() => setTab("history")}>Trade history</button>
+        <button className={tab === "vault" ? "on" : ""} onClick={() => setTab("vault")}>Vault capacity</button>
         <button className={tab === "market" ? "on" : ""} onClick={() => setTab("market")}>Market details</button>
       </div>
       <div className="bottom-body">
@@ -704,24 +810,26 @@ function Bottom({ state, markets, fills, entry, liq, send, busy, go }: {
             <tbody>
               {positions.map(x => {
                 const here = x.asset === v.assetIndex;
-                const c = byAsset.get(x.asset), s = c?.v.feed?.symbol ?? `asset ${x.asset}`;
-                const size = num(x.size, 1e6), mark = num(x.price, 1e6);
-                const e = here ? entry : undefined;
-                const pnl = e !== undefined ? (mark - e) * size : undefined;
+                const c = byAsset.get(x.asset), s = x.sym;
+                const { size, mark, entry: e, pnl } = x;
                 return (
-                  <tr key={x.asset}>
+                  <tr key={x.asset} className={here ? "here" : ""}>
                     <td><button className="link" onClick={() => c && go(c.v.canonical ? `/trade/${s}` : `/m/${c.v.key.toString()}`)}>{s}-PERP</button></td>
                     <td className={size > 0 ? "up" : "down"}>{size > 0 ? "Long" : "Short"}</td>
-                    <td className="r mono">{units(abs(x.size))}</td>
-                    <td className="r mono">{usd(x.notional)}</td>
+                    <td className="r mono">{fmt(Math.abs(size), 4).replace(/\.?0+$/, "")} {s}</td>
+                    <td className="r mono">{money(x.value)}</td>
                     <td className="r mono">{e !== undefined ? fmt(e, priceDp(mark)) : "—"}</td>
                     <td className="r mono">{fmt(mark, priceDp(mark))}</td>
-                    <td className={`r mono ${pnl === undefined ? "" : pnl >= 0 ? "up" : "down"}`}>{pnl === undefined ? "—" : `${signedMoney(pnl)} (${pct(pnl / (Math.abs(size) * e! / 10), 1)})`}</td>
+                    <td className={`r mono pnl ${pnl === undefined ? "" : pnl >= 0 ? "up" : "down"}`} title={pnl === undefined ? "The entry price is not known: this wallet's earlier fills on this market are not on record" : "Against the average entry price, before fees; the percentage is the price move in your favour"}>{pnl === undefined ? "—" : <>{arrow(pnl)} {signedMoney(pnl)} <i>({pct(x.ret ?? 0)})</i></>}</td>
                     <td className="r mono">{here && liq ? fmt(liq, priceDp(mark)) : "—"}</td>
                     <td className="r">{here ? <button className="btn tiny" disabled={locked || !!busy} onClick={close}>Close</button> : <button className="btn tiny ghost" onClick={() => c && go(`/trade/${s}`)}>Open</button>}</td>
                   </tr>
                 );
               })}
+              {positions.length > 1 && (() => {
+                const known = positions.filter(x => x.pnl !== undefined), total = known.reduce((t, x) => t + x.pnl!, 0);
+                return <tr className="total"><td colSpan={3}>Total</td><td className="r mono">{money(positions.reduce((t, x) => t + x.value, 0))}</td><td colSpan={2} /><td className={`r mono pnl ${total >= 0 ? "up" : "down"}`}>{known.length ? <>{arrow(total)} {signedMoney(total)}</> : "—"}</td><td colSpan={2} /></tr>;
+              })()}
             </tbody>
           </table>
         ))}
@@ -752,37 +860,55 @@ function Bottom({ state, markets, fills, entry, liq, send, busy, go }: {
             </tbody>
           </table>
         ))}
-        {tab === "history" && (!publicKey ? <div className="quiet">Connect a wallet to see your trades.</div> : fills.length === 0 ? <div className="quiet">No trades on {sym}-PERP from this wallet yet.</div> : (
-          <table className="tbl">
-            <thead><tr><th>Market</th><th>Side</th><th className="r">Size</th><th className="r">Price</th><th className="r">Value</th><th className="r">Fee</th><th className="r">Transaction</th></tr></thead>
-            <tbody>
-              {[...fills].reverse().map(f => (
-                <tr key={f.sig}>
-                  <td>{sym}-PERP</td>
-                  <td className={f.size > 0 ? "up" : "down"}>{f.size > 0 ? "Buy" : "Sell"}</td>
-                  <td className="r mono">{fmt(Math.abs(f.size), 4).replace(/\.?0+$/, "")}</td>
-                  <td className="r mono">{fmt(f.price, priceDp(f.price))}</td>
-                  <td className="r mono">{money(Math.abs(f.size) * f.price)}</td>
-                  <td className="r mono">{money(Math.abs(f.size) * f.price * C.feeBpsAt(f.slot) / 10_000)}</td>
-                  <td className="r"><a href={explorer("tx", f.sig)} target="_blank" rel="noreferrer">{short(f.sig)}</a></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        ))}
+        {tab === "history" && (!publicKey ? <div className="quiet">Connect a wallet to see your trades.</div> : fills.length === 0 ? <div className="quiet">No trades from this wallet on record yet.</div> : (() => {
+          const symOf = (vault: string) => markets.find(c => c.v.key.toBase58() === vault)?.v.feed?.symbol ?? "?";
+          // Positions now, by vault: the history is worked out backwards from them.
+          const now = new Map(held.flatMap(x => { const c = byAsset.get(x.asset); return c ? [[c.v.key.toBase58(), x.size] as [string, number]] : []; }));
+          const rows = realizedPnl(fills, now);
+          const fee = (f: Fill) => Math.abs(f.size) * f.price * C.feeBpsAt(f.slot) / 10_000;
+          const booked = rows.reduce((t, f) => t + f.realized, 0), fees = rows.reduce((t, f) => t + fee(f), 0);
+          return (
+            <>
+              <div className="hist-sum">
+                <span title="Only trades whose position is known from flat are counted: older fills of this wallet may not be on record">Closed PnL on {rows.filter(f => f.known).length} of these {rows.length} trades</span><b className={`mono pnl ${booked >= 0 ? "up" : "down"}`}>{arrow(booked)} {signedMoney(booked)}</b>
+                <span>fees</span><b className="mono">{money(fees)}</b>
+                <span>after fees</span><b className={`mono pnl ${booked - fees >= 0 ? "up" : "down"}`}>{signedMoney(booked - fees)}</b>
+              </div>
+              <table className="tbl">
+                <thead><tr><th>Time</th><th>Market</th><th>Side</th><th className="r">Size</th><th className="r">Price</th><th className="r">Value</th><th className="r">Fee</th><th className="r" title="What the trade booked when it reduced or closed a position: (price - average entry) x size closed, before fees">Closed PnL</th><th className="r">Transaction</th></tr></thead>
+                <tbody>
+                  {[...rows].reverse().map(f => (
+                    <tr key={f.sig}>
+                      <td className="mono muted">{ago(Math.max(0, (Number(state.slot) - f.slot) * C.slotSeconds()))}</td>
+                      <td>{symOf(f.vault)}-PERP</td>
+                      <td className={f.size > 0 ? "up" : "down"}>{f.size > 0 ? "Buy" : "Sell"}</td>
+                      <td className="r mono">{fmt(Math.abs(f.size), 4).replace(/\.?0+$/, "")}</td>
+                      <td className="r mono">{fmt(f.price, priceDp(f.price))}</td>
+                      <td className="r mono">{money(Math.abs(f.size) * f.price)}</td>
+                      <td className="r mono">{money(fee(f))}</td>
+                      <td className={`r mono pnl ${f.realized > 0 ? "up" : f.realized < 0 ? "down" : "muted"}`}>{f.realized !== 0 ? <>{arrow(f.realized)} {signedMoney(f.realized)}</> : f.known ? "opened" : "—"}</td>
+                      <td className="r"><a href={explorer("tx", f.sig)} target="_blank" rel="noreferrer">{short(f.sig)}</a></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </>
+          );
+        })())}
+        {tab === "vault" && <VaultCapacity state={state} />}
         {tab === "market" && (
           <div className="mkt">
             <div className="kv">
               <div><span>Leverage</span><b>up to {fmt(10_000 / Number(state.levels.open), 0)}×</b></div>
               <div><span>Trading fee</span><b>{C.TRADE_FEE_PCT} per trade</b></div>
               <div><span>Price</span><b>{C.X1 ? "exchange median, posted by the router's reporter" : "Pyth, verified on chain"}</b></div>
-              <div><span>Fill</span><b>first oracle price {C.ROUTER_DELAY_SECS} s after the request</b></div>
+              <div><span>Fill</span><b>first oracle price {C.ROUTER_DELAY_SECS}–{C.ROUTER_DELAY_SECS + C.ROUTER_BATCH_SECS - 1} s after the request</b></div>
               <div><span>Liquidation</span><b>below {fmt(Number(state.levels.liq) / 100, 1)}% margin</b></div>
-              <div><span>Funding</span><b>none</b></div>
+              <div><span>Funding</span><b>{state.funding.capE9 > 0n ? `${fmt(Math.abs(C.fundingPerHour(state.funding.rateE9)) * 100, 4)}%/h now, ${state.funding.rateE9 > 0n ? "longs pay" : state.funding.rateE9 < 0n ? "shorts pay" : "nobody pays"}; up to ${fmt(C.fundingPerHour(BigInt(L_FUNDING.max ?? 30)) * 100, 3)}%/h, by how one-sided the vault is` : "off on this market"}</b></div>
             </div>
             <div className="kv">
               <div><span>Vault liquidity</span><b>{usd(nav)}</b></div>
-              <div><span>Vault position limit</span><b>{units(v.positionNavBps ? capUnits(nav, v.positionNavBps, state.asset.price) : v.maxInventory)} {sym} (3× liquidity)</b></div>
+              <div><span>Vault position limit</span><b>{units(v.positionNavBps ? capUnits(nav, v.positionNavBps, state.asset.price) : v.maxInventory)} {sym}{v.positionNavBps ? ` (${fmt(Number(v.positionNavBps) / 10_000, 2).replace(/\.?0+$/, "")}× liquidity)` : ""}</b></div>
               <div><span>Largest new exposure per order</span><b>{units(v.positionNavBps ? capUnits(nav, v.fillNavBps, state.asset.price) : v.maxFill)} {sym}</b></div>
               <div><span>Fees earned</span><b>{usd(v.feesHarvested + state.asset.insurance)}</b></div>
               <div><span>Insurance kept for traders</span><b>{usd(v.insuranceFloor, 0)}</b></div>

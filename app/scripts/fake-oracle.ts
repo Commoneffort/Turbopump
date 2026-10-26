@@ -3,6 +3,7 @@
 // and a "backup", so the executor's switch from one to the other can be tested too.
 //
 //   GET /v1/stream/prices?symbols=sol,btc    the stream (on both ports)
+//   GET /v1/prices?symbols=sol,btc           the same message once (both ports; the witness reads the backup's)
 //   control, on the primary port only (127.0.0.1):
 //   GET /set?symbol=SOL&price=95             jump to a price
 //   GET /move?symbol=SOL&pct=-8&secs=120     walk there in a straight line (pct of the current price)
@@ -50,6 +51,13 @@ function serve(which: "primary" | "backup", port: number) {
       return;
     }
     const json = (o: unknown) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(o)); };
+    // The same message once (what the X1 witness reads): nothing while silent or down.
+    if (url.pathname === "/v1/prices") {
+      if (down[which]) { req.socket.destroy(); return; }
+      const symbols = q("symbols").split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+      if (Date.now() < silentUntil[which]) return json({ type: "prices", timestamp: new Date().toISOString(), data: [] });
+      res.writeHead(200, { "content-type": "application/json" }); res.end(message(symbols)); return;
+    }
     if (which !== "primary") { res.writeHead(404); res.end(); return; }
     const sym = q("symbol").toUpperCase();
     if (url.pathname === "/set") { walks.delete(sym); price.set(sym, Number(q("price"))); log(`${sym} set to ${q("price")}`); return json({ ok: true }); }

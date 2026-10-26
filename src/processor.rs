@@ -63,7 +63,9 @@ pub const INSURANCE_NAV_BPS: u64 = 0;
 /// (initial margin 5%), and `TopUpMargin` moves the reserve in if the vault's margin runs thin.
 /// The test build keeps 10%, which its numbers are written for.
 #[cfg(feature = "devnet")]
-pub const RESERVE_BPS: u64 = 3_000;
+pub const RESERVE_BPS: u64 = DEPLOYED_RESERVE_BPS;
+/// `RESERVE_BPS` of the deployed builds (exported for the page, which the test build writes).
+pub const DEPLOYED_RESERVE_BPS: u64 = 3_000;
 #[cfg(not(feature = "devnet"))]
 pub const RESERVE_BPS: u64 = 1_000;
 /// `TopUpMargin`: allowed when the vault's equity in Percolator (capital plus PnL) is below this
@@ -157,8 +159,9 @@ impl InitParams {
             oracle_ewma_halflife_slots: 1,
             oracle_mark_min_fee: 0,
             oracle_feeds: [feed, [0; 32], [0; 32]],
-            position_nav_bps: CANON_POSITION_NAV_BPS,
-            fill_nav_bps: CANON_FILL_NAV_BPS,
+            // The feed's tier sets these (see `feeds`; the matcher applies the tier to older vaults too).
+            position_nav_bps: CANON_POSITION_NAV_BPS.min(crate::feeds::position_nav_bps(crate::feeds::cap_tier(&feed))),
+            fill_nav_bps: CANON_FILL_NAV_BPS.min(crate::feeds::fill_nav_bps(crate::feeds::cap_tier(&feed))),
         }
     }
 }
@@ -189,6 +192,19 @@ pub const TAG_TOP_UP_MARGIN: u8 = 38;
 pub const TAG_INIT_COVER: u8 = 39;
 pub const TAG_COVER_LOSS: u8 = 40;
 pub const TAG_WITHDRAW_COVER: u8 = 41;
+pub const TAG_PUSH_FUNDING: u8 = 42;
+pub const TAG_SET_FUNDING_CAP: u8 = 43;
+
+/// The bound on every funding rate of a governed market (e9 per slot); 0 on a market means no
+/// funding at all, and `SetFundingCap` sets a governed market's cap to this.
+///
+/// 0 since 2026-10-20: funding is off. In Percolator any accrual that changes an asset's funding
+/// index marks every position on that asset out of date, and a trade on an asset with an
+/// out-of-date position is refused (LockActive). With a nonzero rate, the crank that brings the
+/// asset to the current slot inside each fill therefore re-marks all its positions, and nearly
+/// every fill failed until all of them were settled in the same transaction (more than fits once
+/// a market has a handful of traders). It was 40 (about 0.036% an hour at 0.4 s slots).
+pub const CANON_MAX_FUNDING_E9: u64 = 0;
 
 /// The fee every canonical market charges on a trade, in basis points of its size. The engine
 /// takes it from both sides, so a vault pays it too and gets its own part back when fees are
@@ -624,6 +640,16 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
             cover_loss(program_id, accounts)
         }
         TAG_WITHDRAW_COVER => withdraw_cover(program_id, accounts, arg_u64(rest)?),
+        TAG_PUSH_FUNDING => {
+            if rest.len() != 8 {
+                return Err(VaultError::InvalidInstruction.into());
+            }
+            push_funding(program_id, accounts, i64::from_le_bytes(rest.try_into().unwrap()))
+        }
+        TAG_SET_FUNDING_CAP => {
+            no_args(rest)?;
+            set_funding_cap(program_id, accounts)
+        }
         _ => Err(VaultError::InvalidInstruction.into()),
     }
 }
@@ -645,6 +671,10 @@ fn init_vault(program_id: &Pubkey, accounts: &[AccountInfo], p: InitParams) -> P
         p
     };
     p.validate()?;
+    // Only feeds deep enough to quote (see `feeds`): opening is permissionless, the list is not.
+    if p.mode == MODE_OPERATE && !crate::feeds::listable(&p.oracle_feeds[0]) {
+        return Err(VaultError::FeedNotListable.into());
+    }
     let payer = acc(accounts, 0)?;
     let creator = acc(accounts, 1)?;
     let vault_ai = acc(accounts, 2)?;
@@ -840,7 +870,7 @@ fn init_vault(program_id: &Pubkey, accounts: &[AccountInfo], p: InitParams) -> P
         oracle_max_staleness_secs: p.oracle_max_staleness_secs,
         oracle_soft_stale_slots: p.oracle_soft_stale_slots,
         oracle_ewma_halflife_slots: p.oracle_ewma_halflife_slots,
-        oracle_mark_min_fee: p.oracle_mark_min_fee,
+        armed_nav: 0,
         oracle_feeds: p.oracle_feeds,
         insurance_floor: p.insurance_floor,
         listing_fee_max: p.listing_fee_max,
@@ -1647,7 +1677,9 @@ fn insurance_excess(market: &AccountInfo, v: &VaultState) -> Result<u64, VaultEr
 /// vaults grew to $30,000, and a 30% gap (crash drill, 2026-10-17) left ~$110 of losses on one
 /// market: the pot has to grow with what it protects. It is filled from trading fees only.
 pub fn insurance_kept(v: &VaultState) -> u64 {
-    insurance_kept_at(v, INSURANCE_NAV_BPS)
+    // Deployed builds keep more for assets that move more (see `feeds::insurance_nav_bps`).
+    let bps = if INSURANCE_NAV_BPS == 0 { 0 } else { crate::feeds::insurance_nav_bps(crate::feeds::cap_tier(&v.oracle_feeds[0])) };
+    insurance_kept_at(v, bps)
 }
 pub fn insurance_kept_at(v: &VaultState, nav_bps: u64) -> u64 {
     let by_value = (v.last_nav as u128 * nav_bps as u128 / 10_000) as u64;
@@ -1878,12 +1910,81 @@ fn push_mark(
     )
 }
 
+/// Sets the funding rate of the vault's asset (e9 per slot, positive = longs pay): the router
+/// works it out from how one-sided the vault is and pushes it after a fill, when the asset is
+/// accrued to the current slot (Percolator applies a rate only from the slot it is set at).
+/// The vault, as the asset's oracle authority, signs; the sequences are read from the market.
+///
+/// Accounts: 0 router authority [signer], 1 vault, 2 market [w], 3 Percolator program.
+fn push_funding(program_id: &Pubkey, accounts: &[AccountInfo], rate_e9: i64) -> ProgramResult {
+    let router = acc(accounts, 0)?;
+    let vault_ai = acc(accounts, 1)?;
+    let market = acc(accounts, 2)?;
+    let percolator = acc(accounts, 3)?;
+    router_signed(router)?;
+    writable(market)?;
+    key_is(percolator, &PERCOLATOR_PROGRAM_ID)?;
+    let v = state::load_vault(vault_ai, program_id)?;
+    if v.mode != MODE_OPERATE || v.status != STATUS_ACTIVE {
+        return Err(VaultError::NotActive.into());
+    }
+    key_is(market, &v.market)?;
+    let (observation, authority_epoch) = perc::asset_sequences(&market.try_borrow_data()?, v.asset_index)?;
+    let bump = v.vault_bump;
+    invoke_signed(
+        &perc::auth_funding(
+            vault_ai.key,
+            market.key,
+            v.asset_index,
+            v.asset_market_id,
+            Clock::get()?.slot,
+            rate_e9,
+            observation.checked_add(1).ok_or(VaultError::Overflow)?,
+            authority_epoch,
+        ),
+        &[vault_ai.clone(), market.clone(), percolator.clone()],
+        &[vault_seeds!(v, bump)],
+    )
+}
+
+/// Sets a governed market's funding cap to `CANON_MAX_FUNDING_E9` (anyone may send it, like
+/// `SetTradeFee`; nobody can set anything else). With that at 0 it switches funding off on a
+/// market where it was on.
+///
+/// Accounts: 0 governor PDA, 1 market [w], 2 Percolator program.
+fn set_funding_cap(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let governor = acc(accounts, 0)?;
+    let market = acc(accounts, 1)?;
+    let percolator = acc(accounts, 2)?;
+    writable(market)?;
+    key_is(percolator, &PERCOLATOR_PROGRAM_ID)?;
+    if market.owner != &PERCOLATOR_PROGRAM_ID {
+        return Err(VaultError::BadPercolatorAccount.into());
+    }
+    let (expected, bump) = state::governor_address(program_id, market.key);
+    key_is(governor, &expected)?;
+    let (sequence, authority_epoch) = {
+        let d = market.try_borrow_data()?;
+        if perc::max_abs_funding_e9(&d)? == CANON_MAX_FUNDING_E9 {
+            return Err(VaultError::InvalidInstruction.into());
+        }
+        (perc::policy_sequence(&d)?, perc::asset_sequences(&d, 0)?.1)
+    };
+    invoke_signed(
+        &perc::update_funding_cap(governor.key, market.key, CANON_MAX_FUNDING_E9, sequence.checked_add(1).ok_or(VaultError::Overflow)?, authority_epoch),
+        &[governor.clone(), market.clone(), percolator.clone()],
+        &[&[SEED_GOVERNOR, market.key.as_ref(), &[bump]]],
+    )
+}
+
 /// Arms the one fill the matcher will accept in this slot: the router calls it right before the
 /// trade it executes. Every other fill (a taker trading directly) is refused by the matcher.
 ///
-/// Accounts: 0 router authority [signer], 1 vault [w]. Data: taker size (i128, + = taker buys),
-/// then optionally one byte, 1 when the fill only reduces the taker's own position (the router
-/// reads that from the taker's portfolio); the matcher takes such a fill even when reduce-only.
+/// Accounts: 0 router authority [signer], 1 vault [w], and optionally 2 market, 3 the vault's LP
+/// portfolio: with them the vault's value now is estimated and the fill held to it if that is
+/// lower than at the last roll (see `live_nav`). Data: taker size (i128, + = taker buys), then
+/// optionally one byte, 1 when the fill only reduces the taker's own position (the router reads
+/// that from the taker's portfolio); the matcher takes such a fill even when reduce-only.
 fn arm_fill(program_id: &Pubkey, accounts: &[AccountInfo], size: i128, closing: bool) -> ProgramResult {
     let router = acc(accounts, 0)?;
     let vault_ai = acc(accounts, 1)?;
@@ -1899,7 +2000,27 @@ fn arm_fill(program_id: &Pubkey, accounts: &[AccountInfo], size: i128, closing: 
     v.armed_size = size;
     v.armed_closing = closing as u8;
     v.armed_slot = Clock::get()?.slot;
+    v.armed_nav = match (accounts.get(2), accounts.get(3)) {
+        (Some(market), Some(portfolio)) => {
+            key_is(market, &v.market)?;
+            key_is(portfolio, &v.lp_portfolio)?;
+            live_nav(&perc::read_portfolio(portfolio, market.key, vault_ai.key)?)
+        }
+        _ => 0,
+    };
     state::store_vault(vault_ai, &v)
+}
+
+/// The vault's value now, estimated from its equity in Percolator (capital plus profit or loss,
+/// every position settled to the current price by the executor before a fill): at a roll the
+/// vault keeps `RESERVE_BPS` of its value as cash and the rest in Percolator, so the estimate
+/// scales the equity back up by that share. It moves with the vault's gains and losses since the
+/// roll (a loss counts a little more than it is, never less), and the matcher only ever uses it
+/// when it is lower than the value at the roll. At least 1, so "not read" stays distinct.
+pub fn live_nav(view: &perc::PortfolioView) -> u64 {
+    let equity = (view.capital as i128).saturating_add(view.pnl).max(0) as u128;
+    let scaled = equity * 10_000 / (10_000 - RESERVE_BPS as u128);
+    u64::try_from(scaled).unwrap_or(u64::MAX).max(1)
 }
 
 /// Switches the vault to closing-only for the rest of an overdue epoch. Allowed when the epoch is

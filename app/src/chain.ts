@@ -2,6 +2,7 @@
 // from layout.json, which a Rust test exports from the program and engine types.
 import {
   AccountMeta,
+  Commitment,
   ComputeBudgetProgram,
   Connection,
   PublicKey,
@@ -12,6 +13,8 @@ import {
 } from "@solana/web3.js";
 import { TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from "@solana/spl-token";
 import L from "./layout.json";
+/** The programs' layout and constants, as the tests export them (app/src/layout.json). */
+export const LAYOUT = L;
 import D from "./devnet.json";
 import X from "./x1-testnet.json";
 
@@ -40,7 +43,7 @@ export const NETWORK_PARAM = NETWORK === "x1-testnet" ? "x1" : "solana";
 // The address always says which network the page shows, so a link copied from it opens the same
 // network for whoever receives it (without this a link made on X1 opened Solana devnet, the
 // default, for a new visitor: other names, other records, no pictures). Whatever else the
-// address holds (a referral, the page after the #) stays as it is.
+// address holds (the page after the #) stays as it is.
 if (typeof window !== "undefined" && typeof history !== "undefined") {
   try {
     const u = new URL(window.location.href);
@@ -217,9 +220,9 @@ export function decodeVault(k: PublicKey, d: Uint8Array): Vault {
     feesHarvested: u64(d, v.total_fees_harvested),
     maxFill: u128(d, v.max_fill_abs),
     maxInventory: u128(d, v.max_inventory_abs),
-    // What the vault keeps as insurance before harvesting: its floor or 3% of its value
-    // (the program's insurance_kept / INSURANCE_NAV_BPS).
-    insuranceFloor: (() => { const f = u64(d, v.insurance_floor), n = u64(d, v.last_nav) * BigInt(R.insurance_nav_bps ?? 300) / 10_000n; return f > n ? f : n; })(),
+    // What the vault keeps as insurance before harvesting: its floor or its tier's share of its
+    // value, 3% on majors and 8% on the rest (the program's insurance_kept, feeds::insurance_nav_bps).
+    insuranceFloor: (() => { const f = u64(d, v.insurance_floor), n = u64(d, v.last_nav) * BigInt(tierInsuranceBps(tierOfFeed(feedHex))) / 10_000n; return f > n ? f : n; })(),
     createdSlot: u64(d, v.created_slot),
     canonical: d[v.vault_kind] === 1,
     positionNavBps: u16(d, v.position_nav_bps),
@@ -491,34 +494,110 @@ export function claimOpenerFees(v: Vault, opener: PublicKey) {
 
 /** The largest fill the vault would take right now in each direction (mirrors the matcher).
  *  `held` is the taker's own position: closing it is taken even while the vault is reduce-only. */
-export function depth(s: State, held = 0n): { long: bigint; short: bigint } {
+// ---- funding (router/src/funding.rs, Percolator PushAuthFunding) ----
+/** An asset's funding as Percolator holds it: the market's cap (0 = no funding on this market),
+ *  the rate (e9 per slot, positive = longs pay shorts), and the slot it was set at. The rate is
+ *  in the asset's control sequences (a lane each for rate, generation and slot), valid only for
+ *  the asset's current generation. */
+export function fundingOf(market: Uint8Array, asset: number): { capE9: bigint; rateE9: bigint; setSlot: bigint } {
+  const RR = L.router as any;
+  const capE9 = RR.funding_cap_off ? u64(market, RR.funding_cap_off) : 0n;
+  if (asset === 0 || RR.funding_seq_off_in_slot === undefined) return { capE9, rateE9: 0n, setSlot: 0n };
+  const slot = L.market.slots + asset * L.market.slot_len;
+  const base = slot + RR.funding_seq_off_in_slot;
+  const generation = u64(market, slot + L.market.engine + L.market.market_id);
+  if (base + 48 > market.length || u64(market, base + 32) !== generation || generation === 0n) return { capE9, rateE9: 0n, setSlot: 0n };
+  return { capE9, rateE9: i64(market, base + 24), setSlot: u64(market, base + 40) };
+}
+/** A rate (e9 per slot) as a share per hour, at the measured slot time. */
+export const fundingPerHour = (rateE9: bigint) => Number(rateE9) / 1e9 * 3600 / slotSeconds();
+/** What a position of `size` (units, + = long) worth `notional` dollars pays (+) or receives (-)
+ *  per hour at `rateE9`: longs pay when the rate is positive, shorts when it is negative. */
+export const fundingCostPerHour = (rateE9: bigint, size: number, notional: number) => (size === 0 ? 0 : Math.sign(size) * fundingPerHour(rateE9) * Math.abs(notional));
+/** Where the router's rate is heading for a vault holding `inventory` against its position limit
+ *  (a mirror of `funding::target_rate`): nothing under a fifth of the limit, then in a line to the
+ *  maximum at the whole limit, paid by the side the vault is not on. */
+export function fundingTarget(inventory: bigint, limit: bigint): bigint {
+  const RR = L.router as any;
+  const max = BigInt(RR.funding_max_e9 ?? 30), free = BigInt(RR.funding_free_bps ?? 2000);
+  if (inventory === 0n || limit === 0n) return 0n;
+  const abs = inventory < 0n ? -inventory : inventory;
+  let used = abs * 10_000n / limit; if (used > 10_000n) used = 10_000n;
+  if (used <= free) return 0n;
+  const rate = max * (used - free) / (10_000n - free);
+  return inventory > 0n ? -rate : rate;
+}
+
+/** The vault's value now, as the router hands it to the vault when it arms a fill (the vault's
+ *  `live_nav`): its equity in Percolator scaled up by the cash share it keeps, never above the
+ *  value at the last roll. */
+export function liveNav(s: State): bigint {
+  const equity = s.lp.capital + s.lp.pnl;
+  const reserve = BigInt((L.router as any).reserve_bps ?? 3000);
+  const live = (equity > 0n ? equity : 0n) * 10_000n / (10_000n - reserve);
+  return live > 0n && live < s.vault.lastNav ? live : s.vault.lastNav;
+}
+
+/** The largest buy and sell the vault takes right now: a mirror of its matcher (`fill_caps` and
+ *  `allowed_fill`). Its limits come from its value now and its feed's tier; ordinary trades use
+ *  80% of the position limit (the rest is kept for closes and liquidations), and a trade that
+ *  adds to the vault's position gets less the fuller the vault is. `closing` = the trade only
+ *  shrinks the trader's own position (it may use the whole limit). */
+export function depth(s: State, held = 0n, closing = false): { long: bigint; short: bigint } {
   const v = s.vault;
   const price = s.asset.price;
+  const RR = L.router as any;
   let maxFill = v.maxFill, maxInv = v.maxInventory;
-  if (v.positionNavBps && price > 0n) {
-    const cap = (bps: number) => (v.lastNav * BigInt(bps) / 10_000n) * UNIT / price;
-    maxInv = maxInv < cap(v.positionNavBps) ? maxInv : cap(v.positionNavBps);
-    maxFill = maxFill < cap(v.fillNavBps) ? maxFill : cap(v.fillNavBps);
-  }
   const inv = v.inventory;
   const abs = inv < 0n ? -inv : inv;
+  const caps = (lpSign: 1n | -1n) => {
+    let f = maxFill, i = maxInv;
+    if (v.positionNavBps && price > 0n) {
+      const tier = tierOfFeed(v.feedHex);
+      const pos = Math.min(v.positionNavBps, tierPositionBps(tier)), fill = Math.min(v.fillNavBps, tierFillBps(tier));
+      const nav = liveNav(s);
+      const cap = (bps: number) => (nav * BigInt(bps) / 10_000n) * UNIT / price;
+      const full = cap(pos);
+      const limit = closing ? full : full * BigInt(RR.trade_room_bps ?? 8000) / 10_000n;
+      let fc = cap(fill);
+      const grows = inv === 0n || (inv > 0n) === (lpSign > 0n);
+      if (grows && full > 0n) {
+        let left = (full > abs ? full - abs : 0n) * 10_000n / full;
+        const min = BigInt(RR.min_fill_bps ?? 1000);
+        if (left < min) left = min;
+        fc = fc * left / 10_000n;
+      }
+      if (limit < i) i = limit;
+      if (fc < f) f = fc;
+    }
+    return { f, i };
+  };
   // Closing the vault's position is never capped; only new exposure is (per fill, and in total).
   const room = (lpSign: 1n | -1n) => {
+    const { f, i } = caps(lpSign);
     const reducing = inv !== 0n && (inv > 0n) !== (lpSign > 0n);
-    const open = reducing ? maxInv : maxInv > abs ? maxInv - abs : 0n;
-    return (reducing ? abs : 0n) + (open < maxFill ? open : maxFill);
+    const open = reducing ? i : i > abs ? i - abs : 0n;
+    return (reducing ? abs : 0n) + (open < f ? open : f);
   };
   const epochOver = s.slot >= v.epochStart + v.epochLen && v.needsFlat;
   if (epochOver) {
     // Reduce-only: a taker long is only filled if the vault is long (and vice versa), or as far
     // as it closes the taker's own short (within the vault's usual room).
     const heldAbs = held < 0n ? -held : held;
-    const closing = (lpSign: 1n | -1n) => (heldAbs < room(lpSign) ? heldAbs : room(lpSign));
+    const closingPart = (lpSign: 1n | -1n) => (heldAbs < room(lpSign) ? heldAbs : room(lpSign));
     const most = (a: bigint, b: bigint) => (a > b ? a : b);
-    return { long: most(inv > 0n ? abs : 0n, held < 0n ? closing(-1n) : 0n), short: most(inv < 0n ? abs : 0n, held > 0n ? closing(1n) : 0n) };
+    return { long: most(inv > 0n ? abs : 0n, held < 0n ? closingPart(-1n) : 0n), short: most(inv < 0n ? abs : 0n, held > 0n ? closingPart(1n) : 0n) };
   }
   // A taker long moves the vault short (lpSign -1).
   return { long: room(-1n), short: room(1n) };
+}
+
+/** What the vault would gain or lose if the price moved by `move` (e.g. -0.2 = a 20% fall),
+ *  with its position as it is now, and what it has to absorb that with: its value now, of which
+ *  its insurance covers traders' bad debt first. */
+export function stress(s: State, move: number): number {
+  const price = Number(s.asset.price) / 1e6;
+  return Number(s.vault.inventory) / Number(UNIT) * price * move;
 }
 
 // ---- cranks ----
@@ -562,11 +641,11 @@ export function politeFetch(gapMs = 120, retries = 4, timeoutMs = 20_000): typeo
 /** What `crankPlan` reads: the market account, the slot it was read at, and every portfolio. */
 export type MarketSnapshot = { market: Uint8Array; slot: number; portfolios: { pubkey: PublicKey; data: Uint8Array }[] };
 
-export async function marketSnapshot(conn: Connection): Promise<MarketSnapshot> {
+export async function marketSnapshot(conn: Connection, commitment: Commitment = "confirmed"): Promise<MarketSnapshot> {
   const [m, slot, accs] = await Promise.all([
-    conn.getAccountInfo(MARKET, "confirmed"),
-    conn.getSlot("confirmed"),
-    conn.getProgramAccounts(PERCOLATOR, { commitment: "confirmed", filters: [{ dataSize: PORTFOLIO_LEN }, { memcmp: { offset: 16, bytes: MARKET.toBase58() } }] }),
+    conn.getAccountInfo(MARKET, commitment),
+    conn.getSlot(commitment),
+    conn.getProgramAccounts(PERCOLATOR, { commitment, filters: [{ dataSize: PORTFOLIO_LEN }, { memcmp: { offset: 16, bytes: MARKET.toBase58() } }] }),
   ]);
   await fetchTiers(conn).catch(() => {}); // the margins and liquidation levels below depend on it
   return { market: new Uint8Array(m!.data), slot, portfolios: accs.map(a => ({ pubkey: a.pubkey, data: new Uint8Array(a.account.data) })) };
@@ -731,6 +810,8 @@ export async function fetchVault(conn: Connection, vaultKey: PublicKey, user?: P
     closeOnly: closeOnly(data(0)!, v.assetIndex),
     /** This asset's margins (bps): to open, below which it is liquidated, Percolator's own; and its tier. */
     levels: levels(data(0)!, v.assetIndex),
+    /** The market's funding: its cap, and the rate the router last set for this asset. */
+    funding: fundingOf(data(0)!, v.assetIndex),
     buffer: tokenAmount(data(2)),
     shareSupply: data(3) ? u64(data(3)!, 36) : 0n,
     pyth: data(4) ? decodePrice(data(4)!) : undefined,
@@ -780,10 +861,17 @@ export function accountHealth(market: Uint8Array, portfolio: Uint8Array) {
   return { equity, notional, settled, positions, floor: floor / 10_000n, liquidatable: settled && notional > 0n && (equity <= 0n || equity * 10_000n < floor) };
 }
 
-// ---- leverage tiers (the router's `levels`): majors open at 20x, the rest at 10x ----
-export const TIER_DEFAULT = 0, TIER_MAJOR = 1;
+// ---- tiers (the vault's `feeds` and the router's `levels`): majors open at 20x, stocks at 5x,
+// the rest at 10x; the vault holds up to 3x its value on majors and 1x on the rest ----
+export const TIER_DEFAULT = 0, TIER_MAJOR = 1, TIER_STOCK = 2;
 export const MAJOR_FEEDS: string[] = (L.router as any).major_feeds ?? [];
-export const tierOfFeed = (hex: string) => (MAJOR_FEEDS.includes(hex) ? TIER_MAJOR : TIER_DEFAULT);
+export const STOCK_FEEDS: string[] = (L.router as any).stock_feeds ?? [];
+export const tierOfFeed = (hex: string) => (MAJOR_FEEDS.includes(hex) ? TIER_MAJOR : STOCK_FEEDS.includes(hex) ? TIER_STOCK : TIER_DEFAULT);
+export const TIER_NAME = ["standard", "major", "stock"];
+const tierRow = (key: string, tier: number, fallback: number) => Number(((L.router as any)[key] as number[] | undefined)?.[tier] ?? fallback);
+export const tierInsuranceBps = (tier: number) => tierRow("insurance_nav_bps", tier, tier === TIER_MAJOR ? 300 : 800);
+export const tierPositionBps = (tier: number) => tierRow("tier_position_nav_bps", tier, tier === TIER_MAJOR ? 30_000 : 10_000);
+export const tierFillBps = (tier: number) => tierRow("tier_fill_nav_bps", tier, tier === TIER_MAJOR ? 7_500 : 2_500);
 export const tiersAddress = () => rpda(Buffer.from("tiers"), MARKET.toBuffer());
 /** The market's tier record as last read with the market (fetchVault, marketSnapshot, fetchTiers). */
 let TIERS: Uint8Array | null = null;
@@ -791,14 +879,14 @@ export const setTiers = (d?: Uint8Array | null) => { TIERS = d && d.length === (
 export async function fetchTiers(conn: Connection) { const a = await conn.getAccountInfo(tiersAddress(), "confirmed"); setTiers(a ? new Uint8Array(a.data) : null); return TIERS; }
 /** bps to open, bps below which it is liquidated, and Percolator's own maintenance margin, for
  *  `asset`: a mirror of the router's `levels` (never below what Percolator requires; without the
- *  record, open as the default tier and liquidate as a major). */
+ *  asset's tier recorded, open as the strictest tier and, with no record at all, liquidate as a major). */
 export function levels(market: Uint8Array, asset: number, tiers: Uint8Array | null = TIERS) {
   const RR = L.router as any;
   const im = u64(market, RR.im_bps_off), mm = u64(market, RR.mm_bps_off);
   const generation = u64(market, L.market.slots + asset * L.market.slot_len + L.market.engine + L.market.market_id);
   const known = tiers && asset < RR.tier_slots && u64(tiers, RR.tiers.generation + asset * 8) === generation ? tiers[RR.tiers.tier + asset] : undefined;
-  const openTier = known ?? TIER_DEFAULT, liqTier = known ?? (tiers ? TIER_DEFAULT : TIER_MAJOR);
-  const lv = (t: number) => (RR.tier_levels[t === TIER_MAJOR ? 1 : 0] as number[]).map(BigInt);
+  const openTier = known ?? TIER_STOCK, liqTier = known ?? (tiers ? TIER_DEFAULT : TIER_MAJOR);
+  const lv = (t: number) => ((RR.tier_levels[t] ?? RR.tier_levels[0]) as number[]).map(BigInt);
   const liqOf = (t: number) => { const a = lv(t)[1], b = mm + BigInt(RR.liq_above_engine_bps); return a > b ? a : b; };
   const ol = liqOf(openTier) + BigInt(RR.open_above_liq_bps);
   let open = lv(openTier)[0]; if (im > open) open = im; if (ol > open) open = ol;
@@ -866,6 +954,7 @@ export async function fetchMarket(conn: Connection) {
 const R = L.router;
 export const ROUTER = new PublicKey(R.program);
 export const ROUTER_DELAY_SECS = R.delay_secs;
+export const ROUTER_BATCH_SECS: number = (R as any).batch_secs ?? 1;
 export const ROUTER_GRACE_SECS = R.grace_secs;
 /** What a request posts and its executor earns. Larger on X1 (the router's X1 build), where a
  *  fill costs its sender about that much in fees. */
@@ -1144,6 +1233,21 @@ export const setTier = (payer: PublicKey, vault: PublicKey) => new TransactionIn
   programId: ROUTER,
   keys: [rw(payer, true), rw(tiersAddress()), ro(vault), ro(MARKET), ro(SystemProgram.programId)],
   data: new W().u8(29).done(),
+});
+/** Turns funding on for the market: its cap set to the vault program's constant (vault
+ *  `SetFundingCap`, anyone; the program's governor address signs, as for the trade fee). */
+export const setFundingCap = () => new TransactionInstruction({
+  programId: VAULT_PROGRAM,
+  keys: [ro(PublicKey.findProgramAddressSync([Buffer.from("governor"), MARKET.toBuffer()], VAULT_PROGRAM)[0]), rw(MARKET), ro(PERCOLATOR)],
+  data: Buffer.from([43]),
+});
+/** One step of a market's funding rate toward its target (router `RefreshFunding`, anyone). It
+ *  only acts when the asset is accrued to the current slot, so it goes right behind the cranks
+ *  that bring it there, in the same transaction; otherwise it does nothing (and fails nothing). */
+export const refreshFunding = (v: Vault) => new TransactionInstruction({
+  programId: ROUTER,
+  keys: [ro(v.key), rw(MARKET), ro(routerAuthority()), ro(VAULT_PROGRAM), ro(PERCOLATOR)],
+  data: Buffer.from([31]),
 });
 /** Fills a request whose target the mark is at. Anyone can; the executor earns the bond. */
 export const fillRequest = (executor: PublicKey, v: Vault, r: RouterRequest) => new TransactionInstruction({

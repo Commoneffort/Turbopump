@@ -94,7 +94,10 @@ pub struct VaultState {
     pub oracle_max_staleness_secs: u64,
     pub oracle_soft_stale_slots: u64,
     pub oracle_ewma_halflife_slots: u64,
-    pub oracle_mark_min_fee: u64,
+    /// The vault's value as the router read it when it armed the current fill (0 = not read).
+    /// The matcher holds the fill to the lower of this and `last_nav`. (These eight bytes were
+    /// `oracle_mark_min_fee`, which nothing ever read.)
+    pub armed_nav: u64,
     pub oracle_feeds: [[u8; 32]; 3],
     /// Insurance (long + short budget of the vault's asset) that fee harvesting never touches.
     pub insurance_floor: u64,

@@ -243,11 +243,11 @@ fn liquidation_and_epoch_settlement_work_on_reported_prices() {
     w.settle_open().unwrap();
     assert_eq!({ w.vault_state().epoch }, epoch + 1);
     // At 0.84 the account is below the router's liquidation level (11% on this 10% market):
-    // anyone closes it.
+    // anyone liquidates it, as far as it takes (a quarter, here).
     w.move_price(20, 840_000);
     w.close_out(7).unwrap();
-    assert_eq!(position(&w, 7), 0);
-    assert_eq!({ w.vault_state().inventory }, 0);
+    assert_eq!(position(&w, 7), 15 * UNIT as i128);
+    assert_eq!({ w.vault_state().inventory }, -15 * UNIT as i128);
 }
 
 #[test]

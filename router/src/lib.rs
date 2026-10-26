@@ -2,7 +2,8 @@
 //! front-run one.
 //!
 //! A trade is a request first. The request lands on chain and gets a target time: the later of
-//! the chain clock and the vault's current mark time, plus `DELAY_SECS`. It then fills at exactly
+//! the chain clock and the vault's current mark time, plus `DELAY_SECS`, rounded up to the next
+//! `BATCH_SECS` mark (so trades sent close together share one price). It then fills at exactly
 //! the first Pyth price published at or after that target, which nobody (the trader, a keeper, a
 //! validator, a Pyth publisher) could have known when the request was made:
 //!
@@ -24,6 +25,7 @@
 
 #[cfg(not(target_os = "solana"))]
 pub mod client;
+pub mod funding;
 pub mod social;
 pub mod state;
 pub mod swap;
@@ -59,6 +61,19 @@ solana_program::entrypoint!(process_instruction);
 /// Seconds between a request landing and the price it fills at. It must exceed the time for a
 /// real-world price move to reach a published Pyth price, plus any lag of the chain clock.
 pub const DELAY_SECS: i64 = 4;
+/// Targets fall on a shared grid: a request's target is rounded up to the next multiple of this
+/// many seconds. Every request in the same window, on every market, then fills at one price, so
+/// one price move (and one re-valuation of the accounts on the market) serves all of them. The
+/// wait only grows: the price is still unknown to everyone when the request lands.
+pub const BATCH_SECS: i64 = 2;
+
+/// The target time of a request landing at `now` while the mark is at `mark_publish`: at least
+/// `delay` seconds after both, rounded up to the batch grid.
+pub fn target_time(now: i64, mark_publish: i64, delay: i64) -> Option<i64> {
+    let earliest = now.max(mark_publish).checked_add(delay)?;
+    let over = earliest.rem_euclid(BATCH_SECS);
+    if over == 0 { Some(earliest) } else { earliest.checked_add(BATCH_SECS - over) }
+}
 /// How long after its target a request can still be filled before anyone may expire it.
 pub const GRACE_SECS: i64 = 90;
 /// A request whose price the mark already holds, and which nobody has filled this long after the
@@ -81,51 +96,36 @@ pub const BOND_LAMPORTS: u64 = 20_000_000;
 pub const STRESS_BPS: u128 = 0;
 
 // ---- leverage tiers (per asset) ----
+// The tier of each feed is the vault program's (`percolator_vault::feeds`), compiled in.
 /// Default tier: up to 10x (10% margin to open), liquidated below 6%.
-pub const TIER_DEFAULT: u8 = 0;
+pub use percolator_vault::feeds::TIER_DEFAULT;
 /// Majors (BTC, ETH): up to 20x (5% to open), liquidated below 3.5%.
-pub const TIER_MAJOR: u8 = 1;
-/// The feeds that are majors (the same ids on Pyth and on X1's reported prices).
-pub const MAJOR_FEEDS: [[u8; 32]; 2] = [
-    hex32("e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43"), // BTC/USD
-    hex32("ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace"), // ETH/USD
-];
+pub use percolator_vault::feeds::TIER_MAJOR;
+/// Stocks and the ETF (X1): up to 5x (20% to open), liquidated below 12%. Their price stands
+/// still while their exchanges are closed and can jump at the open, past a thinner margin.
+pub use percolator_vault::feeds::TIER_STOCK;
+pub use percolator_vault::feeds::{tier_of_feed, MAJOR_FEEDS, STOCK_FEEDS};
 /// The router liquidates at least this far (bps) above Percolator's own maintenance margin, and
 /// a position opens at least this far above the router's liquidation level.
 pub const LIQ_ABOVE_ENGINE_BPS: u64 = 100;
 pub const OPEN_ABOVE_LIQ_BPS: u64 = 150;
-const fn hex_digit(c: u8) -> u8 {
-    match c {
-        b'0'..=b'9' => c - b'0',
-        b'a'..=b'f' => c - b'a' + 10,
-        _ => panic!("hex"),
-    }
-}
-const fn hex32(h: &str) -> [u8; 32] {
-    let b = h.as_bytes();
-    let mut out = [0u8; 32];
-    let mut i = 0;
-    while i < 32 {
-        out[i] = hex_digit(b[2 * i]) * 16 + hex_digit(b[2 * i + 1]);
-        i += 1;
-    }
-    out
-}
 /// (bps to open, bps below which it is liquidated) of a tier.
 pub fn tier_levels(tier: u8) -> (u64, u64) {
-    if tier == TIER_MAJOR { (500, 350) } else { (1_000, 600) }
-}
-/// The tier of a feed: compiled in, so `SetTier` chooses nothing.
-pub fn tier_of_feed(feed: &[u8; 32]) -> u8 {
-    if MAJOR_FEEDS.iter().any(|f| f == feed) { TIER_MAJOR } else { TIER_DEFAULT }
+    match tier {
+        TIER_MAJOR => (500, 350),
+        TIER_STOCK => (2_000, 1_200),
+        _ => (1_000, 600),
+    }
 }
 /// The levels (open, liquidate) that apply to `asset` on this market. Never below what
 /// Percolator itself requires: the router liquidates `LIQ_ABOVE_ENGINE_BPS` above Percolator's
 /// maintenance margin and opens `OPEN_ABOVE_LIQ_BPS` above that, whatever the tier says (on a
 /// market created with 10% margins that is 12.5% to open and 11% to liquidate).
-/// Without the tier record (`tiers` None) the levels are the safe ones for each use: the default
-/// tier to open (never more leverage than is sure), the major tier to liquidate (never an early
-/// liquidation). So leaving the record out can neither buy leverage nor liquidate anyone sooner.
+/// Without the asset's tier in the record the levels are the safe ones for each use: the
+/// strictest tier (stocks) to open, so never more leverage than is sure, and, when the record
+/// itself is left out, the major tier to liquidate (never an early liquidation). So leaving the
+/// record out can neither buy leverage nor liquidate anyone sooner. The executor records every
+/// market's tier (`SetTier`) as soon as it is listed.
 pub fn levels(market: &[u8], tiers: Option<&state::Tiers>, asset: u16) -> Result<(u64, u64, u64), ProgramError> {
     let (im, _, _) = perc::margin_params(market)?;
     let mm = perc::maintenance_margin_bps(market)?;
@@ -134,7 +134,7 @@ pub fn levels(market: &[u8], tiers: Option<&state::Tiers>, asset: u16) -> Result
         let i = asset as usize;
         (i < state::TIER_SLOTS && t.generation[i] == generation).then(|| t.tier[i])
     });
-    let open_tier = known.unwrap_or(TIER_DEFAULT);
+    let open_tier = known.unwrap_or(TIER_STOCK);
     let liq_tier = known.unwrap_or(if tiers.is_some() { TIER_DEFAULT } else { TIER_MAJOR });
     let liq_of = |tier: u8| core::cmp::max(tier_levels(tier).1, mm + LIQ_ABOVE_ENGINE_BPS);
     let open_liq = liq_of(open_tier);
@@ -274,6 +274,7 @@ pub const TAG_REMOVE_BADGE_IMAGE: u8 = 27;
 pub const TAG_FEATURE: u8 = 28;
 pub const TAG_SET_TIER: u8 = 29;
 pub const TAG_SWAP: u8 = 30;
+pub const TAG_REFRESH_FUNDING: u8 = 31;
 /// Widest trail, in basis points.
 pub const MAX_TRAIL_BPS: u64 = 5_000;
 /// Shortest time between two slices of a TWAP order, and the most slices one can have.
@@ -386,6 +387,7 @@ pub fn process_instruction(program_id: &Pubkey, accounts: &[AccountInfo], data: 
         TAG_FEATURE => social::feature(program_id, accounts),
         TAG_SET_TIER => set_tier(program_id, accounts),
         TAG_SWAP => swap::swap(accounts, rest),
+        TAG_REFRESH_FUNDING => funding::refresh_funding(program_id, accounts),
         _ => Err(RouterError::InvalidInstruction.into()),
     }
 }
@@ -763,6 +765,52 @@ fn liquidatable(market: &[u8], portfolio: &[u8], tiers: Option<&state::Tiers>) -
     Ok(notional != 0 && (equity <= 0 || (equity as u128).saturating_mul(10_000) < floor))
 }
 
+/// A liquidation closes only as much as it takes: the size (signed, the opposite of the
+/// position's sign) that leaves the account's equity covering every position at its liquidation
+/// level plus `OPEN_ABOVE_LIQ_BPS` and `LIQ_TARGET_EXTRA_BPS` (its opening margin and a little
+/// more, for a recorded tier), so it is not liquidatable again at the next tick. It closes
+/// at least `LIQ_MIN_PART_BPS` of the position, and all of it when what would be left is under
+/// `LIQ_MIN_KEEP_BPS` of it, when equity is gone, or when the other positions alone need more
+/// than the equity. A partial close leaves the trader a smaller position instead of none, and
+/// asks the vault for less in one fill.
+fn liquidation_size(market: &[u8], portfolio: &[u8], tiers: Option<&state::Tiers>, asset: u16, before: i128) -> Result<i128, ProgramError> {
+    let all = before.checked_neg().ok_or(RouterError::Overflow)?;
+    let (capital, pnl, _) = perc::portfolio_exposure(portfolio)?;
+    let equity = (capital as i128).checked_add(pnl).ok_or(RouterError::Overflow)?;
+    if equity <= 0 || before == 0 {
+        return Ok(all);
+    }
+    let (mut others, mut price_here) = (0u128, 0u64);
+    for p in perc::positions(market, portfolio)? {
+        let (_, price, _) = perc::asset_price(market, p.asset)?;
+        if p.asset == asset {
+            price_here = price;
+            continue;
+        }
+        let n = p.size.unsigned_abs().saturating_mul(price as u128) / POS_SCALE;
+        let (_, liq, _) = levels(market, tiers, p.asset)?;
+        others = others.saturating_add(n.saturating_mul(liq as u128 + OPEN_ABOVE_LIQ_BPS as u128 + LIQ_TARGET_EXTRA_BPS));
+    }
+    let (_, liq_here, _) = levels(market, tiers, asset)?;
+    let room = (equity as u128).saturating_mul(10_000);
+    if price_here == 0 || room <= others {
+        return Ok(all);
+    }
+    let keep_notional = (room - others) / (liq_here as u128 + OPEN_ABOVE_LIQ_BPS as u128 + LIQ_TARGET_EXTRA_BPS);
+    let held = before.unsigned_abs();
+    let keep = (keep_notional.saturating_mul(POS_SCALE) / price_here as u128).min(held);
+    let close = (held - keep).max(held * LIQ_MIN_PART_BPS / 10_000);
+    if close >= held || held - close < held * LIQ_MIN_KEEP_BPS / 10_000 {
+        return Ok(all);
+    }
+    let close = i128::try_from(close).map_err(|_| RouterError::Overflow)?;
+    Ok(if before > 0 { -close } else { close })
+}
+/// See `liquidation_size`.
+pub const LIQ_TARGET_EXTRA_BPS: u128 = 50;
+pub const LIQ_MIN_PART_BPS: u128 = 2_500;
+pub const LIQ_MIN_KEEP_BPS: u128 = 1_000;
+
 /// Records an asset's leverage tier for its market (anyone may send it; the tier comes from the
 /// vault's own feed and the compiled `MAJOR_FEEDS`). Creates the market's record the first time.
 ///
@@ -895,7 +943,7 @@ fn enqueue_after<'a>(
     delay: i64,
 ) -> ProgramResult {
     let clock = Clock::get()?;
-    let target = clock.unix_timestamp.max(b.mark_publish_time).checked_add(delay).ok_or(RouterError::Overflow)?;
+    let target = target_time(clock.unix_timestamp, b.mark_publish_time, delay).ok_or(RouterError::Overflow)?;
     let id = b.next_id;
     let settlement = trader.is_none();
     let (rk, rbump) = request_address(program_id, vault_ai.key, owner, settlement);
@@ -1515,7 +1563,7 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             // without this, an account kept busy with small requests could not be liquidated
             // through the router at all.
             liquidated = before != 0;
-            size = before.checked_neg().ok_or(RouterError::Overflow)?;
+            size = liquidation_size(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, tiers.as_ref(), v.asset_index, before)?;
         } else if (close_only && !reduces) || !margin_covers_at(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, &v, size, 0, tiers.as_ref())? {
             size = 0;
         }
@@ -1525,8 +1573,10 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             // Reduce the whole position unilaterally at Percolator's price, which is the mark.
             reduce_unilaterally(trader_ai, market, portfolio, percolator, &t, v.asset_index)?;
         } else if !close_only && before != 0 && liquidatable(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, tiers_in(program_id, accounts, market.key).as_ref())? {
-            // Still below the liquidation level at the fill price: close against the vault.
-            size = before.checked_neg().ok_or(RouterError::Overflow)?;
+            // Still below the liquidation level at the fill price: close against the vault, as
+            // much as it takes (anyone may queue another if the account is still below after).
+            let tiers = tiers_in(program_id, accounts, market.key);
+            size = liquidation_size(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, tiers.as_ref(), v.asset_index, before)?;
         }
     }
     if size != 0 {
@@ -1534,6 +1584,9 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         // takes it even while it accepts nothing else that grows its position.
         let closing = before != 0 && (before > 0) != (size > 0) && size.unsigned_abs() <= before.unsigned_abs();
         trade_against_vault(accounts, &t, &v, abump, market_id, size, closing, fee_bps)?;
+        // The vault's position just changed: one step of its funding rate toward the new target
+        // (the asset is accrued to this slot, which Percolator requires to take a rate).
+        funding::refresh(acc(accounts, 5)?, acc(accounts, 6)?, acc(accounts, 10)?, acc(accounts, 11)?, acc(accounts, 12)?, abump)?;
     }
     // What actually traded (the vault may fill less than requested) and at what price.
     let traded = held(portfolio, market)? - before;
@@ -1579,10 +1632,15 @@ fn trade_against_vault(accounts: &[AccountInfo], t: &TraderState, v: &vstate::Va
     invoke_signed(
         &Instruction {
             program_id: percolator_vault::id(),
-            accounts: vec![AccountMeta::new_readonly(*authority.key, true), AccountMeta::new(*vault_ai.key, false)],
+            accounts: vec![
+                AccountMeta::new_readonly(*authority.key, true),
+                AccountMeta::new(*vault_ai.key, false),
+                AccountMeta::new_readonly(*market.key, false),
+                AccountMeta::new_readonly(*lp_portfolio.key, false),
+            ],
             data: arm,
         },
-        &[authority.clone(), vault_ai.clone(), vault_program.clone()],
+        &[authority.clone(), vault_ai.clone(), market.clone(), lp_portfolio.clone(), vault_program.clone()],
         &[&[SEED_AUTHORITY, &[abump]]],
     )?;
     let taker_view = perc::read_portfolio(portfolio, market.key, trader_ai.key)?;

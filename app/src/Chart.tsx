@@ -10,8 +10,10 @@ import { registerChartTools, rememberPicture } from "./chartTools";
 import { priceDp } from "./shared";
 import { isSpot, spotCandles } from "./swap";
 import { BADGES, Mark } from "./Traders";
+import { T, alpha } from "./theme";
+import { PULSE, WHALE_MINS, Whale, whaleRadius } from "./Pulse";
 
-const UP = "#48E160", DOWN = "#E15A48";
+const UP = T.green, DOWN = T.red;
 export const TIMEFRAMES: [label: string, res: number][] = [["1m", 60], ["5m", 300], ["15m", 900], ["1H", 3600], ["4H", 14400], ["1D", 86400]];
 
 type History = { source: string; candles: Candle[]; at: number };
@@ -101,40 +103,40 @@ function saveBuilt(symbol: string, res: number, built: Map<number, Candle>) {
 
 type Line = { price: number; title: string; color: string };
 
-const GREY = "#8A8A8A", LINE = "#2A2A2A", TEXT = "#F4F4F4";
+const GREY = T.textSecondary, LINE = T.borderPrimary, TEXT = T.textPrimary, DIM = T.textMuted;
 const period = (res: number) => (res >= 86400 ? { type: "day" as const, span: res / 86400 } : res >= 3600 ? { type: "hour" as const, span: res / 3600 } : { type: "minute" as const, span: res / 60 });
 const bar = (c: Candle): KLineData => ({ timestamp: c[0] * 1000, open: c[1], high: c[2], low: c[3], close: c[4], volume: c[5] });
 const FONT = '"JetBrains Mono", ui-monospace, monospace';
 const txt = (color: string, size = 11) => ({ color, size, family: FONT });
 const STYLES = {
-  grid: { horizontal: { color: "#222222" }, vertical: { color: "#222222" } },
+  grid: { horizontal: { color: T.chartGrid }, vertical: { color: T.chartGrid } },
   candle: {
     bar: { upColor: UP, downColor: DOWN, noChangeColor: GREY, upBorderColor: UP, downBorderColor: DOWN, noChangeBorderColor: GREY, upWickColor: UP, downWickColor: DOWN, noChangeWickColor: GREY },
     priceMark: {
-      high: { color: GREY, textSize: 10, textFamily: FONT }, low: { color: GREY, textSize: 10, textFamily: FONT },
-      last: { upColor: UP, downColor: DOWN, noChangeColor: GREY, text: { ...txt("#121212"), paddingLeft: 4, paddingRight: 4 } },
+      high: { color: DIM, textSize: 10, textFamily: FONT }, low: { color: DIM, textSize: 10, textFamily: FONT },
+      last: { upColor: DOWN, downColor: DOWN, noChangeColor: DOWN, line: { show: true, style: "dashed", dashedValue: [4, 3], size: 1 }, text: { ...txt("#FFFFFF"), paddingLeft: 4, paddingRight: 4 } },
     },
     tooltip: { title: txt(TEXT), legend: txt(GREY) },
   },
   indicator: {
     // Studies are drawn in the palette's greys, with coral and green for the lines that need telling apart.
-    lines: [TEXT, GREY, DOWN, UP, "#4A4A4A"].map(color => ({ color, size: 1, style: "solid", smooth: false, dashedValue: [2, 2] })),
-    bars: [{ style: "fill", borderStyle: "solid", borderSize: 1, borderDashedValue: [2, 2], upColor: "rgba(72,225,96,0.45)", downColor: "rgba(225,90,72,0.45)", noChangeColor: "#4A4A4A" }],
+    lines: [TEXT, GREY, DOWN, UP, DIM].map(color => ({ color, size: 1, style: "solid", smooth: false, dashedValue: [2, 2] })),
+    bars: [{ style: "fill", borderStyle: "solid", borderSize: 1, borderDashedValue: [2, 2], upColor: alpha(T.green, 0.45), downColor: alpha(T.red, 0.45), noChangeColor: DIM }],
     circles: [{ style: "fill", borderStyle: "solid", borderSize: 1, borderDashedValue: [2, 2], upColor: UP, downColor: DOWN, noChangeColor: GREY }],
-    tooltip: { title: txt(GREY), legend: txt(GREY) },
+    tooltip: { title: txt(DIM), legend: txt(DIM) },
     lastValueMark: { show: false },
   },
-  xAxis: { axisLine: { color: LINE }, tickLine: { color: LINE }, tickText: txt(GREY, 10.5) },
-  yAxis: { axisLine: { color: LINE }, tickLine: { color: LINE }, tickText: txt(GREY, 10.5) },
+  xAxis: { axisLine: { color: LINE }, tickLine: { color: LINE }, tickText: txt(DIM, 10.5) },
+  yAxis: { axisLine: { color: LINE }, tickLine: { color: LINE }, tickText: txt(DIM, 10.5) },
   separator: { color: LINE },
   crosshair: {
-    horizontal: { line: { color: "#4A4A4A" }, text: { ...txt(TEXT), backgroundColor: "#2A2A2A", borderColor: "#2A2A2A" } },
-    vertical: { line: { color: "#4A4A4A" }, text: { ...txt(TEXT), backgroundColor: "#2A2A2A", borderColor: "#2A2A2A" } },
+    horizontal: { line: { color: T.textMuted }, text: { ...txt(TEXT), backgroundColor: T.bgElevated, borderColor: T.borderPrimary } },
+    vertical: { line: { color: T.textMuted }, text: { ...txt(TEXT), backgroundColor: T.bgElevated, borderColor: T.borderPrimary } },
   },
   overlay: {
-    line: { color: TEXT }, point: { color: TEXT, borderColor: "rgba(244,244,244,0.3)", activeColor: TEXT, activeBorderColor: "rgba(244,244,244,0.3)" },
-    text: { ...txt(TEXT), backgroundColor: "#2A2A2A", borderColor: "#4A4A4A" }, rect: { color: "rgba(244,244,244,0.06)", borderColor: TEXT },
-    polygon: { color: "rgba(244,244,244,0.06)" }, circle: { color: "rgba(244,244,244,0.06)", borderColor: TEXT }, arc: { color: TEXT },
+    line: { color: TEXT }, point: { color: TEXT, borderColor: alpha(T.textPrimary, 0.3), activeColor: TEXT, activeBorderColor: alpha(T.textPrimary, 0.3) },
+    text: { ...txt(TEXT), backgroundColor: T.bgElevated, borderColor: T.borderPrimary }, rect: { color: alpha(T.textPrimary, 0.06), borderColor: TEXT },
+    polygon: { color: alpha(T.textPrimary, 0.06) }, circle: { color: alpha(T.textPrimary, 0.06), borderColor: TEXT }, arc: { color: TEXT },
   },
 };
 
@@ -170,8 +172,9 @@ const saved = (key: string, fallback: string[]): string[] => { try { const v = J
 /** One chart window. `slot` tells windows apart (each keeps its own timeframe and studies);
  *  `compact` is a secondary window: no drawing toolbar. `dense` is any window that shares the
  *  screen with others: the candle's figures show under the crosshair only. `head` is shown first in the window's bar
- *  (the layout buttons, or a secondary window's market). `marks` are other traders' fills. */
-export default function Chart({ symbol, label, price, lines, marks = [], slot = 0, compact = false, dense = false, head }: { symbol: string; label?: string; price: number; lines: Line[]; marks?: Mark[]; slot?: number; compact?: boolean; dense?: boolean; head?: ReactNode }) {
+ *  (the layout buttons, or a secondary window's market). `marks` are other traders' fills. `whales`, when given,
+ *  are every large fill on this market, drawn while the window's "Whales" box is ticked. */
+export default function Chart({ symbol, label, price, lines, marks = [], whales, slot = 0, compact = false, dense = false, head }: { symbol: string; label?: string; price: number; lines: Line[]; marks?: Mark[]; whales?: Whale[]; slot?: number; compact?: boolean; dense?: boolean; head?: ReactNode }) {
   const name = label ?? `${symbol}-PERP`, spot = isSpot(symbol);
   const own = slot ? `:${slot}` : "";
   const el = useRef<HTMLDivElement>(null);
@@ -281,7 +284,7 @@ export default function Chart({ symbol, label, price, lines, marks = [], slot = 
   // Candles, hollow candles, bars or a line; the crosshair; and whether drawings snap to prices.
   useEffect(() => {
     chart.current?.setStyles({
-      candle: { type: kind, area: { lineColor: TEXT, lineSize: 1.5, backgroundColor: [{ offset: 0, color: "rgba(244,244,244,0.10)" }, { offset: 1, color: "rgba(244,244,244,0)" }], point: { show: false } } },
+      candle: { type: kind, area: { lineColor: TEXT, lineSize: 1.5, backgroundColor: [{ offset: 0, color: alpha(T.textPrimary, 0.10) }, { offset: 1, color: alpha(T.textPrimary, 0) }], point: { show: false } } },
       crosshair: { show: cross },
     } as any);
     try { localStorage.setItem("pv:chart-kind", kind); localStorage.setItem("pv:chart-cross", cross ? "1" : "0"); } catch { /* storage unavailable */ }
@@ -306,7 +309,7 @@ export default function Chart({ symbol, label, price, lines, marks = [], slot = 
   useEffect(() => { chart.current?.overrideOverlay({ groupId: "drawing", visible: !hidden, lock: locked } as any); }, [hidden, locked]);
   /** Saves the chart as it is drawn (studies and drawings included) as a picture. */
   const snapshot = () => {
-    const url = chart.current?.getConvertPictureUrl(true, "png", "#121212");
+    const url = chart.current?.getConvertPictureUrl(true, "png", T.bgPanel);
     if (!url) return;
     const a = document.createElement("a");
     a.href = url;
@@ -334,7 +337,7 @@ export default function Chart({ symbol, label, price, lines, marks = [], slot = 
     if (!c) return;
     c.removeOverlay({ groupId: "position" });
     for (const l of lines.filter(x => x.price > 0)) {
-      c.createOverlay({ name: "simpleTag", groupId: "position", lock: true, extendData: l.title, points: [{ value: l.price }], styles: { line: { color: l.color, style: "dashed" }, text: { ...txt("#121212"), backgroundColor: l.color, borderColor: l.color } } } as any);
+      c.createOverlay({ name: "positionLine", groupId: "position", lock: true, extendData: { text: l.title, color: l.color }, points: [{ value: l.price }] } as any);
     }
   }, [lineKey, symbol, res]);
 
@@ -365,6 +368,27 @@ export default function Chart({ symbol, label, price, lines, marks = [], slot = 
     }
     return () => root.current?.removeEventListener("mouseleave", left);
   }, [markKey, symbol, res]);
+
+  // Large fills by anyone ("Whales" box): a bubble per fill of at least the chosen value.
+  const [whaleOn, setWhaleOn] = useState(() => { try { return localStorage.getItem("pv:whales") === "1"; } catch { return false; } });
+  const [whaleMin, setWhaleMin] = useState(() => { try { const v = Number(localStorage.getItem("pv:whale-min")); return WHALE_MINS.includes(v) ? v : WHALE_MINS[1]; } catch { return WHALE_MINS[1]; } });
+  const keep = (k: string, v: string) => { try { localStorage.setItem(k, v); } catch { /* storage unavailable */ } };
+  const bigOnes = useMemo(() => (whales && whaleOn ? whales.filter(w => w.value >= whaleMin) : []), [whales, whaleOn, whaleMin]);
+  const whaleKey = useMemo(() => bigOnes.map(w => w.key).join("|"), [bigOnes]);
+  useEffect(() => {
+    const c = chart.current;
+    if (!c) return;
+    c.removeOverlay({ groupId: "whales" });
+    const hover = (on: boolean) => (e: any) => { c.overrideOverlay({ id: e.overlay.id, extendData: { ...e.overlay.extendData, hover: on } }); return true; };
+    for (const w of bigOnes) {
+      const t = w.time - (w.time % res);
+      c.createOverlay({
+        name: "whaleMark", groupId: "whales", lock: true, points: [{ timestamp: t * 1000, value: w.price }],
+        extendData: { r: whaleRadius(w.value, whaleMin), buy: w.size > 0, label: `${w.name}${w.bot ? " (bot)" : ""} ${w.size > 0 ? "bought" : "sold"} $${Math.round(w.value).toLocaleString()}` },
+        onMouseEnter: hover(true), onMouseLeave: hover(false),
+      } as any);
+    }
+  }, [whaleKey, symbol, res, whaleMin]);
 
   const toggle = (name: string) => setStudies(s => (s.includes(name) ? s.filter(x => x !== name) : [...s, name]));
   return (
@@ -398,6 +422,17 @@ export default function Chart({ symbol, label, price, lines, marks = [], slot = 
             </div>
           )}
         </div>
+        {whales && PULSE.whales && (
+          <div className={`whale-tog${whaleOn ? " on" : ""}`} title="Mark every fill on this market worth at least the chosen amount, by anyone: a bubble under the candle for a buy, over it for a sell, sized by the trade's value">
+            <label><input type="checkbox" checked={whaleOn} onChange={e => { setWhaleOn(e.target.checked); keep("pv:whales", e.target.checked ? "1" : "0"); }} />Whales</label>
+            {whaleOn && (
+              <select value={whaleMin} aria-label="Smallest trade shown" onChange={e => { const v = Number(e.target.value); setWhaleMin(v); keep("pv:whale-min", String(v)); }}>
+                {WHALE_MINS.map(v => <option key={v} value={v}>≥ ${v >= 1000 ? `${v / 1000}k` : v}</option>)}
+              </select>
+            )}
+            {whaleOn && <em>{bigOnes.length}</em>}
+          </div>
+        )}
         <div className="chart-src" title={spot ? "Where the candles come from: xDEX's record of this pair's swaps. The last one follows the pool's own price." : "Where the candles come from. The last one always follows this market's own oracle price."}>
           {spot ? "xDEX swaps · live pool price" : source === "oracle" || source === "oracle+exchange" ? "Oracle price" : hasHistory(symbol) ? "Exchange history · live oracle price" : "Live oracle price"}
         </div>

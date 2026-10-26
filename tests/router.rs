@@ -8,7 +8,7 @@
 mod common;
 use common::*;
 use percolator_prog::ix::Instruction as ProgIx;
-use percolator_router::{client as rclient, state as rstate, RouterError, BOND_LAMPORTS, DELAY_SECS, GRACE_SECS, STALL_SECS};
+use percolator_router::{client as rclient, state as rstate, RouterError, BATCH_SECS, BOND_LAMPORTS, DELAY_SECS, GRACE_SECS, STALL_SECS};
 use percolator_vault::{error::VaultError, percolator as perc, processor};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
@@ -69,7 +69,8 @@ fn a_trade_fills_at_the_first_pyth_price_after_its_target_and_nothing_else() {
     // The trader "knows" the real price is 1.10 while the mark still says 1.00, and buys.
     let id = w.request(0, size).unwrap();
     let target = w.request_target(id);
-    assert_eq!(target, w.clock_ts().max(w.book().mark_publish_time) + DELAY_SECS);
+    let earliest = w.clock_ts().max(w.book().mark_publish_time) + DELAY_SECS;
+    assert!(target >= earliest && target < earliest + BATCH_SECS && target % BATCH_SECS == 0);
 
     // Before the target: the mark can move forward, but the request cannot fill yet.
     at(&mut w, target - 2);
@@ -449,15 +450,25 @@ fn a_trader_below_the_liquidation_level_is_closed_against_the_vault() {
     // on this market (1% above Percolator's own 10%) and still above that 10%.
     w.move_price(20, 840_000);
     assert_eq!(position(&w, 7), 20 * UNIT as i128, "Percolator has not liquidated it");
-    // Anyone queues the liquidation; it closes the position against the vault at the next price.
+    // Anyone queues the liquidation; it closes against the vault at the next price only as much as
+    // it takes: what is left (1.8 USDC against 12.6 of notional, 14%) is back above 12.5% to open
+    // plus 0.5%, so 3.5 units would do; a liquidation closes at least a quarter, so 5 go.
     w.close_out(7).unwrap();
-    assert_eq!(position(&w, 7), 0);
-    assert!(w.portfolio_view().flat, "the vault's side closed with it");
-    assert_eq!({ w.vault_state().inventory }, 0);
+    assert_eq!(position(&w, 7), 15 * UNIT as i128, "a partial liquidation");
+    assert_eq!({ w.vault_state().inventory }, -15 * UNIT as i128, "the vault's side shrank with it");
+    expect(w.close_out(7), router_code(RouterError::NotCloseOnly));
     // Nothing was deleveraged, so the market stays open, and the trader keeps what was left.
     let a = asset_state(&w);
     assert_eq!((a.a_long, a.a_short), (percolator::ADL_ONE, percolator::ADL_ONE));
     assert!(equity(&w, 7) > 1_700_000 && equity(&w, 7) <= 1_800_000, "equity {}", equity(&w, 7));
+    // A further fall takes it under the level again (at 0.75, 15 units hold 0.45 USDC against
+    // 11.25, 4%), and the next liquidation again closes only what it takes: about 4.6 units stay.
+    w.move_price(20, 750_000);
+    w.close_out(7).unwrap();
+    let left = position(&w, 7);
+    assert!(left > 4 * UNIT as i128 && left < 5 * UNIT as i128, "left {left}");
+    assert_eq!({ w.vault_state().inventory }, -left);
+    expect(w.close_out(7), router_code(RouterError::NotCloseOnly));
     w.taker_trade(1, UNIT as i128).unwrap();
 }
 
@@ -591,15 +602,16 @@ fn a_request_that_lapses_on_a_market_that_was_behind_gets_its_deposit_back() {
 fn the_router_liquidates_above_percolators_own_level() {
     let mut w = live();
     let market = w.env.svm.get_account(&w.env.market).unwrap().data;
-    assert_eq!(percolator_router::levels(&market, None, w.asset()).unwrap(), (1_250, 1_100, 1_000));
+    // (Without the tier record a position would open at the strictest tier's 20%.)
+    assert_eq!(percolator_router::levels(&market, None, w.asset()).unwrap(), (2_000, 1_100, 1_000));
     leveraged_long(&mut w);
     // 20 long on 5 USDC. At 0.845 the account holds 1.9 against 16.9: 11.2%, and stays.
     w.move_price(20, 845_000);
     expect(w.close_out(7), router_code(RouterError::NotCloseOnly));
-    // At 0.84: 1.8 against 16.8 is 10.7%, and it is closed against the vault.
+    // At 0.84: 1.8 against 16.8 is 10.7%, and it is closed against the vault (a quarter of it).
     w.move_price(20, 840_000);
     w.close_out(7).unwrap();
-    assert_eq!(position(&w, 7), 0);
+    assert_eq!(position(&w, 7), 15 * UNIT as i128);
     let a = asset_state(&w);
     assert_eq!((a.a_long, a.a_short), (percolator::ADL_ONE, percolator::ADL_ONE));
 }
@@ -617,7 +629,7 @@ fn leverage_follows_the_assets_tier() {
     let asset = w.asset();
     let market = w.env.market;
     let data = w.env.svm.get_account(&market).unwrap().data;
-    assert_eq!(levels(&data, None, asset).unwrap(), (1_000, 350, 250), "no record: open as default, liquidate as major");
+    assert_eq!(levels(&data, None, asset).unwrap(), (2_000, 350, 250), "no record: open as the strictest tier, liquidate as major");
 
     // SetTier writes the default tier for this vault's feed, with the asset's generation.
     let (tk, _) = rstate::tiers_address(&percolator_router::id(), &market);
@@ -660,7 +672,8 @@ fn leverage_follows_the_assets_tier() {
     expect(w.send(vec![bare], &[&kp8]), router_code(RouterError::InsufficientMargin));
     // ...and is liquidated below 3.5% either way. 9 long on 0.5: at 0.985 it holds 0.365 against
     // 8.87 (4.1%), not yet; at 0.98, 0.32 against 8.82 (3.6%), not yet; at 0.977, 0.293 against
-    // 8.79 (3.3%), and it is closed. (Percolator's own 2.5% is not reached.)
+    // 8.79 (3.3%), and it is liquidated: down to what 0.29 covers at 3.5% + 1.5% + 0.5% (about
+    // 5.4 units of the 9). (Percolator's own 2.5% is not reached.)
     let close = rclient::request_close(&w.payer.pubkey(), &t8, &w.vault);
     let mut close_bare = close.clone();
     close_bare.accounts.pop();
@@ -671,7 +684,8 @@ fn leverage_follows_the_assets_tier() {
     expect(w.send(vec![close_bare.clone()], &[]), router_code(RouterError::NotCloseOnly));
     w.move_price(20, 977_000);
     w.close_out(8).unwrap();
-    assert_eq!(position(&w, 8), 0, "closed against the vault");
+    let left = position(&w, 8);
+    assert!(left > 5 * UNIT as i128 && left < 6 * UNIT as i128, "partly closed against the vault: {left}");
     let a = asset_state(&w);
     assert_eq!((a.a_long, a.a_short), (percolator::ADL_ONE, percolator::ADL_ONE), "before Percolator's own liquidation");
 }
@@ -722,10 +736,10 @@ fn a_trader_below_the_liquidation_level_cannot_hide_behind_its_own_requests() {
     let t = w.trader(7);
     let close = rclient::request_close(&w.payer.pubkey(), &t, &w.vault);
     expect(w.send(vec![close], &[]), router_code(RouterError::RequestPending));
-    // Its own request fills: at that price the account is below the level, and all of it closes.
+    // Its own request fills: at that price the account is below the level, so the fill is a
+    // liquidation (a quarter of the position) instead of the one unit asked for.
     w.execute(7, id).unwrap();
-    assert_eq!(position(&w, 7), 0);
-    assert!(w.portfolio_view().flat);
+    assert_eq!(position(&w, 7), 15 * UNIT as i128);
     let a = asset_state(&w);
     assert_eq!((a.a_long, a.a_short), (percolator::ADL_ONE, percolator::ADL_ONE));
     // A healthy account's request is still just its request.
@@ -885,4 +899,76 @@ fn a_request_left_unfilled_at_its_price_can_be_expired_after_the_stall_time() {
     assert_eq!({ w.book().len }, 0);
     // The mark is free to move on, and the trader to trade.
     w.taker_trade(0, UNIT as i128).unwrap();
+}
+
+/// Two requests waiting at the same price can be filled in one transaction (the executor sends
+/// them together, a few at a time, so many liquidations in a crash do not wait one behind the other).
+#[test]
+fn two_requests_at_one_price_fill_in_one_transaction() {
+    let mut w = live();
+    let a = w.request(1, 2 * UNIT as i128).unwrap();
+    let b = w.request(2, -(3 * UNIT as i128)).unwrap();
+    let target = w.request_target(a).max(w.request_target(b));
+    let slot = w.env.current_slot() + 1;
+    w.env.set_clock(slot, target.max(w.clock_ts()));
+    let prev = w.pyth_time;
+    w.pyth_time = target;
+    let u = w.pyth_update(w.price, target, prev);
+    w.advance_to(u).unwrap();
+    w.converge();
+    let p = w.payer.pubkey();
+    let ixs = vec![w.fill_ix(1, a, &p), w.fill_ix(2, b, &p)];
+    w.send(ixs, &[]).unwrap();
+    assert_eq!(position(&w, 1), 2 * UNIT as i128);
+    assert_eq!(position(&w, 2), -3 * (UNIT as i128));
+}
+
+/// Two liquidations at one price, in one transaction.
+#[test]
+fn two_liquidations_at_one_price_fill_in_one_transaction() {
+    let mut w = live();
+    leveraged_long(&mut w);
+    let mint = w.env.mint;
+    let u = w.new_user(100_000_000);
+    let t = rclient::TraderKeys::new(w.env.market, u.kp.pubkey());
+    w.send(vec![rclient::open_account(&t, &mint), rclient::deposit(&t, &u.collateral, &w.env.vault, 5_000_000)], &[&u.kp]).unwrap();
+    w.traders.insert(8, (u, t));
+    w.taker_trade(8, 20 * UNIT as i128).unwrap();
+    w.move_price(20, 840_000);
+    let p = w.payer.pubkey();
+    let (t7, t8) = (w.trader(7), w.trader(8));
+    let a = w.book().next_id;
+    w.send(vec![rclient::request_close(&p, &t7, &w.vault)], &[]).unwrap();
+    let b = w.book().next_id;
+    w.send(vec![rclient::request_close(&p, &t8, &w.vault)], &[]).unwrap();
+    let target = w.request_target(a).max(w.request_target(b));
+    let slot = w.env.current_slot() + 1;
+    w.env.set_clock(slot, target.max(w.clock_ts()));
+    let prev = w.pyth_time;
+    w.pyth_time = target;
+    let up = w.pyth_update(w.price, target, prev);
+    w.advance_to(up).unwrap();
+    w.converge();
+    let ixs = vec![w.fill_ix(7, a, &p), w.fill_ix(8, b, &p)];
+    w.send(ixs, &[]).unwrap();
+    assert_eq!(position(&w, 7), 15 * UNIT as i128);
+    assert_eq!(position(&w, 8), 15 * UNIT as i128);
+}
+
+/// Targets fall on the batch grid, never sooner than the delay, and requests sent within one
+/// window share a target (and so a price).
+#[test]
+fn targets_are_rounded_up_to_the_batch_grid() {
+    use percolator_router::target_time;
+    for now in 1_000..1_010i64 {
+        for mark in [0, now - 5, now, now + 3] {
+            let t = target_time(now, mark, DELAY_SECS).unwrap();
+            let earliest = now.max(mark) + DELAY_SECS;
+            assert!(t >= earliest && t - earliest < BATCH_SECS && t % BATCH_SECS == 0, "now {now} mark {mark} -> {t}");
+        }
+    }
+    // Sent one second apart, inside one window: the same target.
+    let a = (1_000..).find(|n| (n + DELAY_SECS) % BATCH_SECS == 1).unwrap();
+    assert_eq!(target_time(a, 0, DELAY_SECS), target_time(a + 1, 0, DELAY_SECS));
+    assert_eq!(target_time(i64::MAX - 1, 0, DELAY_SECS), None);
 }
