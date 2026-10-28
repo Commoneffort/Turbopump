@@ -499,24 +499,46 @@ async function fillTogether(v: C.Vault, b: C.Book, rs: C.RouterRequest[]): Promi
   return done;
 }
 
-/** Sends alternative versions of one action at once (no preflight) and waits until one lands. */
+// Which version of a race landed, counted per kind of race (its first word and how many versions
+// it had), so the one that usually lands goes out first.
+const raceWins = new Map<string, number[]>();
+// How long the first version gets before the others follow anyway (a version that neither lands
+// nor fails in that time is usually just slow, and the others cannot both succeed with it).
+const FIRST_ALONE_MS = Number(process.env.RACE_FIRST_MS ?? 1_500);
+
+/** Sends alternative versions of one action (no preflight) and waits until one lands. They differ
+ *  only in their cranks and at most one can succeed. On X1 a failed transaction still pays for all
+ *  the compute it asked for (about 0.011 XNT here), and sending every version at once paid for one
+ *  or two failures on every fill: there the version that usually lands goes out alone first, and
+ *  the others only once it has failed or after FIRST_ALONE_MS. */
 async function race(label: string, variants: TransactionInstruction[][]) {
-  const sigs: string[] = [];
-  // The variants differ by one crank and only one can succeed, so on X1 each asks for what the
-  // largest of them uses in simulation, with room for one more crank.
+  const sigs: (string | null)[] = variants.map(() => null);
+  // Each asks for what the largest of them uses in simulation, with room for one more crank.
   let most = 0;
   if (C.X1) most = Math.max(...(await Promise.all(variants.map(ixs => C.computeLimit(conn, payer.publicKey, ixs)))).map(ix => ix.data.readUInt32LE(1)));
-  const one = async (ixs: TransactionInstruction[]) => {
+  const one = async (i: number) => {
     const head = C.X1 ? [ComputeBudgetProgram.setComputeUnitLimit({ units: Math.min(1_400_000, Math.ceil(most * 1.25) + 150_000) })] : budget();
-    const sig = await conn.sendTransaction(new Transaction().add(...head, ...ixs), [payer], { skipPreflight: true }).catch(() => null);
-    if (sig) sigs.push(sig);
+    sigs[i] = await conn.sendTransaction(new Transaction().add(...head, ...variants[i]), [payer], { skipPreflight: true }).catch(() => null);
   };
-  if (C.X1) await Promise.all(variants.map(one)); else for (const ixs of variants) await one(ixs);
-  for (const until = Date.now() + 20_000; Date.now() < until && sigs.length; ) {
+  const kind = `${label.split(" ")[0]}/${variants.length}`;
+  const wins = raceWins.get(kind) ?? raceWins.set(kind, variants.map(() => 0)).get(kind)!;
+  // Most wins first; a tie keeps the caller's order (its first guess is the slot's own count).
+  const order = variants.map((_, i) => i).sort((a, b) => wins[b] - wins[a] || a - b);
+  let pending = order;
+  const sendRest = async () => { const rest = pending; pending = []; await Promise.all(rest.map(one)); };
+  if (C.X1 && variants.length > 1) { pending = order.slice(1); await one(order[0]); if (!sigs[order[0]]) await sendRest(); }
+  else if (C.X1) await sendRest();
+  else { pending = []; for (const i of order) await one(i); }
+  const firstAlone = Date.now() + FIRST_ALONE_MS;
+  for (const until = Date.now() + 20_000; Date.now() < until && sigs.some(s => s); ) {
     await new Promise(r => setTimeout(r, POLL_MS));
-    const st = (await conn.getSignatureStatuses(sigs).catch(() => null))?.value ?? [];
-    if (st.some(landed)) { log("ok", label); return true; }
-    if (st.length === sigs.length && st.every(x => x?.err)) { log("fail", label, st.map(x => JSON.stringify(x!.err)).join(" / ")); return false; }
+    const sent = sigs.map((s, i) => [s, i] as const).filter(([s]) => s) as (readonly [string, number])[];
+    const st = (await conn.getSignatureStatuses(sent.map(([s]) => s)).catch(() => null))?.value ?? [];
+    const won = st.findIndex(landed);
+    if (won >= 0) { wins[sent[won][1]]++; log("ok", label); return true; }
+    const allFailed = st.length === sent.length && st.every(x => x?.err);
+    if (pending.length && (allFailed || Date.now() > firstAlone)) { await sendRest(); continue; }
+    if (allFailed) { log("fail", label, st.map(x => JSON.stringify(x!.err)).join(" / ")); return false; }
   }
   log("fail", label, "not confirmed within 20 s");
   return false;

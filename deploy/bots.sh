@@ -7,11 +7,13 @@
 #   BOT_PACE_SECS=240 to change the pace, BOT_SYMBOLS=SOL,BTC to change the markets traded
 #   BOT_SKIP=bot-a,bot-b to leave bots out. On X1 the max-leverage bots are left out by default: their
 #   orders mostly expire, and each expired order forfeits up to 5 XNT (about 90% of X1 bot spending).
-#   BOT_SKIP= (empty) runs them all.
+#   Since 2026-10-28 scalper and random are left out on both networks (to save fees: every open
+#   position is settled on every price move; trend, fade and cross cover the same paths), and X1
+#   bots trade every 360 s instead of 240. BOT_SKIP= (empty) runs them all.
 cd "$(dirname "$0")/.."
 case "$1" in
-  x1)     NET=x1-testnet; NAME=x1-bots; RPC=${X1_RPC:-https://rpc.testnet.x1.xyz}; SYMBOLS=${BOT_SYMBOLS:-SOL,BTC,ETH}; PACE=${BOT_PACE_SECS:-240}; SKIP=${BOT_SKIP-bot-edge-long,bot-edge-short,bot-max} ;;
-  devnet) NET=devnet; NAME=devnet-bots; RPC=${DEVNET_RPC:-$(cat ~/.config/percolator/devnet-rpc 2>/dev/null || echo https://api.devnet.solana.com)}; SYMBOLS=${BOT_SYMBOLS:-SOL,BTC,ETH}; PACE=${BOT_PACE_SECS:-600}; SKIP=${BOT_SKIP-} ;;
+  x1)     NET=x1-testnet; NAME=x1-bots; RPC=${X1_RPC:-https://rpc.testnet.x1.xyz}; SYMBOLS=${BOT_SYMBOLS:-SOL,BTC,ETH}; PACE=${BOT_PACE_SECS:-360}; SKIP=${BOT_SKIP-bot-edge-long,bot-edge-short,bot-max,bot-scalper,bot-random} ;;
+  devnet) NET=devnet; NAME=devnet-bots; RPC=${DEVNET_RPC:-$(cat ~/.config/percolator/devnet-rpc 2>/dev/null || echo https://api.devnet.solana.com)}; SYMBOLS=${BOT_SYMBOLS:-SOL,BTC,ETH}; PACE=${BOT_PACE_SECS:-600}; SKIP=${BOT_SKIP-bot-scalper,bot-random} ;;
   *) echo "usage: $0 x1|devnet start | stop | status | report [hours] | failures"; exit 1 ;;
 esac
 mkdir -p deploy/logs

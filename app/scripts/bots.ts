@@ -153,8 +153,9 @@ const trade = (label: string, kp: Keypair, vault: PublicKey, size: bigint) => se
 // ---- money for the bots ----
 const deployer = () => read(process.env.KEYPAIR ?? `${process.env.HOME}/.config/solana/${C.X1 ? "percolator-x1" : "percolator-test"}/deployer.json`);
 // Every order carries a bond that goes to whoever fills it (our own executor, so it comes back
-// to the wallet that pays this). A bot is topped up for about thirty orders at a time.
-const GAS_LOW = C.ROUTER_BOND_LAMPORTS * 4, GAS_FILL = C.ROUTER_BOND_LAMPORTS * 30;
+// to the wallet that pays this). A bot is topped up for about ten orders at a time (thirty until
+// 2026-10-28, which left ~740 XNT sitting in bot wallets on X1).
+const GAS_LOW = C.ROUTER_BOND_LAMPORTS * 4, GAS_FILL = C.ROUTER_BOND_LAMPORTS * 10;
 const ACCOUNT_RENT = 0.12 * LAMPORTS_PER_SOL; // a trading account, its portfolio and track record, with room
 // A request also carries a deposit (0.1% of its size, in the chain's coin) that comes back when
 // it fills: each bot keeps enough for the largest order its money allows (about 5x of it).

@@ -100,6 +100,17 @@ async function gas(kp: Keypair) {
   const r = await send("coin for a swap bot", from, [SystemProgram.transfer({ fromPubkey: from.publicKey, toPubkey: kp.publicKey, lamports })]);
   note({ type: "gas", wallet: kp.publicKey.toBase58(), lamports, ok: !!r.sig });
 }
+// The sellers are topped up from the deploy wallet and the arbitrage bot buys their coin back, so
+// coin piled up in swap-arb (518 XNT by 2026-10-28). Each bot sends back what it holds above its
+// ceiling, keeping its working amount (arb: two of its pool-sized trades and more; the others COIN_KEEP).
+const COIN_MAX = C.X1 ? { arb: [100, 150], other: [40, 60] } : { arb: [1, 1.5], other: [0.4, 0.6] };
+async function giveBack(kp: Keypair, [keep, max]: number[]) {
+  const have = await conn.getBalance(kp.publicKey);
+  if (have <= max * LAMPORTS_PER_SOL) return;
+  const lamports = have - Math.round(keep * LAMPORTS_PER_SOL);
+  const r = await send("coin back from a swap bot", kp, [SystemProgram.transfer({ fromPubkey: kp.publicKey, toPubkey: deployer().publicKey, lamports })]);
+  note({ type: "give-back", wallet: kp.publicKey.toBase58(), lamports, ok: !!r.sig });
+}
 async function usdc(kp: Keypair, amount: number) {
   if ((await balanceOf(kp.publicKey, C.MINT, TOKEN_PROGRAM_ID)) >= BigInt(amount * C.USDC) / 2n) return;
   const f = faucet(), from = deployer(), ata = C.ata(kp.publicKey, C.MINT);
@@ -262,6 +273,7 @@ async function run() {
   for (;;) {
     try {
       for (const kp of [ARB, RANDOM, MARGIN, EXPLORER]) await gas(kp);
+      for (const kp of [ARB, RANDOM, MARGIN, EXPLORER]) await giveBack(kp, kp === ARB ? COIN_MAX.arb : COIN_MAX.other);
       await usdc(ARB, C.X1 ? 30 : 100);
       await usdc(RANDOM, C.X1 ? 20 : 50);
       const p = await S.readPool(conn, S.USDC_POOL).catch(() => undefined);
