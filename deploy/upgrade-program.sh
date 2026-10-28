@@ -74,8 +74,10 @@ fi
 if [ "$2" = devnet ] && [ -z "$FAST_UPLOAD" ]; then
   # The public devnet RPC blocks this server for minutes after the CLI's burst of uploads: a
   # throttled upload instead (only missing pieces are sent; rerun it until the buffer matches).
-  (cd app && RPC=$RPC npx tsx scripts/write-buffer.ts "../$BUF" "../$SO" "$SIGNER") | tail -3
-  (cd app && RPC=$RPC npx tsx scripts/write-buffer.ts "../$BUF" "../$SO" "$SIGNER") | grep -q "buffer matches binary" || { echo "upload not finished: run this again to continue"; exit 1; }
+  # (Run from app/: a relative binary path gets one more ../, an absolute one is kept.)
+  case "$SO" in /*) SO_APP=$SO ;; *) SO_APP=../$SO ;; esac
+  (cd app && RPC=$RPC npx tsx scripts/write-buffer.ts "../$BUF" "$SO_APP" "$SIGNER") | tail -3
+  (cd app && RPC=$RPC npx tsx scripts/write-buffer.ts "../$BUF" "$SO_APP" "$SIGNER") | grep -q "buffer matches binary" || { echo "upload not finished: run this again to continue"; exit 1; }
 else
   solana program write-buffer -u "$RPC" -k "$KEY" --use-rpc --max-sign-attempts 50 --buffer "$BUF" --buffer-authority "$SIGNER" "$SO"
 fi
