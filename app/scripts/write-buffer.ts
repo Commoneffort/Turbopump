@@ -11,7 +11,8 @@ const LOADER = new PublicKey("BPFLoaderUpgradeab1e11111111111111111111111");
 const HEADER = 37; // Buffer { authority: Option<Pubkey> }
 const CHUNK = 900;
 const conn = new Connection(process.env.RPC ?? "https://api.devnet.solana.com", { commitment: "confirmed", disableRetryOnRateLimit: true, fetch: politeFetch(250, 6) });
-const payer = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(`${process.env.HOME}/.config/solana/percolator-test/deployer.json`, "utf8"))));
+// PAYER: the paying wallet (default the devnet deploy wallet; on X1, percolator-x1/deployer.json).
+const payer = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(process.env.PAYER ?? `${process.env.HOME}/.config/solana/percolator-test/deployer.json`, "utf8"))));
 const authority = process.argv[4] ? Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(process.argv[4], "utf8")))) : payer;
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 (async () => {
