@@ -58,7 +58,7 @@ pub fn next_rate(current: i64, target: i64, elapsed: u64) -> i64 {
 
 /// The vault's position limit (units) at `price_e6`, as its matcher counts it (`fill_caps`):
 /// its tier's multiple of its value.
-fn position_limit(v: &vstate::VaultState, price_e6: u64) -> u128 {
+pub fn position_limit(v: &vstate::VaultState, price_e6: u64) -> u128 {
     let tier = percolator_vault::feeds::cap_tier(&v.oracle_feeds[0]);
     let bps = v.position_nav_bps.min(percolator_vault::feeds::position_nav_bps(tier));
     percolator_vault::math::nav_cap(v.last_nav, bps, price_e6)

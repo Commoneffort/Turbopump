@@ -1,5 +1,5 @@
 import { MANIFEST as M } from "./chain";
-import { CANON_EPOCH_LEN_SLOTS, LAYOUT, ROUTER, ROUTER_BATCH_SECS, ROUTER_DELAY_SECS, ROUTER_GRACE_SECS, TRADE_FEE_PCT, X1, slotSeconds } from "./chain";
+import { CANON_EPOCH_LEN_SLOTS, CARRY, LAYOUT, holdPctHour, ROUTER, ROUTER_BATCH_SECS, ROUTER_DELAY_SECS, ROUTER_GRACE_SECS, TRADE_FEE_PCT, X1, slotSeconds } from "./chain";
 import { COPY_FEE_TEXT, LEADER_PAID, REBATE } from "./social";
 
 const ex = (k: string) => (X1 ? `https://explorer.testnet.x1.xyz/address/${k}` : `https://explorer.solana.com/address/${k}?cluster=devnet`);
@@ -30,6 +30,7 @@ const TOC = [
   ["rules", "Market rules"],
   ["pricing", "Share pricing"],
   ["funding", "Funding"],
+  ["holding", "Holding fee and crowded-side fee"],
   ["fees", "Fees and rebates"],
   ["rails", "Safety rails"],
   ["risks", "Risks"],
@@ -343,7 +344,8 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
             liquidations (see Market rules). <b>What brings it back:</b> a change in Percolator so that a funding payment alone
             no longer blocks new trades (each position would take its funding when it is next settled, instead of every position
             having to be settled first). The rest is built and tested: the rate, its limits and the switch are on chain, and the
-            design below is what will run.
+            design below is what will run. Meanwhile the router charges a holding fee of its own to the crowded side, paid to the
+            vault (see the next section).
           </p>
         )}
         <ul>
@@ -354,6 +356,33 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           <li><b>Enforced on chain.</b> Funding is part of every position's value in Percolator's own accounts: it counts toward margin and liquidation like any loss, and what one side pays the other receives (each side's share is rounded against it, so the market is never short). The router sets the rate after each fill and anyone can step it along on a quiet market (<code>RefreshFunding</code>); Percolator applies a new rate only from the slot it is set at, never to time already passed.</li>
           <li><b>Where to see it.</b> The market bar shows the current rate, who pays and where it is heading (today it says "off"); once it is on, the order ticket also shows what the position after your order would pay, or receive, in a day at today's rate.</li>
           <li><b>Example.</b> A vault that is 60% full, short (traders net long), sets a target of half the maximum: about {fmtPct(fundingHour(FUNDING.max) / 2)} an hour. A $10,000 long then pays about ${fmt2(10_000 * fundingHour(FUNDING.max) / 2 * 24)} a day, which goes to the vault and to traders who are short.</li>
+        </ul>
+
+        <h2 id="holding">Holding fee and crowded-side fee</h2>
+        <p>
+          The vault is the other side of every trade. When most traders lean one way for a long time (long on markets that keep
+          rising, for example), the vault holds the opposite position all that time and slowly loses. Elsewhere funding makes
+          the crowded side pay for that; here the router charges it directly, for the vault's depositors.
+        </p>
+        <ul>
+          <li><b>Holding fee.</b> While a vault holds more than {Number(CARRY.holdFreeBps) / 100}% of its position limit, the side it
+            is against owes a fee for every second it holds: nothing at {Number(CARRY.holdFreeBps) / 100}%, rising in a straight
+            line to {holdPctHour(CARRY.holdMaxE12).toFixed(3)}% of the position's value an hour at the whole limit (about
+            {" "}{fmt2(holdPctHour(CARRY.holdMaxE12) * 24 * 365)}% a year). The other side owes nothing. The rate is set from the
+            vault's position after each trade. Example: a vault 55% full, short (traders net long): longs owe half the most,
+            {" "}{holdPctHour(CARRY.holdMaxE12 / 2n).toFixed(4)}% an hour, so a $10,000 long owes about
+            ${fmt2(10_000 * holdPctHour(CARRY.holdMaxE12 / 2n) / 100 * 24)} a day.</li>
+          <li><b>Crowded-side fee.</b> A trade that makes the vault's position bigger owes {CARRY.sideFeeBps / 100}% of the part that
+            grew it, on top of the trading fee. A trade that brings the vault back toward flat owes nothing extra, and closing
+            your own position never does.</li>
+          <li><b>Liquidation fee.</b> A liquidation owes {CARRY.liqFeeBps / 100}% of what it closes.</li>
+          <li><b>How it is paid.</b> The router books what each account owes in its fee ledger at every trade. It counts
+            against the account's equity right away (so it lowers what you can open and moves your liquidation level, like a loss),
+            and shows in the order ticket and the account panel. It is paid into the vault, out of your margin, when you withdraw:
+            Percolator lets nothing leave an account that holds a position, so it waits until you are flat. All of it goes to the
+            depositors. An account never owes more than it is worth after the trade that adds to it.</li>
+          <li><b>Track records.</b> A trader's record counts what is owed as already spent, so a leader who owes a lot does not
+            look better than they are.</li>
         </ul>
 
         <h2 id="fees">Fees and rebates</h2>
@@ -497,11 +526,11 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           <thead><tr><th>Tag</th><th>Instruction</th><th>Who</th><th>Effect</th></tr></thead>
           <tbody>
             <tr><td>0</td><td>OpenAccount</td><td>trader</td><td>Creates the trader's router account, Percolator portfolio and collateral account</td></tr>
-            <tr><td>1 / 2</td><td>Deposit / Withdraw</td><td>trader</td><td>Margin in; margin out to the trader's own wallet (not while a request is queued)</td></tr>
+            <tr><td>1 / 2</td><td>Deposit / Withdraw</td><td>trader</td><td>Margin in; margin out to the trader's own wallet (not while a request is queued, nor while fees are owed to a vault: <code>PayFees</code> first)</td></tr>
             <tr><td>3</td><td>OpenBook</td><td>anyone</td><td>Creates a vault's queue of requests</td></tr>
             <tr><td>4</td><td>Request</td><td>trader</td><td>Queues a trade and fixes its target time</td></tr>
             <tr><td>5</td><td>Advance</td><td>anyone</td><td>Moves a vault's mark to a newer verified Pyth price, never past a pending target</td></tr>
-            <tr><td>6</td><td>Fill</td><td>anyone</td><td>Fills a request at its price; pays the executor the bond</td></tr>
+            <tr><td>6</td><td>Fill</td><td>anyone</td><td>Fills a request at its price; pays the executor the bond. Books the trader's holding, crowded-side and liquidation fees (it names the vault's fee meter and the trader's fee ledger once they exist)</td></tr>
             <tr><td>7</td><td>Expire</td><td>anyone</td><td>Removes a request unfilled {ROUTER_GRACE_SECS} s after its target; the bond is forfeited</td></tr>
             <tr><td>8</td><td>RequestClose</td><td>anyone, for any trader</td><td>Queues a forced close: a close-out on a close-only market, or the (partial) liquidation of an account below its liquidation level</td></tr>
             <tr><td>9</td><td>RequestSettle</td><td>anyone</td><td>Queues the settlement of a vault's epoch at the first Pyth price after its target</td></tr>
@@ -522,6 +551,9 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
             <tr><td>29</td><td>SetTier</td><td>anyone</td><td>Records an asset's leverage tier, which the router decides from its price feed</td></tr>
             <tr><td>30</td><td>Swap</td><td>wallet</td><td>Takes the platform's 0.2%, swaps the rest on xDEX, and checks what arrived against the wallet's minimum</td></tr>
             <tr><td>31</td><td>RefreshFunding</td><td>anyone</td><td>Moves a market's funding rate a step toward its target (a fill does the same step itself); acts only on an asset accrued to the current slot</td></tr>
+            <tr><td>32</td><td>OpenCarry</td><td>anyone (pays the rent)</td><td>Starts a vault's holding-fee meter; from then on every fill on it must name it. Does nothing if it is already started</td></tr>
+            <tr><td>33</td><td>OpenLedger</td><td>anyone (pays the rent)</td><td>Opens a trading account's fee ledger. Without one an account can only reduce its positions</td></tr>
+            <tr><td>34</td><td>PayFees</td><td>anyone</td><td>Pays what an account owes one vault out of its margin into the vault's cash (only when the account holds no position); what an empty account cannot pay is written off</td></tr>
           </tbody>
         </table>
 
@@ -539,7 +571,9 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           fetches the first Pyth update at or after it from Hermes, posts it and moves the vault's mark to it, then fills the
           trade; between trades it keeps the mark on Pyth's free sponsored feed account. It also carries out standing orders whose
           condition holds, queues copy trades, liquidates accounts below their liquidation level, settles epochs, expires late
-          requests, and every 30 seconds applies loss covers and margin top-ups. On X1 a separate script
+          requests, and every 30 seconds applies loss covers and margin top-ups. It starts each vault's holding-fee meter and opens
+          a fee ledger (paying its rent, under a cent) for any trader whose order is waiting without one, and counts what each
+          account owes the vaults when it checks for liquidations. On X1 a separate script
           (<code>app/scripts/witness.ts</code>) posts the witness's prices. It needs
           a Pyth API key; the free plan covers every market listed here, and it makes only a few Hermes requests per trade.
           Anyone can run one; the program checks everything, and each fill pays its executor the request's bond.

@@ -76,10 +76,12 @@ export default async function handler(req: any, res: any) {
       cached.set(net.market, c = { at: Date.now(), body: await b });
     }
     // A few seconds old for everyone at once; while a newer one is read, the last one is handed out.
-    res.setHeader("Cache-Control", "public, s-maxage=4, stale-while-revalidate=20");
+    // Devnet reads through a paid-credit RPC (RPC_URL, Helius): 10 s there keeps its use small.
+    res.setHeader("Cache-Control", net.coin === "XNT" ? "public, s-maxage=4, stale-while-revalidate=20" : "public, s-maxage=10, stale-while-revalidate=60");
     return res.status(200).json(c.body);
   } catch (e: any) {
     res.setHeader("Cache-Control", "no-store");
-    return res.status(502).json({ error: e.message ?? String(e) });
+    // (Never the RPC's address: on devnet it carries a private key.)
+    return res.status(502).json({ error: String(e.message ?? e).replace(/https?:\/\/\S+/g, "the RPC").replace(/api-key=[^&\s"]+/g, "api-key=***") });
   }
 }

@@ -172,7 +172,7 @@ fn a_request_needs_margin_for_a_stressed_price_move() {
     let mint = w.env.mint;
     let open = rclient::open_account(&t, &mint);
     let dep = rclient::deposit(&t, &u.collateral, &w.env.vault, 1_000_000); // 1 USDC
-    w.send(vec![open, dep], &[&u.kp]).unwrap();
+    w.send(vec![open, rclient::open_ledger(&t.wallet, &t), dep], &[&u.kp]).unwrap();
     // 10 units at 1.00 with 10% margin needs 1 USDC, plus the stress buffer: refused.
     let ix = rclient::request(&t, &w.vault, 10 * UNIT as i128);
     expect(w.send(vec![ix], &[&u.kp]), router_code(RouterError::InsufficientMargin));
@@ -190,7 +190,7 @@ fn a_trade_that_only_shrinks_a_position_is_not_refused_for_margin() {
     let mint = w.env.mint;
     let open = rclient::open_account(&t, &mint);
     let dep = rclient::deposit(&t, &u.collateral, &w.env.vault, 1_500_000);
-    w.send(vec![open, dep], &[&u.kp]).unwrap();
+    w.send(vec![open, rclient::open_ledger(&t.wallet, &t), dep], &[&u.kp]).unwrap();
     w.traders.insert(7, (u, t));
     let size = 6 * UNIT as i128;
     w.taker_trade(7, size).unwrap();
@@ -423,7 +423,7 @@ fn leveraged_long(w: &mut World) {
     let u = w.new_user(100_000_000);
     let t = rclient::TraderKeys::new(w.env.market, u.kp.pubkey());
     let mint = w.env.mint;
-    w.send(vec![rclient::open_account(&t, &mint), rclient::deposit(&t, &u.collateral, &w.env.vault, 5_000_000)], &[&u.kp]).unwrap();
+    w.send(vec![rclient::open_account(&t, &mint), rclient::open_ledger(&t.wallet, &t), rclient::deposit(&t, &u.collateral, &w.env.vault, 5_000_000)], &[&u.kp]).unwrap();
     w.traders.insert(7, (u, t));
     w.taker_trade(7, 20 * UNIT as i128).unwrap();
 }
@@ -646,7 +646,7 @@ fn leverage_follows_the_assets_tier() {
         let u = w.new_user(100_000_000);
         let t = rclient::TraderKeys::new(w.env.market, u.kp.pubkey());
         let mint = w.env.mint;
-        w.send(vec![rclient::open_account(&t, &mint), rclient::deposit(&t, &u.collateral, &w.env.vault, usdc)], &[&u.kp]).unwrap();
+        w.send(vec![rclient::open_account(&t, &mint), rclient::open_ledger(&t.wallet, &t), rclient::deposit(&t, &u.collateral, &w.env.vault, usdc)], &[&u.kp]).unwrap();
         w.traders.insert(i, (u, t));
     };
     trader(&mut w, 7, 500_000);
@@ -846,7 +846,7 @@ fn a_request_the_account_cannot_afford_at_its_price_ends_without_trading() {
     let u = w.new_user(100_000_000);
     let t = rclient::TraderKeys::new(w.env.market, u.kp.pubkey());
     let mint = w.env.mint;
-    w.send(vec![rclient::open_account(&t, &mint), rclient::deposit(&t, &u.collateral, &w.env.vault, 5_000_000)], &[&u.kp]).unwrap();
+    w.send(vec![rclient::open_account(&t, &mint), rclient::open_ledger(&t.wallet, &t), rclient::deposit(&t, &u.collateral, &w.env.vault, 5_000_000)], &[&u.kp]).unwrap();
     w.traders.insert(7, (u, t));
     w.taker_trade(7, 10 * UNIT as i128).unwrap();
     // (Two minutes pass, so that the price band takes the fall below.)
@@ -931,7 +931,7 @@ fn two_liquidations_at_one_price_fill_in_one_transaction() {
     let mint = w.env.mint;
     let u = w.new_user(100_000_000);
     let t = rclient::TraderKeys::new(w.env.market, u.kp.pubkey());
-    w.send(vec![rclient::open_account(&t, &mint), rclient::deposit(&t, &u.collateral, &w.env.vault, 5_000_000)], &[&u.kp]).unwrap();
+    w.send(vec![rclient::open_account(&t, &mint), rclient::open_ledger(&t.wallet, &t), rclient::deposit(&t, &u.collateral, &w.env.vault, 5_000_000)], &[&u.kp]).unwrap();
     w.traders.insert(8, (u, t));
     w.taker_trade(8, 20 * UNIT as i128).unwrap();
     w.move_price(20, 840_000);

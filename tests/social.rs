@@ -134,14 +134,16 @@ fn a_track_record_is_profit_after_what_was_paid_in_and_out() {
     w.send(vec![rclient::deposit(&t, &source, &vault, 500_000_000)], &[&kp]).unwrap();
     assert_eq!({ stats(&w, 0).deposited }, 500_000_000);
 
-    // Long 2,000 at 1.00, the price goes to 1.05, close: +100, less fees where the market charges them.
+    // Long 2,000 at 1.00, the price goes to 1.05, close: +100, less fees where the market charges
+    // them and the 5 bps owed to the vault on the 2,000 that grew its position (1.00, see `carry`),
+    // which the record counts as spent already.
     w.taker_trade(0, 2_000 * U).unwrap();
     w.advance(40, 1_050_000);
     w.taker_trade(0, -2_000 * U).unwrap();
     let s = stats(&w, 0);
-    let profit = equity(&w, 0) - 1_000_000_000 - 500_000_000;
+    let profit = equity(&w, 0) - 1_000_000_000 - 500_000_000 - 1_000_000;
     assert_eq!({ s.last_pnl } as i128, profit);
-    assert!((95_000_000..=100_000_000).contains(&profit), "profit {profit}");
+    assert!((94_000_000..=99_000_000).contains(&profit), "profit {profit}");
     assert_eq!({ s.trades }, 2);
     assert_eq!({ s.volume }, 2_000_000_000 + 2_100_000_000);
     // The newest fill, and the one before it.
@@ -151,10 +153,12 @@ fn a_track_record_is_profit_after_what_was_paid_in_and_out() {
     // One trading day so far, in profit.
     let today = s.days[s.day_at as usize];
     assert_eq!({ today.pnl }, { s.last_pnl });
-    assert_eq!({ s.max_drawdown }, 0);
+    // The only dip: the fee owed on the opening fill.
+    assert_eq!({ s.max_drawdown }, 1_000_000);
 
-    // A withdrawal is not a loss.
+    // Paying what is owed changes nothing in the record, and a withdrawal is not a loss.
     let dest = w.traders[&0].0.collateral;
+    w.send(vec![rclient::pay_fees(w.keys.as_ref().unwrap(), &t)], &[]).unwrap();
     w.send(vec![rclient::withdraw(&t, &dest, &vault, 300_000_000)], &[&kp]).unwrap();
     let s = stats(&w, 0);
     assert_eq!({ s.withdrawn }, 300_000_000);
@@ -590,4 +594,6 @@ fn builders_print_what_the_page_must_send() {
     show("trigger_copy", rclient::trigger_copy(&payer, &t, &leader, &vault, -1_500_000));
     show("deposit", rclient::deposit(&t, &token, &pv, 7));
     show("withdraw", rclient::withdraw(&t, &token, &pv, 9));
+    show("open_ledger", rclient::open_ledger(&payer, &t));
+    show("open_carry", rclient::open_carry(&payer, &vault));
 }

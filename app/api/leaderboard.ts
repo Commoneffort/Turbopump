@@ -141,6 +141,6 @@ export default async function handler(req: any, res: any) {
     res.setHeader("Cache-Control", "s-maxage=30, stale-while-revalidate=120");
     return res.status(200).json(c.body);
   } catch (e: any) {
-    return res.status(500).json({ error: e.message ?? String(e) });
+    return res.status(500).json({ error: String(e.message ?? e).replace(/https?:\/\/\S+/g, "the RPC").replace(/api-key=[^&\s"]+/g, "api-key=***") });
   }
 }

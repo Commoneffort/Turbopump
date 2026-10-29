@@ -97,6 +97,11 @@ fn retiring_a_market_that_was_traded_on() {
     });
 }
 
+fn expect_err(r: Result<u64, String>, e: percolator_router::RouterError) {
+    let msg = r.expect_err("expected the attempt to fail");
+    assert!(msg.contains(&format!("custom program error: {:#x}", e as u32)), "expected {e:?}, got:\n{msg}");
+}
+
 /// Can a trader who won and closed take the winnings out? The gain is booked as profit, not as
 /// capital, and a withdrawal pays out capital.
 #[test]
@@ -127,10 +132,18 @@ fn a_winner_can_withdraw_what_it_won() {
         let c = w.send(vec![rclient::convert_pnl(&t)], &[]);
         println!("ConvertPnl after {epochs} more epoch(s): {} | capital {} profit {}", code(&c), read(&w).0, read(&w).1);
     }
-    // Once converted, the winnings are capital like the rest, and all of it comes out.
+    // Once converted, the winnings are capital like the rest.
     assert_eq!(read(&w), (1_015_000_000, 0));
+    // What it owes the vault comes first: 5 bps on the 500 its opening trade added to the
+    // vault's position (0.25). Anyone may pay it in, from the trader's capital to the vault.
+    expect_err(w.send(vec![rclient::withdraw(&t, &dest, &vault, 1_000_000)], &[&kp]), percolator_router::RouterError::FeesOwed);
+    let k = w.keys.clone().unwrap();
+    let buffer = w.tokens(k.buffer);
+    w.send(vec![rclient::pay_fees(&k, &t)], &[]).expect("fees paid");
+    assert_eq!(w.tokens(k.buffer) - buffer, 250_000);
+    // Then all the rest comes out.
     let before = w.tokens(dest);
-    w.send(vec![rclient::withdraw(&t, &dest, &vault, 1_015_000_000)], &[&kp]).expect("margin and winnings withdrawn");
-    assert_eq!(w.tokens(dest) - before, 1_015_000_000);
+    w.send(vec![rclient::withdraw(&t, &dest, &vault, 1_014_750_000)], &[&kp]).expect("margin and winnings withdrawn");
+    assert_eq!(w.tokens(dest) - before, 1_014_750_000);
     assert_eq!(read(&w), (0, 0));
 }

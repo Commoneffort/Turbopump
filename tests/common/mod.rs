@@ -335,7 +335,7 @@ impl World {
         let open = rclient::open_account(&t, &mint);
         let dep = rclient::deposit(&t, &u.collateral, &self.env.vault, 1_000_000_000);
         let kp = u.kp.insecure_clone();
-        self.send(vec![open, dep], &[&kp]).expect("open and fund router account");
+        self.send(vec![open, rclient::open_ledger(&t.wallet, &t), dep], &[&kp]).expect("open and fund router account");
         self.traders.insert(taker, (u, t));
         t
     }

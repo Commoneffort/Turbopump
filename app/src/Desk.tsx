@@ -127,7 +127,7 @@ function DeskInner({ vaultKey, markets, day, send, busy, tick, go }: { vaultKey:
           <button className={panel === "earn" ? "on" : ""} onClick={() => setPanel("earn")}>Earn</button>
         </div>
         {panel === "trade" ? <Ticket state={state} send={wrapped} busy={busy} /> : <div className="earn"><LiquidityPanel state={state} send={wrapped} busy={busy} /></div>}
-        <div className="ticket-acct"><Account state={state} send={wrapped} busy={busy} held={held} row={myRow} /></div>
+        <div className="ticket-acct"><Account state={state} send={wrapped} busy={busy} held={held} row={myRow} vaults={markets.map(c => c.v)} /></div>
       </section>
       <section className="desk-bottom panel"><Bottom state={state} markets={markets} fills={allFills} held={held} liq={liq} send={wrapped} busy={busy} go={go} /></section>
     </main>
@@ -426,6 +426,14 @@ function Ticket({ state, send, busy }: { state: C.State & { readFor?: string }; 
   const reduceOnly = state.slot >= v.epochStart + v.epochLen && v.needsFlat;
   const after = num(held + sent * side, 1e6);
   const liqAfter = liquidationPrice(state, after);
+  // Owed to the vault on top of the fee (router `carry`): on the part of the order that makes the
+  // vault's position bigger, unless it only closes the trader's own position.
+  const vaultNow = v.inventory, vaultAfter = vaultNow - sent * side;
+  const grows = !shrinks && abs(vaultAfter) > abs(vaultNow) ? abs(vaultAfter) - abs(vaultNow) : 0n;
+  const sideFee = num(grows, 1e6) * priceN * C.CARRY.sideFeeBps / 10_000;
+  // The holding fee the side the vault is against owes now (it follows how one-sided the market is).
+  const holdRate = state.carry?.rateE12 ?? 0n;
+  const paysHold = after !== 0 && holdRate !== 0n && (after > 0) === (holdRate > 0n);
 
   // Say what became of a queued trade once it leaves the queue (the fill is sent by an executor,
   // not by this page, so there is no confirmation of its own to show).
@@ -501,7 +509,10 @@ function Ticket({ state, send, busy }: { state: C.State & { readFor?: string }; 
 
   const submit = () => {
     if (!publicKey || !state.book || blocker) return;
-    send(`${side > 0n ? "Long" : "Short"} ${units(sent)} ${sym}`, [C.requestTrade(publicKey, v.key, sent * side)]);
+    // An account opened before the fee ledgers existed gets one with its first trade (it can only
+    // reduce without one).
+    const ledger = state.trader && !state.trader.hasLedger ? [C.openLedger(publicKey, publicKey)] : [];
+    send(`${side > 0n ? "Long" : "Short"} ${units(sent)} ${sym}`, [...ledger, C.requestTrade(publicKey, v.key, sent * side)]);
   };
   const closeAll = () => {
     if (!publicKey || !state.book || held === 0n) return;
@@ -553,6 +564,13 @@ function Ticket({ state, send, busy }: { state: C.State & { readFor?: string }; 
         {!reduces && <div title={`The order's value divided by your leverage (${lev}×), out of ${money(freeMargin)} of free margin`}><span>Margin for this order ({lev}×)</span><b className={`mono ${overLev ? "down" : ""}`}>{money(orderMargin)}<i className="muted"> of {money(freeMargin)} free</i></b></div>}
         {state.trader && <div title="What all your positions are worth divided by your equity, now and after this order (one account covers every market)"><span>Account leverage</span><b className="mono">{want > 0n ? `${fmt(levNow, 1)}× → ${fmt(levAfter, 1)}×` : `${fmt(levNow, 1)}×`}</b></div>}
         <div><span>Fee ({C.TRADE_FEE_PCT})</span><b className="mono">{money(notional * C.TRADE_FEE_BPS / 10_000)}</b></div>
+        {sideFee > 0 && <div title={`This order makes the vault's position bigger: ${C.CARRY.sideFeeBps / 100}% of that part is owed to the vault's depositors, paid when you next withdraw. Orders that shrink the vault's position, and closes of your own position, owe nothing.`}><span>Crowded-side fee ({C.CARRY.sideFeeBps / 100}%)</span><b className="mono">{money(sideFee)}</b></div>}
+        {state.carry && (
+          <div title={`While the vault holds more than ${Number(C.CARRY.holdFreeBps) / 100}% of its limit, the side it is against owes a holding fee to its depositors, up to ${C.holdPctHour(C.CARRY.holdMaxE12).toFixed(3)}% of the position's value an hour at the limit. The other side owes nothing. It is booked at each trade and paid when you withdraw.`}>
+            <span>Holding fee now</span>
+            <b className={`mono ${paysHold ? "down" : ""}`}>{holdRate === 0n ? "none" : paysHold ? `you pay ${C.holdPctHour(holdRate).toFixed(4)}%/h (${money(Math.abs(after) * priceN * C.holdPctHour(holdRate) / 100 * 24, 2)} a day)` : `${holdRate > 0n ? "longs" : "shorts"} pay ${C.holdPctHour(holdRate).toFixed(4)}%/h`}</b>
+          </div>
+        )}
         <div><span>Position after</span><b className="mono">{after === 0 ? "flat" : `${after > 0 ? "long" : "short"} ${fmt(Math.abs(after), 4).replace(/\.?0+$/, "")} ${sym}`}</b></div>
         <div><span>Est. liquidation price</span><b className="mono">{liqAfter && want > 0n ? fmt(liqAfter, dp) : "—"}</b></div>
         {state.funding.capE9 > 0n && (() => {
@@ -566,7 +584,7 @@ function Ticket({ state, send, busy }: { state: C.State & { readFor?: string }; 
       <div className="ticket-go">
       {!publicKey ? <div className="connect"><WalletMultiButton /></div>
         : !mine ? <button className="submit neutral" disabled>Reading your account…</button>
-        : !state.trader ? <button className="submit neutral" disabled={!!busy} onClick={() => send("Create trading account", [C.openTradingAccount(publicKey), S.openStats(publicKey, publicKey)])}>Create trading account</button>
+        : !state.trader ? <button className="submit neutral" disabled={!!busy} onClick={() => send("Create trading account", [C.openTradingAccount(publicKey), C.openLedger(publicKey, publicKey), S.openStats(publicKey, publicKey)])}>Create trading account</button>
         : <button className={`submit ${side > 0n ? "up" : "down"}`} disabled={!!blocker || !!busy} onClick={submit}>{busy ? `${busy}…` : `${side > 0n ? "Long" : "Short"} ${want > 0n ? `${units(sent)} ` : ""}${sym}`}</button>}
       {state.trader && held !== 0n && (
         <button className="closepos" disabled={locked || !!busy} onClick={closeAll}>
@@ -716,7 +734,7 @@ function Pending({ r, sym, send, busy }: { r: C.RouterRequest; sym: string; send
 
 // ---------------------------------------------------------------- account
 
-function Account({ state, send, busy, held, row }: { state: C.State; send: Send; busy?: string; held: Held[]; row?: S.TraderRow }) {
+function Account({ state, send, busy, held, row, vaults }: { state: C.State; send: Send; busy?: string; held: Held[]; row?: S.TraderRow; vaults: C.Vault[] }) {
   const { publicKey } = useWallet();
   const [amount, setAmount] = useState("100");
   const p = state.portfolio, h = state.health;
@@ -731,6 +749,11 @@ function Account({ state, send, busy, held, row }: { state: C.State; send: Send;
   // How full the margin is: 0 with no position, 100 at the liquidation level (each position's own).
   const used = ratio === undefined || !h ? 0 : Math.min(100, Math.max(0, num(h.floor, 1e6) / Math.max(num(h.equity, 1e6), 1e-9) * 100));
   const ata = (u: PublicKey) => createAssociatedTokenAccountIdempotentInstruction(u, C.ata(u, C.MINT), u, C.MINT);
+  // Fees owed to the vaults (router `carry`): paid into them, out of the margin, in the same
+  // transaction as a withdrawal (the router refuses a withdrawal while any is owed).
+  const owed = C.totalOwed(state.owed);
+  const vaultOf = (asset: number) => vaults.find(x => x.assetIndex === asset && x.canonical) ?? vaults.find(x => x.assetIndex === asset);
+  const payAll = (u: PublicKey) => state.owed.flatMap(o => { const x = vaultOf(o.asset); return x ? [C.payFees(x, u)] : []; });
   return (
     <>
       <div className="ph"><h3>Account{h && h.notional > 0n && <span className="lev mono">{fmt(num(h.notional, 1e6) / Math.max(num(h.equity, 1e6), 0.01), 1)}×</span>}</h3><Faucet compact /></div>
@@ -753,6 +776,7 @@ function Account({ state, send, busy, held, row }: { state: C.State; send: Send;
               </>
             );
           })()}
+          {owed > 0n && <div className="acct-row" title="Holding fees, crowded-side fees and liquidation fees owed to the vaults' depositors. They count against your margin and are paid out of it when you withdraw."><span>Owed to vaults</span><b className="mono down">{usd(owed)}</b></div>}
           <div className="acct-row"><span>Wallet test USDC</span><b className="mono">{usd(state.userCollateral)}</b></div>
           <div className="health">
             <div className="health-l"><span>Margin health</span><b className={`mono ${used > 75 ? "down" : ""}`}>{ratio === undefined ? "no position" : `${fmt(ratio * 100, 1)}% · liquidated below ${fmt((h && h.notional > 0n ? num(h.floor, 1e6) / num(h.notional, 1e6) : 0) * 100, 1)}%`}</b></div>
@@ -763,10 +787,11 @@ function Account({ state, send, busy, held, row }: { state: C.State; send: Send;
               <div className="move">
                 <label className="inp small"><span>USDC</span><input value={amount} onChange={e => setAmount(e.target.value.replace(/[^0-9.]/g, ""))} inputMode="decimal" /></label>
                 <button className="btn" disabled={!!busy || atoms <= 0n || atoms > state.userCollateral} onClick={() => send("Add margin", [ata(publicKey), C.routerDeposit(publicKey, atoms)])}>Deposit</button>
-                <button className="btn" disabled={!!busy || locked || state.openPositions > 0 || atoms <= 0n || atoms > (p?.capital ?? 0n) + profit} onClick={() => send("Withdraw margin", [ata(publicKey), ...(profit > 0n ? [C.crank(publicKey, C.routerPortfolio(publicKey), [state.vault.assetIndex]), C.routerConvertPnl(publicKey)] : []), C.routerWithdraw(publicKey, atoms)])}>Withdraw</button>
+                <button className="btn" disabled={!!busy || locked || state.openPositions > 0 || atoms <= 0n || atoms + owed > (p?.capital ?? 0n) + profit} onClick={() => send(owed > 0n ? "Pay fees and withdraw" : "Withdraw margin", [ata(publicKey), ...(profit > 0n ? [C.crank(publicKey, C.routerPortfolio(publicKey), [state.vault.assetIndex]), C.routerConvertPnl(publicKey)] : []), ...payAll(publicKey), C.routerWithdraw(publicKey, atoms)])}>Withdraw</button>
               </div>
               {locked ? <div className="fine">Withdrawals are paused while an order is queued.</div>
                 : state.openPositions > 0 && <div className="fine">Margin can be withdrawn once no position is open on any market. Deposits always work.</div>}
+              {owed > 0n && state.openPositions === 0 && <div className="fine">A withdrawal first pays the {usd(owed)} owed to the vaults, out of your margin.</div>}
             </>
           )}
         </div>

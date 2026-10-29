@@ -23,6 +23,7 @@
 //! derived from their wallet. Only the router can sign for it, and withdrawals only go back to
 //! that wallet. There is no admin instruction.
 
+pub mod carry;
 #[cfg(not(target_os = "solana"))]
 pub mod client;
 pub mod funding;
@@ -275,6 +276,9 @@ pub const TAG_FEATURE: u8 = 28;
 pub const TAG_SET_TIER: u8 = 29;
 pub const TAG_SWAP: u8 = 30;
 pub const TAG_REFRESH_FUNDING: u8 = 31;
+pub const TAG_OPEN_CARRY: u8 = 32;
+pub const TAG_OPEN_LEDGER: u8 = 33;
+pub const TAG_PAY_FEES: u8 = 34;
 /// Widest trail, in basis points.
 pub const MAX_TRAIL_BPS: u64 = 5_000;
 /// Shortest time between two slices of a TWAP order, and the most slices one can have.
@@ -339,6 +343,8 @@ pub enum RouterError {
     /// X1: a reported price the witness has not confirmed (no recent witness price for the feed,
     /// or one too far from it).
     WitnessDisagrees,
+    /// `Withdraw` while the account owes the vaults fees: `PayFees` first (see `carry`).
+    FeesOwed,
 }
 
 impl From<RouterError> for ProgramError {
@@ -388,6 +394,9 @@ pub fn process_instruction(program_id: &Pubkey, accounts: &[AccountInfo], data: 
         TAG_SET_TIER => set_tier(program_id, accounts),
         TAG_SWAP => swap::swap(accounts, rest),
         TAG_REFRESH_FUNDING => funding::refresh_funding(program_id, accounts),
+        TAG_OPEN_CARRY => carry::open_carry(program_id, accounts),
+        TAG_OPEN_LEDGER => carry::open_ledger(program_id, accounts),
+        TAG_PAY_FEES => carry::pay_fees(program_id, accounts),
         _ => Err(RouterError::InvalidInstruction.into()),
     }
 }
@@ -545,7 +554,8 @@ fn open_account(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
         bump,
         has_pending: 0,
         has_stats: 0,
-        _pad: [0; 5],
+        has_ledger: 0,
+        _pad: [0; 4],
         pending_vault: Pubkey::default(),
         pending_id: 0,
     };
@@ -624,6 +634,13 @@ fn withdraw(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -> Progr
     key_is(market, &t.market)?;
     if t.has_pending != 0 {
         return Err(RouterError::RequestPending.into());
+    }
+    // Fees owed to the vaults are paid first (`PayFees`), out of the same money.
+    if t.has_ledger != 0 {
+        let l = carry::ledger_in(program_id, accounts, trader_ai.key).ok_or(RouterError::BadAccount)?;
+        if carry::total_owed(l) > 0 {
+            return Err(RouterError::FeesOwed.into());
+        }
     }
     {
         let d = dest.try_borrow_data().map_err(|_| RouterError::BadAccount)?;
@@ -710,6 +727,13 @@ fn margin_covers(market: &[u8], portfolio: &[u8], v: &vstate::VaultState, size: 
 /// The same check with a price move of `stress_bps` (0: at the current price, which is what the
 /// fill asks for).
 fn margin_covers_at(market: &[u8], portfolio: &[u8], v: &vstate::VaultState, size: i128, stress_bps: u128, tiers: Option<&state::Tiers>) -> Result<bool, ProgramError> {
+    margin_covers_owing(market, portfolio, v, size, stress_bps, tiers, 0)
+}
+
+/// The same check for an account that owes the vaults `debt` (see `carry`): it counts against
+/// the account's equity.
+#[allow(clippy::too_many_arguments)]
+fn margin_covers_owing(market: &[u8], portfolio: &[u8], v: &vstate::VaultState, size: i128, stress_bps: u128, tiers: Option<&state::Tiers>, debt: u64) -> Result<bool, ProgramError> {
     let asset = v.asset_index;
     let (_, min_im, fee_bps) = perc::margin_params(market)?;
     let (capital, pnl, _) = perc::portfolio_exposure(portfolio)?;
@@ -741,14 +765,14 @@ fn margin_covers_at(market: &[u8], portfolio: &[u8], v: &vstate::VaultState, siz
         total += n;
     }
     need += total * stress_bps / 10_000;
-    let equity = (capital as i128).checked_add(pnl).ok_or(RouterError::Overflow)?;
+    let equity = (capital as i128).checked_add(pnl).ok_or(RouterError::Overflow)? - debt as i128;
     Ok(equity >= 0 && equity as u128 >= need)
 }
 
 /// True when the account can be liquidated through the router: every position is settled at the
 /// current price (so capital and PnL reflect it) and equity is below the sum of each position's
 /// notional times its tier's liquidation level (see `levels`).
-fn liquidatable(market: &[u8], portfolio: &[u8], tiers: Option<&state::Tiers>) -> Result<bool, ProgramError> {
+fn liquidatable(market: &[u8], portfolio: &[u8], tiers: Option<&state::Tiers>, debt: u64) -> Result<bool, ProgramError> {
     let (capital, pnl, _) = perc::portfolio_exposure(portfolio)?;
     let (mut notional, mut floor) = (0u128, 0u128);
     for p in perc::positions(market, portfolio)? {
@@ -761,7 +785,7 @@ fn liquidatable(market: &[u8], portfolio: &[u8], tiers: Option<&state::Tiers>) -
         notional = notional.checked_add(n).ok_or(RouterError::Overflow)?;
         floor = floor.checked_add(n.saturating_mul(liq as u128)).ok_or(RouterError::Overflow)?;
     }
-    let equity = (capital as i128).checked_add(pnl).ok_or(RouterError::Overflow)?;
+    let equity = (capital as i128).checked_add(pnl).ok_or(RouterError::Overflow)? - debt as i128;
     Ok(notional != 0 && (equity <= 0 || (equity as u128).saturating_mul(10_000) < floor))
 }
 
@@ -773,10 +797,10 @@ fn liquidatable(market: &[u8], portfolio: &[u8], tiers: Option<&state::Tiers>) -
 /// `LIQ_MIN_KEEP_BPS` of it, when equity is gone, or when the other positions alone need more
 /// than the equity. A partial close leaves the trader a smaller position instead of none, and
 /// asks the vault for less in one fill.
-fn liquidation_size(market: &[u8], portfolio: &[u8], tiers: Option<&state::Tiers>, asset: u16, before: i128) -> Result<i128, ProgramError> {
+fn liquidation_size(market: &[u8], portfolio: &[u8], tiers: Option<&state::Tiers>, asset: u16, before: i128, debt: u64) -> Result<i128, ProgramError> {
     let all = before.checked_neg().ok_or(RouterError::Overflow)?;
     let (capital, pnl, _) = perc::portfolio_exposure(portfolio)?;
-    let equity = (capital as i128).checked_add(pnl).ok_or(RouterError::Overflow)?;
+    let equity = (capital as i128).checked_add(pnl).ok_or(RouterError::Overflow)? - debt as i128;
     if equity <= 0 || before == 0 {
         return Ok(all);
     }
@@ -1030,7 +1054,8 @@ fn request_close(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
     if !perc::asset_close_only(&market.try_borrow_data()?, v.asset_index)? {
         let portfolio = acc(accounts, 8)?;
         key_is(portfolio, &t.portfolio)?;
-        if !liquidatable(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, tiers_in(program_id, accounts, market.key).as_ref())? {
+        let debt = carry::ledger_in(program_id, accounts, trader_ai.key).map_or(0, carry::total_owed);
+        if !liquidatable(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, tiers_in(program_id, accounts, market.key).as_ref(), debt)? {
             return Err(RouterError::NotCloseOnly.into());
         }
     }
@@ -1531,6 +1556,11 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         Ok(perc::positions(&m.try_borrow_data()?, &p.try_borrow_data()?)?.iter().find(|x| x.asset == v.asset_index).map_or(0, |x| x.size))
     };
     let before = held(portfolio, market)?;
+    // What the account owes the vaults (see `carry`): the time it has held this asset since its
+    // last fill is settled first, and the total counts against its equity in every check below.
+    let mut fees = carry::Fees::load(program_id, accounts, &b, &t, vault_ai.key, trader_ai.key)?;
+    let debt = fees.settle(v.asset_index, market_id, before, effective, Clock::get()?.unix_timestamp)?;
+    let mut liquidation_fee = false;
     // A forced close (size 0) trades whatever closes the position, or nothing at all.
     let mut size = r.size;
     let mut liquidated = false;
@@ -1556,15 +1586,20 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         let close_only = perc::asset_close_only(&market.try_borrow_data()?, v.asset_index)?;
         let reduces = before != 0 && (before > 0) != (size > 0) && size.unsigned_abs() <= before.unsigned_abs();
         let tiers = tiers_in(program_id, accounts, market.key);
-        if !close_only && liquidatable(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, tiers.as_ref())? {
+        if !close_only && liquidatable(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, tiers.as_ref(), debt)? {
             // Below the liquidation level at this price: the one thing a fill does for such an
             // account is close its position here, whatever was asked. A trader has one place in
             // the queue, so while a request of its own waits nobody can queue its liquidation;
             // without this, an account kept busy with small requests could not be liquidated
             // through the router at all.
             liquidated = before != 0;
-            size = liquidation_size(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, tiers.as_ref(), v.asset_index, before)?;
-        } else if (close_only && !reduces) || !margin_covers_at(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, &v, size, 0, tiers.as_ref())? {
+            liquidation_fee = liquidated;
+            size = liquidation_size(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, tiers.as_ref(), v.asset_index, before, debt)?;
+        } else if (close_only && !reduces) || !margin_covers_owing(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, &v, size, 0, tiers.as_ref(), debt)? {
+            size = 0;
+        } else if !reduces && !fees.can_book(v.asset_index, market_id)? {
+            // Without a fee ledger (`OpenLedger`), or with all its slots in use, an account can
+            // only reduce: what it adds would owe fees nobody could book.
             size = 0;
         }
     } else if r.size == 0 {
@@ -1572,11 +1607,12 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         if close_only && before != 0 {
             // Reduce the whole position unilaterally at Percolator's price, which is the mark.
             reduce_unilaterally(trader_ai, market, portfolio, percolator, &t, v.asset_index)?;
-        } else if !close_only && before != 0 && liquidatable(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, tiers_in(program_id, accounts, market.key).as_ref())? {
+        } else if !close_only && before != 0 && liquidatable(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, tiers_in(program_id, accounts, market.key).as_ref(), debt)? {
             // Still below the liquidation level at the fill price: close against the vault, as
             // much as it takes (anyone may queue another if the account is still below after).
             let tiers = tiers_in(program_id, accounts, market.key);
-            size = liquidation_size(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, tiers.as_ref(), v.asset_index, before)?;
+            size = liquidation_size(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, tiers.as_ref(), v.asset_index, before, debt)?;
+            liquidation_fee = true;
         }
     }
     if size != 0 {
@@ -1591,9 +1627,10 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     // What actually traded (the vault may fill less than requested) and at what price.
     let traded = held(portfolio, market)? - before;
     msg!("fill {} {} {}", { r.id }, traded, effective);
+    let owed = book_fees(fees, vault_ai, portfolio, v.asset_index, market_id, v.inventory, before, traded, effective, liquidation_fee)?;
     // The trader's track record, when the fill names it (its last account).
     if let Some(stats_ai) = accounts.last() {
-        social::record_fill(program_id, stats_ai, &t, portfolio, v.asset_index, traded, effective);
+        social::record_fill(program_id, stats_ai, &t, portfolio, v.asset_index, traded, effective, owed);
     }
 
     b.remove(r.id)?;
@@ -1606,6 +1643,26 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         settle_order(order_ai, o, if liquidated && !protective { 0 } else { traded }, wallet)?;
     }
     close(request_ai, BOND_LAMPORTS, executor, rent_to)
+}
+
+/// After a fill: the fees it adds (see `carry`), on what grew the vault's position (unless the
+/// trader only closed part or all of their own) and on what a liquidation closed; then the
+/// ledger and the meter are brought up to the new positions. Returns what the account owes.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn book_fees(fees: carry::Fees, vault_ai: &AccountInfo, portfolio: &AccountInfo, asset: u16, generation: u64, inventory_before: i128, before: i128, traded: i128, price: u64, liquidation: bool) -> Result<u64, ProgramError> {
+    let after = load_vault(vault_ai)?;
+    let own_close = before != 0 && traded != 0 && (before > 0) != (traded > 0) && traded.unsigned_abs() <= before.unsigned_abs();
+    let grown = after.inventory.unsigned_abs().saturating_sub(inventory_before.unsigned_abs());
+    let mut extra = if own_close { 0 } else { carry::fee_on(grown, price, carry::SIDE_FEE_BPS) };
+    if liquidation {
+        extra = extra.saturating_add(carry::fee_on(traded.unsigned_abs(), price, carry::LIQ_FEE_BPS));
+    }
+    let (capital, pnl, _) = perc::portfolio_exposure(&portfolio.try_borrow_data()?)?;
+    let equity = (capital as i128).saturating_add(pnl);
+    let limit = funding::position_limit(&after, price);
+    let held_after = before.checked_add(traded).ok_or(RouterError::Overflow)?;
+    fees.finish(asset, generation, held_after, extra, equity, after.inventory, limit)
 }
 
 /// A forced close on a close-only market: Percolator's `RebalanceReduce` on the whole position.

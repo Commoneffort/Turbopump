@@ -94,6 +94,8 @@ pub fn withdraw(t: &TraderKeys, dest: &Pubkey, percolator_vault: &Pubkey, amount
             ro(spl_token::ID),
             ro(perc::PERCOLATOR_PROGRAM_ID),
             w(stats_address(&id(), &t.market, &t.wallet).0),
+            // The fee ledger (see `carry`): what is owed must be paid before a withdrawal.
+            ro(ledger_address(&id(), &t.trader).0),
         ],
         data,
     }
@@ -259,8 +261,11 @@ pub fn fill(executor: &Pubkey, k: &VaultKeys, t: &TraderKeys) -> Instruction {
             ro(authority_address(&id()).0),
             ro(percolator_vault::id()),
             ro(perc::PERCOLATOR_PROGRAM_ID),
-            // The market's leverage-tier record (see `levels`), then last the trader's track
-            // record (ignored when the trader has none).
+            // The vault's holding-fee meter and the trader's fee ledger (see `carry`), the
+            // market's leverage-tier record (see `levels`), then last the trader's track record
+            // (ignored when the trader has none).
+            w(carry_address(&id(), &k.vault).0),
+            w(ledger_address(&id(), &t.trader).0),
             ro(tiers_address(&id(), &k.market).0),
             w(stats_address(&id(), &t.market, &t.wallet).0),
         ],
@@ -633,5 +638,52 @@ pub fn swap(wallet: &Pubkey, fee_account: &Pubkey, p: &XdexPool, zero_for_one: b
             w(p.observation),
         ],
         data,
+    }
+}
+
+// ---- fees owed to the vaults (see `carry`) ----
+
+/// Starts a vault's holding-fee meter (anyone may, and pays for it).
+pub fn open_carry(payer: &Pubkey, vault: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: id(),
+        accounts: vec![
+            AccountMeta::new(*payer, true),
+            w(carry_address(&id(), vault).0),
+            ro(*vault),
+            w(book_address(&id(), vault).0),
+            ro(system_program::ID),
+        ],
+        data: vec![TAG_OPEN_CARRY],
+    }
+}
+
+/// Starts `t`'s fee ledger (anyone may, and pays for it).
+pub fn open_ledger(payer: &Pubkey, t: &TraderKeys) -> Instruction {
+    Instruction {
+        program_id: id(),
+        accounts: vec![AccountMeta::new(*payer, true), w(t.trader), w(ledger_address(&id(), &t.trader).0), ro(system_program::ID)],
+        data: vec![TAG_OPEN_LEDGER],
+    }
+}
+
+/// Pays what `t` owes the vault `k` out of its capital (anyone may; only while it is flat).
+pub fn pay_fees(k: &VaultKeys, t: &TraderKeys) -> Instruction {
+    Instruction {
+        program_id: id(),
+        accounts: vec![
+            ro(t.trader),
+            w(ledger_address(&id(), &t.trader).0),
+            w(t.market),
+            w(t.portfolio),
+            w(t.collateral),
+            w(k.percolator_vault),
+            ro(k.percolator_vault_authority),
+            ro(k.vault),
+            w(k.buffer),
+            ro(spl_token::ID),
+            ro(perc::PERCOLATOR_PROGRAM_ID),
+        ],
+        data: vec![TAG_PAY_FEES],
     }
 }

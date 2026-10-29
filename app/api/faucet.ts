@@ -42,6 +42,6 @@ export default async function handler(req: any, res: any) {
     await conn.confirmTransaction(sig, "confirmed");
     return res.status(200).json({ usdc: DRIP_USDC, sol: sendSol ? DRIP_SOL : 0, coin: net.coin, sig });
   } catch (e: any) {
-    return res.status(500).json({ error: e.message ?? String(e) });
+    return res.status(500).json({ error: String(e.message ?? e).replace(/https?:\/\/\S+/g, "the RPC").replace(/api-key=[^&\s"]+/g, "api-key=***") });
   }
 }

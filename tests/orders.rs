@@ -243,7 +243,7 @@ fn a_sell_limit_and_a_limit_that_the_margin_cannot_carry() {
     let u = w.new_user(100_000_000);
     let t = rclient::TraderKeys::new(w.env.market, u.kp.pubkey());
     let mint = w.env.mint;
-    w.send(vec![rclient::open_account(&t, &mint), rclient::deposit(&t, &u.collateral, &w.env.vault, 1_000_000)], &[&u.kp]).unwrap();
+    w.send(vec![rclient::open_account(&t, &mint), rclient::open_ledger(&t.wallet, &t), rclient::deposit(&t, &u.collateral, &w.env.vault, 1_000_000)], &[&u.kp]).unwrap();
     w.traders.insert(5, (u, t));
     place(&mut w, 5, OrderParams { kind: ORDER_LIMIT, trigger: 1_100_000, size: 30 * U, ..Default::default() }).unwrap();
     expect(trigger(&mut w, 5, 0), RouterError::InsufficientMargin);
@@ -306,8 +306,8 @@ fn an_orders_request_is_bound_to_its_order() {
     w.advance_to(u).unwrap();
     w.converge();
     // Without the order, or with another order of the same wallet, the fill is refused. (Without
-    // it, the account in the order's place is the read-only tier record: refused as not writable.)
-    expect(w.fill(0, id), RouterError::NotWritable);
+    // it, the account in the order's place is the vault's fee meter: not the order.)
+    expect(w.fill(0, id), RouterError::BadAccount);
     let wrong = rclient::fill_order(&w.payer.pubkey(), w.keys.as_ref().unwrap(), &w.traders[&0].1, 1);
     expect(w.send(vec![wrong], &[]), RouterError::BadAccount);
     let right = rclient::fill_order(&w.payer.pubkey(), w.keys.as_ref().unwrap(), &w.traders[&0].1, 0);

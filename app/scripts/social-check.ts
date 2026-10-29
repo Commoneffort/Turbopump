@@ -23,3 +23,5 @@ show("feature", S.feature(wallet));
 show("trigger_copy", S.triggerCopy(payer, { key: S.copyAddress(wallet), market: C.MARKET, follower: wallet, leader, ratioBps: 0, maxNotional: 0n, since: 0, triggers: 0 }, vault, -1_500_000n));
 show("deposit", C.routerDeposit(wallet, 7n));
 show("withdraw", C.routerWithdraw(wallet, 9n));
+show("open_ledger", C.openLedger(payer, wallet));
+show("open_carry", C.openCarry(payer, vault));

@@ -231,7 +231,7 @@ fn liquidation_and_epoch_settlement_work_on_reported_prices() {
     let u = w.new_user(100_000_000);
     let t = rclient::TraderKeys::new(w.env.market, u.kp.pubkey());
     let mint = w.env.mint;
-    w.send(vec![rclient::open_account(&t, &mint), rclient::deposit(&t, &u.collateral, &w.env.vault, 5_000_000)], &[&u.kp]).unwrap();
+    w.send(vec![rclient::open_account(&t, &mint), rclient::open_ledger(&t.wallet, &t), rclient::deposit(&t, &u.collateral, &w.env.vault, 5_000_000)], &[&u.kp]).unwrap();
     w.traders.insert(7, (u, t));
     w.taker_trade(7, 20 * UNIT as i128).unwrap();
     // The epoch settles with the vault's position open, at a reported price.

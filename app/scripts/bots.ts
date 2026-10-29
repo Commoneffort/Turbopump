@@ -468,8 +468,10 @@ async function act(bot: Bot, m: Market, feeBps: bigint) {
     }
     if (s.openPositions > 0) {
       const code = await wouldFail(kp, [createAssociatedTokenAccountIdempotentInstruction(kp.publicKey, C.ata(kp.publicKey, C.MINT), kp.publicKey, C.MINT), C.routerWithdraw(kp.publicKey, 1_000_000n)]);
-      if (code !== "rpc") note({ type: "refusal", bot: bot.name, what: "withdrawal with a position open", code, ok: code === "0x13" });
-      if (code !== "0x13" && code !== "rpc") say("CHECK FAILED", bot.name, "a withdrawal with a position open answered", code);
+      // Percolator's refusal (0x13), or the router's first when fees are owed (FeesOwed, 0x571d).
+      const refused = code === "0x13" || code === "0x571d";
+      if (code !== "rpc") note({ type: "refusal", bot: bot.name, what: "withdrawal with a position open", code, ok: refused });
+      if (!refused && code !== "rpc") say("CHECK FAILED", bot.name, "a withdrawal with a position open answered", code);
     }
     // Nobody can force a healthy account closed (the market is not close-only here).
     if (held !== 0n && s.health && !s.health.liquidatable && s.health.equity > s.health.floor + s.health.notional / 100n) {

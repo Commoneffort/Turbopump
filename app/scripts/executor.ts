@@ -436,7 +436,9 @@ const backstopAt = new Map<string, number>(), backstopTries = new Map<string, nu
 /** How many liquidations are queued in one transaction (`watch`). */
 const LIQ_PER_TX = Number(process.env.LIQ_PER_TX ?? 6);
 /** How many fills go in one transaction when several requests share a price. */
-const FILLS_PER_TX = Number(process.env.FILLS_PER_TX ?? 3);
+// (Two since the fee accounts were added to a fill, 2026-10-29: three fills and three lag cranks
+// came to 1,234 bytes, over a transaction's 1,232.)
+const FILLS_PER_TX = Number(process.env.FILLS_PER_TX ?? 2);
 
 /** Fills requests that wait at the vault's current mark together, `FILLS_PER_TX` to a
  *  transaction, when none of them needs accounts settled first (true right after a fill at that
@@ -636,12 +638,16 @@ async function watch(vaults: C.Vault[], market: Uint8Array, full: boolean) {
   enter("watch");
   const closing = vaults.filter(v => C.closeOnly(market, v.assetIndex));
   if (!closing.length && !full) return false;
-  const [snap, traders, fresh] = await Promise.all([
+  const [snap, traders, fresh, ledgers] = await Promise.all([
     snapshot(),
     conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: C.TRADER_LEN }] }),
     conn.getMultipleAccountsInfo(vaults.map(v => v.key)),
+    conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: C.CARRY.ledgerLen }] }).catch(() => []),
   ]);
   const owners = new Map(traders.map(t => { const d = C.decodeTrader(new Uint8Array(t.account.data)); return [d.portfolio.toBase58(), d] as const; }));
+  // What each trading account owes the vaults (router `carry`): it counts against its equity.
+  const owedBy = new Map(ledgers.map(l => [new PublicKey(l.account.data.subarray(8, 40)).toBase58(), C.totalOwed(C.decodeLedger(new Uint8Array(l.account.data)))] as const));
+  const debt = (portfolio: PublicKey) => { const o = owners.get(portfolio.toBase58()); return o ? owedBy.get(C.traderAddress(o.wallet).toBase58()) ?? 0n : 0n; };
   for (const [i, v] of vaults.entries()) {
     const lp = snap.portfolios.find(p => p.pubkey.equals(v.lpPortfolio));
     if (!lp || !fresh[i]) continue;
@@ -698,7 +704,7 @@ async function watch(vaults: C.Vault[], market: Uint8Array, full: boolean) {
   for (const p of snap.portfolios) {
     const o = owners.get(p.pubkey.toBase58());
     if (!o || o.hasPending || busy.has(p.pubkey.toBase58())) continue;
-    const h = C.accountHealth(snap.market, p.data);
+    const h = C.accountHealth(snap.market, p.data, debt(p.pubkey));
     if (!h.liquidatable) continue;
     // Close the largest position first; the next pass looks again.
     const worst = h.positions.reduce((a, b) => (b.notional > a.notional ? b : a));
@@ -914,14 +920,45 @@ async function settleRound(vaults: C.Vault[]) {
   }
 }
 
+/** Vaults whose meter this executor has tried to start, and wallets known to have a fee ledger. */
+const carryTried = new Set<string>();
+const ledgered = new Set<string>();
+/** Opens a fee ledger for each of `wallets` that has none (the executor pays the rent, about
+ *  0.008 of the chain's coin each). Returns the wallets still without one. */
+async function ensureLedgers(wallets: PublicKey[]): Promise<Set<string>> {
+  const todo = [...new Map(wallets.filter(w => !ledgered.has(w.toBase58())).map(w => [w.toBase58(), w])).values()];
+  if (!todo.length) return new Set();
+  const accs = await conn.getMultipleAccountsInfo(todo.map(w => C.traderAddress(w)), "confirmed").catch(() => null);
+  if (!accs) return new Set(todo.map(w => w.toBase58()));
+  const open: PublicKey[] = [];
+  todo.forEach((w, i) => {
+    const t = accs[i] ? C.decodeTrader(new Uint8Array(accs[i]!.data)) : null;
+    if (t?.hasLedger) ledgered.add(w.toBase58());
+    else if (t) open.push(w);
+  });
+  for (let i = 0; i < open.length; i += 6) {
+    const part = open.slice(i, i + 6);
+    if (await send(`open fee ledger for ${part.map(w => w.toBase58().slice(0, 6)).join(", ")}`, part.map(w => C.openLedger(payer.publicKey, w)))) part.forEach(w => ledgered.add(w.toBase58()));
+  }
+  return new Set(todo.filter(w => !ledgered.has(w.toBase58())).map(w => w.toBase58()));
+}
+
 async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boolean, round: Round | null): Promise<boolean> {
   enter("serviceVault");
   if (!snap.book || !round) {
     if (!snap.book) await send(`open book ${v.feed?.symbol}`, [C.openBook(payer.publicKey, v.key)]);
     return false;
   }
+  // The vault's holding-fee meter (router `carry`): started once, by whoever gets there first.
+  if (!C.decodeBook(snap.book).hasCarry && !carryTried.has(v.key.toBase58())) {
+    carryTried.add(v.key.toBase58());
+    await send(`start the holding-fee meter of ${v.feed?.symbol}`, [C.openCarry(payer.publicKey, v.key)]);
+  }
   const { b, reqs } = round;
   const live = reqs.filter(r => now <= r.target + C.ROUTER_GRACE_SECS);
+  // An account without a fee ledger can only reduce: one is opened (paid here) for every trader
+  // whose request waits, before its fill. A request whose ledger is not open yet waits a pass.
+  const unledgered = await ensureLedgers(live.filter(r => !r.settle).map(r => r.wallet));
 
   // 2. Fill requests the mark is at. The cranks in front bring every asset involved to the
   //    current slot (which also walks Percolator's price to the mark) and settle the positions
@@ -935,7 +972,7 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
   // `fillTogether` and go one by one below.)
   let filledOne = true;
   let notConverged = false;
-  for (const r of live.filter(r => b.markPrev < r.target && r.target <= b.markPublish)) {
+  for (const r of live.filter(r => b.markPrev < r.target && r.target <= b.markPublish && !unledgered.has(r.wallet.toBase58()))) {
     if (notConverged) break;
     const what = `${v.feed?.symbol} #${r.id}`;
     if (r.settle) { await settleEpoch(v, r, what); tried.add(r.id); continue; }
@@ -945,7 +982,7 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
     // many liquidations at once, and one at a time each waited for all those before it).
     // (Not the ones this pass has already filled or tried one by one.)
     if (filledOne) {
-      const rest = live.filter(x => !x.settle && !grouped.has(x.id) && !handled.has(x.id) && x.id !== r.id && b.markPrev < x.target && x.target <= b.markPublish);
+      const rest = live.filter(x => !x.settle && !unledgered.has(x.wallet.toBase58()) && !grouped.has(x.id) && !handled.has(x.id) && x.id !== r.id && b.markPrev < x.target && x.target <= b.markPublish);
       for (const ids of await fillTogether(v, b, [r, ...rest])) grouped.add(ids);
       if (grouped.has(r.id)) continue;
     }

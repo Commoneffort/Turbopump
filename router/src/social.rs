@@ -100,14 +100,17 @@ pub(crate) fn book_flow(program_id: &Pubkey, t: &TraderState, stats_ai: Result<&
 
 /// Books a fill in the trader's track record, if `stats_ai` is it (the last account of a `Fill`;
 /// a fill without it is still a fill). It never fails the fill.
-pub(crate) fn record_fill(program_id: &Pubkey, stats_ai: &AccountInfo, t: &TraderState, portfolio: &AccountInfo, asset: u16, traded: i128, price: u64) {
+/// `owed`: what the account owes the vaults (see `carry`), counted as already lost: paying it
+/// later then changes nothing in the record.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_fill(program_id: &Pubkey, stats_ai: &AccountInfo, t: &TraderState, portfolio: &AccountInfo, asset: u16, traded: i128, price: u64, owed: u64) {
     if t.has_stats == 0 || !stats_ai.is_writable || *stats_ai.key != stats_address(program_id, &t.market, &t.wallet).0 {
         return;
     }
     let Ok(mut s) = load::<Stats>(stats_ai, program_id, STATS_MAGIC) else { return };
     let (Ok(eq), Ok(clock)) = (equity(portfolio), Clock::get()) else { return };
     let now = clock.unix_timestamp;
-    let pnl = clamp_i64(eq - s.start_equity as i128 - s.deposited as i128 + s.withdrawn as i128);
+    let pnl = clamp_i64(eq - owed as i128 - s.start_equity as i128 - s.deposited as i128 + s.withdrawn as i128);
     let today = (now / 86_400).max(0) as u32;
     let mut days = s.days;
     let mut at = s.day_at as usize % STATS_DAYS;

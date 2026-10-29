@@ -79,6 +79,7 @@ export default {
     "bond_lamports": 2000000,
     "book": {
       "forfeited_bonds": 112,
+      "has_carry": 78,
       "len": 73,
       "mark_prev_publish_time": 88,
       "mark_price": 96,
@@ -90,6 +91,15 @@ export default {
       "vault": 8
     },
     "book_len": 632,
+    "carry": {
+      "index_long": 40,
+      "index_short": 56,
+      "magic": 0,
+      "rate_e12": 72,
+      "updated": 80,
+      "vault": 8
+    },
+    "carry_len": 96,
     "delay_secs": 4,
     "expiry_deposit_bps": 10,
     "expiry_deposit_cap": 10000000,
@@ -102,6 +112,8 @@ export default {
     "funding_seq_off_in_slot": 424,
     "funding_tau_slots": 9000,
     "grace_secs": 90,
+    "hold_free_bps": 1000,
+    "hold_max_e12": 27778,
     "im_bps_off": 558,
     "insurance_nav_bps": [
       800,
@@ -109,7 +121,22 @@ export default {
       800
     ],
     "lamports_per_atom": 9,
+    "ledger": {
+      "entries": 48,
+      "magic": 0,
+      "trader": 8
+    },
+    "ledger_entry": {
+      "asset": 0,
+      "owed": 8,
+      "snap": 16
+    },
+    "ledger_entry_len": 32,
+    "ledger_free": 65535,
+    "ledger_len": 1072,
+    "ledger_slots": 32,
     "liq_above_engine_bps": 100,
+    "liq_fee_bps": 50,
     "liquidation_bps": 1500,
     "major_feeds": [
       "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
@@ -151,6 +178,7 @@ export default {
     },
     "request_len": 120,
     "reserve_bps": 3000,
+    "side_fee_bps": 5,
     "stall_secs": 30,
     "stock_feeds": [
       "6d1cb9acc057a81bbf43ce459ce7bdfc3db1a040b25718158bf6d9936025838f",
@@ -201,7 +229,9 @@ export default {
     "trade_room_bps": 8000,
     "trader": {
       "collateral": 104,
+      "has_ledger": 139,
       "has_pending": 137,
+      "has_stats": 138,
       "market": 8,
       "pending_id": 176,
       "pending_vault": 144,

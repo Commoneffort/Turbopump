@@ -789,6 +789,10 @@ export async function fetchVault(conn: Connection, vaultKey: PublicKey, user?: P
   if (user) keys.push(ticketAddress(v.key, user), ata(user, MINT), ata(user, v.shareMint), pf!, traderAddress(user));
   const firstOrder = keys.length;
   if (user) for (let i = 0; i < MAX_ORDERS; i++) keys.push(orderAddress(v.key, user, i));
+  // The vault's holding-fee meter, and the wallet's fee ledger (router `carry`).
+  const carryAt = keys.length;
+  keys.push(carryAddress(v.key));
+  if (user) keys.push(ledgerAddress(user));
   keys.push(tiersAddress()); // last: the market's tier record (margins depend on it)
   const [accs, slot] = await Promise.all([conn.getMultipleAccountsInfo(keys, "confirmed"), conn.getSlot("confirmed")]);
   const data = (i: number) => (accs[i] ? new Uint8Array(accs[i]!.data) : undefined);
@@ -823,8 +827,12 @@ export async function fetchVault(conn: Connection, vaultKey: PublicKey, user?: P
     portfolio: user && data(9) ? decodePortfolio(data(9)!, v.assetIndex, data(0)!) : undefined,
     margin: user && data(9) ? marginRoom(data(0)!, data(9)!, v.assetIndex) : undefined,
     openPositions: user && data(9) ? openPositions(data(9)!) : 0,
-    health: user && data(9) ? accountHealth(data(0)!, data(9)!) : undefined,
+    health: user && data(9) ? accountHealth(data(0)!, data(9)!, totalOwed(decodeLedger(data(carryAt + 1)))) : undefined,
     trader,
+    /** The vault's holding fee: the rate the crowded side owes now (+ longs, - shorts), if it has a meter. */
+    carry: decodeCarry(data(carryAt)),
+    /** What the wallet owes the vaults, per asset (paid before any withdrawal). */
+    owed: user ? decodeLedger(data(carryAt + 1)) : [],
     pending,
     /** The wallet's standing orders on this market. */
     orders: user ? Array.from({ length: MAX_ORDERS }, (_, i) => (accs[firstOrder + i]?.data.length === ORDER_LEN ? [decodeOrder(keys[firstOrder + i], new Uint8Array(accs[firstOrder + i]!.data))] : [])).flat() : [],
@@ -838,7 +846,7 @@ export const LIQUIDATION_BPS = BigInt(L.router.liquidation_bps);
 /** An account's margin position across all markets: equity (capital + PnL), each position as
  *  Percolator counts it with its notional at the current price, and whether every position is
  *  settled at that price (until it is, capital and PnL do not reflect the latest move). */
-export function accountHealth(market: Uint8Array, portfolio: Uint8Array) {
+export function accountHealth(market: Uint8Array, portfolio: Uint8Array, debt = 0n) {
   const P = L.portfolio;
   const at = (a: number) => L.market.slots + a * L.market.slot_len + L.market.engine;
   const positions: { asset: number; size: bigint; price: bigint; notional: bigint }[] = [];
@@ -855,7 +863,8 @@ export function accountHealth(market: Uint8Array, portfolio: Uint8Array) {
     notional += n;
     if (size !== 0n) positions.push({ asset, size, price, notional: n });
   }
-  const equity = u128(portfolio, P.capital) + i128(portfolio, P.pnl);
+  // What the account owes the vaults counts against it (router `carry`).
+  const equity = u128(portfolio, P.capital) + i128(portfolio, P.pnl) - debt;
   // Below the sum of each position's notional times its tier's liquidation level (router `liquidatable`).
   const floor = positions.reduce((t, p) => t + p.notional * levels(market, p.asset).liq, 0n);
   return { equity, notional, settled, positions, floor: floor / 10_000n, liquidatable: settled && notional > 0n && (equity <= 0n || equity * 10_000n < floor) };
@@ -982,12 +991,12 @@ export const requestAddress = (vault: PublicKey, owner: PublicKey, settlement = 
   rpda(Buffer.from("request"), vault.toBuffer(), owner.toBuffer(), Buffer.from([settlement ? 1 : 0]));
 
 /** `markSet`: chain time at which the mark was last moved (0 if not recorded). */
-export type Book = { vault: PublicKey; len: number; markSet: number; markPublish: number; markPrev: number; markPrice: bigint; nextId: bigint; pending: { id: bigint; target: number }[] };
+export type Book = { vault: PublicKey; len: number; hasCarry: boolean; markSet: number; markPublish: number; markPrev: number; markPrice: bigint; nextId: bigint; pending: { id: bigint; target: number }[] };
 export function decodeBook(d: Uint8Array): Book {
   const b = R.book;
   const len = d[b.len];
   const pending = Array.from({ length: len }, (_, i) => ({ id: u64(d, b.pending_id + 8 * i), target: Number(i64(d, b.pending_target + 8 * i)) }));
-  return { vault: key(d, b.vault), len, markSet: u32(d, b.mark_set_time), markPublish: Number(i64(d, b.mark_publish_time)), markPrev: Number(i64(d, b.mark_prev_publish_time)), markPrice: u64(d, b.mark_price), nextId: u64(d, b.next_id), pending };
+  return { vault: key(d, b.vault), len, hasCarry: d[(b as any).has_carry ?? 78] === 1, markSet: u32(d, b.mark_set_time), markPublish: Number(i64(d, b.mark_publish_time)), markPrev: Number(i64(d, b.mark_prev_publish_time)), markPrice: u64(d, b.mark_price), nextId: u64(d, b.next_id), pending };
 }
 /** `settle`: an epoch settlement of the vault (then `wallet` is whoever queued it), not a trade.
  *  `order`: the index of the standing order that queued it, if one did. */
@@ -1072,11 +1081,65 @@ export function orderAction(o: StandingOrder, mark: bigint, held: bigint, now: n
   if (o.kind === ORDER.LIMIT) return (o.size > 0n ? mark <= o.trigger : mark >= o.trigger) ? "fire" : "wait";
   return now >= o.nextTime ? "fire" : "wait";
 }
-export type Trader = { wallet: PublicKey; portfolio: PublicKey; collateral: PublicKey; hasPending: boolean; hasStats: boolean; pendingVault: PublicKey; pendingId: bigint };
+export type Trader = { wallet: PublicKey; portfolio: PublicKey; collateral: PublicKey; hasPending: boolean; hasStats: boolean; hasLedger: boolean; pendingVault: PublicKey; pendingId: bigint };
 export const decodeTrader = (d: Uint8Array): Trader => ({
   wallet: key(d, R.trader.wallet), portfolio: key(d, R.trader.portfolio), collateral: key(d, R.trader.collateral),
-  hasPending: d[R.trader.has_pending] === 1, hasStats: d[R.trader.has_pending + 1] === 1, pendingVault: key(d, R.trader.pending_vault), pendingId: u64(d, R.trader.pending_id),
+  hasPending: d[R.trader.has_pending] === 1, hasStats: d[R.trader.has_pending + 1] === 1, hasLedger: d[R.trader.has_pending + 2] === 1,
+  pendingVault: key(d, R.trader.pending_vault), pendingId: u64(d, R.trader.pending_id),
 });
+
+// ---- fees owed to the vaults (router `carry`) ----
+// The side of the market the vault is against (traders' crowded side) owes a holding fee while the
+// vault holds more than HOLD_FREE_BPS of its limit, rising to HOLD_MAX at the limit; a trade that
+// grows the vault's position owes SIDE_FEE_BPS of what it grew; a liquidation owes LIQ_FEE_BPS of
+// what it closes. It is booked in the account's ledger, counts against its equity, and is paid into
+// the vault (`payFees`, anyone, only while the account holds no position) before any withdrawal.
+const RC = R as any;
+export const CARRY = {
+  holdMaxE12: BigInt(RC.hold_max_e12 ?? 27_778), holdFreeBps: BigInt(RC.hold_free_bps ?? 1_000),
+  sideFeeBps: Number(RC.side_fee_bps ?? 5), liqFeeBps: Number(RC.liq_fee_bps ?? 50),
+  ledgerLen: Number(RC.ledger_len ?? 1_072), carryLen: Number(RC.carry_len ?? 88), slots: Number(RC.ledger_slots ?? 32),
+};
+export const carryAddress = (vault: PublicKey) => rpda(Buffer.from("carry"), vault.toBuffer());
+export const ledgerAddress = (wallet: PublicKey) => rpda(Buffer.from("ledger"), traderAddress(wallet).toBuffer());
+/** Starts a vault's holding-fee meter (anyone may, and pays its rent). */
+export const openCarry = (payer: PublicKey, vault: PublicKey) => new TransactionInstruction({
+  programId: ROUTER,
+  keys: [rw(payer, true), rw(carryAddress(vault)), ro(vault), rw(bookAddress(vault)), ro(SystemProgram.programId)],
+  data: new W().u8(32).done(),
+});
+/** Starts a trading account's fee ledger (anyone may, and pays its rent). Without one an account
+ *  can only reduce its positions. */
+export const openLedger = (payer: PublicKey, wallet: PublicKey) => new TransactionInstruction({
+  programId: ROUTER,
+  keys: [rw(payer, true), rw(traderAddress(wallet)), rw(ledgerAddress(wallet)), ro(SystemProgram.programId)],
+  data: new W().u8(33).done(),
+});
+/** Pays what `wallet` owes vault `v` out of its capital into the vault (anyone may; the account
+ *  must hold no position). */
+export const payFees = (v: Vault, wallet: PublicKey) => new TransactionInstruction({
+  programId: ROUTER,
+  keys: [ro(traderAddress(wallet)), rw(ledgerAddress(wallet)), rw(MARKET), rw(routerPortfolio(wallet)), rw(routerCollateral(wallet)), rw(PERC_VAULT), ro(PERC_VAULT_AUTH), ro(v.key), rw(v.buffer), ro(TOKEN_PROGRAM_ID), ro(PERCOLATOR)],
+  data: new W().u8(34).done(),
+});
+export type Owed = { asset: number; owed: bigint };
+/** What a ledger says is owed, per asset (entries in use only). */
+export function decodeLedger(d?: Uint8Array | null): Owed[] {
+  if (!d || d.length !== CARRY.ledgerLen) return [];
+  const out: Owed[] = [];
+  for (let i = 0; i < CARRY.slots; i++) {
+    const at = 48 + 32 * i;
+    const asset = d[at] | (d[at + 1] << 8);
+    if (asset !== 0xffff) out.push({ asset, owed: u64(d, at + 8) });
+  }
+  return out;
+}
+export const totalOwed = (o: Owed[]) => o.reduce((t, x) => t + x.owed, 0n);
+/** A vault's meter: the rate (e12 of the position's value per second; + longs owe, - shorts owe). */
+export const decodeCarry = (d?: Uint8Array | null) => (d && d.length === CARRY.carryLen ? { rateE12: i64(d, 72), updated: Number(i64(d, 80)) } : null);
+/** A rate as percent of the position's value per hour (and per year). */
+export const holdPctHour = (rateE12: bigint) => Number(rateE12 < 0n ? -rateE12 : rateE12) * 3_600 / 1e10;
+export const holdPctYear = (rateE12: bigint) => holdPctHour(rateE12) * 24 * 365;
 
 /** An asset's next oracle observation sequence and its authority epoch (Percolator checks both). */
 export function controlSequences(market: Uint8Array, asset: number) {
@@ -1096,7 +1159,8 @@ export const routerDeposit = (wallet: PublicKey, amount: bigint) => new Transact
 });
 export const routerWithdraw = (wallet: PublicKey, amount: bigint) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [ro(wallet, true), ro(traderAddress(wallet)), rw(routerPortfolio(wallet)), rw(MARKET), rw(routerCollateral(wallet)), rw(ata(wallet, MINT)), rw(PERC_VAULT), ro(PERC_VAULT_AUTH), ro(TOKEN_PROGRAM_ID), ro(PERCOLATOR), rw(statsAddress(wallet))],
+  // Last: the fee ledger (what is owed to the vaults must be paid before a withdrawal).
+  keys: [ro(wallet, true), ro(traderAddress(wallet)), rw(routerPortfolio(wallet)), rw(MARKET), rw(routerCollateral(wallet)), rw(ata(wallet, MINT)), rw(PERC_VAULT), ro(PERC_VAULT_AUTH), ro(TOKEN_PROGRAM_ID), ro(PERCOLATOR), rw(statsAddress(wallet)), ro(ledgerAddress(wallet))],
   data: new W().u8(2).u64(amount).done(),
 });
 /** Turns a trading account's released profit into capital (what a withdrawal pays out). Anyone
@@ -1214,7 +1278,8 @@ export const syncInventory = (v: Vault) => new TransactionInstruction({
  *  a close-out on a close-only market, or a liquidation of an account below the router's level. */
 export const requestClose = (payer: PublicKey, wallet: PublicKey, vault: PublicKey) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [rw(payer, true), rw(traderAddress(wallet)), ro(wallet), ro(vault), rw(bookAddress(vault)), rw(requestAddress(vault, wallet)), ro(MARKET), ro(SystemProgram.programId), ro(routerPortfolio(wallet)), ro(tiersAddress())],
+  // (The fee ledger: what the account owes the vaults counts toward its liquidation.)
+  keys: [rw(payer, true), rw(traderAddress(wallet)), ro(wallet), ro(vault), rw(bookAddress(vault)), rw(requestAddress(vault, wallet)), ro(MARKET), ro(SystemProgram.programId), ro(routerPortfolio(wallet)), ro(tiersAddress()), ro(ledgerAddress(wallet))],
   data: new W().u8(8).done(),
 });
 /** Moves a vault's mark to a verified Pyth update (a PriceUpdateV2 account). */
@@ -1257,7 +1322,9 @@ export const fillRequest = (executor: PublicKey, v: Vault, r: RouterRequest) => 
     rw(routerPortfolio(r.wallet)), rw(v.lpPortfolio), ro(v.delegate), ro(routerAuthority()), ro(VAULT_PROGRAM), ro(PERCOLATOR),
     // A request queued by a standing order comes with that order.
     ...(r.order !== undefined ? [rw(orderAddress(r.vault, r.wallet, r.order))] : []),
-    // The market's leverage-tier record, then last the trader's track record (ignored when the trader has none).
+    // The vault's holding-fee meter and the trader's fee ledger (router `carry`), the market's
+    // leverage-tier record, then last the trader's track record (ignored when the trader has none).
+    rw(carryAddress(v.key)), rw(ledgerAddress(r.wallet)),
     ro(tiersAddress()),
     rw(statsAddress(r.wallet)),
   ],

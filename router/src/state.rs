@@ -10,6 +10,8 @@ pub const BOOK_MAGIC: u64 = u64::from_le_bytes(*b"PRBOOK01");
 pub const REQUEST_MAGIC: u64 = u64::from_le_bytes(*b"PRREQST1");
 pub const ORDER_MAGIC: u64 = u64::from_le_bytes(*b"PRORDER1");
 pub const TIERS_MAGIC: u64 = u64::from_le_bytes(*b"PRTIERS1");
+pub const CARRY_MAGIC: u64 = u64::from_le_bytes(*b"PRCARRY1");
+pub const LEDGER_MAGIC: u64 = u64::from_le_bytes(*b"PRLEDGR1");
 pub const MAX_PENDING: usize = 32;
 /// Standing orders one wallet can have on one vault's market.
 pub const MAX_ORDERS: u8 = 8;
@@ -22,6 +24,8 @@ pub const SEED_BOOK: &[u8] = b"book";
 pub const SEED_REQUEST: &[u8] = b"request";
 pub const SEED_ORDER: &[u8] = b"order";
 pub const SEED_TIERS: &[u8] = b"tiers";
+pub const SEED_CARRY: &[u8] = b"carry";
+pub const SEED_LEDGER: &[u8] = b"ledger";
 
 /// A trader's router account. Its address owns the trader's Percolator portfolio and collateral
 /// token account; only the router can sign for it.
@@ -38,7 +42,10 @@ pub struct TraderState {
     /// 1 once the account has a track record (`OpenStats`): `Deposit` and `Withdraw` then book
     /// what they move in it.
     pub has_stats: u8,
-    pub _pad: [u8; 5],
+    /// 1 once the account has a fee ledger (`OpenLedger`): every fill and withdrawal must then
+    /// name it (see `carry`).
+    pub has_ledger: u8,
+    pub _pad: [u8; 4],
     pub pending_vault: Pubkey,
     pub pending_id: u64,
 }
@@ -56,7 +63,9 @@ pub struct Book {
     /// Chain time (unix seconds) at which the mark was last moved; 0 in a book last written by a
     /// build that did not record it. See `STALL_SECS`.
     pub mark_set_time: u32,
-    pub _pad: [u8; 2],
+    /// 1 once the vault has a holding-fee meter (`OpenCarry`): every fill must then name it.
+    pub has_carry: u8,
+    pub _pad: [u8; 1],
     /// Publish time, previous publish time and price (e6) of the Pyth update the mark holds.
     pub mark_publish_time: i64,
     pub mark_prev_publish_time: i64,
@@ -429,6 +438,65 @@ pub struct Tiers {
 pub const TIERS_LEN: usize = core::mem::size_of::<Tiers>();
 pub fn tiers_address(program_id: &Pubkey, market: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[SEED_TIERS, market.as_ref()], program_id)
+}
+
+/// A vault's holding-fee meter (see `carry`): how much one unit of a long, and of a short,
+/// position has owed since the meter started, and the rate it owes now.
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+#[repr(C, packed)]
+pub struct Carry {
+    pub magic: u64,
+    pub vault: Pubkey,
+    /// Running sums of price (e6) x rate (e12 per second) x seconds, one per side: what a
+    /// position of `q` units owes between two readings is `q` x the difference / 1e18 atoms.
+    pub index_long: u128,
+    pub index_short: u128,
+    /// The rate (e12 of the position's value per second) the crowded side pays now: positive,
+    /// longs pay; negative, shorts pay. Set from the vault's position after each fill.
+    pub rate_e12: i64,
+    /// Chain time (unix seconds) the sums were last brought up to.
+    pub updated: i64,
+    pub bump: u8,
+    pub _pad: [u8; 7],
+}
+pub const CARRY_LEN: usize = core::mem::size_of::<Carry>();
+pub fn carry_address(program_id: &Pubkey, vault: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[SEED_CARRY, vault.as_ref()], program_id)
+}
+
+/// How many assets one ledger tracks at once. A slot is reused once its position is closed and
+/// what it owed is paid.
+pub const LEDGER_SLOTS: usize = 32;
+pub const LEDGER_FREE: u16 = u16::MAX;
+/// What a trader owes on one asset, and the meter reading their position was last settled at.
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+#[repr(C, packed)]
+pub struct LedgerEntry {
+    /// The asset (`LEDGER_FREE` = unused).
+    pub asset: u16,
+    /// The low 48 bits of the asset's generation (Percolator's `market_id`) when the entry was
+    /// made: a slot reused by another asset after a market retires is another generation, and
+    /// what was owed is paid only to the vault of this one. 0 in entries made before it existed.
+    pub generation: [u8; 6],
+    /// Fees owed to that asset's vault (collateral atoms).
+    pub owed: u64,
+    /// The meter's sum for the side the position was on when last settled.
+    pub snap: u128,
+}
+/// A trading account's fees owed to the vaults (see `carry`). Paid into the vaults, out of the
+/// trader's own money, before anything can be withdrawn.
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+#[repr(C, packed)]
+pub struct Ledger {
+    pub magic: u64,
+    pub trader: Pubkey,
+    pub bump: u8,
+    pub _pad: [u8; 7],
+    pub entries: [LedgerEntry; LEDGER_SLOTS],
+}
+pub const LEDGER_LEN: usize = core::mem::size_of::<Ledger>();
+pub fn ledger_address(program_id: &Pubkey, trader: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[SEED_LEDGER, trader.as_ref()], program_id)
 }
 
 pub fn book_address(program_id: &Pubkey, vault: &Pubkey) -> (Pubkey, u8) {

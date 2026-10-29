@@ -165,6 +165,8 @@ type Me = ReturnType<typeof useMe>;
  *  transaction: a trading account and its track record. */
 const setup = (pk: PublicKey, me: Me): TransactionInstruction[] => [
   ...(me.trader === null ? [C.openTradingAccount(pk)] : []),
+  // A fee ledger (router `carry`): a copier's account cannot open positions without one.
+  ...(!me.trader?.hasLedger ? [C.openLedger(pk, pk)] : []),
   ...(!me.trader?.hasStats ? [S.openStats(pk, pk)] : []),
 ];
 
