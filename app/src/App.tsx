@@ -9,8 +9,10 @@ import { readDirect, view } from "./view";
 import Desk from "./Desk";
 import Docs from "./Docs";
 import HealthPage from "./Health";
+import ExecutionPage from "./Execution";
 import SpotDesk from "./Spot";
 import { TraderPage, TradersPage } from "./Traders";
+import { TraderModalHost } from "./TraderIntel";
 import { Card, Faucet, Icon, Send, Stat, Toast, ago, explorer, fmt, px, short, units, usd, useCards } from "./shared";
 import logo from "./turbopump-logo.png";
 
@@ -129,6 +131,7 @@ export default function App() {
           <a className={tab(page === "markets")} href="#/markets">Markets</a>
           <a className={tab(page === "launch")} href="#/launch">Open a market</a>
           <a className={tab(page === "traders" || page === "trader" || page === "leaderboard")} href="#/leaderboard">Leaderboard</a>
+          <a className={tab(page === "execution")} href="#/execution">Execution</a>
           <a className={tab(page === "health")} href="#/health">Health</a>
           <a className={tab(page === "how" || page === "docs")} href="#/docs">Docs</a>
         </nav>
@@ -158,6 +161,8 @@ export default function App() {
             <LaunchPage key={route[1] ?? ""} send={send} busy={busy} go={go} initial={route[1]} />
           ) : page === "health" ? (
             <HealthPage tick={tick} />
+          ) : page === "execution" ? (
+            <ExecutionPage tick={tick} />
           ) : page === "how" || page === "docs" ? (
             <Docs />
           ) : page === "traders" || page === "leaderboard" ? (
@@ -176,6 +181,7 @@ export default function App() {
         </div>
       )}
 
+      <TraderModalHost send={send} busy={busy} tick={tick} go={go} />
       {toast && (
         <div className={toast.ok ? "toast ok" : "toast err"} onClick={clearToast}>
           {toast.text}
@@ -194,7 +200,7 @@ function MarketCard({ c, go }: { c: Card; go: (to: string) => void }) {
       <div className="mc-head">
         <Icon symbol={sym} />
         <div>
-          <div className="mc-sym">{sym}-PERP</div>
+          <div className="mc-sym">{sym}</div>
           <div className="muted small">{c.v.feed!.name} · vault {short(c.v.key)}</div>
         </div>
         <div className="mc-price">{px(c.asset.price)}</div>
@@ -246,7 +252,7 @@ function MarketsPage({ go, tick }: { go: (to: string) => void; tick: number }) {
           return (
             <button key={f.symbol} className="market-card launch-card" onClick={() => go(`/launch/${f.symbol}`)}>
               <Icon symbol={f.symbol} />
-              <div className="mc-sym">{f.symbol}-PERP</div>
+              <div className="mc-sym">{f.symbol}</div>
               <div className="muted small">{c ? "Created, waiting to be listed. Anyone can finish it." : `Not open yet. Open the ${f.name} market.`}</div>
             </button>
           );
@@ -303,7 +309,7 @@ function LaunchPage({ send, busy, go, initial }: { send: Send; busy?: string; go
     // Listing appends a new asset slot, so read the market right before it.
     const m = await C.fetchMarket(connection);
     const pyth = C.decodePrice(new Uint8Array((await connection.getAccountInfo(C.priceAccount(feed.id)))!.data));
-    const listed = await send(`List ${feed.symbol}-PERP`, [
+    const listed = await send(`List ${feed.symbol} market`, [
       createAssociatedTokenAccountIdempotentInstruction(publicKey, C.ata(publicKey, C.MINT), publicKey, C.MINT),
       C.listAsset(publicKey, vault, feed.id, m.listSlot, m.nextMarketId, pyth.e6),
       C.openBook(publicKey, vault),
@@ -355,22 +361,22 @@ function LaunchPage({ send, busy, go, initial }: { send: Send; busy?: string; go
         <p className="muted small">Limits scale with the vault: an empty vault quotes nothing, and every deposit deepens the market. Depositors share the rest pro rata: 85%, after the platform's 10% (which a vault under $5,000 does not pay).</p>
       </section>
       <section className="card">
-        <h3>{st === 1 ? `${feed.symbol}-PERP is live` : st === 0 ? `Finish listing ${feed.symbol}-PERP` : `Open ${feed.symbol}-PERP`}</h3>
+        <h3>{st === 1 ? `${feed.symbol} market is live` : st === 0 ? `Finish listing ${feed.symbol} market` : `Open ${feed.symbol} market`}</h3>
         {st === 1 ? (
           <>
             <p className="muted">This market already exists. Trade it or add to its shared pool.</p>
-            <button className="btn primary wide" onClick={() => go(`/m/${vault.toString()}`)}>Go to {feed.symbol}-PERP</button>
+            <button className="btn primary wide" onClick={() => go(`/m/${vault.toString()}`)}>Go to {feed.symbol} market</button>
           </>
         ) : (
           <>
             <label className="field"><span>Your seed deposit (USDC, optional)</span><input value={seedDeposit} onChange={e => setSeedDeposit(e.target.value)} inputMode="decimal" /></label>
             <ol className="stepper">
               <li className={st === 0 || step > 1 ? "done" : step === 1 ? "active" : ""}>Create the vault {st === 0 && "(done)"}</li>
-              <li className={step > 2 ? "done" : step === 2 ? "active" : ""}>List {feed.symbol}-PERP with its Pyth feed</li>
+              <li className={step > 2 ? "done" : step === 2 ? "active" : ""}>List {feed.symbol} market with its Pyth feed</li>
               <li className={step === 3 ? "active" : ""}>Seed deposit (settles when the first epoch ends)</li>
             </ol>
             <button className="btn primary wide" disabled={!publicKey || !!busy || !prices[feed.symbol]} onClick={open}>
-              {!publicKey ? "Connect a wallet" : busy ? `${busy}…` : st === 0 ? `Finish listing ${feed.symbol}-PERP` : `Open ${feed.symbol}-PERP`}
+              {!publicKey ? "Connect a wallet" : busy ? `${busy}…` : st === 0 ? `Finish listing ${feed.symbol} market` : `Open ${feed.symbol} market`}
             </button>
           </>
         )}

@@ -10,7 +10,7 @@ use common::*;
 use percolator_router::{
     client::{self as rclient, OrderParams},
     state::{self as rstate, Order, ORDER_LIMIT, ORDER_STOP, ORDER_TAKE, ORDER_TRAIL, ORDER_TWAP},
-    RouterError, BOND_LAMPORTS, GRACE_SECS,
+    RouterError, BOND_LAMPORTS, EXPIRE_SHARE_DIV, GRACE_SECS, KEEPER_FEE,
 };
 use percolator_vault::percolator as perc;
 use solana_sdk::signature::{Keypair, Signer};
@@ -371,4 +371,137 @@ fn an_expired_order_is_removed_instead_of_carried_out() {
     assert!(order(&w, 0, 0).is_none());
     assert_eq!({ w.book().len }, 0);
     assert_eq!(position(&w, 0), 0);
+}
+
+// ---- keeper rewards: paid out of the order's own budget, never out of the platform ----
+
+fn balance(w: &World, k: &solana_sdk::pubkey::Pubkey) -> u64 {
+    w.env.svm.get_balance(k).unwrap_or(0)
+}
+fn keeper(w: &mut World) -> Keypair {
+    let k = Keypair::new();
+    w.env.svm.airdrop(&k.pubkey(), 1_000_000_000).unwrap();
+    k
+}
+fn trigger_by(w: &mut World, k: &Keypair, taker: usize, index: u8) -> Result<u64, String> {
+    let t = w.trader(taker);
+    let id = w.book().next_id;
+    let ix = rclient::trigger_order(&k.pubkey(), &t, &w.vault, index);
+    w.send(vec![ix], &[k]).map(|_| id)
+}
+fn request_rent(w: &World) -> u64 {
+    w.env.svm.minimum_balance_for_rent_exemption(rstate::REQUEST_LEN)
+}
+
+#[test]
+fn a_keeper_is_paid_from_the_orders_budget_and_whoever_fills_earns_the_bond() {
+    let mut w = live();
+    w.taker_trade(0, 10 * U).unwrap();
+    let budget = rclient::keeper_budget(ORDER_STOP, 0, request_rent(&w));
+    place(&mut w, 0, OrderParams { keeper_budget: budget, ..stop(950_000) }).unwrap();
+    w.move_price(20, 950_000);
+    // A keeper that only triggers (another executor fills) ends up with exactly the fee: the
+    // request's rent and bond it put up came back out of the budget.
+    let k = keeper(&mut w);
+    let k0 = balance(&w, &k.pubkey());
+    let id = trigger_by(&mut w, &k, 0, 0).unwrap();
+    assert_eq!(balance(&w, &k.pubkey()) - k0, KEEPER_FEE);
+    let wallet = w.traders[&0].1.wallet;
+    let wallet0 = balance(&w, &wallet);
+    fill_at(&mut w, 0, id, 0, 950_000).unwrap();
+    assert_eq!(position(&w, 0), 0);
+    // The order is done: its rent and the request's rent (paid from the budget) go back.
+    let order_rent = w.env.svm.minimum_balance_for_rent_exemption(rstate::ORDER_LEN);
+    assert_eq!(balance(&w, &wallet) - wallet0, order_rent + request_rent(&w));
+}
+
+#[test]
+fn a_twap_budget_pays_every_slice_and_a_keeper_cannot_be_paid_twice() {
+    let mut w = live();
+    w.trader(0);
+    let budget = rclient::keeper_budget(ORDER_TWAP, 3, request_rent(&w));
+    place(&mut w, 0, OrderParams { kind: ORDER_TWAP, size: 6 * U, slices: 3, interval: 60, keeper_budget: budget, ..Default::default() }).unwrap();
+    let k = keeper(&mut w);
+    let k0 = balance(&w, &k.pubkey());
+    for n in 1..=3i128 {
+        let id = trigger_by(&mut w, &k, 0, 0).unwrap();
+        // A second attempt while the slice waits is refused, and pays nothing.
+        assert!(trigger_by(&mut w, &k, 0, 0).is_err());
+        fill_at(&mut w, 0, id, 0, 1_000_000).unwrap();
+        assert_eq!(position(&w, 0), 2 * n * U);
+        if n < 3 {
+            let due = { order(&w, 0, 0).unwrap().next_time };
+            let slot = w.env.current_slot() + 1;
+            w.env.set_clock(slot, due);
+        }
+    }
+    assert_eq!(balance(&w, &k.pubkey()) - k0, 3 * KEEPER_FEE);
+    assert!(order(&w, 0, 0).is_none());
+    // The account never queued a trade itself, so it had no keeper deposit: the TWAP, which
+    // opened its position, filled it in out of its budget.
+    let t = w.trader(0);
+    let trader_rent = w.env.svm.minimum_balance_for_rent_exemption(rstate::TRADER_LEN);
+    assert_eq!(balance(&w, &t.trader) - trader_rent, percolator_router::keeper_deposit(request_rent(&w)));
+}
+
+#[test]
+fn an_order_without_a_budget_works_as_before_and_pays_no_keeper() {
+    let mut w = live();
+    w.taker_trade(0, 10 * U).unwrap();
+    place(&mut w, 0, stop(950_000)).unwrap();
+    w.move_price(20, 950_000);
+    let k = keeper(&mut w);
+    let k0 = balance(&w, &k.pubkey());
+    trigger_by(&mut w, &k, 0, 0).unwrap();
+    assert_eq!(k0 - balance(&w, &k.pubkey()), request_rent(&w) + BOND_LAMPORTS, "it put up the request, as before");
+}
+
+#[test]
+fn removing_an_order_that_can_do_nothing_pays_the_fee_and_returns_the_rest() {
+    let mut w = live();
+    w.trader(0);
+    let now = w.clock_ts();
+    let budget = rclient::keeper_budget(ORDER_LIMIT, 0, request_rent(&w));
+    place(&mut w, 0, OrderParams { kind: ORDER_LIMIT, trigger: 970_000, size: 5 * U, expiry: now + 30, keeper_budget: budget, ..Default::default() }).unwrap();
+    w.move_price(200, 960_000);
+    let k = keeper(&mut w);
+    let k0 = balance(&w, &k.pubkey());
+    let wallet = w.traders[&0].1.wallet;
+    let wallet0 = balance(&w, &wallet);
+    trigger_by(&mut w, &k, 0, 0).unwrap();
+    assert!(order(&w, 0, 0).is_none());
+    assert_eq!(balance(&w, &k.pubkey()) - k0, KEEPER_FEE);
+    let order_rent = w.env.svm.minimum_balance_for_rent_exemption(rstate::ORDER_LEN);
+    assert_eq!(balance(&w, &wallet) - wallet0, order_rent + budget - KEEPER_FEE);
+}
+
+#[test]
+fn a_budget_larger_than_the_cap_is_refused() {
+    let mut w = live();
+    w.trader(0);
+    expect(place(&mut w, 0, OrderParams { kind: ORDER_LIMIT, trigger: 970_000, size: 5 * U, keeper_budget: percolator_router::MAX_KEEPER_BUDGET + 1, ..Default::default() }), RouterError::BadOrder);
+}
+
+#[test]
+fn expiring_an_orders_request_pays_a_quarter_of_its_bond_and_the_rent_goes_back_to_the_order() {
+    let mut w = live();
+    w.taker_trade(0, 10 * U).unwrap();
+    let budget = rclient::keeper_budget(ORDER_STOP, 0, request_rent(&w));
+    place(&mut w, 0, OrderParams { keeper_budget: budget, ..stop(950_000) }).unwrap();
+    w.move_price(20, 950_000);
+    let k = keeper(&mut w);
+    let id = trigger_by(&mut w, &k, 0, 0).unwrap();
+    let target = w.request_target(id);
+    let slot = w.env.current_slot() + 1;
+    w.env.set_clock(slot, target + GRACE_SECS + 1);
+    let x = keeper(&mut w);
+    let x0 = balance(&w, &x.pubkey());
+    let t = w.traders[&0].1;
+    let vault = w.vault;
+    w.send(vec![rclient::expire_order(&x.pubkey(), &vault, &t, 0)], &[&x]).unwrap();
+    assert_eq!(balance(&w, &x.pubkey()) - x0, BOND_LAMPORTS / EXPIRE_SHARE_DIV, "less than a fill pays");
+    // The request's rent is back in the order, so it can be carried out again.
+    let order_ai = rstate::order_address(&percolator_router::id(), &vault, &t.wallet, 0).0;
+    let order_rent = w.env.svm.minimum_balance_for_rent_exemption(rstate::ORDER_LEN);
+    assert_eq!(balance(&w, &order_ai) - order_rent, request_rent(&w));
 }

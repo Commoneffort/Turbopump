@@ -15,6 +15,15 @@ case "$1" in
     if ! running devnet-executor; then
       (cd app && RPC=$RPC setsid sh -c 'echo $$ > ../deploy/logs/devnet-executor.pid; while :; do npx tsx scripts/executor.ts; echo "$(date -u +%T) restart: devnet-executor exited with status $?, starting it again in 5 s"; sleep 5; done' >> ../deploy/logs/executor.log 2>&1 < /dev/null &)
     fi
+    # A backup executor with a wallet of its own (see deploy/x1-services.sh): it starts once
+    # ~/.config/solana/percolator-test/backup-executor.json exists. Kept off for now (the wallet is
+    # funded, as backup-executor.json.standby): on the public devnet RPC two executors throttle
+    # each other, and the primary itself leaves fills minutes late. Rename it back once devnet has
+    # an RPC that keeps up.
+    BACKUP_KEY=$HOME/.config/solana/percolator-test/backup-executor.json
+    if [ -f "$BACKUP_KEY" ] && ! running devnet-backup-executor; then
+      (cd app && RPC=$RPC KEYPAIR=$BACKUP_KEY BACKUP_AFTER_SECS=180 setsid sh -c 'echo $$ > ../deploy/logs/devnet-backup-executor.pid; while :; do npx tsx scripts/executor.ts; echo "$(date -u +%T) restart: devnet-backup-executor exited with status $?, starting it again in 5 s"; sleep 5; done' >> ../deploy/logs/devnet-backup-executor.log 2>&1 < /dev/null &)
+    fi
     if ! running devnet-watchdog; then
       (cd app && NETWORK=devnet RPC=$RPC setsid sh -c 'echo $$ > ../deploy/logs/devnet-watchdog.pid; while :; do npx tsx scripts/watchdog.ts; echo "$(date -u +%T) restart: devnet-watchdog exited with status $?, starting it again in 30 s"; sleep 30; done' >> ../deploy/logs/devnet-watchdog.log 2>&1 < /dev/null &)
     fi
@@ -28,10 +37,10 @@ case "$1" in
     sleep 2
     "$0" status
     ;;
-  stop) stop devnet-executor; stop devnet-keeper; stop devnet-watchdog; stop devnet-fills-log ;;
+  stop) stop devnet-executor; stop devnet-backup-executor; stop devnet-keeper; stop devnet-watchdog; stop devnet-fills-log ;;
   restart-executor) stop devnet-executor; sleep 1; "$0" start ;;
   status)
-    for s in devnet-executor devnet-keeper devnet-watchdog devnet-fills-log; do
+    for s in devnet-executor devnet-backup-executor devnet-keeper devnet-watchdog devnet-fills-log; do
       if running $s; then echo "$s running (process group $(cat deploy/logs/$s.pid))"; else echo "$s not running"; fi
     done
     ;;

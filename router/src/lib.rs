@@ -285,6 +285,76 @@ pub const MAX_TRAIL_BPS: u64 = 5_000;
 pub const MIN_TWAP_INTERVAL_SECS: i64 = 10;
 pub const MAX_TWAP_SLICES: u32 = 500;
 
+// ---- executor rewards ----
+// Every reward is paid by whoever needs the work done, never out of the platform's fees, and only
+// by an instruction that succeeds: a failed or duplicate attempt earns nothing.
+//
+// - Fill: the request's bond (`BOND_LAMPORTS`), put up with the request.
+// - Trigger a standing order: `KEEPER_FEE`, plus the request's bond and rent paid back, out of
+//   the order's keeper budget (lamports above its rent, attached when it was placed). Removing an
+//   order that can do nothing more earns `KEEPER_FEE` out of the same budget; the rest goes back.
+// - Liquidate: `LIQ_REWARD`, plus the request's bond and rent paid back, out of the liquidated
+//   account's keeper deposit (lamports above its trader account's rent, topped up by `Request`).
+// - Expire a request nobody filled: `EXPIRE_SHARE_DIV`-th of its bond (the rest is forfeited as
+//   before). Always less than filling it would have paid, so letting a request lapse never pays.
+
+/// Paid to whoever carries out or removes a standing order, from the order's keeper budget.
+#[cfg(not(feature = "x1"))]
+pub const KEEPER_FEE: u64 = 100_000;
+/// (On X1 a trigger asks for about 100,000 compute units: 0.001 XNT.)
+#[cfg(feature = "x1")]
+pub const KEEPER_FEE: u64 = 2_000_000;
+/// Paid to whoever liquidates an account, from that account's keeper deposit: a fixed amount,
+/// whatever the position's size, so no position is worth more to liquidate than another.
+pub const LIQ_REWARD: u64 = BOND_LAMPORTS / 2;
+/// The part of a request's bond paid to whoever expires it.
+pub const EXPIRE_SHARE_DIV: u64 = 4;
+/// The most lamports an order can hold for its keepers (every slice of the longest TWAP).
+/// (Plus room for a keeper deposit, which an order that can open a position carries: see
+/// `TriggerOrder`.)
+pub const MAX_KEEPER_BUDGET: u64 = (MAX_TWAP_SLICES as u64 + 1) * (BOND_LAMPORTS + KEEPER_FEE) + 2 * BOND_LAMPORTS + 10_000_000;
+
+/// What a request costs whoever queues it: its rent and its bond.
+fn request_cost() -> Result<u64, ProgramError> {
+    Ok(Rent::get()?.minimum_balance(REQUEST_LEN).saturating_add(BOND_LAMPORTS))
+}
+/// What a trading account keeps for whoever liquidates it: a liquidation's request and reward.
+pub fn keeper_deposit(request_rent: u64) -> u64 {
+    request_rent.saturating_add(BOND_LAMPORTS).saturating_add(LIQ_REWARD)
+}
+/// What the trading account's keeper deposit lacks (0 when it is whole).
+fn deposit_short(trader_ai: &AccountInfo) -> Result<u64, ProgramError> {
+    Ok(keeper_deposit(Rent::get()?.minimum_balance(REQUEST_LEN)).saturating_sub(spare(trader_ai, TRADER_LEN)?))
+}
+/// Tops the trading account's keeper deposit up from the wallet (a signer).
+pub(crate) fn top_up_deposit<'a>(wallet: &AccountInfo<'a>, trader_ai: &AccountInfo<'a>, system: &AccountInfo<'a>) -> ProgramResult {
+    let short = deposit_short(trader_ai)?;
+    if short > 0 {
+        invoke(&solana_program::system_instruction::transfer(wallet.key, trader_ai.key, short), &[wallet.clone(), trader_ai.clone(), system.clone()])?;
+    }
+    Ok(())
+}
+/// Lamports `ai` holds above its rent.
+fn spare(ai: &AccountInfo, len: usize) -> Result<u64, ProgramError> {
+    Ok(ai.lamports().saturating_sub(Rent::get()?.minimum_balance(len)))
+}
+/// Moves lamports out of an account this program owns.
+fn pay(from: &AccountInfo, to: &AccountInfo, amount: u64) -> ProgramResult {
+    if amount == 0 || from.key == to.key {
+        return Ok(());
+    }
+    **from.try_borrow_mut_lamports()? = from.lamports().checked_sub(amount).ok_or(RouterError::Overflow)?;
+    **to.try_borrow_mut_lamports()? = to.lamports().checked_add(amount).ok_or(RouterError::Overflow)?;
+    Ok(())
+}
+/// Marks a request as paid for by its owner (an order's budget or a keeper deposit): its rent then
+/// goes back there, not to whoever queued it.
+fn mark_funded(program_id: &Pubkey, request_ai: &AccountInfo) -> ProgramResult {
+    let mut r: Request = load(request_ai, program_id, REQUEST_MAGIC)?;
+    r.funded = 1;
+    store(request_ai, &r)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum RouterError {
@@ -662,6 +732,16 @@ fn withdraw(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -> Progr
         &[collateral.clone(), dest.clone(), trader_ai.clone(), token.clone()],
         &[trader_seeds!(t)],
     )?;
+    // With no position left the keeper deposit has nothing to pay for: it goes back to the
+    // wallet (when the wallet and the trader account are passed writable; the next trade tops
+    // it up again).
+    // A copy, while it runs, can open a position for the account at any time without the wallet:
+    // the deposit stays then. So the refund needs the account's copy address passed, and empty.
+    let copy_key = state::copy_address(program_id, &t.market, wallet.key).0;
+    let no_copy = accounts.iter().any(|a| *a.key == copy_key && a.owner != program_id);
+    if no_copy && wallet.is_writable && trader_ai.is_writable && perc::positions(&market.try_borrow_data()?, &portfolio.try_borrow_data()?)?.iter().all(|p| p.size == 0) {
+        pay(trader_ai, wallet, spare(trader_ai, TRADER_LEN)?)?;
+    }
     social::book_flow(program_id, &t, acc(accounts, 10), 0, received)
 }
 
@@ -924,6 +1004,9 @@ fn request(program_id: &Pubkey, accounts: &[AccountInfo], size: i128) -> Program
     }
     // The deposit is counted at the mark (Percolator's price for a book that has none yet).
     let price = if b.mark_price != 0 { b.mark_price } else { perc::asset_price(&market.try_borrow_data()?, v.asset_index)?.1 };
+    // The account's keeper deposit: what whoever liquidates it is paid (see `keeper_deposit`),
+    // topped up from the wallet when a liquidation has used it. Paid once; it stays the trader's.
+    top_up_deposit(wallet, trader_ai, system)?;
     enqueue(program_id, wallet, wallet.key, Some((trader_ai, &mut t)), vault_ai, book_ai, &mut b, request_ai, system, size, None, expiry_deposit(size, price))
 }
 
@@ -986,7 +1069,8 @@ fn enqueue_after<'a>(
             bump: rbump,
             kind: if trader.is_none() { KIND_SETTLE } else if order.is_some() { KIND_ORDER } else { KIND_TRADE },
             order_index: order.unwrap_or(0),
-            _pad: [0; 5],
+            funded: 0,
+            _pad: [0; 4],
         },
     )?;
     b.next_id = id.checked_add(1).ok_or(RouterError::Overflow)?;
@@ -1051,9 +1135,15 @@ fn request_close(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
         return Err(RouterError::BookFull.into());
     }
     perc::expect_market(market)?;
-    if !perc::asset_close_only(&market.try_borrow_data()?, v.asset_index)? {
-        let portfolio = acc(accounts, 8)?;
-        key_is(portfolio, &t.portfolio)?;
+    let liquidation = !perc::asset_close_only(&market.try_borrow_data()?, v.asset_index)?;
+    let portfolio = acc(accounts, 8)?;
+    key_is(portfolio, &t.portfolio)?;
+    // A close-out needs a position to close on this market: without one the request would do
+    // nothing but hold the trader's queue place (and cost its keeper deposit).
+    if !liquidation && position_on(market, portfolio, v.asset_index)? == 0 {
+        return Err(RouterError::NotCloseOnly.into());
+    }
+    if liquidation {
         let debt = carry::ledger_in(program_id, accounts, trader_ai.key).map_or(0, carry::total_owed);
         if !liquidatable(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, tiers_in(program_id, accounts, market.key).as_ref(), debt)? {
             return Err(RouterError::NotCloseOnly.into());
@@ -1061,7 +1151,18 @@ fn request_close(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
     }
     // No delay: the trader chooses nothing here, so there is no one to trade ahead of; the close
     // takes the next price.
-    enqueue_after(program_id, payer, wallet.key, Some((trader_ai, &mut t)), vault_ai, book_ai, &mut b, request_ai, system, 0, None, 0, 1)
+    enqueue_after(program_id, payer, wallet.key, Some((trader_ai, &mut t)), vault_ai, book_ai, &mut b, request_ai, system, 0, None, 0, 1)?;
+    // Whoever queued it is paid back the request's rent and bond out of the account's keeper
+    // deposit. The liquidation reward itself (`LIQ_REWARD`) is paid only by a fill that does
+    // liquidate the account: an account that recovers before the fill pays no reward.
+    if payer.key != wallet.key {
+        let cost = request_cost()?;
+        if spare(trader_ai, TRADER_LEN)? >= cost {
+            pay(trader_ai, payer, cost)?;
+            mark_funded(program_id, request_ai)?;
+        }
+    }
+    Ok(())
 }
 
 // ---- standing orders: stop, take-profit, trailing stop, limit, TWAP ----
@@ -1084,7 +1185,9 @@ fn closing(held: i128, amount: i128) -> i128 {
 /// Accounts: 0 wallet [s, w], 1 trader, 2 vault, 3 book, 4 order [w], 5 market, 6 trader
 /// portfolio, 7 system program.
 /// Data: index (u8), kind (u8), reduce-only (u8), size (i128), trigger (u64), TWAP interval
-/// seconds (i64), TWAP slices (u32), expiry time (i64, 0 = none).
+/// seconds (i64), TWAP slices (u32), expiry time (i64, 0 = none), then optionally the keeper
+/// budget (u64 lamports, at most `MAX_KEEPER_BUDGET`): kept in the order's account and paid to
+/// whoever carries it out (see `KEEPER_FEE`); what is left goes back with the order's rent.
 #[inline(never)]
 fn place_order(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let wallet = acc(accounts, 0)?;
@@ -1099,8 +1202,12 @@ fn place_order(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     writable(wallet)?;
     writable(order_ai)?;
     key_is(system, &system_program::ID)?;
-    if data.len() != 47 {
+    if data.len() != 47 && data.len() != 55 {
         return Err(RouterError::InvalidInstruction.into());
+    }
+    let budget = if data.len() == 55 { u64::from_le_bytes(data[47..55].try_into().unwrap()) } else { 0 };
+    if budget > MAX_KEEPER_BUDGET {
+        return Err(RouterError::BadOrder.into());
     }
     let (index, kind, reduce_only) = (data[0], data[1], data[2]);
     let size = i128::from_le_bytes(data[3..19].try_into().unwrap());
@@ -1168,7 +1275,7 @@ fn place_order(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         }
         _ => return Err(RouterError::BadOrder.into()),
     }
-    create_pda(wallet, order_ai, system, program_id, ORDER_LEN, 0, &[SEED_ORDER, vault_ai.key.as_ref(), wallet.key.as_ref(), &[index], &[bump]])?;
+    create_pda(wallet, order_ai, system, program_id, ORDER_LEN, budget, &[SEED_ORDER, vault_ai.key.as_ref(), wallet.key.as_ref(), &[index], &[bump]])?;
     store(order_ai, &o)
 }
 
@@ -1247,7 +1354,7 @@ fn trigger_order(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
     let held = position_on(market, portfolio, v.asset_index)?;
     let protective = matches!(o.kind, ORDER_STOP | ORDER_TAKE | ORDER_TRAIL);
     if (o.expiry != 0 && now > o.expiry) || (protective && (held == 0 || (held > 0) != (o.side > 0))) {
-        return close(order_ai, 0, wallet, wallet);
+        return remove_order(order_ai, payer, wallet);
     }
     let mark = b.mark_price;
     if mark == 0 {
@@ -1291,7 +1398,7 @@ fn trigger_order(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
     };
     if !protective && o.reduce_only != 0 {
         if held == 0 || (held > 0) == (size > 0) {
-            return close(order_ai, 0, wallet, wallet);
+            return remove_order(order_ai, payer, wallet);
         }
         if size.unsigned_abs() > held.unsigned_abs() {
             size = -held;
@@ -1311,7 +1418,37 @@ fn trigger_order(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
     }
     o.queued_id = b.next_id.checked_add(1).ok_or(RouterError::Overflow)?;
     store(order_ai, &o)?;
-    enqueue(program_id, payer, wallet.key, Some((trader_ai, &mut t)), vault_ai, book_ai, &mut b, request_ai, system, size, Some(o.index), 0)
+    enqueue(program_id, payer, wallet.key, Some((trader_ai, &mut t)), vault_ai, book_ai, &mut b, request_ai, system, size, Some(o.index), 0)?;
+    // Out of the order's keeper budget: the request's rent and bond back to whoever queued it,
+    // and `KEEPER_FEE` for doing so. (An order placed without a budget pays nothing: the caller
+    // gets the rent and bond back only by filling the request too, as before.)
+    let cost = request_cost()?;
+    // An order that can open a position fills in the account's keeper deposit first, when it
+    // lacks one (the wallet may have had it refunded while flat): out of the order's budget,
+    // which the page sizes to hold it, and only when the keeper's share is still there after.
+    if matches!(o.kind, ORDER_LIMIT | ORDER_TWAP) && o.reduce_only == 0 {
+        let short = deposit_short(trader_ai)?;
+        if short > 0 && spare(order_ai, ORDER_LEN)? >= short.saturating_add(cost + KEEPER_FEE) {
+            pay(order_ai, trader_ai, short)?;
+        }
+    }
+    if spare(order_ai, ORDER_LEN)? >= cost + KEEPER_FEE {
+        pay(order_ai, payer, cost + KEEPER_FEE)?;
+        mark_funded(program_id, request_ai)?;
+        msg!("reward trigger {}", KEEPER_FEE);
+    }
+    Ok(())
+}
+
+/// Removes an order that can do nothing more: `KEEPER_FEE` of its keeper budget to whoever
+/// noticed, the rest and its rent to the wallet.
+fn remove_order<'a>(order_ai: &AccountInfo<'a>, payer: &AccountInfo<'a>, wallet: &AccountInfo<'a>) -> ProgramResult {
+    let fee = KEEPER_FEE.min(spare(order_ai, ORDER_LEN)?);
+    if fee > 0 && payer.key != wallet.key {
+        pay(order_ai, payer, fee)?;
+        msg!("reward cleanup {}", fee);
+    }
+    close(order_ai, 0, wallet, wallet)
 }
 
 /// Books what a request queued by a standing order traded, and removes the order once it has
@@ -1525,9 +1662,7 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     } else {
         None
     };
-    // The rent of a request goes back to who paid it: the trader, or for a standing order's
-    // request whoever carried the order out (the executor earns it by filling).
-    let rent_to = if order.is_some() || r.kind == KIND_COPY { executor } else { wallet };
+    let order_ai = order.as_ref().map(|(a, _)| *a);
     let mut b: Book = load(book_ai, program_id, BOOK_MAGIC)?;
     let v = load_vault(vault_ai)?;
     if r.vault != *vault_ai.key || b.vault != *vault_ai.key || t.pending_vault != *vault_ai.key || t.pending_id != r.id {
@@ -1642,6 +1777,31 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         let protective = matches!(o.kind, ORDER_STOP | ORDER_TAKE | ORDER_TRAIL);
         settle_order(order_ai, o, if liquidated && !protective { 0 } else { traded }, wallet)?;
     }
+    // A fill that liquidated the account (a trader's own request turned into a liquidation, or a
+    // queued forced close while the account is still below its level) pays the executor
+    // `LIQ_REWARD` from its keeper deposit.
+    if liquidation_fee && traded != 0 {
+        let reward = LIQ_REWARD.min(spare(trader_ai, TRADER_LEN)?);
+        if reward > 0 {
+            pay(trader_ai, executor, reward)?;
+            msg!("reward liquidate {}", reward);
+        }
+    }
+    // The bond is the executor's. The rent goes back to who paid it: the trader; for a request
+    // paid for by its owner, the order's budget (or the wallet, once the order is done) or the
+    // account's keeper deposit; otherwise, for a standing order's or a copy's request, whoever
+    // queued it, who is paid back only by filling it.
+    let rent_to = if r.funded != 0 {
+        match order_ai {
+            Some(oa) if oa.data_len() > 0 => oa,
+            Some(_) => wallet,
+            None => trader_ai,
+        }
+    } else if order_ai.is_some() || r.kind == KIND_COPY {
+        executor
+    } else {
+        wallet
+    };
     close(request_ai, BOND_LAMPORTS, executor, rent_to)
 }
 
@@ -1913,8 +2073,16 @@ fn expire(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         t.has_pending = 0;
         store(trader_ai, &t)?;
     }
+    // A share of the bond to whoever expires it (when they let the router credit them); the
+    // rest is forfeited.
+    let share = if caller.is_writable && caller.key != book_ai.key && caller.key != request_ai.key { BOND_LAMPORTS / EXPIRE_SHARE_DIV } else { 0 };
+    let bond = BOND_LAMPORTS - share;
+    if share > 0 {
+        pay(request_ai, caller, share)?;
+        msg!("reward expire {}", share);
+    }
     b.remove(r.id)?;
-    b.forfeited_bonds = b.forfeited_bonds.saturating_add(BOND_LAMPORTS);
+    b.forfeited_bonds = b.forfeited_bonds.saturating_add(bond);
     store(book_ai, &b)?;
     if r.kind == KIND_ORDER {
         let order_ai = acc(accounts, 5)?;
@@ -1923,21 +2091,24 @@ fn expire(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         let mut o: Order = load(order_ai, program_id, ORDER_MAGIC)?;
         o.queued_id = 0;
         store(order_ai, &o)?;
-        return close(request_ai, BOND_LAMPORTS, book_ai, book_ai);
+        // Paid for out of the order's budget: its rent goes back there.
+        return close(request_ai, bond, book_ai, if r.funded != 0 { order_ai } else { book_ai });
     }
     if r.kind == KIND_COPY {
-        return close(request_ai, BOND_LAMPORTS, book_ai, book_ai);
+        return close(request_ai, bond, book_ai, book_ai);
     }
+    // A forced close paid for out of the keeper deposit gives its rent back to the deposit.
+    let rent_to = if r.funded != 0 && r.kind == KIND_TRADE { trader_ai } else { wallet };
     // Its price was the mark and it still was not filled: the deposit that came with it stays
     // here with the bond (see `EXPIRY_DEPOSIT_BPS`); only the account's rent goes back. A request
     // whose price never arrived (no oracle price, no executor) lost nothing but its bond.
     if r.kind == KIND_TRADE && at_mark && !market_was_behind(accounts, &r)? {
         let rent = Rent::get()?.minimum_balance(REQUEST_LEN);
-        let kept = request_ai.lamports().saturating_sub(rent).max(BOND_LAMPORTS);
+        let kept = request_ai.lamports().saturating_sub(rent).max(bond);
         let mut b: Book = load(book_ai, program_id, BOOK_MAGIC)?;
-        b.forfeited_bonds = b.forfeited_bonds.saturating_add(kept - BOND_LAMPORTS);
+        b.forfeited_bonds = b.forfeited_bonds.saturating_add(kept - bond);
         store(book_ai, &b)?;
-        return close(request_ai, kept, book_ai, wallet);
+        return close(request_ai, kept, book_ai, rent_to);
     }
-    close(request_ai, BOND_LAMPORTS, book_ai, wallet)
+    close(request_ai, bond, book_ai, rent_to)
 }

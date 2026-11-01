@@ -8,6 +8,8 @@ import { Stat, ago, fmt, usd } from "./shared";
 import * as S from "./social";
 import { useBoard } from "./Traders";
 import { SEED_WALLETS } from "../api/_config";
+import { OrderIntegrity } from "./Execution";
+import { useExecReport } from "./Pulse";
 
 type VaultRow = {
   symbol: string;
@@ -139,7 +141,7 @@ export default function HealthPage({ tick }: { tick: number }) {
               <tr><td colSpan={10} className="muted">Reading…</td></tr>
             ) : h.vaults.map(r => (
               <tr key={r.symbol}>
-                <td>{r.symbol}-PERP</td>
+                <td>{r.symbol}</td>
                 <td className="r">{usd(r.nav, 0)}</td>
                 <td className="r">{fmt(r.share, 4)}</td>
                 <td className="r">{r.share24h === undefined ? "—" : pct(r.share24h)}</td>
@@ -166,6 +168,7 @@ export default function HealthPage({ tick }: { tick: number }) {
       {h && <p className="muted small">Read {ago((Date.now() - h.at) / 1000)}. "Price" is how old the price each market last moved to is.</p>}
       {h && <Crowding vaults={h.vaults} tick={tick} />}
       <Organic tick={tick} />
+      <OrderHealth />
     </main>
   );
 }
@@ -255,7 +258,7 @@ function Crowding({ vaults, tick }: { vaults: VaultRow[]; tick: number }) {
           <tbody>
             {rows.map(({ v, c }) => (
               <tr key={v.symbol}>
-                <td>{v.symbol}-PERP</td>
+                <td>{v.symbol}</td>
                 <td className={`r ${c.now >= 0.8 ? "down" : ""}`}>{pct(c.now, 0)} {Number(v.position) === 0 ? "" : Number(v.position) > 0 ? "long" : "short"}</td>
                 <td className={`r ${c.at80 >= 0.25 ? "down" : ""}`}>{pct(c.at80, 0)}</td>
                 <td className="r">{pct(c.at50, 0)}</td>
@@ -265,6 +268,22 @@ function Crowding({ vaults, tick }: { vaults: VaultRow[]; tick: number }) {
           </tbody>
         </table>
       </div>
+    </>
+  );
+}
+
+/** Conditional-order integrity (from the execution report): whether stops, limits and TWAPs are
+ *  carried out once their price is reached, and how their fills compare with their levels. */
+function OrderHealth() {
+  const { report, err } = useExecReport();
+  return (
+    <>
+      <h3 className="section-title">Conditional-order integrity</h3>
+      <p className="muted small">
+        Stops, take-profits, limits and TWAPs trigger on the oracle price, which no trade here can push, and anyone may carry them out.
+        Measured from the chain over the last hours. <a className="link" href="#/execution">More on the Execution page →</a>
+      </p>
+      {report ? <OrderIntegrity report={report} compact /> : <p className="muted small">{err ? "The report could not be read." : "Reading…"}</p>}
     </>
   );
 }

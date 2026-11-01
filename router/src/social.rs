@@ -339,6 +339,12 @@ pub(crate) fn set_copy(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
     }
     let (ck, bump) = copy_address(program_id, &t.market, wallet.key);
     key_is(copy_ai, &ck)?;
+    // A copy opens positions for the account without the wallet: its keeper deposit (what a
+    // liquidator is paid from) is filled in now, while the wallet signs (when the trader account
+    // is passed writable, as the clients do).
+    if trader_ai.is_writable {
+        crate::top_up_deposit(wallet, trader_ai, system)?;
+    }
     let now = Clock::get()?.unix_timestamp;
     let mut c = if copy_ai.owner == program_id {
         let c: Copy = load(copy_ai, program_id, COPY_MAGIC)?;

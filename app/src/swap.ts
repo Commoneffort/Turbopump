@@ -26,7 +26,7 @@ export const USDC_POOL = (() => {
   return PublicKey.findProgramAddressSync([Buffer.from("pool"), XDEX.ammConfig.toBuffer(), m0.toBuffer(), m1.toBuffer()], XDEX.program)[0];
 })();
 
-type Listed = { mint: string; symbol: string; price: number; volume: number };
+type Listed = { mint: string; symbol: string; logo?: string; price: number; volume: number };
 export type ListedPool = { pool: string; a: Listed; b: Listed; tvl: number; volume: number; txns: number };
 
 /** xDEX's pool list for this network (through our /api/pools, which also serves the charts' history). */

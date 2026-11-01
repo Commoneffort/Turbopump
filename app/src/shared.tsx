@@ -35,8 +35,21 @@ export function Stat({ label, value, sub }: { label: string; value: string; sub?
   );
 }
 
-/** A market's mark: its symbol's first letters on a quiet tile. */
-export function Icon({ symbol }: { symbol: string }) {
+/** Token and company logos kept with the page (public/logos), by symbol. */
+const LOGOS: Record<string, string> = Object.fromEntries([
+  ...["AAPL", "AMD", "BTC", "COIN", "DOGE", "ETH", "FARTCOIN", "GOOGL", "HYPE", "META", "MSTR", "NVDA", "PLTR", "PYTH", "SOL", "SPY", "TSLA", "USDC", "XNT", "ZEC"].map(s => [s, `/logos/${s}.webp`]),
+  ...["EUR", "SPCX", "XAG", "XAU"].map(s => [s, `/logos/${s}.svg`]),
+]);
+/** Wrapped and X1-bridged names share their token's logo: WXNT, PLTR.X, USDC.X. */
+const logoKey = (symbol: string) => { const s = symbol.toUpperCase().replace(/\.X$/, ""); return s === "WXNT" ? "XNT" : s === "WSOL" ? "SOL" : s; };
+/** Only xDEX's own and X1 Labs' token images are shown for spot tokens we do not keep. */
+const trustedLogo = (url?: string) => !!url && /^https:\/\/(app\.xdex\.xyz\/|raw\.githubusercontent\.com\/x1-labs\/assets\/)/.test(url);
+
+/** A market's mark: the token's logo, else its symbol's first letters on a quiet tile. */
+export function Icon({ symbol, logo }: { symbol: string; logo?: string }) {
+  const src = LOGOS[logoKey(symbol)] ?? (trustedLogo(logo) ? logo : undefined);
+  const [bad, setBad] = useState(false);
+  if (src && !bad) return <img className="coin logo" src={src} alt="" loading="lazy" onError={() => setBad(true)} />;
   return <span className="coin">{symbol.slice(0, symbol.length > 4 ? 2 : 1)}</span>;
 }
 
@@ -237,7 +250,7 @@ function describe(tx: any, v: C.Vault): string {
 
 // ---------------------------------------------------------------- fills
 
-export type Fill = { sig: string; slot: number; vault: string; size: number; price: number };
+export type Fill = { sig: string; slot: number; vault: string; size: number; price: number; time?: number };
 
 /** This wallet's fills on a vault, read from the router's fill logs ("fill <id> <size> <price>")
  *  in the trading account's transaction history and cached in this browser. Only a few new
@@ -250,7 +263,7 @@ export function useFills(wallet: PublicKey | null, vault: PublicKey, tick: bigin
 /** This wallet's fills on every market (see `useFills`). */
 export function useWalletFills(wallet: PublicKey | null, tick: bigint): Fill[] {
   const { connection } = useConnection();
-  const key = wallet ? `pv:fills:${C.ROUTER.toBase58().slice(0, 8)}:${wallet.toBase58()}` : "";
+  const key = wallet ? `pv:fills2:${C.ROUTER.toBase58().slice(0, 8)}:${wallet.toBase58()}` : "";
   const [fills, setFills] = useState<Fill[]>([]);
   useEffect(() => {
     if (!wallet) { setFills([]); return; }
@@ -267,13 +280,21 @@ export function useWalletFills(wallet: PublicKey | null, tick: bigint): Fill[] {
           const tx = await connection.getTransaction(x.signature, { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
           if (!tx) continue;
           cache.seen.push(x.signature);
-          const line = (tx.meta?.logMessages ?? []).find(l => /^Program log: fill \d+ -?\d+ \d+$/.test(l));
-          if (!line) continue;
-          const [, , , , size, price] = line.split(" ");
+          // One transaction can fill several traders (the executor's batched round): only the fill
+          // instruction whose trader account is this wallet's counts. Each fill logs one line.
+          const lines = (tx.meta?.logMessages ?? []).filter(l => /^Program log: fill \d+ -?\d+ \d+$/.test(l));
+          if (!lines.length) continue;
           const keys = [...tx.transaction.message.staticAccountKeys, ...(tx.meta?.loadedAddresses?.writable ?? []), ...(tx.meta?.loadedAddresses?.readonly ?? [])].map(k => k.toString());
-          // The vault is the account whose router book is also in the transaction.
-          const v = keys.find(k => keys.includes(C.bookAddress(new PublicKey(k)).toString()));
-          if (v && Number(size) !== 0) cache.fills.push({ sig: x.signature, slot: x.slot, vault: v, size: Number(size) / 1e6, price: Number(price) / 1e6 });
+          const trader = C.traderAddress(wallet).toString(), router = C.ROUTER.toString();
+          let n = 0;
+          for (const ix of tx.transaction.message.compiledInstructions) {
+            if (keys[ix.programIdIndex] !== router || ix.data[0] !== 6) continue;
+            const line = lines[n++];
+            if (!line || keys[ix.accountKeyIndexes[2]] !== trader) continue;
+            const [, , , , size, price] = line.split(" ");
+            const v = keys[ix.accountKeyIndexes[5]];
+            if (v && Number(size) !== 0) cache.fills.push({ sig: x.signature, slot: x.slot, vault: v, size: Number(size) / 1e6, price: Number(price) / 1e6, time: x.blockTime ?? tx.blockTime ?? undefined });
+          }
         }
         cache.seen = cache.seen.slice(-200);
         cache.fills = cache.fills.sort((a, b) => a.slot - b.slot).slice(-200);
@@ -286,13 +307,37 @@ export function useWalletFills(wallet: PublicKey | null, tick: bigint): Fill[] {
   return fills;
 }
 
+/** The wallet's fills back to the opening of each position it holds (api/fills.ts reads its whole
+ *  history on the server), merged with the recent ones read here. `need`: "<vault>:<position e6>"
+ *  joined by commas, one per position held. */
+export function useDeepFills(wallet: PublicKey | null, need: string, recent: Fill[]): Fill[] {
+  const [deep, setDeep] = useState<Fill[]>([]);
+  const who = wallet?.toBase58() ?? "";
+  useEffect(() => {
+    if (!who || !need) { setDeep([]); return; }
+    let live = true;
+    fetch(`/api/fills?network=${C.NETWORK}&wallet=${who}&need=${need}`).then(r => r.json()).then(j => {
+      if (live && Array.isArray(j?.fills)) setDeep(j.fills);
+    }).catch(() => undefined);
+    return () => { live = false; };
+  }, [who, need]);
+  return useMemo(() => {
+    if (!deep.length) return recent;
+    const seen = new Set(deep.map(f => f.sig));
+    return [...deep, ...recent.filter(f => !seen.has(f.sig))].sort((a, b) => a.slot - b.slot);
+  }, [deep, recent]);
+}
+
 /** Each fill with the profit or loss it booked (average-cost method, per market, before fees):
  *  a fill that shrinks or flips a position books (price - average entry) x the size it closed;
  *  one that opens or adds books nothing. The fills on record may not go back to when a position
  *  was opened, so the position before each fill is worked out backwards from the position held
  *  now (`now`, by vault), and a market's PnL is only counted from a fill that started from flat:
- *  `known` is false before that, and nothing is guessed. */
-export function realizedPnl(fills: Fill[], now: Map<string, number>): (Fill & { realized: number; known: boolean })[] {
+ *  `known` is false before that (or before a flip, which opens the new side wholly at its own
+ *  price), and nothing is guessed. Each fill also gets its entry and close prices: one that shrinks
+ *  or flips a position closes at its own price against the average entry before it (`entry` is
+ *  undefined while that is not known); one that opens or adds has its own price as entry. */
+export function realizedPnl(fills: Fill[], now: Map<string, number>): (Fill & { realized: number; known: boolean; entry?: number; close?: number; flips: boolean })[] {
   const before = new Array<number>(fills.length);
   const after = new Map(now);
   for (let i = fills.length - 1; i >= 0; i--) {
@@ -305,6 +350,10 @@ export function realizedPnl(fills: Fill[], now: Map<string, number>): (Fill & { 
     const b = book.get(f.vault) ?? { pos: 0, avg: 0, known: false };
     if (!b.known && before[i] === 0) { b.known = true; b.pos = 0; }
     let realized = 0;
+    // The position before this fill is known from the one now even when its entry is not.
+    const closes = before[i] !== 0 && Math.sign(f.size) !== Math.sign(before[i]);
+    const opens = !closes || Math.abs(f.size) > Math.abs(before[i]) + 1e-9;
+    const entry = closes ? (b.known ? b.avg : undefined) : f.price;
     if (b.known) {
       const next = b.pos + f.size;
       if (b.pos !== 0 && Math.sign(f.size) !== Math.sign(b.pos)) realized = (f.price - b.avg) * Math.min(Math.abs(f.size), Math.abs(b.pos)) * Math.sign(b.pos);
@@ -312,8 +361,11 @@ export function realizedPnl(fills: Fill[], now: Map<string, number>): (Fill & { 
       else if (Math.abs(next) > Math.abs(b.pos)) b.avg = (b.avg * Math.abs(b.pos) + f.price * Math.abs(f.size)) / Math.abs(next);
       b.pos = Math.abs(next) < 1e-9 ? 0 : next;
     }
+    const rowKnown = b.known;
+    // A flip leaves a new position opened wholly at this fill's price: known from here on.
+    if (!b.known && closes && opens) { b.known = true; b.pos = before[i] + f.size; b.avg = f.price; }
     book.set(f.vault, b);
-    return { ...f, realized, known: b.known };
+    return { ...f, realized, known: rowKnown, entry, close: closes ? f.price : undefined, flips: closes && opens };
   });
 }
 
@@ -321,8 +373,16 @@ export function realizedPnl(fills: Fill[], now: Map<string, number>): (Fill & { 
  *  undefined when the fills on record do not add up to the position (older fills are missing,
  *  or it was changed by a liquidation or a close-out). */
 export function entryPrice(fills: Fill[], position: number): number | undefined {
+  // Back from the position now to the fill that opened it from flat; the average from there.
+  // (Fills before that belong to earlier positions, and may not reach back to flat themselves.)
+  let rem = position, start = -1;
+  for (let i = fills.length - 1; i >= 0; i--) {
+    rem -= fills[i].size;
+    if (Math.abs(rem) < 1e-7) { start = i; break; }
+  }
+  if (position === 0 || start < 0) return undefined;
   let pos = 0, avg = 0;
-  for (const f of fills) {
+  for (const f of fills.slice(start)) {
     const next = pos + f.size;
     if (pos === 0 || Math.sign(next) !== Math.sign(pos)) avg = f.price;                  // opened, or flipped
     else if (Math.abs(next) > Math.abs(pos)) avg = (avg * Math.abs(pos) + f.price * Math.abs(f.size)) / Math.abs(next);

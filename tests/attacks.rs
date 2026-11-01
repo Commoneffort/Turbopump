@@ -520,6 +520,9 @@ fn a_market_is_closed_out_after_an_unwind_and_reopens() {
     w.trader(1);
     router_err(w.request(1, 1_000_000), RouterError::CloseOnly);
     router_err(w.request(0, -1_000_000), RouterError::CloseOnly);
+    // A close-out needs a position on this market: an account without one cannot be made to pay
+    // for a request (out of its keeper deposit) or have its queue place held.
+    router_err(w.close_out(1), RouterError::NotCloseOnly);
 
     // Anyone closes a remaining position out, at the first Pyth price after its target. Closing
     // one side deleverages the other, so here the long's close-out empties the market.

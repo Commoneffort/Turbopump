@@ -117,7 +117,11 @@ pub struct Request {
     /// (a trade queued by one of the trader's standing orders, `order_index`) or `KIND_COPY`.
     pub kind: u8,
     pub order_index: u8,
-    pub _pad: [u8; 5],
+    /// 1 when its rent and bond came out of its owner's money (an order's keeper budget, or the
+    /// account's keeper deposit for a liquidation) rather than out of whoever queued it: the rent
+    /// then goes back to the owner's side, and the caller was already paid back.
+    pub funded: u8,
+    pub _pad: [u8; 4],
 }
 pub const KIND_TRADE: u8 = 0;
 pub const KIND_SETTLE: u8 = 1;

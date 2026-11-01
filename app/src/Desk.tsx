@@ -7,19 +7,21 @@
 import { CSSProperties, useEffect, useMemo, useRef, useState } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
-import { PublicKey } from "@solana/web3.js";
+import { Connection, PublicKey, TransactionInstruction } from "@solana/web3.js";
 import { createAssociatedTokenAccountIdempotentInstruction } from "@solana/spl-token";
 import * as C from "./chain";
 import { T } from "./theme";
-import Chart, { DayStats, useDayStats } from "./Chart";
+import Chart, { DayStats, Trade, useDayStats } from "./Chart";
 import * as S from "./social";
-import { Mark, marksFor, useBoard, useMe, usePictures } from "./Traders";
-import { Crowd, Liquidations, PULSE, PULSE_BOARD_MS, Queue, Trades, Whale, marketFills } from "./Pulse";
-import { Card, Faucet, Fill, Icon, LiquidityPanel, OpenerPanel, Send, ago, capUnits, entryPrice, explorer, fmt, num, priceDp, px, realizedPnl, short, units, usd, useActivity, useCards, useVault, useWalletFills } from "./shared";
+import { Mark, marksFor, useBoard, useMe, useNotes, usePictures } from "./Traders";
+import { Liquidations, ORDER_KINDS, PULSE, PULSE_BOARD_MS, Whale, marketFills, useExecReport, useMarketOrders, useVolume } from "./Pulse";
+import { WidgetPanel } from "./Widgets";
+import { Card, Faucet, Fill, Icon, LiquidityPanel, OpenerPanel, Send, ago, capUnits, entryPrice, explorer, fmt, num, priceDp, px, realizedPnl, short, units, usd, useActivity, useCards, useDeepFills, useVault, useWalletFills } from "./shared";
 
 const UP = T.green, DOWN = T.red;
 const pct = (x: number, dp = 2) => `${x >= 0 ? "+" : "−"}${fmt(Math.abs(x) * 100, dp)}%`;
 const money = (x: number, dp = 2) => `$${fmt(x, dp)}`;
+const compact = (x: number) => (x >= 1e9 ? `$${fmt(x / 1e9, 2)}B` : x >= 1e6 ? `$${fmt(x / 1e6, 2)}M` : x >= 1e3 ? `$${fmt(x / 1e3, 1)}k` : `$${fmt(x, 0)}`);
 const signedMoney = (x: number) => `${x >= 0 ? "+" : "−"}$${fmt(Math.abs(x))}`;
 /** An up or down arrow for a gain or a loss. */
 const arrow = (x: number) => (x > 0 ? "▲" : x < 0 ? "▼" : "•");
@@ -76,7 +78,13 @@ function DeskInner({ vaultKey, markets, day, send, busy, tick, go }: { vaultKey:
   const { state, err, reload } = useVault(vaultKey, tick);
   const [panel, setPanel] = useState<"trade" | "earn">("trade");
   const wrapped: Send = async (l, ixs) => { const r = await send(l, ixs); reload(); return r; };
-  const allFills = useWalletFills(publicKey, state?.portfolio?.position ?? 0n);
+  const recentFills = useWalletFills(publicKey, state?.portfolio?.position ?? 0n);
+  // Each position held, by vault, so its whole history back to the opening fill can be read.
+  const need = useMemo(() => (state?.health?.positions ?? []).map(x => {
+    const c = markets.find(m => m.v.assetIndex === x.asset && (m.v.canonical || m.v.key.equals(state!.vault.key)));
+    return c ? `${c.v.key.toBase58()}:${x.size}` : "";
+  }).filter(Boolean).sort().join(","), [state, markets]);
+  const allFills = useDeepFills(publicKey, need, recentFills);
   const fills = useMemo(() => allFills.filter(f => f.vault === vaultKey.toBase58()), [allFills, vaultKey.toBase58()]);
   // The traders this wallet follows or copies: their fills on this market are marked on the chart.
   const { board } = useBoard(tick, Object.values(PULSE).some(Boolean) ? PULSE_BOARD_MS : undefined);
@@ -85,9 +93,20 @@ function DeskInner({ vaultKey, markets, day, send, busy, tick, go }: { vaultKey:
   const asset = state?.vault.assetIndex ?? -1;
   // (Badge pictures are checked and loaded a moment after the board arrives: the marks follow.)
   const pictures = usePictures();
-  const marks = useMemo(() => marksFor(board, leaders, asset), [board, leaders.join(","), asset, pictures]);
+  const notes = useNotes(leaders, tick);
+  const marks = useMemo(() => marksFor(board, leaders, asset, notes), [board, leaders.join(","), asset, pictures, notes]);
   // Every fill on this market by anyone: the trades list, the queue's fills and the chart's whales.
   const marketTrades = useMemo(() => marketFills(board, asset), [board, asset]);
+  // This wallet's own fills on this market (green and red dots on the chart): its track record's,
+  // plus any newer ones read from its own transactions.
+  const mine = useMemo((): Trade[] => {
+    if (!publicKey) return [];
+    const rec = board?.rows.find(r => r.wallet === publicKey.toBase58())?.stats?.fills.filter(f => f.asset === asset) ?? [];
+    const out: Trade[] = rec.map(f => ({ key: `r:${f.time}:${f.size}`, time: f.time, price: f.price, size: f.size }));
+    const same = (a: Trade, f: { size: number; price: number; time?: number }) => Math.abs(a.size - f.size) < 1e-6 && Math.abs(a.price - f.price) < 1e-6 && Math.abs(a.time - (f.time ?? 0)) < 120;
+    for (const f of fills) if (f.time && !out.some(a => same(a, f))) out.push({ key: f.sig, time: f.time, price: f.price, size: f.size });
+    return out;
+  }, [board, publicKey?.toBase58(), asset, fills]);
 
   if (err && !state) return <div className="desk-msg">{err}</div>;
   if (!state) return <div className="desk-msg">Loading market…</div>;
@@ -117,9 +136,9 @@ function DeskInner({ vaultKey, markets, day, send, busy, tick, go }: { vaultKey:
 
   return (
     <main className="desk">
-      <MarketBar state={state} markets={markets} day={day} go={go} />
-      <section className="desk-chart panel"><Charts sym={sym} price={price} lines={lines} linesOf={linesOf} marks={marks} whales={PULSE.whales ? marketTrades : undefined} markets={markets} go={go} /></section>
-      <section className="desk-book panel"><VaultDepth state={state} tick={tick} board={board} fills={marketTrades} go={go} /></section>
+      <MarketBar state={state} markets={markets} day={day} go={go} tick={tick} />
+      <section className="desk-chart panel"><Charts sym={sym} price={price} lines={lines} linesOf={linesOf} marks={marks} mine={mine} whales={PULSE.whales ? marketTrades : undefined} markets={markets} go={go} /></section>
+      <section className="desk-book panel"><WidgetPanel state={state} tick={tick} board={board} fills={marketTrades} markets={markets} go={go} /></section>
       {PULSE.liqs && <Liquidations board={board} markets={markets} go={go} />}
       <section className="desk-ticket panel">
         <div className="ptabs">
@@ -129,7 +148,7 @@ function DeskInner({ vaultKey, markets, day, send, busy, tick, go }: { vaultKey:
         {panel === "trade" ? <Ticket state={state} send={wrapped} busy={busy} /> : <div className="earn"><LiquidityPanel state={state} send={wrapped} busy={busy} /></div>}
         <div className="ticket-acct"><Account state={state} send={wrapped} busy={busy} held={held} row={myRow} vaults={markets.map(c => c.v)} /></div>
       </section>
-      <section className="desk-bottom panel"><Bottom state={state} markets={markets} fills={allFills} held={held} liq={liq} send={wrapped} busy={busy} go={go} /></section>
+      <section className="desk-bottom panel"><Bottom state={state} markets={markets} fills={allFills} held={held} liq={liq} send={wrapped} busy={busy} go={go} tick={tick} /></section>
     </main>
   );
 }
@@ -144,7 +163,7 @@ const LAYOUTS: [id: string, label: string, panes: number, icon: string][] = [
   ["2v", "Two charts, one over the other", 2, "M2.5 2.5h11v11h-11zM2.5 8h11"],
   ["4", "Four charts", 4, "M2.5 2.5h11v11h-11zM8 2.5v11M2.5 8h11"],
 ];
-function Charts({ sym, price, lines, linesOf, marks, whales, markets, go }: { sym: string; price: number; lines: { price: number; title: string; color: string }[]; linesOf: (sym: string) => { price: number; title: string; color: string }[]; marks: Mark[]; whales?: Whale[]; markets: Card[]; go: (to: string) => void }) {
+function Charts({ sym, price, lines, linesOf, marks, mine, whales, markets, go }: { sym: string; price: number; lines: { price: number; title: string; color: string }[]; linesOf: (sym: string) => { price: number; title: string; color: string }[]; marks: Mark[]; mine: Trade[]; whales?: Whale[]; markets: Card[]; go: (to: string) => void }) {
   const [layout, setLayout] = useState(() => { const l = localStorage.getItem("pv:chart-layout"); return LAYOUTS.some(x => x[0] === l) ? l! : "1"; });
   const [others, setOthers] = useState<string[]>(() => { try { const v = JSON.parse(localStorage.getItem("pv:chart-panes") ?? "[]"); return Array.isArray(v) ? v : []; } catch { return []; } });
   const n = LAYOUTS.find(l => l[0] === layout)?.[2] ?? 1;
@@ -170,13 +189,13 @@ function Charts({ sym, price, lines, linesOf, marks, whales, markets, go }: { sy
   );
   return (
     <div className={`charts l-${layout}`}>
-      <Chart symbol={sym} price={price} lines={lines} marks={marks} whales={whales} dense={n > 1} head={<>{picker}{n > 1 && <div className="pane-sym main"><b>{sym}</b></div>}</>} />
+      <Chart symbol={sym} price={price} lines={lines} marks={marks} mine={mine} whales={whales} dense={n > 1} head={<>{picker}{n > 1 && <div className="pane-sym main"><b>{sym}</b></div>}</>} />
       {Array.from({ length: n - 1 }, (_, k) => {
         const i = k + 1, s = paneSym(i);
         return (
           <Chart key={i} slot={i} compact dense symbol={s} price={priceOf(s)} lines={linesOf(s)} head={
             <div className="pane-sym">
-              <select value={s} aria-label="Market in this window" onChange={e => setPane(i, e.target.value)}>{syms.map(x => <option key={x} value={x}>{x}-PERP</option>)}</select>
+              <select value={s} aria-label="Market in this window" onChange={e => setPane(i, e.target.value)}>{syms.map(x => <option key={x} value={x}>{x}</option>)}</select>
               <button title={`Trade ${s}`} onClick={() => go(`/trade/${s}`)}>Trade</button>
             </div>
           } />
@@ -202,7 +221,7 @@ function liquidationPrice(state: C.State, posN: number): number | undefined {
 
 // ---------------------------------------------------------------- market bar
 
-function MarketBar({ state, markets, day, go }: { state: C.State; markets: Card[]; day: Record<string, DayStats>; go: (to: string) => void }) {
+function MarketBar({ state, markets, day, go, tick }: { state: C.State; markets: Card[]; day: Record<string, DayStats>; go: (to: string) => void; tick: number }) {
   const v = state.vault, sym = v.feed?.symbol ?? "?";
   const [open, setOpen] = useState(false);
   const box = useRef<HTMLDivElement>(null);
@@ -219,29 +238,43 @@ function MarketBar({ state, markets, day, go }: { state: C.State; markets: Card[
   // The day's change is measured to this market's own price, not the history's last candle.
   const change = d && d.last > 0 ? (price / (d.last / (1 + d.change))) - 1 : undefined;
   const oiUsd = num(state.asset.oiLong, 1e6) * price;
-  const age = state.pyth ? Date.now() / 1000 - state.pyth.publish : undefined;
-  const end = v.epochStart + v.epochLen, left = end > state.slot ? end - state.slot : 0n;
+  const [now, setNow] = useState(Date.now() / 1000);
+  useEffect(() => { const id = setInterval(() => document.hidden || setNow(Date.now() / 1000), 1000); return () => clearInterval(id); }, []);
+  const b = state.book;
+  // The newest oracle price on chain: the feed's own account, or the router's mark if that is newer.
+  const feedNewer = !!state.pyth && state.pyth.e6 > 0n && state.pyth.publish >= (b?.markPublish ?? 0);
+  const mark = feedNewer ? num(state.pyth!.e6, 1e6) : b && b.markPrice > 0n ? num(b.markPrice, 1e6) : price;
+  const published = (feedNewer ? state.pyth!.publish : b?.markPublish) || undefined;
+  const age = published ? Math.max(0, now - published) : undefined;
+  const queued = b?.pending.length ?? 0;
+  const nextDue = queued ? Math.min(...b!.pending.map(p => p.target)) : undefined;
+  const orders = useMarketOrders(v.key, tick);
+  const byKind = orders ? ORDER_KINDS.map((_, k) => orders.filter(o => o.kind === k).length) : undefined;
+  const { report } = useExecReport();
+  const fillStats = report?.markets.find(x => x.symbol === sym)?.stats.latency;
+  const vol = useVolume();
   const dp = priceDp(price);
   return (
     <header className="mbar">
       <div className="msel" ref={box}>
         <button className="msel-btn" onClick={() => setOpen(o => !o)} aria-expanded={open}>
           <Icon symbol={sym} />
-          <span className="msel-sym">{sym}-PERP</span>
+          <span className="msel-sym">{sym}</span>
           <span className="msel-lev">{fmt(10_000 / Number(state.levels.open), 0)}×</span>
           <svg width="10" height="6" viewBox="0 0 10 6" aria-hidden><path d="M1 1l4 4 4-4" fill="none" stroke="currentColor" strokeWidth="1.5" /></svg>
         </button>
         {open && (
           <div className="msel-menu">
-            <div className="msel-head"><span>Market</span><span>Price</span><span>24h</span><span>Liquidity</span></div>
+            <div className="msel-head"><span>Market</span><span>Price</span><span>24h</span><span>24h volume</span><span>Liquidity</span></div>
             {markets.map(c => {
               const s = c.v.feed!.symbol, ds = day[s], p = num(c.asset.price, 1e6);
               const ch = ds && ds.last > 0 ? p / (ds.last / (1 + ds.change)) - 1 : undefined;
               return (
                 <button key={c.v.key.toString()} className={c.v.key.equals(v.key) ? "msel-row on" : "msel-row"} onClick={() => { setOpen(false); go(c.v.canonical ? `/trade/${s}` : `/m/${c.v.key.toString()}`); }}>
-                  <span className="msel-name"><Icon symbol={s} />{s}-PERP{!c.v.canonical && <em>earlier vault</em>}</span>
+                  <span className="msel-name"><Icon symbol={s} />{s}{!c.v.canonical && <em>earlier vault</em>}</span>
                   <span className="mono">{px(c.asset.price)}</span>
                   <span className={`mono ${ch === undefined ? "" : ch >= 0 ? "up" : "down"}`}>{ch === undefined ? "—" : pct(ch)}</span>
+                  <span className="mono">{c.v.canonical && vol?.markets[s] ? compact(vol.markets[s].volume) : "—"}</span>
                   <span className="mono">{usd(c.nav, 0)}</span>
                 </button>
               );
@@ -255,40 +288,26 @@ function MarketBar({ state, markets, day, go }: { state: C.State; markets: Card[
         <Cell label="24h change" value={change === undefined ? "—" : pct(change)} tone={change === undefined ? undefined : change >= 0 ? "up" : "down"} />
         <Cell label="24h high" value={d ? fmt(Math.max(d.high, price), dp) : "—"} />
         <Cell label="24h low" value={d ? fmt(Math.min(d.low, price), dp) : "—"} />
+        <Cell label="24h volume" value={vol?.markets[sym] && v.canonical ? compact(vol.markets[sym].volume) : "—"} sub={vol?.markets[sym] && v.canonical ? `${fmt(vol.markets[sym].trades, 0)} trades${vol.markets[sym].hours < 23.5 ? ` in ${fmt(vol.markets[sym].hours, 0)} h` : ""}` : undefined} title="Everything traded on this market in the last 24 hours, counted from its fills on chain (refreshed every ten minutes)" />
         <Cell label="Open interest" value={money(oiUsd, 0)} sub={`${units(state.asset.oiLong)} ${sym}`} />
-        <Cell label="Vault liquidity" value={usd(C.navOf(state), 0)} />
-        <Cell label="Oracle" value={C.X1 ? "Jack's oracle" : "Pyth"} sub={age !== undefined ? ago(age) : undefined} />
-        <Cell label="Fee" value={C.TRADE_FEE_PCT} sub="no spread, no price impact" />
-        <FundingCell state={state} />
-        <Cell label={`Liquidity epoch ${v.epoch}`} value={left > 0n ? `${Math.max(1, Math.ceil(Number(left) * C.slotSeconds() / 60))} min left` : v.pendingDeposit > 0n || v.pendingWithdraw > 0n ? "settling" : "no requests"} />
+        <Cell label="Vault liquidity" value={usd(C.navOf(state), 0)} title="What the vault, which takes the other side of every trade, is worth now" />
+        <Cell label="Oracle price" value={`$${fmt(mark, dp)}`} sub={age === undefined ? undefined : age < 1.5 ? "just now" : `${Math.round(age)}s ago`} tone={age !== undefined && age > 30 && queued > 0 ? "down" : undefined} title={`Every fill is at this price: the first oracle price after a request's target time. ${C.X1 ? "On X1 a new price is put on chain when a trade, order or liquidation needs one, so on a quiet market its age grows; it is late only if a trade is waiting." : "Published by Pyth and put on chain."}`} />
+        <Cell label="Pending orders" value={orders ? String(orders.length) : "…"} sub={byKind ? ORDER_KINDS.map((n, k) => (byKind[k] ? `${byKind[k]} ${n}` : "")).filter(Boolean).join(" · ") || "none" : undefined} title="Stop losses, take profits, trailing stops, limits and TWAPs waiting for their price, by every trader on this market" />
+        <Cell label="Awaiting execution" value={String(queued)} sub={nextDue && nextDue > now ? `next in ${Math.ceil(nextDue - now)}s` : queued ? "due" : undefined} title="Requests in this market's queue, waiting for the oracle price at their target time" />
+        <a className="cell cell-link" href="#/execution" title={`From a request landing on chain to its fill, over the last hours (the designed wait is ${C.ROUTER_DELAY_SECS}–${C.ROUTER_DELAY_SECS + C.ROUTER_BATCH_SECS} s). Opens the Execution page.`}>
+          <div className="cell-l">Time to fill</div>
+          <div className="cell-v mono">{fillStats ? `${fmt(fillStats.median, 0)}s` : "—"}{fillStats && <span className="cell-s">p90 {fmt(fillStats.p90, 0)}s →</span>}</div>
+        </a>
       </div>
     </header>
   );
 }
 
-/** Funding: who pays now, how much an hour, and where the rate is heading. The crowded side pays
- *  the other (the vault included, which holds the opposite side), every slot, inside Percolator. */
-function FundingCell({ state }: { state: C.State }) {
-  const f = state.funding, v = state.vault;
-  if (f.capE9 === 0n) return <Cell label="Funding" value="off" sub="switched off on every market for now (see Docs)" />;
-  const perHour = C.fundingPerHour(f.rateE9);
-  const price = state.asset.price;
-  const limit = price > 0n ? C.liveNav(state) * BigInt(C.tierPositionBps(C.tierOfFeed(v.feedHex))) / 10_000n * C.UNIT / price : 0n;
-  const target = C.fundingTarget(v.inventory, limit);
-  const who = f.rateE9 > 0n ? "longs pay" : f.rateE9 < 0n ? "shorts pay" : "nobody pays";
-  const heading = target === f.rateE9 ? "" : ` · heading to ${fmt(Math.abs(C.fundingPerHour(target)) * 100, 4)}%/h${target === 0n ? "" : target > 0n ? " (longs)" : " (shorts)"}`;
-  return (
-    <div className="cell" title={`Paid every slot by the side the market is crowded on, to the other side (the vault holds the other side of every trade). It follows how full the vault is on one side: nothing under ${(Number((L_FUNDING.free ?? 2000)) / 100)}% of its limit, up to ${fmt(C.fundingPerHour(BigInt(L_FUNDING.max ?? 30)) * 100, 3)}% an hour at the whole limit, and it moves there over about an hour, so one trade cannot set it. It is part of every position's value, so it counts toward margin and liquidation.`}>
-      <div className="cell-l">Funding</div>
-      <div className={`cell-v mono ${f.rateE9 === 0n ? "" : "down"}`}>{f.rateE9 === 0n ? "0%" : `${fmt(Math.abs(perHour) * 100, 4)}%/h`}<span className="cell-s">{who}, every slot{heading}</span></div>
-    </div>
-  );
-}
 const L_FUNDING = { free: (C.LAYOUT.router as any).funding_free_bps as number | undefined, max: (C.LAYOUT.router as any).funding_max_e9 as number | undefined };
 
-function Cell({ label, value, sub, tone }: { label: string; value: string; sub?: string; tone?: "up" | "down" }) {
+function Cell({ label, value, sub, tone, title }: { label: string; value: string; sub?: string; tone?: "up" | "down"; title?: string }) {
   return (
-    <div className="cell">
+    <div className="cell" title={title}>
       <div className="cell-l">{label}</div>
       <div className={`cell-v mono ${tone ?? ""}`}>{value}{sub && <span className="cell-s">{sub}</span>}</div>
     </div>
@@ -331,33 +350,6 @@ function VaultCapacity({ state }: { state: C.State }) {
   );
 }
 
-/** The middle column: the long/short crowd, the queue, and the trades tape. */
-function VaultDepth({ state, tick, board, fills, go }: { state: C.State; tick: number; board?: S.Board; fills: Whale[]; go: (to: string) => void }) {
-  const v = state.vault, sym = v.feed?.symbol ?? "";
-  const rows = useActivity(v, tick);
-  const [list, setList] = useState<"trades" | "vault">(PULSE.tape ? "trades" : "vault");
-  return (
-    <>
-      {PULSE.crowd && <Crowd state={state} board={board} />}
-      {PULSE.queue && <Queue state={state} fills={fills} board={board} go={go} />}
-      {PULSE.tape ? (
-        <div className="ph tape-h tape-tabs">
-          <button className={list === "trades" ? "on" : ""} onClick={() => setList("trades")}>Trades</button>
-          <button className={list === "vault" ? "on" : ""} onClick={() => setList("vault")}>Vault events</button>
-        </div>
-      ) : <div className="ph tape-h"><h3>Market activity</h3></div>}
-      <div className="tape">
-        {list === "trades" ? <Trades fills={fills} board={board} sym={sym} go={go} /> : !rows ? <div className="quiet">Loading…</div> : rows.length === 0 ? <div className="quiet">No activity yet.</div> : rows.map(r => (
-          <a key={r.sig} className="tape-row" href={explorer("tx", r.sig)} target="_blank" rel="noreferrer">
-            <span className={/^Long/.test(r.what) ? "up" : /^Short/.test(r.what) ? "down" : ""}>{r.what.replace(" vs vault", "")}</span>
-            <span className="mono">{r.when ? ago(Date.now() / 1000 - r.when) : ""}</span>
-          </a>
-        ))}
-      </div>
-    </>
-  );
-}
-
 /** What the vault can actually absorb, next to what it lets traders open: its value now, its
  *  insurance, and what it would lose on a move of 10, 20 or 30% against the position it holds. */
 function Stress({ state }: { state: C.State }) {
@@ -394,6 +386,10 @@ function Ticket({ state, send, busy }: { state: C.State & { readFor?: string }; 
   }, [publicKey?.toBase58(), busy]);
   const [side, setSide] = useState<1n | -1n>(1n);
   const [text, setText] = useState("");
+  // An optional note for the trader's followers, sent with the trade (see S.tradeNote).
+  const [note, setNote] = useState("");
+  const withNote = (ixs: TransactionInstruction[]) => (publicKey && S.cleanNote(note) ? [...ixs, S.tradeNote(publicKey, note)] : ixs);
+  const sendNoted = async (l: string, ixs: TransactionInstruction[]) => { const r = await send(l, withNote(ixs)); if (r) setNote(""); return r; };
   const [unit, setUnit] = useState<"coin" | "usd">("coin");
   const [mode, setMode] = useState<"market" | "limit" | "protect" | "twap">("market");
   // Whether what is shown includes this wallet's own accounts yet (the market itself shows first).
@@ -491,7 +487,8 @@ function Ticket({ state, send, busy }: { state: C.State & { readFor?: string }; 
   const overLev = !reduces && want > 0n && !shrinks && orderMargin > freeMargin * 1.0001 && lev < maxLev;
 
   // Deposit + bond + a little for the fee.
-  const coinsNeeded = Number(C.expiryDeposit(sent, state.asset.price)) + C.ROUTER_BOND_LAMPORTS + 1_000_000;
+  // (Once the router pays liquidators, the first trade also tops up the account's keeper deposit.)
+  const coinsNeeded = Number(C.expiryDeposit(sent, state.asset.price)) + C.ROUTER_BOND_LAMPORTS + 1_000_000 + (C.KEEPER_REWARDS ? C.KEEPER_DEPOSIT : 0);
   // The one thing that stops this order, if anything does.
   const blockerBase = !publicKey || !state.trader || !state.book || locked || state.closeOnly || noLiquidity || vaultMax === 0n;
   const blocker = !publicKey ? "Connect a wallet to trade"
@@ -512,13 +509,13 @@ function Ticket({ state, send, busy }: { state: C.State & { readFor?: string }; 
     // An account opened before the fee ledgers existed gets one with its first trade (it can only
     // reduce without one).
     const ledger = state.trader && !state.trader.hasLedger ? [C.openLedger(publicKey, publicKey)] : [];
-    send(`${side > 0n ? "Long" : "Short"} ${units(sent)} ${sym}`, [...ledger, C.requestTrade(publicKey, v.key, sent * side)]);
+    sendNoted(`${side > 0n ? "Long" : "Short"} ${units(sent)} ${sym}`, [...ledger, C.requestTrade(publicKey, v.key, sent * side)]);
   };
   const closeAll = () => {
     if (!publicKey || !state.book || held === 0n) return;
     // A close-only market has no counterparty for a close: the position is closed out instead.
-    if (state.closeOnly) send("Close position", [C.requestClose(publicKey, publicKey, v.key)]);
-    else send("Close position", [C.requestTrade(publicKey, v.key, -held)]);
+    if (state.closeOnly) sendNoted("Close position", [C.requestClose(publicKey, publicKey, v.key)]);
+    else sendNoted("Close position", [C.requestTrade(publicKey, v.key, -held)]);
   };
 
   return (
@@ -579,8 +576,15 @@ function Ticket({ state, send, busy }: { state: C.State & { readFor?: string }; 
           return <div title="At the current rate, which follows how one-sided the market is and can change"><span>Funding a day (est.)</span><b className={`mono ${day > 0 ? "down" : day < 0 ? "up" : ""}`}>{after === 0 || day === 0 ? "—" : `${day > 0 ? "you pay " : "you receive "}${money(Math.abs(day), 2)}`}</b></div>;
         })()}
         <div><span>Largest order now</span><b className="mono">{state.trader ? `${units(most)} ${sym}` : `${units(vaultMax)} ${sym}`}</b></div>
+        {C.KEEPER_REWARDS && <div title={`Kept in your trading account (topped up by a trade when needed, so usually paid once). If the account is ever liquidated, whoever does it is paid from this, not from your margin. It comes back when you withdraw with no position open.`}><span>Keeper deposit</span><b className="mono">{(C.KEEPER_DEPOSIT / 1e9).toFixed(4)} {C.COIN}<i className="muted"> held, refundable</i></b></div>}
       </div>
 
+      {publicKey && state.trader && (
+        <label className="ticket-note" title="Sent with this trade and signed by your wallet. People who follow you see it when they point at this trade on their chart. It is public: anyone can read it on chain.">
+          <input value={note} onChange={e => setNote(e.target.value.slice(0, S.NOTE_MAX))} maxLength={S.NOTE_MAX} placeholder="Note to your followers (optional)" />
+          {note && <em>{S.NOTE_MAX - [...note].length}</em>}
+        </label>
+      )}
       <div className="ticket-go">
       {!publicKey ? <div className="connect"><WalletMultiButton /></div>
         : !mine ? <button className="submit neutral" disabled>Reading your account…</button>
@@ -604,6 +608,17 @@ function Ticket({ state, send, busy }: { state: C.State & { readFor?: string }; 
         when the order is sent, so nobody can trade ahead of it. An order cannot be cancelled; unfilled after {C.ROUTER_GRACE_SECS} s, it expires.
         {want > 0n && <> A deposit of {(Number(C.expiryDeposit(sent, state.asset.price)) / 1e9).toFixed(4)} {C.COIN} ({C.EXPIRY_DEPOSIT_BPS / 100}% of the order, at most {Number(C.EXPIRY_DEPOSIT_CAP) / 1e9} {C.COIN}) goes with it and comes back when it fills; it is kept only if the order's price arrived and the order still expired while the market was current.</>}
       </p>
+    </div>
+  );
+}
+
+/** What a standing order sets aside for whoever carries it out (only once the router pays keepers
+ *  on this network). Unused, it comes back with the order. */
+function KeeperLine({ lamports }: { lamports: number }) {
+  if (!C.KEEPER_REWARDS) return null;
+  return (
+    <div title={`Kept with the order and paid to whoever carries it out when its price is reached: ${(C.KEEPER_FEE / 1e9).toFixed(4)} ${C.COIN} each time, plus the cost of queuing its trade. Anyone can run an executor and earn it. What is not used comes back to you when the order ends or you cancel it.`}>
+      <span>Keeper budget</span><b className="mono">{(lamports / 1e9).toFixed(4)} {C.COIN}<i className="muted"> back if unused</i></b>
     </div>
   );
 }
@@ -638,10 +653,11 @@ function StandingForm({ mode, side, state, send, busy }: { mode: "limit" | "prot
       <div className="sform">
         <label className="inp"><span>Limit price</span><input value={limit} onChange={digits(setLimit)} placeholder={fmt(priceN, dp)} inputMode="decimal" /><button className="unit" onClick={() => setLimit(String(+priceN.toFixed(dp)))}>Mark</button></label>
         <label className="inp"><span>Size</span><input value={size} onChange={digits(setSize)} placeholder="0.00" inputMode="decimal" /><em>{sym}</em></label>
-        <label className="check"><input type="checkbox" checked={reduce} onChange={e => setReduce(e.target.checked)} />Reduce only (never opens or flips a position)</label>
+        <label className="check" title={REDUCE_ONLY_HELP}><input type="checkbox" checked={reduce} onChange={e => setReduce(e.target.checked)} />Reduce only (never opens or flips a position)</label>
         <div className="sum">
           <div><span>Order value</span><b className="mono">{money(n(size) * (px || priceN))}</b></div>
           <div><span>Carried out when the price is</span><b className="mono">{px ? `${side > 0n ? "≤" : "≥"} ${fmt(px, dp)}` : "—"}</b></div>
+          <KeeperLine lamports={C.keeperBudget(C.ORDER.LIMIT)} />
         </div>
         <button className={`submit ${side > 0n ? "up" : "down"}`} disabled={!!why || !!busy || !ready} onClick={() => publicKey && send(`Limit ${side > 0n ? "buy" : "sell"} ${size} ${sym} at ${limit}`, [C.placeOrder(publicKey, v.key, { index: free[0], kind: C.ORDER.LIMIT, reduceOnly: reduce, size: q, trigger: e6(px) })])}>
           {busy ? `${busy}…` : `Place limit ${side > 0n ? "buy" : "sell"}`}
@@ -675,6 +691,7 @@ function StandingForm({ mode, side, state, send, busy }: { mode: "limit" | "prot
         <label className="inp"><span>Take profit</span><input value={tp} onChange={digits(setTp)} placeholder={fmt(priceN * (long ? 1.05 : 0.95), dp)} inputMode="decimal" /><em>{pnl(t)}</em></label>
         <label className="inp"><span>Stop loss</span><input value={sl} onChange={digits(setSl)} placeholder={fmt(priceN * (long ? 0.95 : 1.05), dp)} inputMode="decimal" /><em>{pnl(s)}</em></label>
         <label className="inp"><span>Trailing stop</span><input value={trail} onChange={digits(setTrail)} placeholder="2.0" inputMode="decimal" /><em>% back from the best price</em></label>
+        {C.KEEPER_REWARDS && count > 0 && <div className="sum"><KeeperLine lamports={count * C.keeperBudget(C.ORDER.STOP)} /></div>}
         <button className="submit neutral" disabled={!!why || !!busy || !ready} onClick={place}>{busy ? `${busy}…` : count > 1 ? `Set ${count} orders` : "Set order"}</button>
         {why && <div className="why">{why}</div>}
         {!why && (slNow || tpNow) && <div className="why">{slNow ? "The price is already past this stop" : "The price has already reached this take-profit"}, so it is carried out right away.</div>}
@@ -693,13 +710,14 @@ function StandingForm({ mode, side, state, send, busy }: { mode: "limit" | "prot
         <label className="inp"><span>Slices</span><input value={slices} onChange={digits(setSlices)} inputMode="numeric" /></label>
         <label className="inp"><span>Over</span><input value={minutes} onChange={digits(setMinutes)} inputMode="decimal" /><em>min</em></label>
       </div>
-      <label className="check"><input type="checkbox" checked={reduce} onChange={e => setReduce(e.target.checked)} />Reduce only</label>
+      <label className="check" title={REDUCE_ONLY_HELP}><input type="checkbox" checked={reduce} onChange={e => setReduce(e.target.checked)} />Reduce only (never opens or flips a position)</label>
       <div className="sum">
         <div><span>Each slice</span><b className="mono">{k >= 2 && total ? `${fmt(total / k, 4).replace(/\.?0+$/, "")} ${sym} (${money(total / k * priceN)})` : "—"}</b></div>
         <div><span>One slice every</span><b className="mono">{interval ? (interval >= 120 ? `${fmt(interval / 60, 1)} min` : `${interval} s`) : "—"}</b></div>
         <div><span>Total value</span><b className="mono">{money(total * priceN)}</b></div>
+        {k >= 2 && <KeeperLine lamports={C.keeperBudget(C.ORDER.TWAP, k)} />}
       </div>
-      <button className={`submit ${side > 0n ? "up" : "down"}`} disabled={!!why || !!busy || !ready} onClick={() => publicKey && send(`TWAP ${side > 0n ? "buy" : "sell"} ${size} ${sym}`, [C.placeOrder(publicKey, v.key, { index: free[0], kind: C.ORDER.TWAP, reduceOnly: reduce, size: e6(total) * side, trigger: 0n, interval, slices: k })])}>
+      <button className={`submit ${side > 0n ? "up" : "down"}`} disabled={!!why || !!busy || !ready} onClick={() => { if (!publicKey) return; const at = free[0], q = e6(total) * side; send(`TWAP ${side > 0n ? "buy" : "sell"} ${size} ${sym}`, [C.placeOrder(publicKey, v.key, { index: at, kind: C.ORDER.TWAP, reduceOnly: reduce, size: q, trigger: 0n, interval, slices: k })]).then(sig => sig && keepTwapPlan(C.orderAddress(v.key, publicKey, at), { total: q, slices: k, sig })); }}>
         {busy ? `${busy}…` : `Start TWAP ${side > 0n ? "buy" : "sell"}`}
       </button>
       {why && <div className="why">{why}</div>}
@@ -802,11 +820,108 @@ function Account({ state, send, busy, held, row, vaults }: { state: C.State; sen
 
 // ---------------------------------------------------------------- positions, history, market
 
-function Bottom({ state, markets, fills, held, liq, send, busy, go }: {
-  state: C.State; markets: Card[]; fills: Fill[]; held: Held[]; liq?: number; send: Send; busy?: string; go: (to: string) => void;
+const REDUCE_ONLY_HELP = "The order may only shrink the position you hold. If you have no position, or it is already on the order's side, the order is dropped instead of opening one; a slice bigger than what is left is cut to what closes it.";
+
+/** The wallet's standing orders on other markets than the one on screen (that one's come with
+ *  its state), so each position can show its take-profit, stop and trail. */
+function useOrdersOn(vaults: PublicKey[], tick: number) {
+  const { connection } = useConnection();
+  const { publicKey } = useWallet();
+  const [orders, setOrders] = useState(new Map<string, C.StandingOrder[]>());
+  const keys = vaults.map(v => v.toBase58()).sort().join(",");
+  useEffect(() => {
+    if (!publicKey || !keys) { setOrders(new Map()); return; }
+    let on = true;
+    const vs = keys.split(",").map(k => new PublicKey(k));
+    const addrs = vs.flatMap(v => Array.from({ length: C.MAX_ORDERS }, (_, i) => C.orderAddress(v, publicKey, i)));
+    connection.getMultipleAccountsInfo(addrs, "confirmed").then(accs => {
+      if (!on) return;
+      const m = new Map<string, C.StandingOrder[]>();
+      accs.forEach((a, i) => { if (a?.data.length === C.ORDER_LEN) { const o = C.decodeOrder(addrs[i], new Uint8Array(a.data)); const k = o.vault.toBase58(); m.set(k, [...(m.get(k) ?? []), o]); } });
+      setOrders(m);
+    }).catch(() => { /* kept as last read */ });
+    return () => { on = false; };
+    // Read again every few ticks; the market on screen has its own, fresher copy.
+  }, [connection, publicKey?.toBase58(), keys, Math.floor(tick / 4)]);
+  return orders;
+}
+
+/** A TWAP's full size and slice count. The chain keeps only what is left, so they are taken
+ *  from the transaction that placed it (kept in the browser when placed from this page). */
+type TwapPlan = { total: bigint; slices: number; sig?: string };
+const TWAP_KEY = (order: PublicKey) => `pv:twap:${C.NETWORK}:${order.toBase58()}`;
+function keepTwapPlan(order: PublicKey, plan: TwapPlan) {
+  try { localStorage.setItem(TWAP_KEY(order), JSON.stringify({ total: plan.total.toString(), slices: plan.slices, sig: plan.sig })); } catch { /* storage off */ }
+}
+function keptTwapPlan(order: PublicKey): TwapPlan | undefined {
+  try { const j = JSON.parse(localStorage.getItem(TWAP_KEY(order)) ?? "null"); return j ? { total: BigInt(j.total), slices: j.slices, sig: j.sig } : undefined; } catch { return undefined; }
+}
+const i128le = (d: Uint8Array, o: number) => { let x = 0n; for (let i = 15; i >= 0; i--) x = (x << 8n) | BigInt(d[o + i]); return x >= 1n << 127n ? x - (1n << 128n) : x; };
+async function findTwapPlan(conn: Connection, o: C.StandingOrder): Promise<TwapPlan | undefined> {
+  // Newest first: the same order slot can have held earlier orders.
+  const sigs = await conn.getSignaturesForAddress(o.key, { limit: 12 }, "confirmed");
+  for (const s of sigs) {
+    if (s.err) continue;
+    const tx = await conn.getTransaction(s.signature, { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
+    const msg = tx?.transaction.message;
+    if (!msg) continue;
+    const keys = msg.getAccountKeys({ accountKeysFromLookups: tx.meta?.loadedAddresses ?? undefined });
+    for (const ix of msg.compiledInstructions) {
+      const d = ix.data;
+      if (!keys.get(ix.programIdIndex)?.equals(C.ROUTER) || (d.length !== 48 && d.length !== 56) || d[0] !== 12 || d[1] !== o.index || d[2] !== C.ORDER.TWAP) continue;
+      const plan = { total: i128le(d, 4), slices: new DataView(d.buffer, d.byteOffset + 36, 4).getUint32(0, true), sig: s.signature };
+      keepTwapPlan(o.key, plan);
+      return plan;
+    }
+  }
+  return undefined;
+}
+function useTwapPlans(twaps: C.StandingOrder[]) {
+  const { connection } = useConnection();
+  const [plans, setPlans] = useState(new Map<string, TwapPlan | null>());
+  const ids = twaps.map(o => o.key.toBase58()).join(",");
+  useEffect(() => {
+    let on = true;
+    for (const o of twaps) {
+      const k = o.key.toBase58();
+      if (plans.has(k)) continue;
+      const kept = keptTwapPlan(o.key);
+      // A kept plan for an earlier order in the same slot would not add up: look it up again.
+      if (kept && (kept.total < 0n) === (o.size < 0n) && abs(kept.total) >= abs(o.size)) { setPlans(m => new Map(m).set(k, kept)); continue; }
+      findTwapPlan(connection, o).then(p => on && setPlans(m => new Map(m).set(k, p ?? null))).catch(() => on && setPlans(m => new Map(m).set(k, null)));
+    }
+    return () => { on = false; };
+  }, [connection, ids]);
+  return plans;
+}
+
+/** Take-profit, stop and trail levels of one position, as small coloured tags. */
+function Protection({ orders, dp }: { orders: C.StandingOrder[]; dp: number }) {
+  const mine = orders.filter(o => o.kind <= C.ORDER.TRAIL);
+  if (!mine.length) return <span className="muted">—</span>;
+  const part = (o: C.StandingOrder) => (o.size === 0n ? "" : ` · ${units(o.size)}`);
+  return (
+    <span className="prot">
+      {mine.sort((a, b) => a.kind - b.kind).map(o => {
+        if (o.kind === C.ORDER.TRAIL) {
+          const stop = num(o.peak, 1e6) * (1 - o.side * Number(o.trigger) / 10_000);
+          return <span key={o.index} className="ptag trail" title={`Closes ${o.size === 0n ? "the whole position" : units(o.size)} once the price comes back ${fmt(Number(o.trigger) / 100, 2)}% from the best price since it was set (${fmt(num(o.peak, 1e6), dp)})`}>Trail {fmt(Number(o.trigger) / 100, 2).replace(/\.?0+$/, "")}% <i>@ {fmt(stop, dp)}</i>{part(o)}{o.queued ? " · filling" : ""}</span>;
+        }
+        const tp = o.kind === C.ORDER.TAKE;
+        return <span key={o.index} className={`ptag ${tp ? "tp" : "sl"}`} title={`${tp ? "Take profit" : "Stop loss"}: closes ${o.size === 0n ? "the whole position" : units(o.size)} once the price reaches ${fmt(num(o.trigger, 1e6), dp)}`}>{tp ? "TP" : "SL"} {fmt(num(o.trigger, 1e6), dp)}{part(o)}{o.queued ? " · filling" : ""}</span>;
+      })}
+    </span>
+  );
+}
+
+function Bottom({ state, markets, fills, held, liq, send, busy, go, tick }: {
+  state: C.State; markets: Card[]; fills: Fill[]; held: Held[]; liq?: number; send: Send; busy?: string; go: (to: string) => void; tick: number;
 }) {
   const { publicKey } = useWallet();
-  const [tab, setTab] = useState<"positions" | "orders" | "history" | "vault" | "market">("positions");
+  const [tab, setTab] = useState<"positions" | "orders" | "twap" | "history" | "vault" | "market">("positions");
+  const others = useOrdersOn(held.flatMap(x => { const c = markets.find(m => m.v.assetIndex === x.asset && (m.v.canonical || m.v.key.equals(state.vault.key))); return c && !c.v.key.equals(state.vault.key) ? [c.v.key] : []; }), tick);
+  const standing = state.orders.filter(o => o.kind !== C.ORDER.TWAP), twaps = state.orders.filter(o => o.kind === C.ORDER.TWAP);
+  const plans = useTwapPlans(twaps);
   const v = state.vault, sym = v.feed?.symbol ?? "";
   const positions = held;
   const byAsset = new Map(markets.filter(c => c.v.canonical || c.v.key.equals(v.key)).map(c => [c.v.assetIndex, c]));
@@ -823,7 +938,8 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go }: {
     <>
       <div className="ptabs wide">
         <button className={tab === "positions" ? "on" : ""} onClick={() => setTab("positions")}>Positions{positions.length ? <em>{positions.length}</em> : null}</button>
-        <button className={tab === "orders" ? "on" : ""} onClick={() => setTab("orders")}>Open orders{state.orders.length ? <em>{state.orders.length}</em> : null}</button>
+        <button className={tab === "orders" ? "on" : ""} onClick={() => setTab("orders")}>Open orders{standing.length ? <em>{standing.length}</em> : null}</button>
+        <button className={tab === "twap" ? "on" : ""} onClick={() => setTab("twap")}>TWAP{twaps.length ? <em>{twaps.length}</em> : null}</button>
         <button className={tab === "history" ? "on" : ""} onClick={() => setTab("history")}>Trade history</button>
         <button className={tab === "vault" ? "on" : ""} onClick={() => setTab("vault")}>Vault capacity</button>
         <button className={tab === "market" ? "on" : ""} onClick={() => setTab("market")}>Market details</button>
@@ -831,7 +947,7 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go }: {
       <div className="bottom-body">
         {tab === "positions" && (!publicKey ? <div className="quiet">Connect a wallet to see your positions.</div> : positions.length === 0 ? <div className="quiet">No open positions.</div> : (
           <table className="tbl">
-            <thead><tr><th>Market</th><th>Side</th><th className="r">Size</th><th className="r">Value</th><th className="r">Entry price</th><th className="r">Mark price</th><th className="r">PnL</th><th className="r">Liq. price</th><th /></tr></thead>
+            <thead><tr><th>Market</th><th>Side</th><th className="r">Size</th><th className="r">Value</th><th className="r">Entry price</th><th className="r">Mark price</th><th className="r">PnL</th><th className="r">Liq. price</th><th title="Take profit, stop loss and trailing stop set on this position">TP / SL</th><th /></tr></thead>
             <tbody>
               {positions.map(x => {
                 const here = x.asset === v.assetIndex;
@@ -839,7 +955,7 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go }: {
                 const { size, mark, entry: e, pnl } = x;
                 return (
                   <tr key={x.asset} className={here ? "here" : ""}>
-                    <td><button className="link" onClick={() => c && go(c.v.canonical ? `/trade/${s}` : `/m/${c.v.key.toString()}`)}>{s}-PERP</button></td>
+                    <td><button className="link" onClick={() => c && go(c.v.canonical ? `/trade/${s}` : `/m/${c.v.key.toString()}`)}>{s}</button></td>
                     <td className={size > 0 ? "up" : "down"}>{size > 0 ? "Long" : "Short"}</td>
                     <td className="r mono">{fmt(Math.abs(size), 4).replace(/\.?0+$/, "")} {s}</td>
                     <td className="r mono">{money(x.value)}</td>
@@ -847,22 +963,23 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go }: {
                     <td className="r mono">{fmt(mark, priceDp(mark))}</td>
                     <td className={`r mono pnl ${pnl === undefined ? "" : pnl >= 0 ? "up" : "down"}`} title={pnl === undefined ? "The entry price is not known: this wallet's earlier fills on this market are not on record" : "Against the average entry price, before fees; the percentage is the price move in your favour"}>{pnl === undefined ? "—" : <>{arrow(pnl)} {signedMoney(pnl)} <i>({pct(x.ret ?? 0)})</i></>}</td>
                     <td className="r mono">{here && liq ? fmt(liq, priceDp(mark)) : "—"}</td>
+                    <td><Protection orders={here ? state.orders : (c && others.get(c.v.key.toBase58())) ?? []} dp={priceDp(mark)} /></td>
                     <td className="r">{here ? <button className="btn tiny" disabled={locked || !!busy} onClick={close}>Close</button> : <button className="btn tiny ghost" onClick={() => c && go(`/trade/${s}`)}>Open</button>}</td>
                   </tr>
                 );
               })}
               {positions.length > 1 && (() => {
                 const known = positions.filter(x => x.pnl !== undefined), total = known.reduce((t, x) => t + x.pnl!, 0);
-                return <tr className="total"><td colSpan={3}>Total</td><td className="r mono">{money(positions.reduce((t, x) => t + x.value, 0))}</td><td colSpan={2} /><td className={`r mono pnl ${total >= 0 ? "up" : "down"}`}>{known.length ? <>{arrow(total)} {signedMoney(total)}</> : "—"}</td><td colSpan={2} /></tr>;
+                return <tr className="total"><td colSpan={3}>Total</td><td className="r mono">{money(positions.reduce((t, x) => t + x.value, 0))}</td><td colSpan={2} /><td className={`r mono pnl ${total >= 0 ? "up" : "down"}`}>{known.length ? <>{arrow(total)} {signedMoney(total)}</> : "—"}</td><td colSpan={3} /></tr>;
               })()}
             </tbody>
           </table>
         ))}
-        {tab === "orders" && (!publicKey ? <div className="quiet">Connect a wallet to see your orders.</div> : state.orders.length === 0 ? <div className="quiet">No open orders on {sym}-PERP. Limit, TP / SL, trailing stop and TWAP orders are placed from the order ticket.</div> : (
+        {tab === "orders" && (!publicKey ? <div className="quiet">Connect a wallet to see your orders.</div> : standing.length === 0 ? <div className="quiet">No open orders on {sym}. Limit, TP / SL and trailing stop orders are placed from the order ticket; TWAP orders are in their own tab.</div> : (
           <table className="tbl">
             <thead><tr><th>Market</th><th>Type</th><th>Side</th><th className="r">Size</th><th className="r">Trigger</th><th className="r">Mark price</th><th>Status</th><th /></tr></thead>
             <tbody>
-              {state.orders.map(o => {
+              {standing.map(o => {
                 const protective = o.kind <= C.ORDER.TRAIL;
                 const buys = protective ? o.side < 0 : o.size > 0n;
                 const mark = num(state.asset.price, 1e6), dpp = priceDp(mark);
@@ -871,7 +988,7 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go }: {
                   : `${o.kind === C.ORDER.LIMIT ? (buys ? "≤ " : "≥ ") : ""}${fmt(num(o.trigger, 1e6), dpp)}`;
                 return (
                   <tr key={o.index}>
-                    <td>{sym}-PERP</td>
+                    <td>{sym}</td>
                     <td>{ORDER_NAME[o.kind]}{o.reduceOnly && !protective ? " · reduce only" : ""}</td>
                     <td className={buys ? "up" : "down"}>{buys ? "Buy" : "Sell"}</td>
                     <td className="r mono">{protective ? (o.size === 0n ? "whole position" : units(o.size)) : `${units(abs(o.size))} left`}</td>
@@ -879,6 +996,36 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go }: {
                     <td className="r mono">{fmt(mark, dpp)}</td>
                     <td>{o.queued ? "queued: filling at the next price" : o.kind === C.ORDER.TWAP ? `next slice ${o.nextTime * 1000 <= Date.now() ? "due" : `in ${Math.max(1, Math.round((o.nextTime * 1000 - Date.now()) / 1000))} s`}` : "waiting"}</td>
                     <td className="r"><button className="btn tiny" disabled={o.queued || !!busy} title={o.queued ? "Its queued request has to fill or expire first" : undefined} onClick={() => publicKey && send(`Cancel ${ORDER_NAME[o.kind].toLowerCase()}`, [C.cancelOrder(publicKey, v.key, o.index)])}>Cancel</button></td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        ))}
+        {tab === "twap" && (!publicKey ? <div className="quiet">Connect a wallet to see your TWAP orders.</div> : twaps.length === 0 ? <div className="quiet">No running TWAP on {sym}. Start one from the TWAP tab of the order ticket; it shows here until its last slice has filled.</div> : (
+          <table className="tbl">
+            <thead><tr><th>Market</th><th>Side</th><th className="r">Total</th><th className="r" title="Slices that have filled, and the size they traded">Filled</th><th className="r" title="Slices still to come, and the size left">Waiting</th><th>Progress</th><th className="r">Slice</th><th>Next slice</th><th /></tr></thead>
+            <tbody>
+              {twaps.map(o => {
+                const buys = o.size > 0n, left = abs(o.size), plan = plans.get(o.key.toBase58());
+                const total = plan ? abs(plan.total) : undefined, done = total !== undefined && total > left ? total - left : 0n;
+                // The last slice takes what is left, so the count rounds up.
+                const waitingN = o.slice > 0n ? Number((left + o.slice - 1n) / o.slice) : 0;
+                const doneN = plan ? Math.max(0, plan.slices - waitingN) : undefined;
+                const share = total ? Number(done * 10_000n / total) / 10_000 : undefined;
+                const every = o.interval >= 120 ? `${fmt(o.interval / 60, 1)} min` : `${o.interval} s`;
+                const due = o.nextTime * 1000 <= Date.now();
+                return (
+                  <tr key={o.index}>
+                    <td>{sym}{o.reduceOnly ? <i className="muted" title={REDUCE_ONLY_HELP}> · reduce only</i> : null}</td>
+                    <td className={buys ? "up" : "down"}>{buys ? "Buy" : "Sell"}</td>
+                    <td className="r mono">{total !== undefined ? units(total) : plan === undefined ? "…" : "—"}</td>
+                    <td className="r mono">{doneN !== undefined ? <>{doneN}<i className="muted"> / {plan!.slices}</i> · {units(done)}</> : "—"}</td>
+                    <td className="r mono">{waitingN} · {units(left)}</td>
+                    <td><span className={`twap-bar ${buys ? "up" : "down"}`} title={share !== undefined ? `${fmt(share * 100, 1)}% filled` : "The full size is not known yet"}><span style={{ width: `${(share ?? 0) * 100}%` }} /></span></td>
+                    <td className="r mono">{units(o.slice)} every {every}</td>
+                    <td>{o.queued ? "filling at the next price" : due ? "due now" : `in ${Math.max(1, Math.round((o.nextTime * 1000 - Date.now()) / 1000))} s`}</td>
+                    <td className="r"><button className="btn tiny" disabled={o.queued || !!busy} title={o.queued ? "Its queued slice has to fill or expire first" : "Stops the TWAP; slices already filled stay filled"} onClick={() => publicKey && send("Cancel TWAP", [C.cancelOrder(publicKey, v.key, o.index)])}>Cancel</button></td>
                   </tr>
                 );
               })}
@@ -900,15 +1047,16 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go }: {
                 <span>after fees</span><b className={`mono pnl ${booked - fees >= 0 ? "up" : "down"}`}>{signedMoney(booked - fees)}</b>
               </div>
               <table className="tbl">
-                <thead><tr><th>Time</th><th>Market</th><th>Side</th><th className="r">Size</th><th className="r">Price</th><th className="r">Value</th><th className="r">Fee</th><th className="r" title="What the trade booked when it reduced or closed a position: (price - average entry) x size closed, before fees">Closed PnL</th><th className="r">Transaction</th></tr></thead>
+                <thead><tr><th>Time</th><th>Market</th><th>Side</th><th className="r">Size</th><th className="r" title="For a trade that opened or added: its fill price. For a trade that reduced or closed: the position's average entry before it">Entry price</th><th className="r" title="The fill price of a trade that reduced or closed a position">Close price</th><th className="r">Value</th><th className="r">Fee</th><th className="r" title="What the trade booked when it reduced or closed a position: (price - average entry) x size closed, before fees">Closed PnL</th><th className="r">Transaction</th></tr></thead>
                 <tbody>
                   {[...rows].reverse().map(f => (
                     <tr key={f.sig}>
                       <td className="mono muted">{ago(Math.max(0, (Number(state.slot) - f.slot) * C.slotSeconds()))}</td>
-                      <td>{symOf(f.vault)}-PERP</td>
+                      <td>{symOf(f.vault)}</td>
                       <td className={f.size > 0 ? "up" : "down"}>{f.size > 0 ? "Buy" : "Sell"}</td>
                       <td className="r mono">{fmt(Math.abs(f.size), 4).replace(/\.?0+$/, "")}</td>
-                      <td className="r mono">{fmt(f.price, priceDp(f.price))}</td>
+                      <td className="r mono">{f.entry !== undefined ? fmt(f.entry, priceDp(f.entry)) : <span className="muted" title="This position was opened by fills that are not on record">—</span>}</td>
+                      <td className="r mono">{f.close !== undefined ? <>{fmt(f.close, priceDp(f.close))}{f.flips && <i className="muted" title="This trade closed the position and opened one on the other side at the same price"> flip</i>}</> : <span className="muted">—</span>}</td>
                       <td className="r mono">{money(Math.abs(f.size) * f.price)}</td>
                       <td className="r mono">{money(fee(f))}</td>
                       <td className={`r mono pnl ${f.realized > 0 ? "up" : f.realized < 0 ? "down" : "muted"}`}>{f.realized !== 0 ? <>{arrow(f.realized)} {signedMoney(f.realized)}</> : f.known ? "opened" : "—"}</td>
@@ -938,6 +1086,7 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go }: {
               <div><span>Fees earned</span><b>{usd(v.feesHarvested + state.asset.insurance)}</b></div>
               <div><span>Insurance kept for traders</span><b>{usd(v.insuranceFloor, 0)}</b></div>
               <div><span>Fills</span><b>{String(v.totalFills)}</b></div>
+              <div><span>Liquidity epoch</span><b>{String(v.epoch)}: {state.slot < v.epochStart + v.epochLen ? `ends in about ${Math.max(1, Math.ceil(Number(v.epochStart + v.epochLen - state.slot) * C.slotSeconds() / 60))} min` : v.pendingDeposit > 0n || v.pendingWithdraw > 0n ? "settling" : "no deposits or withdrawals waiting"}</b></div>
             </div>
             <div className="kv">
               <div><span>Vault</span><b><a href={explorer("address", v.key.toString())} target="_blank" rel="noreferrer">{short(v.key)}</a></b></div>

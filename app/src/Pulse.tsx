@@ -10,11 +10,14 @@
 // copy, /api/state): the router's queue and every account's track record (its last 16 fills), so
 // none of it costs the visitor a transaction-history request. Our own test bots are labelled.
 import { useEffect, useMemo, useRef, useState } from "react";
+import { PublicKey } from "@solana/web3.js";
 import * as C from "./chain";
 import * as S from "./social";
 import { Badge, nameOf } from "./Traders";
+import { openTrader } from "./TraderIntel";
 import { Card, ago, fmt, num } from "./shared";
 import { view } from "./view";
+import type { Report } from "../api/_execution";
 import { SEED_WALLETS } from "../api/_config";
 
 export const PULSE = { queue: true, tape: true, whales: true, liqs: true, crowd: true };
@@ -45,10 +48,10 @@ export function marketFills(board: S.Board | undefined, asset: number): Whale[] 
 }
 
 /** Who a wallet is, as the tape and the queue show it: badge, name, a tag for our test bots. */
-function Who({ wallet, board, go }: { wallet: string; board?: S.Board; go: (to: string) => void }) {
+export function Who({ wallet, board }: { wallet: string; board?: S.Board; go?: (to: string) => void }) {
   const profile = board?.profiles.get(wallet);
   return (
-    <button className="who" title={wallet} onClick={() => go(`/trader/${wallet}`)}>
+    <button className="who" title={`${wallet}: open this trader's profile`} onClick={e => { e.stopPropagation(); openTrader(wallet); }}>
       <Badge wallet={wallet} profile={profile} size={14} />
       <span>{nameOf(wallet, profile)}</span>
       {isBot(wallet) && <em>bot</em>}
@@ -57,7 +60,7 @@ function Who({ wallet, board, go }: { wallet: string; board?: S.Board; go: (to: 
 }
 
 /** The market's trades, newest first; ones that arrived since the last read flash once. */
-export function Trades({ fills, board, sym, go }: { fills: Whale[]; board?: S.Board; sym: string; go: (to: string) => void }) {
+export function Trades({ fills, board, sym, go, limit = 40 }: { fills: Whale[]; board?: S.Board; sym: string; go: (to: string) => void; limit?: number }) {
   const seen = useRef<Set<string>>();
   const fresh = useMemo(() => {
     const had = seen.current;
@@ -72,7 +75,7 @@ export function Trades({ fills, board, sym, go }: { fills: Whale[]; board?: S.Bo
   return (
     <div className="trades">
       <div className="trades-head"><span>Trader</span><span>{sym}</span><span>Price</span><span>Time</span></div>
-      {fills.slice(0, 40).map(f => (
+      {fills.slice(0, limit).map(f => (
         <div key={f.key} className={`trades-row${fresh.has(f.key) ? (f.size > 0 ? " flash-up" : " flash-down") : ""}${f.value >= WHALE_MINS[1] ? " big" : ""}`}>
           <Who wallet={f.wallet} board={board} go={go} />
           <span className={`mono ${f.size > 0 ? "up" : "down"}`} title={money(f.value)}>{f.size > 0 ? "+" : "−"}{fmt(Math.abs(f.size), Math.abs(f.size) >= 100 ? 1 : 3)}</span>
@@ -91,7 +94,7 @@ const KIND = ["Stop loss", "Take profit", "Trailing stop", "Limit", "TWAP slice"
 
 /** Trades waiting for their price: each shows a countdown to its target time, then its fill (found
  *  in the trader's track record), then leaves. */
-export function Queue({ state, fills, board, go }: { state: C.State; fills: Whale[]; board?: S.Board; go: (to: string) => void }) {
+export function Queue({ state, fills, board, go, bare }: { state: C.State; fills: Whale[]; board?: S.Board; go: (to: string) => void; bare?: boolean }) {
   const vault = state.vault.key, sym = state.vault.feed?.symbol ?? "";
   const price = num(state.asset.price, 1e6);
   const [rows, setRows] = useState<Map<string, Queued>>(new Map());
@@ -128,10 +131,11 @@ export function Queue({ state, fills, board, go }: { state: C.State; fills: Whal
   const waiting = shown.filter(q => !q.gone).length;
   return (
     <div className="queue">
-      <div className="ph queue-h">
+      {!bare && <div className="ph queue-h">
         <h3>Queue{waiting > 0 && <em>{waiting}</em>}</h3>
         <span className="hint" title={`Every trade waits ${C.ROUTER_DELAY_SECS} seconds and then fills at the first oracle price after that: a price nobody, the trader included, could know when it was sent.`}>{shown.length ? "fills at the next price" : "no trade waiting"}</span>
-      </div>
+      </div>}
+      {bare && !shown.length && <div className="quiet">No trade waiting.</div>}
       {shown.slice(0, 4).map(q => {
         const n = num(q.r.size, 1e6), w = q.r.wallet.toBase58();
         const what = q.r.settle ? "Vault settlement" : `${q.r.order !== undefined ? `${KIND[q.r.order] ?? "Order"} · ` : ""}${n > 0 ? "Long" : "Short"} ${fmt(Math.abs(n), Math.abs(n) >= 100 ? 1 : 3)} ${sym}`;
@@ -150,6 +154,68 @@ export function Queue({ state, fills, board, go }: { state: C.State; fills: Whal
   );
 }
 
+// ---------------------------------------------------------------- execution engine
+
+/** The site's execution-quality report (api/execution.ts), shared by the Trade panel and the
+ *  Execution page; read once a few minutes per page. */
+let reportNow: { at: number; body?: Report; err?: string } | undefined;
+export function useExecReport(): { report?: Report; err?: string } {
+  const [r, setR] = useState(reportNow);
+  useEffect(() => {
+    let on = true;
+    const load = () => {
+      if (reportNow && Date.now() - reportNow.at < 240_000 && reportNow.body) { setR(reportNow); return; }
+      fetch(`/api/execution?network=${C.NETWORK}`).then(x => x.json()).then(j => {
+        reportNow = j?.error ? { at: Date.now(), body: reportNow?.body, err: j.error } : { at: Date.now(), body: j };
+        if (on) setR(reportNow);
+      }).catch(e => { if (on) setR({ at: Date.now(), body: reportNow?.body, err: String(e) }); });
+    };
+    load();
+    const id = setInterval(() => document.hidden || load(), 300_000);
+    return () => { on = false; clearInterval(id); };
+  }, []);
+  return { report: r?.body, err: r?.err };
+}
+
+export const ORDER_KINDS = ["stop loss", "take profit", "trailing stop", "limit", "TWAP"];
+
+/** Every wallet's standing orders on one vault (the router's accounts are in the shared copy). */
+export function useMarketOrders(vault: PublicKey, tick: number): C.StandingOrder[] | undefined {
+  const [orders, setOrders] = useState<C.StandingOrder[]>();
+  useEffect(() => {
+    let on = true;
+    view.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: C.ORDER_LEN }, { memcmp: { offset: 8, bytes: vault.toBase58() } }] })
+      .then(accs => { if (on) setOrders(accs.map(a => C.decodeOrder(a.pubkey, new Uint8Array(a.account.data)))); })
+      .catch(() => { /* kept as last read */ });
+    return () => { on = false; };
+  }, [vault.toBase58(), tick]);
+  return orders;
+}
+
+/** Each market's trading volume over the last 24 hours (api/volume.ts), read once every ten
+ *  minutes per page and shared by every part of it. */
+export type VolumeReport = { at: number; markets: Record<string, { volume: number; trades: number; hours: number }> };
+let volumeNow: { at: number; body?: VolumeReport } | undefined;
+const volumeWaiters = new Set<(v: VolumeReport) => void>();
+let volumeLoading = false;
+export function useVolume(): VolumeReport | undefined {
+  const [v, setV] = useState(volumeNow?.body);
+  useEffect(() => {
+    volumeWaiters.add(setV);
+    const load = () => {
+      if (volumeLoading || (volumeNow && Date.now() - volumeNow.at < 540_000)) return;
+      volumeLoading = true;
+      fetch(`/api/volume?network=${C.NETWORK}`).then(x => x.json()).then(j => {
+        if (j?.markets) { volumeNow = { at: Date.now(), body: j }; volumeWaiters.forEach(f => f(j)); }
+      }).catch(() => { /* shown as "—" */ }).finally(() => { volumeLoading = false; });
+    };
+    load();
+    const id = setInterval(() => document.hidden || load(), 60_000);
+    return () => { volumeWaiters.delete(setV); clearInterval(id); };
+  }, []);
+  return v;
+}
+
 // ---------------------------------------------------------------- how the crowd leans
 
 /** Traders' longs against their shorts on this market: Percolator's open interest less the
@@ -166,7 +232,7 @@ export function Crowd({ state, board }: { state: C.State; board?: S.Board }) {
   for (const r of board?.rows ?? []) for (const p of r.positions) if (p.asset === asset && p.size !== 0) p.size > 0 ? longs++ : shorts++;
   return (
     <div className="crowd">
-      <div className="crowd-l"><span>Traders</span><b className="mono"><span className="up">{fmt(longPct, 0)}% long</span> · <span className="down">{fmt(100 - longPct, 0)}% short</span></b></div>
+      <div className="crowd-l"><span>Long / short</span><b className="mono"><span className="up">{fmt(longPct, 0)}% long</span> · <span className="down">{fmt(100 - longPct, 0)}% short</span></b></div>
       <div className="crowd-bar" title={`Longs ${money(L)} (${longs} traders) · shorts ${money(Sh)} (${shorts} traders)`}><i className="crowd-long" style={{ width: `${longPct}%` }} /><i className="crowd-short" style={{ width: `${100 - longPct}%` }} /></div>
       <div className="crowd-ends mono"><span>{money(L)}{board ? ` · ${longs} trader${longs === 1 ? "" : "s"}` : ""}</span><span>{board ? `${shorts} trader${shorts === 1 ? "" : "s"} · ` : ""}{money(Sh)}</span></div>
     </div>

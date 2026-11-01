@@ -7,6 +7,31 @@ const FONT = '"JetBrains Mono", ui-monospace, monospace';
 const GREEN = rgbOf(T.green), CORAL = rgbOf(T.red), WHITE = rgbOf(T.textPrimary), GREY = rgbOf(T.textSecondary);
 const rgba = (c: string, a: number) => `rgba(${c},${a})`;
 const label = (color: string) => ({ color, size: 10.5, family: FONT, backgroundColor: "transparent", borderColor: "transparent", paddingLeft: 4, paddingRight: 4, paddingTop: 2, paddingBottom: 2 });
+/** Splits a text into lines of at most `n` characters, at spaces where it can. */
+const wrap = (text: string, n: number): string[] => {
+  const out: string[] = [];
+  let line = "";
+  for (const word of text.split(" ")) {
+    const parts = word.length > n ? word.match(new RegExp(`.{1,${n}}`, "g"))! : [word];
+    for (const p of parts) {
+      if (line && (line + " " + p).length > n) { out.push(line); line = p; } else line = line ? `${line} ${p}` : p;
+    }
+  }
+  if (line) out.push(line);
+  return out.slice(0, 5);
+};
+/** A hover card beside a mark at `x`, `gap` pixels clear of its centre: the first line bold, the
+ *  rest plain (lines from `quietFrom` on are a note's words). It goes to the left of the mark when
+ *  there is no room on the right. */
+const card = (x: number, gap: number, y: number, lines: string[], side: string, width: number, quietFrom = lines.length): any[] => {
+  const lh = 18, pad = 9;
+  const w = Math.max(...lines.map(l => [...l].length)) * 7.3 + pad * 2, h = lines.length * lh + pad * 2 - 4;
+  const left = x + gap + w > width - 4 ? Math.max(4, x - gap - w) : x + gap;
+  const top = y - h / 2;
+  const figs: any[] = [{ type: "rect", ignoreEvent: true, attrs: { x: left, y: top, width: w, height: h }, styles: { style: "stroke_fill", color: `rgba(${rgbOf(T.bgElevated)},0.97)`, borderColor: rgba(side, 0.9), borderSize: 1, borderRadius: 5 } }];
+  lines.forEach((t, i) => figs.push({ type: "text", ignoreEvent: true, attrs: { x: left + pad, y: top + pad - 2 + i * lh + lh / 2, text: t, baseline: "middle" }, styles: { ...label(rgba(WHITE, i === 0 ? 1 : i >= quietFrom ? 0.95 : 0.7)), size: i === 0 ? 13 : 12, weight: i === 0 ? 600 : 400, paddingLeft: 0, paddingRight: 0, paddingTop: 0, paddingBottom: 0 } }));
+  return figs;
+};
 
 /** Retracement levels from the second point (0) back to the first (1), each in its own colour,
  *  with the band between two levels tinted. */
@@ -95,8 +120,8 @@ export function registerChartTools() {
     needDefaultPointFigure: false,
     needDefaultXAxisFigure: false,
     needDefaultYAxisFigure: false,
-    createPointFigures: ({ coordinates, overlay }) => {
-      const m = overlay.extendData as { points: [number, number][]; color: string; picture?: string; buy: boolean; label: string; hover?: boolean } | undefined;
+    createPointFigures: ({ coordinates, overlay, bounding }) => {
+      const m = overlay.extendData as { points: [number, number][]; color: string; picture?: string; buy: boolean; label: string; what?: string; note?: string; hover?: boolean } | undefined;
       if (!coordinates.length || !m) return [];
       const { x, y } = coordinates[0];
       const side = m.buy ? GREEN : CORAL, dir = m.buy ? 1 : -1, r = 15;
@@ -106,7 +131,43 @@ export function registerChartTools() {
         { type: "polygon", ignoreEvent: true, attrs: { coordinates: [{ x, y: y + dir * 1 }, { x: x - 4, y: y + dir * 7 }, { x: x + 4, y: y + dir * 7 }] }, styles: { style: "fill", color: rgba(side, 1) } },
         { type: "traderBadge", attrs: { x, y: cy, r, src: m.picture, points: m.points, color: m.color }, styles: { borderColor: rgba(side, 1) } },
       ];
-      if (m.hover && m.label) figures.push({ type: "text", ignoreEvent: true, attrs: { x: x + r + 6, y: cy, text: m.label, baseline: "middle" }, styles: { ...label(rgba(WHITE, 1)), size: 14, weight: 600, backgroundColor: `rgba(${rgbOf(T.bgElevated)},0.95)`, borderColor: rgba(side, 0.9), borderSize: 1, borderRadius: 3, paddingLeft: 7, paddingRight: 7, paddingTop: 4, paddingBottom: 4 } });
+      // A trade with a note carries a small speech mark on its badge.
+      if (m.note) figures.push(
+        { type: "circle", ignoreEvent: true, attrs: { x: x + r * 0.78, y: cy - r * 0.78, r: 6 }, styles: { style: "stroke_fill", color: rgba(WHITE, 1), borderColor: `rgba(${rgbOf(T.bgPanel)},1)`, borderSize: 1.5 } },
+        { type: "polygon", ignoreEvent: true, attrs: { coordinates: [{ x: x + r * 0.78 - 2.5, y: cy - r * 0.78 + 4 }, { x: x + r * 0.78 - 5, y: cy - r * 0.78 + 8 }, { x: x + r * 0.78 + 1, y: cy - r * 0.78 + 5 }] }, styles: { style: "fill", color: rgba(WHITE, 1) } },
+      );
+      if (m.hover && m.label) {
+        const head = [m.label, ...(m.what ? [m.what] : [])];
+        figures.push(...card(x, r + 8, cy, [...head, ...(m.note ? wrap(`“${m.note}”`, 44) : [])], side, bounding.width, head.length));
+      }
+      return figures;
+    },
+  });
+
+  // One of this wallet's own fills: a green triangle pointing up under the candle for a buy, a
+  // red one pointing down over it for a sell, clear of the candle's wick so it never covers it.
+  // What it was, and at what price, shows on hover.
+  registerOverlay({
+    name: "tradeDot",
+    totalStep: 2,
+    needDefaultPointFigure: false,
+    needDefaultXAxisFigure: false,
+    needDefaultYAxisFigure: false,
+    createPointFigures: ({ chart, coordinates, overlay, bounding, yAxis }) => {
+      const m = overlay.extendData as { buy: boolean; label: string; hover?: boolean } | undefined;
+      if (!coordinates.length || !m) return [];
+      const { x, y } = coordinates[0];
+      const side = m.buy ? GREEN : CORAL, dir = m.buy ? 1 : -1, w = m.hover ? 11 : 9.5, h = m.hover ? 18 : 16;
+      // The candle the fill is in: the triangle goes past its low (buy) or high (sell).
+      const p = overlay.points[0], list = chart.getDataList();
+      let k = p?.dataIndex !== undefined ? list[p.dataIndex] : undefined;
+      if (!k || k.timestamp !== p?.timestamp) k = list.find(d => d.timestamp === p?.timestamp);
+      const edge = k && yAxis ? yAxis.convertToPixel(m.buy ? k.low : k.high) : y;
+      const tip = (m.buy ? Math.max(y, edge) : Math.min(y, edge)) + dir * 9;
+      const figures: any[] = [
+        { type: "polygon", attrs: { coordinates: [{ x, y: tip }, { x: x - w, y: tip + dir * h }, { x: x + w, y: tip + dir * h }] }, styles: { style: "stroke_fill", color: rgba(side, 1), borderColor: `rgba(${rgbOf(T.bgPanel)},1)`, borderSize: 1.2 } },
+      ];
+      if (m.hover && m.label) figures.push(...card(x, w + 6, tip + dir * h / 2, [m.label], side, bounding.width));
       return figures;
     },
   });

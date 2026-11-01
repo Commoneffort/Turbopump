@@ -2,7 +2,7 @@
 // src/chain.ts KNOWN_FEEDS). The programs have the same addresses on both networks.
 export const PERCOLATOR = "8o3uV87X2CvPYfPwM1sxeaYYE7sGWsTUiEy7SskEMM3P";
 export const VAULT_PROGRAM = "BSync6F8gtJs3Wj4w8L6H3ZtS397w2XoCYGEAJGmeYX";
-export const MARKET = "8ZMjDzhAgcV7zidvkRXM257Dp2HmzeNz7jpbTFvRE1Ls";
+export const MARKET = "35XfkPtqC3jL2hQEMakwoi6TqtCVnLAkHTghfcz64tb7";
 export const ROUTER = "DkK9TSMpVXLq26HeqxTXLysXyRKDYHTKU94SLFDWgjw3";
 export const FEED_SYMBOLS: Record<string, string> = {
   ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d: "SOL",
@@ -34,7 +34,7 @@ export const FEED_SYMBOLS: Record<string, string> = {
  *  (the page does, from its network switch); anything else is Solana devnet. */
 export const NETWORKS = {
   devnet: { rpc: process.env.RPC_URL ?? "https://api.devnet.solana.com", market: MARKET, mint: "FT7B8rR8NN1ciyGPmTDT8AxUUWtF1PGc4NCmuisYVPkh", faucetSecret: "FAUCET_SECRET", coin: "SOL", drip: 0.3, lowWater: 0.2 },
-  "x1-testnet": { rpc: process.env.X1_RPC_URL ?? "https://rpc.testnet.x1.xyz", market: "EmNL4qAvngUBAga4Wv3DWkQbtRAJfXq61NhdpzeGWaoJ", mint: "7jpUVrakCqTm68aatnDHYe7qhSF7Zq39PWoSKM1u2Aaw", faucetSecret: "FAUCET_SECRET_X1", coin: "XNT", drip: 0.3, lowWater: 0.2 },
+  "x1-testnet": { rpc: process.env.X1_RPC_URL ?? "https://rpc.testnet.x1.xyz", market: "281YHBA8J4DyU8yiyjZJgWE7FaA5G1ax4F5iPeB3WSZn", mint: "7jpUVrakCqTm68aatnDHYe7qhSF7Zq39PWoSKM1u2Aaw", faucetSecret: "FAUCET_SECRET_X1", coin: "XNT", drip: 0.3, lowWater: 0.2 },
 };
 export const networkOf = (req: any) => (req?.query?.network === "x1-testnet" ? NETWORKS["x1-testnet"] : NETWORKS.devnet);
 

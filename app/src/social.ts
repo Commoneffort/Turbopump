@@ -155,7 +155,7 @@ export const setCopy = (wallet: PublicKey, leader: PublicKey, ratioBps: number, 
   data[0] = 19; data.writeUInt32LE(ratioBps, 1); data.writeBigUInt64LE(maxNotional, 5);
   return new TransactionInstruction({
     programId: C.ROUTER,
-    keys: [rw(wallet, true), rw(copyAddress(wallet)), ro(C.traderAddress(wallet)), rw(leader), ro(C.traderAddress(leader)), ro(SystemProgram.programId), rw(C.TREASURY)],
+    keys: [rw(wallet, true), rw(copyAddress(wallet)), rw(C.traderAddress(wallet)), rw(leader), ro(C.traderAddress(leader)), ro(SystemProgram.programId), rw(C.TREASURY)],
     data,
   });
 };
@@ -337,4 +337,56 @@ function row(wallet: string, s: Stats | undefined, profile: Profile | undefined,
     followers, copiers, copying,
     liquidatable: !!h?.liquidatable,
   };
+}
+
+// ---------------------------------------------------------------- trade notes
+// A trader can send a short note with a trade, for the people who follow them. It goes in the
+// trade's own transaction as a memo signed by the trader's wallet (so nobody else can write one
+// in their name), and followers' charts show it on that trade's badge. Nothing is stored by us.
+export const MEMO_PROGRAM = new PublicKey("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
+export const NOTE_MAX = 140;
+const NOTE_TAG = "tp:";
+/** Keeps a note to what is shown: one line, no control characters, at most NOTE_MAX characters. */
+export const cleanNote = (text: string) => [...text.replace(/[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁦-⁩]/g, " ").replace(/\s+/g, " ").trim()].slice(0, NOTE_MAX).join("");
+export const tradeNote = (wallet: PublicKey, text: string) => new TransactionInstruction({
+  programId: MEMO_PROGRAM, keys: [ro(wallet, true)], data: Buffer.from(NOTE_TAG + cleanNote(text), "utf8"),
+});
+export type Note = { time: number; text: string; sig: string };
+/** The note in a transaction's memo field as an RPC reports it ("[len] text", several joined by "; "). */
+export function noteOf(memo: string | null | undefined): string | undefined {
+  if (!memo) return undefined;
+  for (const part of memo.split(/;\s*(?=\[\d+\])/)) {
+    const m = /^(?:\[\d+\]\s*)?(.*)$/s.exec(part.trim());
+    if (m && m[1].startsWith(NOTE_TAG)) { const t = cleanNote(m[1].slice(NOTE_TAG.length)); if (t) return t; }
+  }
+  return undefined;
+}
+/** A wallet's recent trade notes, newest first: read from its trading account's transactions.
+ *  Anyone can send a transaction that names someone else's trading account and carries a memo,
+ *  so a note only counts when that wallet signed the transaction, the memo lists it as its
+ *  signer, and the same transaction queues a trade with the router. */
+const verified = new Map<string, boolean>();
+export async function loadNotes(conn: Connection, wallet: PublicKey, limit = 60): Promise<Note[]> {
+  const sigs = await conn.getSignaturesForAddress(C.traderAddress(wallet), { limit }, "confirmed");
+  const out: Note[] = [];
+  const me = wallet.toBase58(), router = C.ROUTER.toBase58(), memo = MEMO_PROGRAM.toBase58();
+  for (const s of sigs) {
+    const text = !s.err && s.blockTime ? noteOf(s.memo) : undefined;
+    if (!text) continue;
+    let ok = verified.get(s.signature);
+    if (ok === undefined) {
+      const tx = await conn.getTransaction(s.signature, { maxSupportedTransactionVersion: 0, commitment: "confirmed" }).catch(() => null);
+      if (!tx) continue;
+      const m = tx.transaction.message, keys = m.staticAccountKeys.map(k => k.toBase58());
+      const signers = keys.slice(0, m.header.numRequiredSignatures);
+      const ixs = m.compiledInstructions;
+      ok = signers.includes(me)
+        && ixs.some(ix => keys[ix.programIdIndex] === memo && ix.accountKeyIndexes.some(i => keys[i] === me))
+        // Request (4) or close (8) from this wallet: account 0 (the wallet / payer) is this wallet.
+        && ixs.some(ix => keys[ix.programIdIndex] === router && (ix.data[0] === 4 || ix.data[0] === 8) && keys[ix.accountKeyIndexes[0]] === me);
+      verified.set(s.signature, ok);
+    }
+    if (ok) out.push({ time: s.blockTime!, text, sig: s.signature });
+  }
+  return out;
 }

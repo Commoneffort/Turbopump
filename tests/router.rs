@@ -8,7 +8,7 @@
 mod common;
 use common::*;
 use percolator_prog::ix::Instruction as ProgIx;
-use percolator_router::{client as rclient, state as rstate, RouterError, BATCH_SECS, BOND_LAMPORTS, DELAY_SECS, GRACE_SECS, STALL_SECS};
+use percolator_router::{client as rclient, state as rstate, RouterError, BATCH_SECS, BOND_LAMPORTS, DELAY_SECS, GRACE_SECS, LIQ_REWARD, STALL_SECS};
 use percolator_vault::{error::VaultError, percolator as perc, processor};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
@@ -153,10 +153,11 @@ fn a_request_cannot_be_cancelled_or_withdrawn_from_and_expires_with_its_bond() {
     let ix = rclient::expire(&kp.pubkey(), &w.vault, &t);
     expect(w.send(vec![ix.clone()], &[&kp]), router_code(RouterError::TooEarly));
 
-    // After the grace period it expires; the bond is forfeited to the book, never to the trader.
+    // After the grace period it expires; the bond is forfeited to the book, never to the trader
+    // (whoever expires it, here the trader itself, gets a quarter of it for doing so).
     at(&mut w, target + GRACE_SECS + 1);
     w.send(vec![ix], &[&kp]).unwrap();
-    assert_eq!(w.env.svm.get_balance(&book).unwrap() - book_before, BOND_LAMPORTS);
+    assert_eq!(w.env.svm.get_balance(&book).unwrap() - book_before, BOND_LAMPORTS - BOND_LAMPORTS / percolator_router::EXPIRE_SHARE_DIV);
     assert_eq!({ w.book().len }, 0);
     // The trader is unlocked, and nothing was filled.
     assert_eq!({ w.vault_state().inventory }, 0);
@@ -526,15 +527,15 @@ fn a_request_that_lapses_after_its_price_arrived_loses_its_deposit() {
     let mut again = expire.clone();
     again.accounts[0] = AccountMeta::new_readonly(kp.pubkey(), true); // the trader itself lets it lapse
     w.send(vec![again], &[&kp]).unwrap();
-    assert_eq!(bal(&w, &book) - book_before, BOND_LAMPORTS + deposit);
-    assert!(bal(&w, &t.wallet) <= queued + rent, "only the rent came back");
+    assert_eq!(bal(&w, &book) - book_before, BOND_LAMPORTS - BOND_LAMPORTS / percolator_router::EXPIRE_SHARE_DIV + deposit, "the trader, writable as the request's wallet, gets the expirer's quarter of its own bond");
+    assert!(bal(&w, &t.wallet) <= queued + rent + BOND_LAMPORTS / percolator_router::EXPIRE_SHARE_DIV, "only the rent (and the expirer's share) came back");
 
     // What lapsed requests left in the book goes to the treasury, and nowhere else; the book
     // keeps its rent, and a second sweep finds nothing.
     let treasury = percolator_vault::processor::TREASURY;
     let book_rent = w.env.svm.minimum_balance_for_rent_exemption(rstate::BOOK_LEN);
     let spare = bal(&w, &book) - book_rent;
-    assert!(spare >= 2 * BOND_LAMPORTS + deposit);
+    assert!(spare >= 2 * (BOND_LAMPORTS - BOND_LAMPORTS / percolator_router::EXPIRE_SHARE_DIV) + deposit);
     let mut wrong = rclient::sweep(&w.vault);
     wrong.accounts[1] = AccountMeta::new(kp.pubkey(), false);
     assert!(w.send(vec![wrong], &[]).is_err(), "only the treasury");
@@ -580,7 +581,7 @@ fn a_request_that_lapses_on_a_market_that_was_behind_gets_its_deposit_back() {
     at(&mut w, set + STALL_SECS + 1);
     let before = bal(&w, &book);
     w.send(vec![rclient::expire_trade(&w.payer.pubkey(), &w.vault, &market, &t)], &[]).unwrap();
-    assert_eq!(bal(&w, &book) - before, BOND_LAMPORTS + deposit);
+    assert_eq!(bal(&w, &book) - before, BOND_LAMPORTS - BOND_LAMPORTS / percolator_router::EXPIRE_SHARE_DIV + deposit, "a quarter of the bond to whoever expired it");
     assert!(bal(&w, &t.wallet) <= queued + rent);
 
     // The market fell more than BEHIND_REFUND_SLOTS behind before the lapse: the deposit goes back.
@@ -592,7 +593,7 @@ fn a_request_that_lapses_on_a_market_that_was_behind_gets_its_deposit_back() {
     assert!(w.send(vec![wrong], &[]).is_err(), "not the vault's market");
     let before = bal(&w, &book);
     w.send(vec![rclient::expire_trade(&w.payer.pubkey(), &w.vault, &market, &t)], &[]).unwrap();
-    assert_eq!(bal(&w, &book) - before, BOND_LAMPORTS, "only the bond is kept");
+    assert_eq!(bal(&w, &book) - before, BOND_LAMPORTS - BOND_LAMPORTS / percolator_router::EXPIRE_SHARE_DIV, "only the bond (less the expirer's share) is kept");
     assert_eq!(bal(&w, &t.wallet), queued + rent + deposit);
 }
 
@@ -971,4 +972,54 @@ fn targets_are_rounded_up_to_the_batch_grid() {
     let a = (1_000..).find(|n| (n + DELAY_SECS) % BATCH_SECS == 1).unwrap();
     assert_eq!(target_time(a, 0, DELAY_SECS), target_time(a + 1, 0, DELAY_SECS));
     assert_eq!(target_time(i64::MAX - 1, 0, DELAY_SECS), None);
+}
+
+// ---- liquidation rewards: out of the liquidated account's keeper deposit ----
+
+#[test]
+fn a_liquidator_is_paid_back_and_the_filler_rewarded_out_of_the_accounts_keeper_deposit() {
+    let mut w = live();
+    leveraged_long(&mut w);
+    let t = w.trader(7);
+    let rent = w.env.svm.minimum_balance_for_rent_exemption(rstate::REQUEST_LEN);
+    let trader_rent = w.env.svm.minimum_balance_for_rent_exemption(rstate::TRADER_LEN);
+    // Its first trade topped up the deposit.
+    assert_eq!(w.env.svm.get_balance(&t.trader).unwrap() - trader_rent, percolator_router::keeper_deposit(rent));
+    w.move_price(20, 840_000);
+    let liquidator = Keypair::new();
+    w.env.svm.airdrop(&liquidator.pubkey(), 1_000_000_000).unwrap();
+    let l0 = w.env.svm.get_balance(&liquidator.pubkey()).unwrap();
+    let id = w.book().next_id;
+    w.send(vec![rclient::request_close(&liquidator.pubkey(), &t, &w.vault)], &[&liquidator]).unwrap();
+    // Queuing it is paid back exactly: the reward waits for a fill that does liquidate.
+    assert_eq!(w.env.svm.get_balance(&liquidator.pubkey()).unwrap(), l0);
+    // Someone else fills it and earns the bond and the reward; the request's rent goes back to the deposit.
+    w.execute(7, id).unwrap();
+    assert!(position(&w, 7) < 20 * UNIT as i128);
+    assert_eq!(w.env.svm.get_balance(&t.trader).unwrap() - trader_rent, rent, "left: the rent the fill returned");
+}
+
+#[test]
+fn a_healthy_account_cannot_be_liquidated_for_its_deposit() {
+    let mut w = live();
+    leveraged_long(&mut w);
+    let t = w.trader(7);
+    let liquidator = Keypair::new();
+    w.env.svm.airdrop(&liquidator.pubkey(), 1_000_000_000).unwrap();
+    let close = rclient::request_close(&liquidator.pubkey(), &t, &w.vault);
+    expect(w.send(vec![close], &[&liquidator]), router_code(RouterError::NotCloseOnly));
+}
+
+#[test]
+fn the_fill_that_liquidates_an_account_pays_its_executor_the_reward() {
+    let mut w = live();
+    leveraged_long(&mut w);
+    w.move_price(20, 840_000);
+    let id = w.request(7, -(UNIT as i128)).unwrap();
+    let t = w.trader(7);
+    let trader_rent = w.env.svm.minimum_balance_for_rent_exemption(rstate::TRADER_LEN);
+    let before = w.env.svm.get_balance(&t.trader).unwrap() - trader_rent;
+    w.execute(7, id).unwrap();
+    assert_eq!(position(&w, 7), 15 * UNIT as i128, "a liquidation, not the unit asked for");
+    assert_eq!(before - (w.env.svm.get_balance(&t.trader).unwrap() - trader_rent), LIQ_REWARD);
 }

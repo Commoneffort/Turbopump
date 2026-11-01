@@ -814,6 +814,8 @@ export async function fetchVault(conn: Connection, vaultKey: PublicKey, user?: P
     closeOnly: closeOnly(data(0)!, v.assetIndex),
     /** This asset's margins (bps): to open, below which it is liquidated, Percolator's own; and its tier. */
     levels: levels(data(0)!, v.assetIndex),
+    /** The market account as read (every asset's margins and prices: see `levels`). */
+    marketData: data(0)!,
     /** The market's funding: its cap, and the rate the router last set for this asset. */
     funding: fundingOf(data(0)!, v.assetIndex),
     buffer: tokenAmount(data(2)),
@@ -925,7 +927,7 @@ export function openPositions(portfolio: Uint8Array): number {
  *  at request time accepts for this portfolio: equity must cover every position's opening margin
  *  (its tier's, see `levels`) and fees, after a further `stress_bps` price move, plus that move
  *  as a loss (the router's `margin_covers`). A trade that only shrinks a position is always accepted. */
-export function marginRoom(market: Uint8Array, portfolio: Uint8Array, asset: number): bigint {
+export function marginRoom(market: Uint8Array, portfolio: Uint8Array, asset: number, owed = 0n): bigint {
   const R = L.router, P = L.portfolio;
   const price = (a: number) => u64(market, L.market.slots + a * L.market.slot_len + L.market.engine + L.market.effective_price);
   const stress = BigInt(R.stress_bps), fee = marketRates(market).feeBps;
@@ -939,7 +941,8 @@ export function marginRoom(market: Uint8Array, portfolio: Uint8Array, asset: num
     const q = legPosition(market, portfolio, leg);
     if (a !== asset) otherNeed += (q < 0n ? -q : q) * price(a) / UNIT * perUnit(a);
   }
-  const equity = u128(portfolio, P.capital) + i128(portfolio, P.pnl);
+  // (Fees owed to the vaults count against equity, as the router counts them at a fill.)
+  const equity = u128(portfolio, P.capital) + i128(portfolio, P.pnl) - owed;
   const total = ((equity - u128(market, R.min_im_off)) * 100_000_000n - otherNeed) / perUnit(asset);
   const p = price(asset);
   return total > 0n && p > 0n ? total * UNIT * 999n / (p * 1000n) : 0n;
@@ -968,6 +971,24 @@ export const ROUTER_GRACE_SECS = R.grace_secs;
 /** What a request posts and its executor earns. Larger on X1 (the router's X1 build), where a
  *  fill costs its sender about that much in fees. */
 export const ROUTER_BOND_LAMPORTS = X1 ? 20_000_000 : R.bond_lamports;
+/** Executor rewards (router, 2026-10-31): a standing order carries a keeper budget that pays
+ *  whoever carries it out (`KEEPER_FEE` and the request's rent and bond back); a trading account
+ *  keeps a keeper deposit that pays whoever liquidates it. Switched on per network once the
+ *  router with them is deployed there (an older router refuses an order with a budget). */
+export const KEEPER_REWARDS_LIVE: Record<"devnet" | "x1-testnet", boolean> = { devnet: true, "x1-testnet": true };
+export const KEEPER_REWARDS = KEEPER_REWARDS_LIVE[NETWORK];
+export const KEEPER_FEE = X1 ? 2_000_000 : 100_000;
+/** Rent of a request account (120 bytes): (128 + 120) x 3,480 x 2 lamports. */
+export const REQUEST_RENT = 1_726_080;
+/** What a trading account keeps for whoever liquidates it: a request's rent and bond, and the
+ *  liquidator's reward (half a bond). Topped up by a trade request; back with a flat withdrawal. */
+export const KEEPER_DEPOSIT = REQUEST_RENT + ROUTER_BOND_LAMPORTS + ROUTER_BOND_LAMPORTS / 2;
+/** The keeper budget an order is placed with: one execution for a stop, take-profit, trail or
+ *  limit, one a slice for a TWAP, and one request's rent (each fill returns it to the order).
+ *  What is not used goes back to the wallet with the order's rent. */
+/** A limit or TWAP order can open a position, so it also carries a keeper deposit: its first
+ *  execution moves it into the trading account if that has none (router `TriggerOrder`). */
+export const keeperBudget = (kind: number, slices = 0) => (kind === ORDER.TWAP ? Math.max(1, slices) : 1) * (ROUTER_BOND_LAMPORTS + KEEPER_FEE) + REQUEST_RENT + (kind === ORDER.LIMIT || kind === ORDER.TWAP ? KEEPER_DEPOSIT : 0);
 /** The deposit (lamports) a trader's own request carries on top of the bond: a share of its
  *  notional, in the chain's coin at a fixed rate. It comes back when the request fills, and is
  *  kept only if the request expires after its price had arrived. */
@@ -1047,7 +1068,9 @@ export type OrderParams = { index: number; kind: number; reduceOnly?: boolean; s
 export const placeOrder = (wallet: PublicKey, vault: PublicKey, o: OrderParams) => new TransactionInstruction({
   programId: ROUTER,
   keys: [rw(wallet, true), ro(traderAddress(wallet)), ro(vault), ro(bookAddress(vault)), rw(orderAddress(vault, wallet, o.index)), ro(MARKET), ro(routerPortfolio(wallet)), ro(SystemProgram.programId)],
-  data: new W().u8(12).u8(o.index).u8(o.kind).u8(o.reduceOnly ? 1 : 0).i128(o.size).u64(o.trigger).i64(BigInt(o.interval ?? 0)).u32(o.slices ?? 0).i64(BigInt(o.expiry ?? 0)).done(),
+  data: KEEPER_REWARDS
+    ? new W().u8(12).u8(o.index).u8(o.kind).u8(o.reduceOnly ? 1 : 0).i128(o.size).u64(o.trigger).i64(BigInt(o.interval ?? 0)).u32(o.slices ?? 0).i64(BigInt(o.expiry ?? 0)).u64(BigInt(keeperBudget(o.kind, o.slices))).done()
+    : new W().u8(12).u8(o.index).u8(o.kind).u8(o.reduceOnly ? 1 : 0).i128(o.size).u64(o.trigger).i64(BigInt(o.interval ?? 0)).u32(o.slices ?? 0).i64(BigInt(o.expiry ?? 0)).done(),
 });
 export const cancelOrder = (wallet: PublicKey, vault: PublicKey, index: number) => new TransactionInstruction({
   programId: ROUTER,
@@ -1159,8 +1182,12 @@ export const routerDeposit = (wallet: PublicKey, amount: bigint) => new Transact
 });
 export const routerWithdraw = (wallet: PublicKey, amount: bigint) => new TransactionInstruction({
   programId: ROUTER,
-  // Last: the fee ledger (what is owed to the vaults must be paid before a withdrawal).
-  keys: [ro(wallet, true), ro(traderAddress(wallet)), rw(routerPortfolio(wallet)), rw(MARKET), rw(routerCollateral(wallet)), rw(ata(wallet, MINT)), rw(PERC_VAULT), ro(PERC_VAULT_AUTH), ro(TOKEN_PROGRAM_ID), ro(PERCOLATOR), rw(statsAddress(wallet)), ro(ledgerAddress(wallet))],
+  // Last: the fee ledger (what is owed to the vaults must be paid before a withdrawal). The
+  // wallet and trader account writable: a withdrawal with no position left returns the keeper
+  // deposit (see `KEEPER_DEPOSIT`).
+  keys: [rw(wallet, true), rw(traderAddress(wallet)), rw(routerPortfolio(wallet)), rw(MARKET), rw(routerCollateral(wallet)), rw(ata(wallet, MINT)), rw(PERC_VAULT), ro(PERC_VAULT_AUTH), ro(TOKEN_PROGRAM_ID), ro(PERCOLATOR), rw(statsAddress(wallet)), ro(ledgerAddress(wallet)),
+    // The copy address: only while it is empty (no copy running) does a flat withdrawal return the keeper deposit.
+    ro(rpda(Buffer.from("copy"), MARKET.toBuffer(), wallet.toBuffer()))],
   data: new W().u8(2).u64(amount).done(),
 });
 /** Turns a trading account's released profit into capital (what a withdrawal pays out). Anyone
@@ -1361,6 +1388,7 @@ export const expireRequest = (caller: PublicKey, r: RouterRequest) => new Transa
   programId: ROUTER,
   // (A settlement names its vault: it can then go as soon as its epoch has rolled. A trader's own
   // request names its vault and the market: if the market was behind, its deposit goes back.)
-  keys: [ro(caller, true), rw(r.key), rw(traderAddress(r.wallet)), rw(r.wallet), rw(bookAddress(r.vault)), ...(r.order !== undefined ? [rw(orderAddress(r.vault, r.wallet, r.order))] : r.settle ? [ro(r.vault)] : [ro(r.vault), ro(MARKET)])],
+  // (The caller writable: the router pays whoever expires a request a quarter of its bond.)
+  keys: [rw(caller, true), rw(r.key), rw(traderAddress(r.wallet)), rw(r.wallet), rw(bookAddress(r.vault)), ...(r.order !== undefined ? [rw(orderAddress(r.vault, r.wallet, r.order))] : r.settle ? [ro(r.vault)] : [ro(r.vault), ro(MARKET)])],
   data: new W().u8(7).done(),
 });

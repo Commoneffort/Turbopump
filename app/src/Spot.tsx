@@ -47,7 +47,7 @@ function listedPair(l: S.ListedPool) {
   const { base, quote } = S.pairOf([l.a.mint, l.b.mint], [l.a.symbol, l.b.symbol]);
   const side = [l.a, l.b], q = side[quote];
   const name = (i: 0 | 1) => tokenName(side[i].mint, l);
-  return { name: `${name(base)}/${name(quote)}`, quote: name(quote), price: q.price > 0 ? side[base].price / q.price : 0, volume: q.volume, liquidity: q.price > 0 ? l.tvl / q.price : 0 };
+  return { name: `${name(base)}/${name(quote)}`, logo: side[base].logo, quote: name(quote), price: q.price > 0 ? side[base].price / q.price : 0, volume: q.volume, liquidity: q.price > 0 ? l.tvl / q.price : 0 };
 }
 // (A pool list cached from before a field was added has none of it.)
 /** Our own pool first, then pairs priced in the chain's coin or USDC, then the rest. */
@@ -198,7 +198,7 @@ function SpotBar({ pair, list, day, go }: { pair: Pair; list?: S.ListedPool[]; d
     const name = lp?.name ?? `${C.COIN}/USDC`;
     return (
       <button key={key} className={key === pool.key.toBase58() ? "msel-row on" : "msel-row"} onClick={() => pick(key)}>
-        <span className="msel-name"><Icon symbol={name.split("/")[0]} />{name}{note && <em>{note}</em>}</span>
+        <span className="msel-name"><Icon symbol={name.split("/")[0]} logo={lp?.logo} />{name}{note && <em>{note}</em>}</span>
         <span className="mono">{lp ? prc(lp.price) : "—"}</span>
         <span className="mono">{lp ? inQuote(lp.volume, lp.quote) : "—"}</span>
         <span className="mono">{lp ? inQuote(lp.liquidity, lp.quote) : "—"}</span>
@@ -209,7 +209,7 @@ function SpotBar({ pair, list, day, go }: { pair: Pair; list?: S.ListedPool[]; d
     <header className="mbar">
       <div className="msel" ref={box}>
         <button className="msel-btn" onClick={() => setOpen(o => !o)} aria-expanded={open}>
-          <Icon symbol={baseName} />
+          <Icon symbol={baseName} logo={listed && (listed.a.mint === pool.mints[base].toBase58() ? listed.a.logo : listed.b.logo)} />
           <span className="msel-sym">{baseName}/{quoteName}</span>
           <span className="msel-lev">SPOT</span>
           <svg width="10" height="6" viewBox="0 0 10 6" aria-hidden><path d="M1 1l4 4 4-4" fill="none" stroke="currentColor" strokeWidth="1.5" /></svg>

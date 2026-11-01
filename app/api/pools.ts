@@ -11,6 +11,8 @@ const RESOLUTIONS = new Set([60, 300, 900, 3600, 14400, 86400]);
 const API = "https://api.xdex.xyz/api";
 const text = (s: unknown) => String(s ?? "").replace(/[^\p{L}\p{N} ._$-]/gu, "").slice(0, 16);
 const n = (x: unknown) => (Number.isFinite(Number(x)) ? Number(x) : 0);
+/** A token image from xDEX itself or the X1 Labs assets repository; anything else is left out. */
+const logo = (s: unknown) => (typeof s === "string" && /^https:\/\/(app\.xdex\.xyz\/|raw\.githubusercontent\.com\/x1-labs\/assets\/)[\w./-]+$/.test(s) ? s : undefined);
 const get = async (url: string) => (await fetch(url, { signal: AbortSignal.timeout(6_000) })).json() as Promise<any>;
 
 export default async function handler(req: any, res: any) {
@@ -49,8 +51,8 @@ export default async function handler(req: any, res: any) {
         // Prices and value are xDEX's, in a unit of its own per network (the page only divides
         // them by each other, to list pools).
         // `volume` is the token's own amount swapped in 24 hours.
-        a: { mint: p.token1_address, symbol: text(p.token1_symbol), price: n(p.token1_price), volume: n(p.token1_volume_24h) },
-        b: { mint: p.token2_address, symbol: text(p.token2_symbol), price: n(p.token2_price), volume: n(p.token2_volume_24h) },
+        a: { mint: p.token1_address, symbol: text(p.token1_symbol), logo: logo(p.token1_logo), price: n(p.token1_price), volume: n(p.token1_volume_24h) },
+        b: { mint: p.token2_address, symbol: text(p.token2_symbol), logo: logo(p.token2_logo), price: n(p.token2_price), volume: n(p.token2_volume_24h) },
         tvl: n(p.tvl),
         volume: n(p.token1_volume_usd_24h) + n(p.token2_volume_usd_24h),
         txns: n(p.txns_24h),

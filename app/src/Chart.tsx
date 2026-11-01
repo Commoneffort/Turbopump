@@ -174,8 +174,18 @@ const saved = (key: string, fallback: string[]): string[] => { try { const v = J
  *  screen with others: the candle's figures show under the crosshair only. `head` is shown first in the window's bar
  *  (the layout buttons, or a secondary window's market). `marks` are other traders' fills. `whales`, when given,
  *  are every large fill on this market, drawn while the window's "Whales" box is ticked. */
-export default function Chart({ symbol, label, price, lines, marks = [], whales, slot = 0, compact = false, dense = false, head }: { symbol: string; label?: string; price: number; lines: Line[]; marks?: Mark[]; whales?: Whale[]; slot?: number; compact?: boolean; dense?: boolean; head?: ReactNode }) {
-  const name = label ?? `${symbol}-PERP`, spot = isSpot(symbol);
+/** One of this wallet's own fills, drawn as a green up triangle (buy) or a red down one (sell). */
+export type Trade = { key: string; time: number; price: number; size: number };
+
+/** What the chart can show on top of the candles. Each one can be switched off, and "Clear chart"
+ *  switches them all off at once (and the same button brings them back). */
+type Layers = { mine: boolean; follow: boolean; whales: boolean; lines: boolean; studies: boolean; drawings: boolean };
+const ALL_ON: Layers = { mine: true, follow: true, whales: false, lines: true, studies: true, drawings: true };
+const NOTHING: Layers = { mine: false, follow: false, whales: false, lines: false, studies: false, drawings: false };
+const shown = (l: Layers) => Object.values(l).some(Boolean);
+
+export default function Chart({ symbol, label, price, lines, marks = [], mine, whales, slot = 0, compact = false, dense = false, head }: { symbol: string; label?: string; price: number; lines: Line[]; marks?: Mark[]; mine?: Trade[]; whales?: Whale[]; slot?: number; compact?: boolean; dense?: boolean; head?: ReactNode }) {
+  const name = label ?? `${symbol}`, spot = isSpot(symbol);
   const own = slot ? `:${slot}` : "";
   const el = useRef<HTMLDivElement>(null);
   const chart = useRef<KChart | null>(null);
@@ -192,7 +202,23 @@ export default function Chart({ symbol, label, price, lines, marks = [], whales,
   const [cross, setCross] = useState(() => localStorage.getItem("pv:chart-cross") !== "0");
   const [note, setNote] = useState<string>();
   const [full, setFull] = useState(false);
-  const [hidden, setHidden] = useState(false);
+  const [layers, setLayers] = useState<Layers>(() => {
+    try {
+      const v = JSON.parse(localStorage.getItem(`pv:chart-layers${own}`) ?? "null");
+      if (v && typeof v === "object") return { ...ALL_ON, ...v };
+      return { ...ALL_ON, whales: localStorage.getItem("pv:whales") === "1" };
+    } catch { return ALL_ON; }
+  });
+  // What was on before "Clear chart", so the same button brings it back.
+  const before = useRef<Layers | null>(null);
+  const [show, setShow] = useState(false);
+  const showBox = useRef<HTMLDivElement>(null);
+  const layer = (k: keyof Layers, on: boolean) => { before.current = null; setLayers(l => ({ ...l, [k]: on })); };
+  const clean = !shown(layers);
+  const clearAll = () => { if (clean) { setLayers(before.current ?? ALL_ON); before.current = null; } else { before.current = layers; setLayers(NOTHING); } };
+  useEffect(() => { try { localStorage.setItem(`pv:chart-layers${own}`, JSON.stringify(layers)); } catch { /* storage unavailable */ } }, [layers]);
+  const hidden = !layers.drawings;
+  const whaleOn = layers.whales;
   const [locked, setLocked] = useState(false);
   const root = useRef<HTMLDivElement>(null);
   const drawn = useRef<string[]>([]);
@@ -205,7 +231,10 @@ export default function Chart({ symbol, label, price, lines, marks = [], whales,
     chart.current = c;
     const ro = new ResizeObserver(() => c?.resize());
     ro.observe(el.current!);
-    const close = (e: MouseEvent) => { if (!menuBox.current?.contains(e.target as Node)) setMenu(false); };
+    const close = (e: MouseEvent) => {
+      if (!menuBox.current?.contains(e.target as Node)) setMenu(false);
+      if (!showBox.current?.contains(e.target as Node)) setShow(false);
+    };
     document.addEventListener("mousedown", close);
     return () => { ro.disconnect(); document.removeEventListener("mousedown", close); dispose(el.current!); chart.current = null; };
   }, []);
@@ -274,12 +303,12 @@ export default function Chart({ symbol, label, price, lines, marks = [], whales,
     const c = chart.current;
     if (!c) return;
     for (const [name] of [...ON_PRICE, ...BELOW]) c.removeIndicator({ name });
-    for (const name of studies) {
+    for (const name of layers.studies ? studies : []) {
       if (ON_PRICE.some(([n]) => n === name)) c.createIndicator({ name, paneId: "candle_pane" } as any, true);
       else if (BELOW.some(([n]) => n === name)) c.createIndicator(name);
     }
     try { localStorage.setItem(`pv:chart-studies${own}`, JSON.stringify(studies)); } catch { /* storage unavailable */ }
-  }, [studies.join(",")]);
+  }, [studies.join(","), layers.studies]);
 
   // Candles, hollow candles, bars or a line; the crosshair; and whether drawings snap to prices.
   useEffect(() => {
@@ -300,7 +329,7 @@ export default function Chart({ symbol, label, price, lines, marks = [], whales,
     try { localStorage.setItem("pv:chart-magnet", magnet ? "1" : "0"); } catch { /* storage unavailable */ }
   }, [magnet]);
   const draw = (name: string, extendData?: unknown) => {
-    if (hidden) setHidden(false);
+    if (hidden) layer("drawings", true);
     const id = chart.current?.createOverlay({ name, groupId: "drawing", mode, extendData, lock: locked } as any);
     if (typeof id === "string") drawn.current.push(id);
   };
@@ -336,10 +365,10 @@ export default function Chart({ symbol, label, price, lines, marks = [], whales,
     const c = chart.current;
     if (!c) return;
     c.removeOverlay({ groupId: "position" });
-    for (const l of lines.filter(x => x.price > 0)) {
+    for (const l of layers.lines ? lines.filter(x => x.price > 0) : []) {
       c.createOverlay({ name: "positionLine", groupId: "position", lock: true, extendData: { text: l.title, color: l.color }, points: [{ value: l.price }] } as any);
     }
-  }, [lineKey, symbol, res]);
+  }, [lineKey, symbol, res, layers.lines]);
 
   // Trades of the traders this wallet follows or copies: their badge at the candle and price of
   // each fill, under the candle for a buy and over it for a sell.
@@ -358,19 +387,36 @@ export default function Chart({ symbol, label, price, lines, marks = [], whales,
     // The pointer can leave the chart straight from a badge, and the chart then reports nothing.
     const left = () => { for (const [id, data] of over) c.overrideOverlay({ id, extendData: { ...data, hover: false } }); over.clear(); };
     root.current?.addEventListener("mouseleave", left);
-    for (const m of marks) {
+    for (const m of layers.follow ? marks : []) {
       const t = m.time - (m.time % res);
       c.createOverlay({
         name: "traderMark", groupId: "social", lock: true, points: [{ timestamp: t * 1000, value: m.price }],
-        extendData: { points: BADGES[m.shape % BADGES.length].points, color: m.color, picture: m.picture && rememberPicture(m.picture), buy: m.size > 0, label: m.name },
+        extendData: { points: BADGES[m.shape % BADGES.length].points, color: m.color, picture: m.picture && rememberPicture(m.picture), buy: m.size > 0, label: m.name, what: `${m.size > 0 ? "Bought" : "Sold"} ${Math.abs(m.size).toFixed(4).replace(/\.?0+$/, "")} at ${m.price.toFixed(dp)}`, note: m.note },
         onMouseEnter: hover(true), onMouseLeave: hover(false),
       } as any);
     }
     return () => root.current?.removeEventListener("mouseleave", left);
-  }, [markKey, symbol, res]);
+  }, [markKey, symbol, res, layers.follow, dp]);
+
+  // This wallet's own fills: a green triangle under the price of each buy, a red one over each sell.
+  const mineKey = useMemo(() => (mine ?? []).map(m => m.key).join("|"), [mine]);
+  useEffect(() => {
+    const c = chart.current;
+    if (!c) return;
+    c.removeOverlay({ groupId: "mine" });
+    const hover = (on: boolean) => (e: any) => { c.overrideOverlay({ id: e.overlay.id, extendData: { ...e.overlay.extendData, hover: on } }); return true; };
+    for (const m of layers.mine ? mine ?? [] : []) {
+      const t = m.time - (m.time % res);
+      const size = Math.abs(m.size).toFixed(4).replace(/\.?0+$/, "");
+      c.createOverlay({
+        name: "tradeDot", groupId: "mine", lock: true, points: [{ timestamp: t * 1000, value: m.price }],
+        extendData: { buy: m.size > 0, label: `You ${m.size > 0 ? "bought" : "sold"} ${size} at ${m.price.toFixed(dp)}` },
+        onMouseEnter: hover(true), onMouseLeave: hover(false),
+      } as any);
+    }
+  }, [mineKey, symbol, res, layers.mine, dp]);
 
   // Large fills by anyone ("Whales" box): a bubble per fill of at least the chosen value.
-  const [whaleOn, setWhaleOn] = useState(() => { try { return localStorage.getItem("pv:whales") === "1"; } catch { return false; } });
   const [whaleMin, setWhaleMin] = useState(() => { try { const v = Number(localStorage.getItem("pv:whale-min")); return WHALE_MINS.includes(v) ? v : WHALE_MINS[1]; } catch { return WHALE_MINS[1]; } });
   const keep = (k: string, v: string) => { try { localStorage.setItem(k, v); } catch { /* storage unavailable */ } };
   const bigOnes = useMemo(() => (whales && whaleOn ? whales.filter(w => w.value >= whaleMin) : []), [whales, whaleOn, whaleMin]);
@@ -422,21 +468,46 @@ export default function Chart({ symbol, label, price, lines, marks = [], whales,
             </div>
           )}
         </div>
-        {whales && PULSE.whales && (
-          <div className={`whale-tog${whaleOn ? " on" : ""}`} title="Mark every fill on this market worth at least the chosen amount, by anyone: a bubble under the candle for a buy, over it for a sell, sized by the trade's value">
-            <label><input type="checkbox" checked={whaleOn} onChange={e => { setWhaleOn(e.target.checked); keep("pv:whales", e.target.checked ? "1" : "0"); }} />Whales</label>
-            {whaleOn && (
-              <select value={whaleMin} aria-label="Smallest trade shown" onChange={e => { const v = Number(e.target.value); setWhaleMin(v); keep("pv:whale-min", String(v)); }}>
-                {WHALE_MINS.map(v => <option key={v} value={v}>≥ ${v >= 1000 ? `${v / 1000}k` : v}</option>)}
-              </select>
+        {!spot && (
+          <div className="studies layers" ref={showBox}>
+            <button className={show ? "on" : ""} onClick={() => setShow(m => !m)} title="Choose what is drawn on the chart">
+              <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden><path d="M8 2 1.5 5.5 8 9l6.5-3.5zM1.5 8.5 8 12l6.5-3.5M1.5 11.5 8 15l6.5-3.5" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" /></svg>
+              On chart
+            </button>
+            {show && (
+              <div className="studies-menu layers-menu">
+                <div className="studies-h">Trades</div>
+                {mine && <button className={layers.mine ? "on" : ""} onClick={() => layer("mine", !layers.mine)}><span className="lay-dots"><b className="tri up" /><b className="tri down" /></span>My trades<em>{mine.length}</em><i /></button>}
+                <button className={layers.follow ? "on" : ""} onClick={() => layer("follow", !layers.follow)} title={marks.length ? "" : "Follow a trader (click their name anywhere) and their trades on this market show here"}><span className="lay-dots"><b className="badge" /></span>Traders I follow<em>{marks.length}</em><i /></button>
+                {whales && PULSE.whales && <>
+                  <button className={layers.whales ? "on" : ""} onClick={() => layer("whales", !layers.whales)} title="Every fill on this market worth at least the chosen amount, by anyone"><span className="lay-dots"><b className="whale" /></span>Whales{whaleOn ? <em>{bigOnes.length}</em> : <em />}<i /></button>
+                  {whaleOn && (
+                    <label className="lay-sub">Smallest trade
+                      <select value={whaleMin} aria-label="Smallest trade shown" onChange={e => { const v = Number(e.target.value); setWhaleMin(v); keep("pv:whale-min", String(v)); }}>
+                        {WHALE_MINS.map(v => <option key={v} value={v}>≥ ${v >= 1000 ? `${v / 1000}k` : v}</option>)}
+                      </select>
+                    </label>
+                  )}
+                </>}
+                <div className="studies-h">On the price</div>
+                <button className={layers.lines ? "on" : ""} onClick={() => layer("lines", !layers.lines)}><span className="lay-dots"><b className="line" /></span>Position and order lines<em>{lines.filter(l => l.price > 0).length}</em><i /></button>
+                <button className={layers.studies ? "on" : ""} onClick={() => layer("studies", !layers.studies)}><span className="lay-dots"><b className="line" /></span>Indicators<em>{studies.length}</em><i /></button>
+                <button className={layers.drawings ? "on" : ""} onClick={() => layer("drawings", !layers.drawings)}><span className="lay-dots"><b className="line" /></span>My drawings<em /><i /></button>
+                <div className="lay-acts">
+                  <button className="btn sm" onClick={clearAll}>{clean ? "Show all again" : "Clear chart"}</button>
+                  <button className="btn sm ghost" onClick={() => { clear(); }} title="Delete every drawing on this chart">Delete drawings</button>
+                </div>
+              </div>
             )}
-            {whaleOn && <em>{bigOnes.length}</em>}
           </div>
         )}
-        <div className="chart-src" title={spot ? "Where the candles come from: xDEX's record of this pair's swaps. The last one follows the pool's own price." : "Where the candles come from. The last one always follows this market's own oracle price."}>
-          {spot ? "xDEX swaps · live pool price" : source === "oracle" || source === "oracle+exchange" ? "Oracle price" : hasHistory(symbol) ? "Exchange history · live oracle price" : "Live oracle price"}
-        </div>
+        {spot && <div className="chart-src" title="Where the candles come from: xDEX's record of this pair's swaps. The last one follows the pool's own price.">xDEX swaps · live pool price</div>}
         <div className="chart-acts">
+          {!spot && (
+            <button title={clean ? "Show everything again" : "Clear the chart: hide trades, lines, indicators and drawings (click again to bring them back)"} aria-label="Clear the chart" className={clean ? "on" : ""} onClick={clearAll}>
+              <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden><path d="M9.5 2.5 13.5 6.5 7 13H3.5L2 11.5zM6 6l4 4M7 13h7" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" /></svg>
+            </button>
+          )}
           <button title="Zoom out" aria-label="Zoom out" onClick={() => chart.current?.zoomAtCoordinate(0.8, undefined, 150)}>
             <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden><path d="M7 2.5a4.5 4.5 0 1 0 0 9 4.5 4.5 0 0 0 0-9zM10.5 10.5 14 14M5 7h4" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" /></svg>
           </button>
@@ -477,7 +548,7 @@ export default function Chart({ symbol, label, price, lines, marks = [], whales,
             </form>
           )}
           <span />
-          <button title={hidden ? "Drawings are hidden: show them" : "Hide the drawings"} aria-label="Hide or show the drawings" className={hidden ? "on" : ""} onClick={() => setHidden(h => !h)}>
+          <button title={hidden ? "Drawings are hidden: show them" : "Hide the drawings"} aria-label="Hide or show the drawings" className={hidden ? "on" : ""} onClick={() => layer("drawings", hidden)}>
             <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden><path d={hidden ? "M1.5 8s2.5-4 6.5-4 6.5 4 6.5 4-2.5 4-6.5 4-6.5-4-6.5-4zM2.5 13.5l11-11" : "M1.5 8s2.5-4 6.5-4 6.5 4 6.5 4-2.5 4-6.5 4-6.5-4-6.5-4zM8 6.3a1.7 1.7 0 1 0 0 3.4 1.7 1.7 0 0 0 0-3.4z"} fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" /></svg>
           </button>
           <button title={locked ? "Drawings are locked: unlock them" : "Lock the drawings in place"} aria-label="Lock or unlock the drawings" className={locked ? "on" : ""} onClick={() => setLocked(l => !l)}>

@@ -183,7 +183,7 @@ fn money_cannot_move_past_a_track_record() {
     other.accounts[9].pubkey = rstate::stats_address(&RID(), &t.market, &w.payer.pubkey()).0;
     expect(w.send(vec![other], &[&kp]), RouterError::BadAccount);
     let mut out = rclient::withdraw(&t, &source, &vault, 1_000_000);
-    out.accounts.pop();
+    out.accounts.truncate(out.accounts.len() - 2); // (the copy address, then the ledger)
     expect(w.send(vec![out], &[&kp]), RouterError::BadAccount);
     // A second record for the same account cannot be opened (it would reset the first).
     let again = rclient::open_stats(&w.payer.pubkey(), &t);
@@ -362,12 +362,21 @@ fn a_follower_is_brought_in_line_with_its_leader_by_anyone() {
     let f = w.trader(1); // the follower: 1,000, of which 750 is withdrawn again
     let (kp, dest) = (w.trader_kp(1), w.traders[&1].0.collateral);
     let vault = w.env.vault;
-    w.send(vec![rclient::withdraw(&f, &dest, &vault, 750_000_000)], &[&kp]).unwrap();
+    // (One atom less: the check below that a running copy keeps the keeper deposit withdraws it.)
+    w.send(vec![rclient::withdraw(&f, &dest, &vault, 750_000_000 - 1)], &[&kp]).unwrap();
     // Nothing to copy yet, and nobody is copying.
     assert!(trigger(&mut w, 1, 0, 0).is_err());
     set_copy(&mut w, 1, 0, 10_000, 0).unwrap();
     let c = copy(&w, 1).unwrap();
     assert_eq!((c.leader, { c.ratio_bps }), (w.traders[&0].1.wallet, 10_000));
+    // Setting the copy filled in the follower's keeper deposit (a copy opens positions without
+    // the wallet), and while the copy runs a flat withdrawal does not give it back.
+    let rr = w.env.svm.minimum_balance_for_rent_exemption(percolator_router::state::REQUEST_LEN);
+    let tr = w.env.svm.minimum_balance_for_rent_exemption(percolator_router::state::TRADER_LEN);
+    assert_eq!(w.env.svm.get_balance(&f.trader).unwrap() - tr, percolator_router::keeper_deposit(rr));
+    w.tick(1);
+    w.send(vec![rclient::withdraw(&f, &dest, &vault, 1)], &[&kp]).unwrap();
+    assert_eq!(w.env.svm.get_balance(&f.trader).unwrap() - tr, percolator_router::keeper_deposit(rr), "kept while copying");
     expect(trigger(&mut w, 1, 0, 0), RouterError::InLine);
 
     // The leader goes long 2,000 (2x). The follower's 250 at 2x is 500.

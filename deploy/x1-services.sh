@@ -45,6 +45,13 @@ case "$1" in
     if ! running x1-executor; then
       (cd app && NETWORK=x1-testnet RPC=$RPC KEYPAIR=$KEY setsid sh -c 'echo $$ > ../deploy/logs/x1-executor.pid; while :; do npx tsx scripts/executor.ts; echo "$(date -u +%T) restart: x1-executor exited with status $?, starting it again in 5 s"; sleep 5; done' >> ../deploy/logs/x1-executor.log 2>&1 < /dev/null &)
     fi
+    # A backup executor with a wallet of its own (scripts/executor.ts, BACKUP_AFTER_SECS): it only
+    # reads until a fill or a price is 45 s overdue (the slowest normal fills land ~20 s after their target), then does the work itself. It starts once its
+    # wallet file exists (fund it like the main one): ~/.config/solana/percolator-x1/backup-executor.json
+    BACKUP_KEY=$HOME/.config/solana/percolator-x1/backup-executor.json
+    if [ -f "$BACKUP_KEY" ] && ! running x1-backup-executor; then
+      (cd app && NETWORK=x1-testnet RPC=$RPC KEYPAIR=$BACKUP_KEY BACKUP_AFTER_SECS=45 setsid sh -c 'echo $$ > ../deploy/logs/x1-backup-executor.pid; while :; do npx tsx scripts/executor.ts; echo "$(date -u +%T) restart: x1-backup-executor exited with status $?, starting it again in 5 s"; sleep 5; done' >> ../deploy/logs/x1-backup-executor.log 2>&1 < /dev/null &)
+    fi
     if ! running x1-keeper; then
       (PERCOLATOR_FIT_COMPUTE=1 PERCOLATOR_MANIFEST=deploy/x1-testnet.json PERCOLATOR_NETWORK=x1-testnet DEVNET_RPC=$RPC PERCOLATOR_KEYPAIR=$KEY PERCOLATOR_FAUCET_KEY=keys/x1-faucet.json \
         setsid sh -c 'echo $$ > deploy/logs/x1-keeper.pid; while :; do deploy/x1-tool keeper; echo "$(date -u +%T) restart: x1-keeper exited with status $?, starting it again in 5 s"; sleep 5; done' >> deploy/logs/x1-keeper.log 2>&1 < /dev/null &)
@@ -53,13 +60,13 @@ case "$1" in
     "$0" status
     ;;
   stop)
-    for s in price-service price-witness-source x1-witness x1-alerts x1-watchdog x1-fills-log x1-executor x1-keeper; do
+    for s in price-service price-witness-source x1-witness x1-alerts x1-watchdog x1-fills-log x1-executor x1-backup-executor x1-keeper; do
       if running $s; then kill -- "-$(cat deploy/logs/$s.pid)"; echo "$s stopped"; fi
       rm -f deploy/logs/$s.pid
     done
     ;;
   status)
-    for s in price-service price-witness-source x1-witness x1-alerts x1-watchdog x1-fills-log x1-executor x1-keeper; do
+    for s in price-service price-witness-source x1-witness x1-alerts x1-watchdog x1-fills-log x1-executor x1-backup-executor x1-keeper; do
       if running $s; then echo "$s running (process group $(cat deploy/logs/$s.pid))"; else echo "$s not running"; fi
     done
     ;;

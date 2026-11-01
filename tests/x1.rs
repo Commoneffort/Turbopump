@@ -193,8 +193,13 @@ fn a_fill_pays_its_sender_what_a_fill_costs_on_x1() {
     let ix = w.fill_ix(0, id, &executor.pubkey());
     w.send(vec![ix], &[&executor]).unwrap();
     assert_eq!(w.env.svm.get_balance(&executor.pubkey()).unwrap() - before, BOND);
-    // The rent of the request account goes back to the trader.
-    assert!(trader_before - w.env.svm.get_balance(&trader).unwrap() <= BOND + 20_000);
+    // The rent of the request account goes back to the trader. (Its first request also put the
+    // keeper deposit in its trader account, which stays the trader's.)
+    let t = w.trader(0);
+    let deposit = w.env.svm.get_balance(&t.trader).unwrap() - w.env.svm.minimum_balance_for_rent_exemption(percolator_router::state::TRADER_LEN);
+    // (rent of a request + its bond + the liquidation reward, half a bond: the X1 build's values)
+    assert_eq!(deposit, w.env.svm.minimum_balance_for_rent_exemption(percolator_router::state::REQUEST_LEN) + BOND + BOND / 2);
+    assert!(trader_before - w.env.svm.get_balance(&trader).unwrap() <= BOND + deposit + 20_000);
 }
 
 #[test]

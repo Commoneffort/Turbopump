@@ -1,6 +1,7 @@
 // The leaderboard and copy trading: who trades well here, by a record the router keeps itself;
 // names and badges; following (their trades show on your chart) and copying (your account
 // mirrors theirs).
+import { openTrader } from "./TraderIntel";
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { Connection, PublicKey, TransactionInstruction } from "@solana/web3.js";
@@ -173,7 +174,7 @@ const setup = (pk: PublicKey, me: Me): TransactionInstruction[] => [
 const signed = (x: number, dp = 2) => `${x >= 0 ? "+" : "−"}$${fmt(Math.abs(x), dp)}`;
 const pct = (x: number, dp = 1) => `${x >= 0 ? "+" : "−"}${fmt(Math.abs(x) * 100, dp)}%`;
 const tone = (x: number) => (x > 0 ? "up" : x < 0 ? "down" : "");
-const tagOf = (wallet: string) => (SEED_WALLETS[wallet] ? (SEED_WALLETS[wallet].startsWith("bot") ? "test bot" : "demo") : undefined);
+export const tagOf = (wallet: string) => (SEED_WALLETS[wallet] ? (SEED_WALLETS[wallet].startsWith("bot") ? "test bot" : "demo") : undefined);
 
 /** A day's result as a bar: thirty trading days, oldest on the left. */
 function DayBars({ days, height = 22, width = 96 }: { days: S.Day[]; height?: number; width?: number }) {
@@ -208,7 +209,7 @@ function Search({ board, go }: { board?: S.Board; go: (to: string) => void }) {
     const t = text.toLowerCase();
     return board.rows.filter(r => r.profile?.name.toLowerCase().includes(t) || r.wallet.toLowerCase().startsWith(t) || SEED_WALLETS[r.wallet]?.includes(t)).slice(0, 8);
   }, [text, board]);
-  const pick = (w: string) => { setOpen(false); setQ(""); go(`/trader/${w}`); };
+  const pick = (w: string) => { setOpen(false); setQ(""); openTrader(w); };
   return (
     <div className="tsearch" ref={box}>
       <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden><path d="M7 2.5a4.5 4.5 0 1 0 0 9 4.5 4.5 0 0 0 0-9zM10.5 10.5 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /></svg>
@@ -359,7 +360,7 @@ function PictureEditor({ me, has, send, busy, reload }: { me: Me; has: boolean; 
 
 // ---------------------------------------------------------------- actions
 
-function useActions(me: Me, send: Send, reload: () => void) {
+export function useActions(me: Me, send: Send, reload: () => void) {
   const { publicKey } = useWallet();
   const run = async (label: string, ixs: TransactionInstruction[]) => { const r = await send(label, ixs); reload(); return r; };
   return {
@@ -400,7 +401,7 @@ function ContestBox({ rows, me, go }: { rows: S.TraderRow[]; me?: string; go: (t
         <ol className="contest-list">
           {standings.slice(0, S.CONTEST.prizes.length).map((r, i) => (
             <li key={r.wallet}>
-              <button className="link" onClick={() => go(`/trader/${r.wallet}`)}>
+              <button className="link" onClick={() => openTrader(r.wallet)}>
                 <span className="mono muted">{i + 1}.</span> {nameOf(r.wallet, byWallet.get(r.wallet)?.profile)}
               </button>
               <span className={`mono ${tone(r.pnl)}`}>{signed(r.pnl)}</span>
@@ -517,7 +518,7 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
           <div className="featured">
             <span className="featured-l">Featured <em>paid</em></span>
             {featured.map(r => (
-              <button key={r.wallet} className="trader" title={`Paid placement, ${left(r.profile!.featuredUntil!)} left. The figures are the router's record, the same as in the table.`} onClick={() => go(`/trader/${r.wallet}`)}>
+              <button key={r.wallet} className="trader" title={`Paid placement, ${left(r.profile!.featuredUntil!)} left. The figures are the router's record, the same as in the table.`} onClick={() => openTrader(r.wallet)}>
                 <Badge wallet={r.wallet} profile={r.profile} size={22} />
                 <b>{nameOf(r.wallet, r.profile)}</b>
                 {r.stats && <span className={`mono ${tone(over(r, period).pnl)}`}>{signed(over(r, period).pnl, 0)}</span>}
@@ -532,7 +533,7 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
               return (
                 <div key={r.wallet} className={`podium-card p${i + 1}`}>
                   <span className="podium-rank mono">{i + 1}</span>
-                  <button className="trader" onClick={() => go(`/trader/${r.wallet}`)}>
+                  <button className="trader" onClick={() => openTrader(r.wallet)}>
                     <Badge wallet={r.wallet} profile={r.profile} size={44} />
                     <span className="podium-name"><b>{name}</b>{r.profile && <i className="mono muted">{short(r.wallet)}</i>}</span>
                   </button>
@@ -559,7 +560,7 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
                   <tr key={r.wallet} className={isMe ? "me" : ""}>
                     <td className="mono muted">{i + 1}</td>
                     <td>
-                      <button className="trader" onClick={() => go(`/trader/${r.wallet}`)}>
+                      <button className="trader" onClick={() => openTrader(r.wallet)}>
                         <Badge wallet={r.wallet} profile={r.profile} size={20} />
                         <b>{name}</b>
                         {r.profile && <span className="mono muted">{short(r.wallet)}</span>}
@@ -667,13 +668,13 @@ export function TraderPage({ wallet, send, busy, tick, go }: { wallet: string; s
               <h3>Open positions</h3>
               {r!.positions.length === 0 ? <div className="quiet">None.</div> : (
                 <table className="tbl"><thead><tr><th>Market</th><th>Side</th><th className="r">Size</th><th className="r">Value</th></tr></thead><tbody>
-                  {r!.positions.map(p => <tr key={p.asset}><td><button className="link" onClick={() => go(`/trade/${symbol(p.asset)}`)}>{symbol(p.asset)}-PERP</button></td><td className={p.size > 0 ? "up" : "down"}>{p.size > 0 ? "Long" : "Short"}</td><td className="r mono">{fmt(Math.abs(p.size), 4).replace(/\.?0+$/, "")}</td><td className="r mono">${fmt(p.notional)}</td></tr>)}
+                  {r!.positions.map(p => <tr key={p.asset}><td><button className="link" onClick={() => go(`/trade/${symbol(p.asset)}`)}>{symbol(p.asset)}</button></td><td className={p.size > 0 ? "up" : "down"}>{p.size > 0 ? "Long" : "Short"}</td><td className="r mono">{fmt(Math.abs(p.size), 4).replace(/\.?0+$/, "")}</td><td className="r mono">${fmt(p.notional)}</td></tr>)}
                 </tbody></table>
               )}
               <h3>Latest trades</h3>
               {s.fills.length === 0 ? <div className="quiet">None yet.</div> : (
                 <table className="tbl"><thead><tr><th>When</th><th>Market</th><th>Side</th><th className="r">Size</th><th className="r">Price</th></tr></thead><tbody>
-                  {[...s.fills].reverse().map((f, i) => <tr key={i}><td className="mono">{ago(Date.now() / 1000 - f.time)}</td><td>{symbol(f.asset)}-PERP</td><td className={f.size > 0 ? "up" : "down"}>{f.size > 0 ? "Buy" : "Sell"}</td><td className="r mono">{fmt(Math.abs(f.size), 4).replace(/\.?0+$/, "")}</td><td className="r mono">{fmt(f.price, priceDp(f.price))}</td></tr>)}
+                  {[...s.fills].reverse().map((f, i) => <tr key={i}><td className="mono">{ago(Date.now() / 1000 - f.time)}</td><td>{symbol(f.asset)}</td><td className={f.size > 0 ? "up" : "down"}>{f.size > 0 ? "Buy" : "Sell"}</td><td className="r mono">{fmt(Math.abs(f.size), 4).replace(/\.?0+$/, "")}</td><td className="r mono">{fmt(f.price, priceDp(f.price))}</td></tr>)}
                 </tbody></table>
               )}
             </section>
@@ -716,16 +717,53 @@ export function TraderPage({ wallet, send, busy, tick, go }: { wallet: string; s
 }
 
 /** For other pages: a wallet's trades as chart marks (see Chart `marks`). */
-/** `picture`: the trader's badge picture, already checked and loaded, where they have one. */
-export type Mark = { key: string; time: number; price: number; size: number; name: string; shape: number; color: string; picture?: HTMLImageElement };
-export function marksFor(board: S.Board | undefined, leaders: Iterable<string>, asset: number): Mark[] {
+/** `picture`: the trader's badge picture, already checked and loaded, where they have one.
+ *  `note`: what the trader wrote with that trade for their followers, if anything. */
+export type Mark = { key: string; time: number; price: number; size: number; name: string; shape: number; color: string; picture?: HTMLImageElement; note?: string };
+/** A note belongs to the trader's first fill (on any market) that came after it, within 5 minutes:
+ *  the note rides on the request, and the fill follows a few seconds to a minute later. */
+const NOTE_REACH_SECS = 300;
+export function marksFor(board: S.Board | undefined, leaders: Iterable<string>, asset: number, notes?: Map<string, S.Note[]>): Mark[] {
   const out: Mark[] = [];
   for (const w of leaders) {
     const r = board?.rows.find(x => x.wallet === w);
     if (!r?.stats) continue;
     const b = badgeOf(w, r.profile), picture = shown.get(w)?.img;
-    for (const f of r.stats.fills) if (f.asset === asset) out.push({ key: `${w}:${f.time}:${f.size}${picture ? ":p" : ""}`, time: f.time, price: f.price, size: f.size, name: nameOf(w, r.profile), shape: b.shape, color: b.color === UNSET ? T.textSecondary : b.color, picture });
+    const fills = [...r.stats.fills].sort((x, y) => x.time - y.time);
+    const noteAt = new Map<number, string>();
+    for (const n of [...(notes?.get(w) ?? [])].sort((x, y) => x.time - y.time)) {
+      const i = fills.findIndex((f, k) => f.time >= n.time - 2 && f.time - n.time <= NOTE_REACH_SECS && !noteAt.has(k));
+      if (i >= 0) noteAt.set(i, n.text);
+    }
+    fills.forEach((f, i) => {
+      if (f.asset !== asset) return;
+      const note = noteAt.get(i);
+      out.push({ key: `${w}:${f.time}:${f.size}${picture ? ":p" : ""}${note ? `:n${note.length}` : ""}`, time: f.time, price: f.price, size: f.size, name: nameOf(w, r.profile), shape: b.shape, color: b.color === UNSET ? T.textSecondary : b.color, picture, note });
+    });
   }
   return out.sort((a, b) => a.time - b.time);
+}
+/** The trade notes of the traders this wallet follows, read from chain every half minute or so. */
+const notesSeen = new Map<string, { at: number; notes: S.Note[] }>();
+export function useNotes(wallets: string[], tick: number): Map<string, S.Note[]> {
+  const { connection } = useConnection();
+  const [version, setN] = useState(0);
+  const key = wallets.join(",");
+  useEffect(() => {
+    let live = true;
+    (async () => {
+      for (const w of wallets) {
+        const had = notesSeen.get(w);
+        if (had && Date.now() - had.at < 30_000) continue;
+        try {
+          const notes = await S.loadNotes(connection, new PublicKey(w));
+          notesSeen.set(w, { at: Date.now(), notes });
+          if (live) setN(x => x + 1);
+        } catch { /* rate-limited: next time */ }
+      }
+    })();
+    return () => { live = false; };
+  }, [key, tick]);
+  return useMemo(() => new Map(wallets.map(w => [w, notesSeen.get(w)?.notes ?? []])), [key, version]);
 }
 export type { Connection };

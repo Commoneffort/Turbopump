@@ -83,8 +83,9 @@ pub fn withdraw(t: &TraderKeys, dest: &Pubkey, percolator_vault: &Pubkey, amount
     Instruction {
         program_id: id(),
         accounts: vec![
-            AccountMeta::new_readonly(t.wallet, true),
-            ro(t.trader),
+            // Both writable: with no position left the keeper deposit goes back to the wallet.
+            AccountMeta::new(t.wallet, true),
+            w(t.trader),
             w(t.portfolio),
             w(t.market),
             w(t.collateral),
@@ -96,6 +97,8 @@ pub fn withdraw(t: &TraderKeys, dest: &Pubkey, percolator_vault: &Pubkey, amount
             w(stats_address(&id(), &t.market, &t.wallet).0),
             // The fee ledger (see `carry`): what is owed must be paid before a withdrawal.
             ro(ledger_address(&id(), &t.trader).0),
+            // The copy address: empty (no copy running), the keeper deposit can go back.
+            ro(copy_address(&id(), &t.market, &t.wallet).0),
         ],
         data,
     }
@@ -277,7 +280,8 @@ pub fn expire(caller: &Pubkey, vault: &Pubkey, t: &TraderKeys) -> Instruction {
     Instruction {
         program_id: id(),
         accounts: vec![
-            AccountMeta::new_readonly(*caller, true),
+            // Writable, so the router can pay the caller its share of the bond.
+            AccountMeta::new(*caller, true),
             w(request_address(&id(), vault, &t.wallet, false).0),
             w(t.trader),
             w(t.wallet),
@@ -349,6 +353,18 @@ pub struct OrderParams {
     pub interval: i64,
     pub slices: u32,
     pub expiry: i64,
+    /// Lamports for whoever carries the order out (see `KEEPER_FEE`); 0 sends the older form.
+    pub keeper_budget: u64,
+}
+
+/// The keeper budget that pays for every execution an order can need: once for a stop,
+/// take-profit, trail or limit, once a slice for a TWAP (plus one request's rent, which each
+/// fill returns to the order). A limit or TWAP order, which can open a position, also carries a
+/// keeper deposit, which its first execution moves into a trading account that lacks one.
+pub fn keeper_budget(kind: u8, slices: u32, request_rent: u64) -> u64 {
+    let n = if kind == crate::state::ORDER_TWAP { slices.max(1) as u64 } else { 1 };
+    let opens = kind == crate::state::ORDER_LIMIT || kind == crate::state::ORDER_TWAP;
+    n * (crate::BOND_LAMPORTS + crate::KEEPER_FEE) + request_rent + if opens { crate::keeper_deposit(request_rent) } else { 0 }
 }
 
 pub fn place_order(t: &TraderKeys, vault: &Pubkey, o: &OrderParams) -> Instruction {
@@ -358,6 +374,9 @@ pub fn place_order(t: &TraderKeys, vault: &Pubkey, o: &OrderParams) -> Instructi
     data.extend_from_slice(&o.interval.to_le_bytes());
     data.extend_from_slice(&o.slices.to_le_bytes());
     data.extend_from_slice(&o.expiry.to_le_bytes());
+    if o.keeper_budget > 0 {
+        data.extend_from_slice(&o.keeper_budget.to_le_bytes());
+    }
     Instruction {
         program_id: id(),
         accounts: vec![
@@ -493,7 +512,8 @@ pub fn set_copy(t: &TraderKeys, leader: &Pubkey, ratio_bps: u32, max_notional: u
         accounts: vec![
             AccountMeta::new(t.wallet, true),
             w(copy_address(&id(), &t.market, &t.wallet).0),
-            ro(t.trader),
+            // Writable: setting a copy fills in the account's keeper deposit.
+            w(t.trader),
             w(*leader),
             ro(trader_address(&id(), &t.market, leader).0),
             ro(system_program::ID),

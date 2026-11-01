@@ -191,7 +191,10 @@ fn what_is_owed_is_paid_into_the_vault_before_anything_is_withdrawn() {
     assert_eq!(w.tokens(k.buffer) - buffer, due);
     assert_eq!(cap - capital(&w, 0), due as u128);
     assert!(ledger(&w, 0).is_empty(), "the slot is free again");
+    let trader_rent = w.env.svm.minimum_balance_for_rent_exemption(percolator_router::state::TRADER_LEN);
+    assert!(w.env.svm.get_balance(&t.trader).unwrap() > trader_rent, "the keeper deposit, kept while it held a position");
     w.send(vec![rclient::withdraw(&t, &dest, &vault, 1_000_000)], &[&kp]).unwrap();
+    assert_eq!(w.env.svm.get_balance(&t.trader).unwrap(), trader_rent, "flat: the deposit went back with the withdrawal");
     // The fees are the depositors': the vault is worth that much more at its next roll (it was
     // also paid the traders' losses and fees along the way, so at least that much).
     let p = w.price;

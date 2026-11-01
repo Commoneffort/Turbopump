@@ -50,7 +50,7 @@ import { createAssociatedTokenAccountIdempotentInstruction, createMintToInstruct
 import * as fs from "fs";
 import * as C from "../src/chain";
 import L from "../src/layout.json";
-import { decodeStats } from "../src/social";
+import { decodeStats, tradeNote } from "../src/social";
 
 // (BOT_LOG, FAUCET_KEY and BOT_NO_EXCHANGE are for a rehearsal on a local chain: its own log, its own
 // test USDC, and prices that are made up, so not compared with an exchange.)
@@ -148,7 +148,28 @@ async function wouldFail(kp: Keypair, ixs: TransactionInstruction[]): Promise<st
 }
 
 /** Queues a trade for `kp`'s account. */
-const trade = (label: string, kp: Keypair, vault: PublicKey, size: bigint) => send(label, kp, [C.requestTrade(kp.publicKey, vault, size)]);
+/** `note`: a few words for the bot's followers, sent with the trade (see social.ts tradeNote). */
+const trade = (label: string, kp: Keypair, vault: PublicKey, size: bigint, note?: string) => send(label, kp, [C.requestTrade(kp.publicKey, vault, size), ...(note ? [tradeNote(kp.publicKey, note)] : [])]);
+const pick = <T>(xs: T[]) => xs[Math.floor(Math.random() * xs.length)];
+/** What TrendRider tells its followers about a trade: why it opens, adds or takes it off. */
+function trendNote(sym: string, held: bigint, want: bigint, up: boolean, move: number): string {
+  const pct = `${move >= 0 ? "+" : ""}${(move * 100).toFixed(2)}%`;
+  const dir = up ? "up" : "down";
+  if (held !== 0n && want === -held) return pick([
+    `Taking my ${sym} ${held > 0n ? "long" : "short"} off. Banking it and waiting for the next clean move.`,
+    `Out of ${sym}. The move is losing steam, flat until the trend shows again.`,
+    `Closing ${sym} here. No point overstaying, I'll re-enter on the next leg.`,
+  ]);
+  if (held !== 0n && (held > 0n) === (want > 0n)) return pick([
+    `Adding to my ${sym} ${want > 0n ? "long" : "short"}: still trending ${dir} (${pct} recently).`,
+    `${sym} keeps going ${dir}, pressing the ${want > 0n ? "long" : "short"} a little more.`,
+  ]);
+  return pick([
+    `${sym} is trending ${dir} (${pct} over the last few prices). Going ${want > 0n ? "long" : "short"} with it.`,
+    `Following the trend on ${sym}: ${want > 0n ? "long" : "short"}. I'll cut it if it turns.`,
+    `${want > 0n ? "Long" : "Short"} ${sym}. Momentum is ${dir}, riding it while it lasts.`,
+  ]);
+}
 
 // ---- money for the bots ----
 const deployer = () => read(process.env.KEYPAIR ?? `${process.env.HOME}/.config/solana/${C.X1 ? "percolator-x1" : "percolator-test"}/deployer.json`);
@@ -511,7 +532,8 @@ async function act(bot: Bot, m: Market, feeBps: bigint) {
   if (want === 0n || vaultRoom === 0n) { note({ type: "skip", bot: bot.name, symbol: m.symbol, why: vaultRoom === 0n ? "the vault takes nothing on that side" : "no margin for an order" }); return; }
 
   const sentAt = Date.now();
-  const r = await trade(`${bot.name} ${Number(want) / 1e6} ${m.symbol}`, kp, m.vault, want);
+  const move = prices.length >= 3 && prices[prices.length - 3] > 0 ? (prices[prices.length - 1] - prices[prices.length - 3]) / prices[prices.length - 3] : 0;
+  const r = await trade(`${bot.name} ${Number(want) / 1e6} ${m.symbol}`, kp, m.vault, want, bot.kind === "trend" ? trendNote(m.symbol, held, want, up, move) : undefined);
   if (r !== true) { note({ type: "order", bot: bot.name, symbol: m.symbol, want, outcome: "not accepted", error: r, ok: false }); return; }
   const seen: bigint[] = [];
   let after = await settledState(kp, m.vault, seen);

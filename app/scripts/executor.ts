@@ -25,6 +25,20 @@
 //
 // Hermes needs an API key (Pyth's free plan covers the feeds in chain.ts FEEDS). The key is read
 // from HERMES_API_KEY or ~/.config/solana/percolator-test/hermes-key and never printed.
+// Roles: anyone may run an executor for any part of the work, without asking anyone (the
+// programs check everything, and pay for each piece of work out of whoever needed it done):
+//   EXECUTOR_ROLES=trade         fill queued requests (earns each request's bond), with the price
+//                                moves and settling their fills need
+//   EXECUTOR_ROLES=maintenance   carry out standing orders (earns their keeper fee), bring copiers
+//                                in line, expire requests nobody filled (a quarter of the bond),
+//                                keep prices and accounts current, settle epochs, sweep, convert
+//   EXECUTOR_ROLES=liquidation   queue the close of every account below its level (earns its
+//                                liquidation reward from that account's keeper deposit)
+// Default: all three. Several can run side by side; the first to do a piece of work is paid, a
+// duplicate fails harmlessly and earns nothing.
+// Failover: BACKUP_AFTER_SECS=N runs this one as a backup. It does a piece of work only once it
+// has been due N seconds and nobody did it: a primary that stopped, ran out of fees or fell
+// behind is covered within N seconds, and while it works the backup only reads.
 // Run: RPC=... npx tsx scripts/executor.ts
 // On X1 testnet: NETWORK=x1-testnet npx tsx scripts/executor.ts (the price service is then the
 // source, the key is ~/.config/solana/percolator-x1/deployer.json, and no Hermes key is needed).
@@ -65,6 +79,27 @@ const receiver = new PythSolanaReceiver({ connection: conn, wallet: new Wallet(p
 const FAR_BEHIND = 1_000; // slots: beyond this an asset is caught up before anything else is tried
 const PRIORITY = 1_000; // micro-lamports per CU: devnet needs little
 const log = (...a: unknown[]) => console.log(new Date().toISOString().slice(11, 19), ...a);
+// ---- roles and failover (see the top of the file) ----
+const ROLES = new Set((process.env.EXECUTOR_ROLES ?? "trade,maintenance,liquidation").split(",").map(x => x.trim()).filter(Boolean));
+const can = (role: "trade" | "maintenance" | "liquidation") => ROLES.has(role);
+const BACKUP_SECS = Number(process.env.BACKUP_AFTER_SECS ?? 0);
+const dueSince = new Map<string, number>();
+// A price on a market with positions counts as late past this age: the primary refreshes it every
+// HELD_MARK_SECS on X1 (so up to about twice that between two refreshes is normal); on devnet a
+// mark moves only with a new Pyth price, minutes apart when nothing trades.
+const markLateSecs = () => (C.X1 ? 2 * HELD_MARK_SECS : 300);
+/** Whether to do a piece of work that is due now: always for a primary; for a backup, once it has
+ *  been due `BACKUP_SECS` (asked about on every pass while it is). */
+function overdue(work: string): boolean {
+  if (!BACKUP_SECS) return true;
+  const now = Date.now();
+  let since = dueSince.get(work);
+  if (since === undefined) { since = now; dueSince.set(work, now); }
+  if (dueSince.size > 5_000) for (const [k, t] of dueSince) if (now - t > 600_000) dueSince.delete(k);
+  const late = now - since >= BACKUP_SECS * 1000;
+  if (late && now - since < BACKUP_SECS * 1000 + 2_000) log("failover", `taking over: ${work} has waited ${BACKUP_SECS} s`);
+  return late;
+}
 // The step the executor entered last, for the watchdog's message when a pass never finishes.
 let stage = "start", stageAt = Date.now();
 const enter = (s: string) => { stage = s; stageAt = Date.now(); };
@@ -407,6 +442,10 @@ async function budgetFor(ixs: TransactionInstruction[], atLeast = 0): Promise<Tr
 async function tune(lagCrank: TransactionInstruction, k: number, settle: TransactionInstruction[], tail: TransactionInstruction[]) {
   enter("tune");
   const seen: string[] = [];
+  // A load-balanced RPC answers from nodes a slot or so apart: one says k cranks leave the asset
+  // behind (21), the next that k + 1 has a crank with nothing to do (22). That is exactly the
+  // boundary the fill's two versions (k and k + 1, see `race`) are sent for: stop there.
+  let shortAt = -1, overAt = -1;
   for (let round = 0; round < 10; round++) {
     // The simulation replaces the blockhash, so any well-formed one will do.
     const msg = new TransactionMessage({ payerKey: payer.publicKey, recentBlockhash: PublicKey.default.toBase58(), instructions: [...budget(), ...Array(k).fill(lagCrank), ...settle, ...tail] }).compileToV0Message();
@@ -419,9 +458,17 @@ async function tune(lagCrank: TransactionInstruction, k: number, settle: Transac
     // Out of compute (with many markets the cranks alone come close to a transaction's limit):
     // settle fewer portfolios in this transaction; the rest follow on later passes.
     if ((why === "ProgramFailedToComplete" || why === "ComputationalBudgetExceeded") && settle.length > 1) settle = settle.slice(0, Math.ceil(settle.length / 2));
-    else if (code === 22 && i >= 0 && i < k) k--;
+    else if (code === 22 && i >= 0 && i < k) {
+      overAt = k;
+      if (shortAt === k - 1) return { k: k - 1, settle };
+      k--;
+    }
     else if (code === 22 && i >= k && i < k + settle.length) settle = settle.filter((_, j) => j !== i - k);
-    else if (code === 21 && i >= k && k < 12) k++;
+    else if (code === 21 && i >= k && k < 12) {
+      shortAt = k;
+      if (overAt === k + 1) return { k, settle };
+      k++;
+    }
     // EngineCounterUnderflow (engine with upstream PR #226): this account cannot be settled
     // before one of the others is (seen on X1 and devnet on 2026-10-13). The others go now,
     // this one on the next pass.
@@ -494,7 +541,8 @@ async function fillTogether(v: C.Vault, b: C.Book, rs: C.RouterRequest[]): Promi
     // slot: a later one landing in that same slot needs no lag crank at all. (The versions differ
     // only in their cranks, and at most one of them fits the slot it lands in.)
     // (Markets fill side by side as well, so even the first group may land behind another's.)
-    const versions = t.k > 0 ? [version(t.k), version(t.k + 1), version(0)] : [version(t.k), version(t.k + 1)];
+    // (On devnet a transaction can land a crank's worth of slots later than expected: one more there.)
+    const versions = [version(t.k), version(t.k + 1), ...(C.X1 ? [] : [version(t.k + 2)]), ...(t.k > 0 ? [version(0)] : [])];
     sends.push(race(`fill ${group.length > 1 ? `${group.length} together ` : ""}on ${v.feed?.symbol}: ${group.map(r => `#${r.id}`).join(" ")} at ${Number(b.markPrice) / 1e6}`, versions).then(ok => { if (ok) done.push(...group.map(r => r.id)); }));
   }
   await Promise.all(sends);
@@ -634,7 +682,7 @@ async function catchUp(label: string, lagCrank: TransactionInstruction, lag: num
  *   - A vault's tracked position is re-read when Percolator changed it outside a fill.
  *  Anyone may queue a forced close for a trader; this queues one per pass and market, and the
  *  fill path executes it at its target Pyth price like any request. */
-async function watch(vaults: C.Vault[], market: Uint8Array, full: boolean) {
+async function watch(vaults: C.Vault[], market: Uint8Array, full: boolean, maintOn = true) {
   enter("watch");
   const closing = vaults.filter(v => C.closeOnly(market, v.assetIndex));
   if (!closing.length && !full) return false;
@@ -649,6 +697,7 @@ async function watch(vaults: C.Vault[], market: Uint8Array, full: boolean) {
   const owedBy = new Map(ledgers.map(l => [new PublicKey(l.account.data.subarray(8, 40)).toBase58(), C.totalOwed(C.decodeLedger(new Uint8Array(l.account.data)))] as const));
   const debt = (portfolio: PublicKey) => { const o = owners.get(portfolio.toBase58()); return o ? owedBy.get(C.traderAddress(o.wallet).toBase58()) ?? 0n : 0n; };
   for (const [i, v] of vaults.entries()) {
+    if (!maintOn) break;
     const lp = snap.portfolios.find(p => p.pubkey.equals(v.lpPortfolio));
     if (!lp || !fresh[i]) continue;
     const held = C.decodePortfolio(lp.data, v.assetIndex, snap.market).position;
@@ -660,6 +709,7 @@ async function watch(vaults: C.Vault[], market: Uint8Array, full: boolean) {
   // withdrawals fit in the vault's cash, otherwise it has to get flat first.
   let sent = false;
   for (const [i, v] of vaults.entries()) {
+    if (!maintOn) break;
     const lp = snap.portfolios.find(p => p.pubkey.equals(v.lpPortfolio));
     if (!lp || !fresh[i]) continue;
     const cur = C.decodeVault(v.key, new Uint8Array(fresh[i]!.data));
@@ -676,7 +726,7 @@ async function watch(vaults: C.Vault[], market: Uint8Array, full: boolean) {
   // Each listed asset's leverage tier is on record (SetTier; anyone may send it, the router
   // decides the tier from the vault's feed). A new listing, or a slot reused by another asset,
   // would otherwise open at the default tier and be liquidated only at the major level.
-  if (Date.now() - tiersAt > 600_000) {
+  if (maintOn && Date.now() - tiersAt > 600_000) {
     tiersAt = Date.now();
     const rec = await C.fetchTiers(conn).catch(() => null);
     const L2 = (await import("../src/layout.json")).default as any;
@@ -688,12 +738,15 @@ async function watch(vaults: C.Vault[], market: Uint8Array, full: boolean) {
   }
   const queue = (v: C.Vault, wallet: PublicKey, why: string) =>
     send(`queue ${why} ${v.feed?.symbol} for ${wallet.toBase58().slice(0, 6)}`, [C.requestClose(payer.publicKey, wallet, v.key)], true);
+  // Everything below is liquidation work (an executor without that role stops here).
+  if (!can("liquidation")) return sent;
   const busy = new Set<string>();
   for (const v of closing) {
     const holder = snap.portfolios.find(p => { const o = owners.get(p.pubkey.toBase58()); return o && !o.hasPending && C.decodePortfolio(p.data, v.assetIndex, snap.market).position !== 0n; });
     if (!holder) continue;
     const t = owners.get(holder.pubkey.toBase58())!;
     busy.add(holder.pubkey.toBase58());
+    if (!overdue(`close-out ${t.wallet.toBase58()}`)) continue;
     sent = (await queue(v, t.wallet, "close-out")) || sent;
   }
   // Every account below its level, by market. They are queued together, several to a transaction
@@ -705,7 +758,7 @@ async function watch(vaults: C.Vault[], market: Uint8Array, full: boolean) {
     const o = owners.get(p.pubkey.toBase58());
     if (!o || o.hasPending || busy.has(p.pubkey.toBase58())) continue;
     const h = C.accountHealth(snap.market, p.data, debt(p.pubkey));
-    if (!h.liquidatable) continue;
+    if (!h.liquidatable || !overdue(`liquidate ${o.wallet.toBase58()}`)) continue;
     // Close the largest position first; the next pass looks again.
     const worst = h.positions.reduce((a, b) => (b.notional > a.notional ? b : a));
     const v = vaults.find(x => x.assetIndex === worst.asset);
@@ -738,7 +791,7 @@ async function watch(vaults: C.Vault[], market: Uint8Array, full: boolean) {
     for (const q of h.positions) need += q.notional * C.levels(snap.market, q.asset).mm;
     if (h.equity * 10_000n >= need) continue;
     const k = p.pubkey.toBase58();
-    if (Date.now() - (backstopAt.get(k) ?? 0) < 30_000) continue;
+    if (Date.now() - (backstopAt.get(k) ?? 0) < 30_000 || !overdue(`backstop ${k}`)) continue;
     // An account already past zero is not closed by a crank (only one with something left is);
     // it is tried a few times, then left to the router's close-out and logged once.
     const tries = (backstopTries.get(k) ?? 0) + 1;
@@ -943,14 +996,14 @@ async function ensureLedgers(wallets: PublicKey[]): Promise<Set<string>> {
   return new Set(todo.filter(w => !ledgered.has(w.toBase58())).map(w => w.toBase58()));
 }
 
-async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boolean, round: Round | null): Promise<boolean> {
+async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boolean, round: Round | null, tradeOn = true, maintOn = true): Promise<boolean> {
   enter("serviceVault");
   if (!snap.book || !round) {
-    if (!snap.book) await send(`open book ${v.feed?.symbol}`, [C.openBook(payer.publicKey, v.key)]);
+    if (!snap.book && maintOn) await send(`open book ${v.feed?.symbol}`, [C.openBook(payer.publicKey, v.key)]);
     return false;
   }
   // The vault's holding-fee meter (router `carry`): started once, by whoever gets there first.
-  if (!C.decodeBook(snap.book).hasCarry && !carryTried.has(v.key.toBase58())) {
+  if (maintOn && !C.decodeBook(snap.book).hasCarry && !carryTried.has(v.key.toBase58())) {
     carryTried.add(v.key.toBase58());
     await send(`start the holding-fee meter of ${v.feed?.symbol}`, [C.openCarry(payer.publicKey, v.key)]);
   }
@@ -958,7 +1011,7 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
   const live = reqs.filter(r => now <= r.target + C.ROUTER_GRACE_SECS);
   // An account without a fee ledger can only reduce: one is opened (paid here) for every trader
   // whose request waits, before its fill. A request whose ledger is not open yet waits a pass.
-  const unledgered = await ensureLedgers(live.filter(r => !r.settle).map(r => r.wallet));
+  const unledgered = tradeOn ? await ensureLedgers(live.filter(r => !r.settle).map(r => r.wallet)) : new Set<string>();
 
   // 2. Fill requests the mark is at. The cranks in front bring every asset involved to the
   //    current slot (which also walks Percolator's price to the mark) and settle the positions
@@ -972,7 +1025,7 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
   // `fillTogether` and go one by one below.)
   let filledOne = true;
   let notConverged = false;
-  for (const r of live.filter(r => b.markPrev < r.target && r.target <= b.markPublish && !unledgered.has(r.wallet.toBase58()))) {
+  for (const r of live.filter(r => tradeOn && b.markPrev < r.target && r.target <= b.markPublish && !unledgered.has(r.wallet.toBase58()))) {
     if (notConverged) break;
     const what = `${v.feed?.symbol} #${r.id}`;
     if (r.settle) { await settleEpoch(v, r, what); tried.add(r.id); continue; }
@@ -1030,7 +1083,7 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
     // 10-slot boundary on. Whichever matches the landing slot fills; the other fails harmlessly.
     const version = (n: number) => [...Array(n).fill(plan.lagCrank), ...tuned.settle, ...tail];
     // (A version without lag cranks too, for landing just behind another market's fill.)
-    await race(`${r.size === 0n ? "forced close" : "fill"} ${what} size ${Number(r.size) / 1e6} at ${Number(b.markPrice) / 1e6} (${tuned.k} lag + ${tuned.settle.length} settle cranks)`, tuned.k > 0 && !tuned.settle.length && C.X1 ? [version(tuned.k), version(tuned.k + 1), version(0)] : [version(tuned.k), version(tuned.k + 1)]);
+    await race(`${r.size === 0n ? "forced close" : "fill"} ${what} size ${Number(r.size) / 1e6} at ${Number(b.markPrice) / 1e6} (${tuned.k} lag + ${tuned.settle.length} settle cranks)`, tuned.k > 0 && !tuned.settle.length && C.X1 ? [version(tuned.k), version(tuned.k + 1), version(0)] : C.X1 ? [version(tuned.k), version(tuned.k + 1)] : [version(tuned.k), version(tuned.k + 1), version(tuned.k + 2)]);
     log(`  ${what}: ${Math.round(Date.now() / 1000 - (r.target - C.ROUTER_DELAY_SECS))} s from request to result (${(Date.now() / 1000 - r.target).toFixed(1)} s after its price time)`);
     break;
     }
@@ -1048,7 +1101,7 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
     const cur = va && C.decodeVault(v.key, new Uint8Array(va.data));
     dead = !!cur && (snap.slot < cur.epochStart + cur.epochLen || (cur.pendingDeposit === 0n && cur.pendingWithdraw === 0n));
   }
-  for (const r of reqs.filter(r => now > r.target + C.ROUTER_GRACE_SECS || (dead && r.settle && !tried.has(r.id)) || (stalled && refused.has(r.id) && b.markPrev < r.target && r.target <= b.markPublish))) {
+  for (const r of reqs.filter(r => maintOn && (now > r.target + C.ROUTER_GRACE_SECS || (dead && r.settle && !tried.has(r.id)) || (stalled && refused.has(r.id) && b.markPrev < r.target && r.target <= b.markPublish)) && overdue(`expire ${r.id}`))) {
     await send(`expire ${v.feed?.symbol} #${r.id}${now > r.target + C.ROUTER_GRACE_SECS ? "" : dead && r.settle ? " (its epoch has rolled)" : " (it cannot fill, and others are waiting behind it)"}`, [C.expireRequest(payer.publicKey, r)]);
   }
 
@@ -1057,6 +1110,7 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
   // While trades are queued on other markets they come first, with one exception: a market with
   // positions whose price has moved 1% or more is brought up to date at once. Liquidations and
   // stops depend on it, and in a fast market there is always a trade queued somewhere.
+  if (!maintOn) return reqs.length > 0;
   if (ORACLE === "jack" && live.length === 0 && reqs.length === 0) {
     // No sponsored feed accounts here: refresh the mark from the price service every 30 s or
     // on a 0.3% move (each refresh is a transaction, so not on every tick). That is for a market
@@ -1085,6 +1139,7 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
 
 // ---- loss covers and margin top-ups ----
 let coverAt = 0;
+let tookOver = false;
 async function serviceCovers(vaults: C.Vault[]) {
   enter("serviceCovers");
   const covers = await conn.getMultipleAccountsInfo(vaults.map(v => C.coverAddress(v.key)));
@@ -1121,7 +1176,7 @@ async function serviceOrders(vaults: C.Vault[], books: Map<string, C.Book>, mark
     if (!pf || !tr) continue;
     const held = C.decodePortfolio(new Uint8Array(pf.data), v.assetIndex, market).position;
     const what = C.orderAction(o, b.markPrice, held, now);
-    if (what === "wait") continue;
+    if (what === "wait" || !overdue(`${what} order ${o.key.toBase58()}`)) continue;
     // A trail's record is only worth a transaction once the mark is clearly better.
     if (what === "record" && (o.peak === 0n || (b.markPrice > o.peak ? b.markPrice - o.peak : o.peak - b.markPrice) * 1000n < o.peak)) continue;
     if (what === "fire" && (queuedNow.has(o.wallet.toBase58()) || C.decodeTrader(new Uint8Array(tr.data)).hasPending || b.pending.length >= 30 || C.closeOnly(market, v.assetIndex))) continue;
@@ -1145,6 +1200,9 @@ async function serviceOrders(vaults: C.Vault[], books: Map<string, C.Book>, mark
 let copiesAt = 0;
 let copyCache: S.Copy[] = [];
 const copyRetry = new Map<string, number>();
+/** The last copy request sent per follower and market: what it held and aimed for, and how many
+ *  times in a row that same request was sent (see `serviceCopies`). */
+const copyTries = new Map<string, { held: bigint; target: bigint; at: number; n: number }>();
 /** Brings every follower whose position has left its leader's in line (router `TriggerCopy`:
  *  anyone may, the size is the router's to compute). Where the follower's margin does not take
  *  the whole difference, the step that it does take is sent. One request per wallet at a time. */
@@ -1157,10 +1215,12 @@ async function serviceCopies(vaults: C.Vault[], books: Map<string, C.Book>, mark
   }
   const due = copyCache.filter(c => (copyRetry.get(c.key.toBase58()) ?? 0) <= Date.now());
   if (!due.length) return;
-  const accs = await conn.getMultipleAccountsInfo(due.flatMap(c => [C.routerPortfolio(c.follower), C.traderAddress(c.follower), C.routerPortfolio(c.leader)]));
+  const accs = await conn.getMultipleAccountsInfo(due.flatMap(c => [C.routerPortfolio(c.follower), C.traderAddress(c.follower), C.routerPortfolio(c.leader), C.ledgerAddress(c.follower)]));
   const abs = (x: bigint) => (x < 0n ? -x : x);
   for (const [i, c] of due.entries()) {
-    const pf = accs[3 * i], tr = accs[3 * i + 1], lpf = accs[3 * i + 2];
+    const pf = accs[4 * i], tr = accs[4 * i + 1], lpf = accs[4 * i + 2], led = accs[4 * i + 3];
+    // What the follower owes the vaults counts against its margin at the fill (router `carry`).
+    const owed = led ? C.totalOwed(C.decodeLedger(new Uint8Array(led.data))) : 0n;
     if (!pf || !tr || !lpf || C.decodeTrader(new Uint8Array(tr.data)).hasPending) continue;
     const fd = new Uint8Array(pf.data), ld = new Uint8Array(lpf.data);
     const eq = (d: Uint8Array) => { const p = C.decodePortfolio(d, 0); return p.capital + p.pnl; };
@@ -1173,7 +1233,7 @@ async function serviceCopies(vaults: C.Vault[], books: Map<string, C.Book>, mark
       if (!S.copyDue(held, target, price)) continue;
       // The whole difference, or as far towards it as the follower's margin goes.
       let size = 0n;
-      const room = C.marginRoom(market, fd, v.assetIndex);
+      const room = C.marginRoom(market, fd, v.assetIndex, owed);
       const grows = target !== 0n && (held === 0n || (held > 0n) !== (target > 0n) || abs(target) > abs(held));
       if (grows && abs(target) > room) {
         const reach = target > 0n ? room : -room;
@@ -1186,8 +1246,19 @@ async function serviceCopies(vaults: C.Vault[], books: Map<string, C.Book>, mark
         if (size === 0n || (size > 0n) !== (target - held > 0n) || abs(size) * price / C.UNIT < S.MIN_COPY_NOTIONAL || abs(size) < minPart) { copyRetry.set(c.key.toBase58(), Date.now() + 60_000); continue; }
       }
       const who = `${c.follower.toBase58().slice(0, 6)} to ${c.leader.toBase58().slice(0, 6)}`;
+      // The last request for this follower here traded nothing (the router refused it at its
+      // fill: margin, a close-only market...): the same request again would too. It waits, longer
+      // each time, until the follower's or the leader's position changes.
+      const tryKey = `${c.key.toBase58()}:${v.key.toBase58()}`, last = copyTries.get(tryKey);
+      if (last && last.held === held && last.target === target) {
+        const wait = Math.min(600_000, 30_000 * 2 ** Math.min(5, last.n));
+        if (Date.now() - last.at < wait) continue;
+        if (last.n === 1) log("copy", `${who} on ${v.feed?.symbol}: its last copy traded nothing; trying again less often`);
+      }
+      if (!overdue(`copy ${tryKey}`)) continue;
       const ok = await send(`copy: bring ${who} in line on ${v.feed?.symbol} (${Number(held) / 1e6} -> ${Number(size === 0n ? target : held + size) / 1e6})`, [S.triggerCopy(payer.publicKey, c, v.key, size)], true);
       if (!ok) copyRetry.set(c.key.toBase58(), Date.now() + 30_000);
+      else copyTries.set(tryKey, { held, target, at: Date.now(), n: last && last.held === held && last.target === target ? last.n + 1 : 1 });
       break; // one request per wallet at a time: its other markets follow on later passes
     }
   }
@@ -1360,6 +1431,14 @@ setInterval(() => {
       const slot = clock.getBigUint64(0, true);
       const market = new Uint8Array(accs[1]!.data);
       let busy = false;
+      // A backup takes over for this pass when a fill, or a price on a market with positions, is
+      // overdue by BACKUP_AFTER_SECS: the primary is not doing its work. (A primary always is.)
+      const books0 = vaults.map((_, i) => (accs[2 + 2 * i] ? C.decodeBook(new Uint8Array(accs[2 + 2 * i]!.data)) : null));
+      const lateFill = books0.some(b => !!b && b.pending.some(p => p.target < now - BACKUP_SECS));
+      const lateMark = books0.some((b, i) => { const a = C.decodeAsset(market, vaults[i].assetIndex); return !!b && (a.oiLong !== 0n || a.oiShort !== 0n) && now - b.markPublish > markLateSecs() + BACKUP_SECS; });
+      const takeover = !BACKUP_SECS || lateFill || lateMark;
+      if (BACKUP_SECS && takeover !== tookOver) { tookOver = takeover; log("failover", takeover ? `taking over (${lateFill ? "a fill" : "a price"} is ${BACKUP_SECS} s overdue)` : "standing by: the primary is keeping up"); }
+      const tradeOn = can("trade") && takeover, maintOn = can("maintenance") && takeover;
       // While any trade is queued, routine cranking stops: the fill carries the exact cranks it
       // needs, and one landing in between would make one of those a no-op and fail the fill.
       // The fill catches up whatever the request needs itself.
@@ -1368,17 +1447,17 @@ setInterval(() => {
       // market always has some, and an account below the level cannot wait for a quiet moment.
       // While trades are queued the scan runs every 6 seconds at most (it reads every account).
       const scan = queued || !C.X1 ? Date.now() - watchAt > 6_000 : pass % 3 === 1;
-      if (vaults.length && (scan || !queued)) {
+      if (vaults.length && (scan || !queued) && (maintOn || can("liquidation"))) {
         if (scan) watchAt = Date.now();
-        const sent = await watch(vaults, market, scan).catch(e => { log("error", "watch", String(e?.message ?? e).slice(0, 140)); return false; });
+        const sent = await watch(vaults, market, scan, maintOn).catch(e => { log("error", "watch", String(e?.message ?? e).slice(0, 140)); return false; });
         if (sent && !queued) continue;
       }
-      if (!queued && vaults.length) await upkeep(vaults, market, slot, pass++).catch(e => log("error", "upkeep", String(e?.message ?? e).slice(0, 140)));
+      if (!queued && vaults.length && maintOn) await upkeep(vaults, market, slot, pass++).catch(e => log("error", "upkeep", String(e?.message ?? e).slice(0, 140)));
       // On a busy network a trade is queued somewhere nearly all the time. Accounts that no fill
       // touches would then never be re-valued after a price move, and an account that is not
       // re-valued cannot be liquidated: every 30 seconds they are settled anyway. (This can make
       // one fill's cranks miss, and that fill is retried on the next pass.)
-      else if (queued && vaults.length && Date.now() - upkeepAt > 30_000) {
+      else if (queued && vaults.length && maintOn && Date.now() - upkeepAt > 30_000) {
         upkeepAt = Date.now();
         await upkeep(vaults, market, slot, 0, true).catch(e => log("error", "upkeep", String(e?.message ?? e).slice(0, 140)));
       }
@@ -1391,7 +1470,7 @@ setInterval(() => {
       // One round for all markets: every due price move at once, then one re-valuation of the
       // accounts they left out of date, then each market's fills. Requests on every market
       // target the same seconds (the router's batch grid), so a round serves all of them.
-      const pending = order.filter(hasPending);
+      const pending = tradeOn ? order.filter(hasPending) : [];
       const mark = async (i: number, n: number) =>
         [i, await markPhase(vaults[i], now, snaps[i], n === 0).catch(e => { log("error", vaults[i].feed?.symbol, String(e?.message ?? e).slice(0, 140)); return null; })] as const;
       // (Side by side where the RPC allows it; one after the other on a throttled one.)
@@ -1401,7 +1480,7 @@ setInterval(() => {
         const v = vaults[i];
         // (A market with nothing queued gets an empty round: only its routine price refresh.)
         const round = rounds.has(i) ? rounds.get(i)! : snaps[i].book ? { b: C.decodeBook(snaps[i].book!), reqs: [], moved: false } : null;
-        return serviceVault(v, now, snaps[i], queued, round).catch(e => { log("error", v.feed?.symbol, String(e?.message ?? e).slice(0, 140)); return false; });
+        return serviceVault(v, now, snaps[i], queued, round, tradeOn, maintOn).catch(e => { log("error", v.feed?.symbol, String(e?.message ?? e).slice(0, 140)); return false; });
       };
       // The markets' fills side by side on X1 (each is checked by simulation first, and a version
       // that does not fit the slot it lands in fails harmlessly); one after the other elsewhere.
@@ -1409,7 +1488,7 @@ setInterval(() => {
       else for (const i of order) busy = (await service(i)) || busy;
       const books = new Map(vaults.flatMap((v, i) => (accs[2 + 2 * i] ? [[v.key.toBase58(), C.decodeBook(new Uint8Array(accs[2 + 2 * i]!.data))] as [string, C.Book]] : [])));
       // Once an hour: what expired requests left in the books goes to the treasury.
-      if (Date.now() - sweptAt > 3_600_000) {
+      if (maintOn && Date.now() - sweptAt > 3_600_000) {
         sweptAt = Date.now();
         bookRent ||= await conn.getMinimumBalanceForRentExemption(accs[2]?.data.length ?? 0);
         for (const [i, v] of vaults.entries()) {
@@ -1419,19 +1498,21 @@ setInterval(() => {
       }
       // Every 30 s, with nothing queued: pay out a vault's loss cover after its roll, and move its
       // cash reserve into its margin if that ran thin.
-      if (!queued && Date.now() - coverAt > 30_000) {
+      if (maintOn && !queued && Date.now() - coverAt > 30_000) {
         coverAt = Date.now();
         await serviceCovers(vaults).catch(e => log("error", "covers", String(e?.message ?? e).slice(0, 140)));
       }
-      await serviceOrders(vaults, books, market, now, slot).catch(e => log("error", "orders", String(e?.message ?? e).slice(0, 140)));
-      await serviceCopies(vaults, books, market).catch(e => log("error", "copies", String(e?.message ?? e).slice(0, 140)));
-      if (Date.now() - slowAt >= SLOW_JOBS_MS) {
+      if (can("maintenance")) {
+        await serviceOrders(vaults, books, market, now, slot).catch(e => log("error", "orders", String(e?.message ?? e).slice(0, 140)));
+        await serviceCopies(vaults, books, market).catch(e => log("error", "copies", String(e?.message ?? e).slice(0, 140)));
+      }
+      if (maintOn && Date.now() - slowAt >= SLOW_JOBS_MS) {
         slowAt = Date.now();
         if (!queued) await openTrackRecords().catch(e => log("error", "track records", String(e?.message ?? e).slice(0, 140)));
         await convertProfits(vaults, market).catch(e => log("error", "profits", String(e?.message ?? e).slice(0, 140)));
       }
       // Low priority, in the background, and only while no trade is waiting.
-      if (!busy && !refreshing) {
+      if (maintOn && !busy && !refreshing) {
         refreshing = true;
         refreshUnlistedFeeds(new Set(vaults.map(v => v.feed!.id))).finally(() => (refreshing = false));
       }
