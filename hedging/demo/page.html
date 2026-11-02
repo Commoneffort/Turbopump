@@ -1,0 +1,677 @@
+<title>Turbopump Hedge Lab</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* Layout: one reading column (1120px) of stacked panels on the Turbopump desk palette;
+   Turbopump = green, Hyperliquid = blue, everywhere a place is named. Dark first. */
+:root {
+  --bg: #010001; --panel: #111013; --raised: #17161a; --line: #24232a; --line-2: #2f2e36;
+  --text: #E8EDF4; --muted: #A3AFC0; --dim: #6E7A8C;
+  --tp: #35E58B; --tp-soft: rgba(53,229,139,.12); --hl: #7AA7FF; --hl-soft: rgba(122,167,255,.13);
+  --good: #35E58B; --bad: #FF5C68; --warn: #F2B544;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+  --sans: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) {
+  --bg: #F4F5F7; --panel: #FFFFFF; --raised: #F7F8FA; --line: #E3E6EB; --line-2: #D3D8E0;
+  --text: #0E1420; --muted: #475163; --dim: #6B7585;
+  --tp: #0B8F50; --tp-soft: rgba(11,143,80,.10); --hl: #2F5FD0; --hl-soft: rgba(47,95,208,.10);
+  --good: #0B8F50; --bad: #D0313F; --warn: #A86A00;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
+  color-scheme: light;
+} }
+:root[data-theme="light"] {
+  --bg: #F4F5F7; --panel: #FFFFFF; --raised: #F7F8FA; --line: #E3E6EB; --line-2: #D3D8E0;
+  --text: #0E1420; --muted: #475163; --dim: #6B7585;
+  --tp: #0B8F50; --tp-soft: rgba(11,143,80,.10); --hl: #2F5FD0; --hl-soft: rgba(47,95,208,.10);
+  --good: #0B8F50; --bad: #D0313F; --warn: #A86A00;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
+  color-scheme: light;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font: 15px/1.55 var(--sans); }
+.wrap { max-width: 1120px; margin: 0 auto; padding-block: 28px 64px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: grid; gap: 16px; }
+h1, h2, h3 { margin: 0; text-wrap: balance; line-height: 1.2; }
+h1 { font-size: clamp(26px, 4vw, 36px); font-weight: 700; letter-spacing: -.02em; }
+h2 { font-size: 21px; font-weight: 650; letter-spacing: -.01em; }
+h3 { font-size: 15px; font-weight: 600; }
+p { margin: 0; max-width: 72ch; }
+.muted { color: var(--muted); } .dim { color: var(--dim); }
+.num, .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.num { white-space: nowrap; }
+.eyebrow { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--dim); font-weight: 600; }
+.panel { background: var(--panel); border-radius: 12px; padding: 22px; display: grid; gap: 14px; min-width: 0; }
+.panel > header { display: grid; gap: 6px; }
+.good { color: var(--good); } .bad { color: var(--bad); }
+.chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+.chip.tp { background: var(--tp-soft); color: var(--tp); }
+.chip.hl { background: var(--hl-soft); color: var(--hl); }
+.chip.sim { background: var(--raised); color: var(--muted); border: 1px solid var(--line-2); }
+.hero { display: grid; gap: 12px; padding-block: 8px 4px; }
+.hero .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
+.fact { background: var(--raised); border-radius: 8px; padding: 12px 14px; display: grid; gap: 2px; }
+.fact b { font-family: var(--mono); font-size: 17px; font-weight: 500; }
+.fact span { font-size: 13px; color: var(--muted); }
+
+/* Diagram */
+.diagram { overflow-x: auto; }
+.diagram svg { display: block; width: 100%; min-width: 720px; height: auto; }
+.d-zone { fill: none; stroke-width: 1.5; }
+.d-zone.tp { stroke: var(--tp); } .d-zone.hl { stroke: var(--hl); }
+.d-zlabel { font: 600 12px var(--sans); letter-spacing: .08em; }
+.d-zlabel.tp { fill: var(--tp); } .d-zlabel.hl { fill: var(--hl); }
+.d-box { fill: var(--raised); stroke: var(--line-2); stroke-width: 1; }
+.d-box.vault { stroke: var(--tp); stroke-width: 1.5; }
+.d-box.hedge { stroke: var(--hl); stroke-width: 1.5; }
+.d-title { font: 600 15px var(--sans); fill: var(--text); }
+.d-sub { font: 400 12.5px var(--sans); fill: var(--muted); }
+.d-arrow { stroke: var(--muted); stroke-width: 1.6; fill: none; }
+.d-arrow.dash { stroke-dasharray: 5 5; }
+.d-label { font: 500 12px var(--sans); fill: var(--muted); }
+.d-head { fill: var(--muted); }
+
+/* Tables */
+.tablewrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 12px; font-weight: 600; color: var(--dim); letter-spacing: .04em; text-transform: uppercase; background: var(--raised); white-space: nowrap; }
+td.r, th.r { text-align: right; }
+td.num { white-space: nowrap; }
+tr:last-child td { border-bottom: 0; }
+tr.total td { font-weight: 650; background: var(--raised); }
+td small { display: block; color: var(--dim); font-size: 12.5px; }
+
+/* Walkthrough */
+.story { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; align-items: start; }
+@media (max-width: 860px) { .story { grid-template-columns: minmax(0, 1fr); } }
+ol.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; counter-reset: s; }
+ol.steps li { display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 10px; counter-increment: s; }
+ol.steps li::before { content: counter(s); width: 24px; height: 24px; border-radius: 50%; background: var(--raised); border: 1px solid var(--line-2);
+  display: grid; place-items: center; font: 600 12px var(--mono); color: var(--muted); }
+ol.steps .when { font: 500 12.5px var(--mono); color: var(--dim); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.chartbox { position: relative; min-width: 0; }
+.chartbox svg { display: block; width: 100%; height: auto; overflow: visible; }
+.ax { font: 11.5px var(--mono); fill: var(--dim); }
+.grid { stroke: var(--line); stroke-width: 1; }
+.lbl { font: 600 12px var(--sans); fill: var(--text); }
+.lbl.sub { font-weight: 500; fill: var(--muted); }
+.legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 13px; color: var(--muted); }
+.legend i { display: inline-block; width: 14px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 6px; }
+.legend i.dot { width: 10px; height: 10px; border-radius: 50%; }
+.callout { background: var(--raised); border-radius: 10px; padding: 14px 16px; display: grid; gap: 6px; }
+
+/* Controls */
+.controls { display: grid; gap: 10px; }
+.ctl-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.ctl-row > .eyebrow { min-width: 92px; }
+.seg { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+.seg button, .btn { font: 500 13.5px var(--sans); color: var(--muted); background: var(--raised); border: 1px solid var(--line-2);
+  padding: 6px 12px; border-radius: 8px; cursor: pointer; }
+.seg button:hover, .btn:hover { color: var(--text); border-color: var(--dim); }
+.seg button[aria-pressed="true"] { color: var(--text); border-color: var(--tp); background: var(--tp-soft); }
+button:focus-visible { outline: 2px solid var(--hl); outline-offset: 2px; }
+.about { font-size: 14px; color: var(--muted); }
+
+/* Strategy cards */
+.cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+@media (max-width: 900px) { .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 480px) { .cards { grid-template-columns: minmax(0, 1fr); } }
+.card { text-align: left; font: inherit; color: inherit; background: var(--raised); border: 1px solid var(--line-2); border-radius: 10px;
+  padding: 14px; display: grid; gap: 6px; cursor: pointer; align-content: start; }
+.card:hover { border-color: var(--dim); }
+.card[aria-pressed="true"] { border-color: var(--text); box-shadow: inset 0 0 0 1px var(--text); }
+.card .name { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.card .name i { width: 12px; height: 12px; border-radius: 3px; flex: none; }
+.card .rule { font-size: 13px; color: var(--muted); min-height: 3.1em; }
+.card .big { font: 500 22px var(--mono); }
+.card .meta { font-size: 12.5px; color: var(--dim); display: grid; gap: 1px; }
+.best { font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--good); }
+
+.tooltip { position: absolute; pointer-events: none; background: var(--panel); border: 1px solid var(--line-2); border-radius: 8px;
+  padding: 8px 10px; font-size: 12.5px; display: grid; gap: 3px; min-width: 170px; box-shadow: 0 6px 20px rgba(0,0,0,.25); z-index: 2; }
+.tooltip .row { display: flex; justify-content: space-between; gap: 12px; }
+.tooltip .row span:first-child { display: flex; align-items: center; gap: 6px; color: var(--muted); }
+.tooltip i { width: 10px; height: 3px; border-radius: 2px; display: inline-block; }
+
+.two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+@media (max-width: 860px) { .two { grid-template-columns: minmax(0, 1fr); } }
+ul.plain { margin: 0; padding-left: 18px; display: grid; gap: 8px; max-width: 80ch; }
+.more { justify-self: start; }
+.check { font-size: 13px; color: var(--dim); }
+@media (prefers-reduced-motion: no-preference) { .card, .seg button { transition: border-color .12s, background .12s; } }
+/* Income section: one range row per fee setup */
+.irow { display: grid; grid-template-columns: minmax(150px, 210px) minmax(0, 1fr) 96px; gap: 14px; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.irow:last-child { border-bottom: 0; }
+.irow .nm { display: grid; gap: 3px; font-weight: 600; font-size: 14px; }
+.irow .nm small { font-weight: 400; font-size: 12.5px; color: var(--dim); }
+.irow .val { text-align: right; display: grid; gap: 1px; }
+.irow .val b { font: 500 17px var(--mono); }
+.irow .val small { font-size: 12px; color: var(--dim); white-space: nowrap; }
+.irow svg { display: block; width: 100%; height: 34px; overflow: visible; }
+.chip.live { background: var(--tp-soft); color: var(--tp); } .chip.no { background: var(--raised); color: var(--dim); border: 1px solid var(--line-2); }
+@media (max-width: 640px) { .irow { grid-template-columns: minmax(0, 1fr) 90px; } .irow .bar { grid-column: 1 / -1; grid-row: 2; } }
+</style>
+
+<div class="wrap">
+  <section class="hero">
+    <div class="eyebrow">Turbopump · internal · hedge lab</div>
+    <h1>Should the vault hedge on Hyperliquid?</h1>
+    <p class="muted" id="heroText"></p>
+    <div class="chips">
+      <span class="chip sim">Simulation: no real money moved</span>
+      <span class="chip tp">Turbopump = where our users trade</span>
+      <span class="chip hl">Hyperliquid = where the hedge trades</span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <header>
+      <div class="eyebrow">1 · Who is who</div>
+      <h2>Two places, five kinds of players</h2>
+      <p class="muted">Our users trade on Turbopump. The vault, which holds depositors' money, takes the other side of every trade. The only thing we would ever trade on Hyperliquid is the hedge account. Leaders are people on Hyperliquid we only watch.</p>
+    </header>
+    <div class="diagram" role="img" aria-label="Diagram: crowd traders and copiers trade against the vault on Turbopump; a leader on Hyperliquid gives copiers their signal; the hedger reads the vault's position and trades the hedge account on Hyperliquid.">
+      <svg viewBox="0 0 1000 400" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-head" d="M0,0 L10,5 L0,10 z"/></marker>
+        </defs>
+        <rect class="d-zone tp" x="10" y="20" width="590" height="370" rx="14"/>
+        <text class="d-zlabel tp" x="30" y="46">TURBOPUMP · OUR PLATFORM</text>
+        <rect class="d-zone hl" x="640" y="20" width="350" height="370" rx="14"/>
+        <text class="d-zlabel hl" x="660" y="46">HYPERLIQUID · OUTSIDE EXCHANGE</text>
+
+        <rect class="d-box" x="35" y="70" width="210" height="78" rx="10"/>
+        <text class="d-title" x="52" y="100">Crowd traders</text>
+        <text class="d-sub" x="52" y="121">Our users, trading their</text>
+        <text class="d-sub" x="52" y="138">own ideas</text>
+
+        <rect class="d-box" x="35" y="245" width="210" height="96" rx="10"/>
+        <text class="d-title" x="52" y="275">Copiers</text>
+        <text class="d-sub" x="52" y="296">Our users who copy a leader</text>
+        <text class="d-sub" x="52" y="313">automatically, 1 minute</text>
+        <text class="d-sub" x="52" y="330">after the leader trades</text>
+
+        <rect class="d-box vault" x="345" y="140" width="225" height="118" rx="10"/>
+        <text class="d-title" x="362" y="170">Vault</text>
+        <text class="d-sub" x="362" y="191">Depositors' money. It is the</text>
+        <text class="d-sub" x="362" y="208">other side of every trade:</text>
+        <text class="d-sub" x="362" y="225">when traders win, it loses.</text>
+        <text class="d-sub" x="362" y="242">It earns most of the fees.</text>
+
+        <rect class="d-box hedge" x="665" y="70" width="300" height="118" rx="10"/>
+        <text class="d-title" x="682" y="100">Hedge account (us)</text>
+        <text class="d-sub" x="682" y="121">Separate money we run. It copies</text>
+        <text class="d-sub" x="682" y="138">the traders' side so the vault's</text>
+        <text class="d-sub" x="682" y="155">price risk cancels out. Pays</text>
+        <text class="d-sub" x="682" y="172">Hyperliquid's fees.</text>
+
+        <rect class="d-box" x="665" y="245" width="300" height="96" rx="10"/>
+        <text class="d-title" x="682" y="275">Leader</text>
+        <text class="d-sub" x="682" y="296">A trader on Hyperliquid we watch</text>
+        <text class="d-sub" x="682" y="313">(like the feeds you sent). We never</text>
+        <text class="d-sub" x="682" y="330">touch their account or money.</text>
+
+        <path class="d-arrow" d="M245,112 C300,112 300,175 343,180" marker-end="url(#ah)" marker-start="url(#ah)"/>
+        <text class="d-label" x="262" y="104">trade against</text>
+        <path class="d-arrow" d="M245,290 C300,290 300,230 343,222" marker-end="url(#ah)" marker-start="url(#ah)"/>
+        <text class="d-label" x="262" y="318">trade against</text>
+        <path class="d-arrow dash" d="M815,343 C800,372 300,378 140,345" marker-end="url(#ah)"/>
+        <text class="d-label" x="470" y="380" text-anchor="middle">"leader bought BTC" signal</text>
+        <path class="d-arrow dash" d="M572,170 C610,170 620,130 663,128" marker-end="url(#ah)"/>
+        <text class="d-label" x="560" y="122" text-anchor="end">hedger reads the</text>
+        <text class="d-label" x="560" y="137" text-anchor="end">vault's position</text>
+      </svg>
+    </div>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Who</th><th>Where</th><th>Whose money</th><th>How they make or lose money</th></tr></thead>
+        <tbody>
+          <tr><td>Crowd traders</td><td><span class="chip tp">Turbopump</span></td><td>Their own</td><td>Price moves on their positions, minus our trading fee.</td></tr>
+          <tr><td>Copiers</td><td><span class="chip tp">Turbopump</span></td><td>Their own</td><td>Same as the crowd, but their trades follow a leader. A good leader makes them win; a bad one makes them lose.</td></tr>
+          <tr><td>Vault depositors</td><td><span class="chip tp">Turbopump</span></td><td>Theirs, in the vault</td><td>They win what traders lose and lose what traders win. They keep 80% of the trading fees. They also get the hedge's whole result and pay the hedge operator.</td></tr>
+          <tr><td>Market opener</td><td><span class="chip tp">Turbopump</span></td><td>—</td><td>Gets the other 20% of the trading fees.</td></tr>
+          <tr><td>Hedge operator (us)</td><td><span class="chip hl">Hyperliquid</span></td><td>Ours, kept on Hyperliquid</td><td>Runs the hedge account. Its gains and losses go to the depositors; we are paid <span id="opPct"></span> of the depositors' fee income for running it.</td></tr>
+          <tr><td>Leaders</td><td><span class="chip hl">Hyperliquid</span></td><td>Their own</td><td>Not part of our numbers. We only use their trades as the copiers' signal.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel" id="storyPanel">
+    <header>
+      <div class="eyebrow">2 · One trade, step by step</div>
+      <h2 id="storyTitle">One copied trade, start to finish</h2>
+      <p class="muted" id="storyIntro"></p>
+    </header>
+    <div class="story">
+      <ol class="steps" id="storySteps"></ol>
+      <div style="display:grid; gap:12px; min-width:0">
+        <div class="chartbox" id="storyChart"></div>
+        <div class="legend" id="storyLegend"></div>
+        <div class="tablewrap"><table id="storyTable"></table></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <header>
+      <div class="eyebrow">3 · Two weeks of trading</div>
+      <h2>What each hedge choice leaves the depositors</h2>
+      <p class="muted" id="runsText"></p>
+    </header>
+    <div class="controls">
+      <div class="ctl-row"><span class="eyebrow">Traders</span><div class="seg" id="scenarioSeg"></div></div>
+      <div class="ctl-row"><span class="eyebrow">Hedge cost</span><div class="seg" id="pricingSeg"></div></div>
+      <p class="about" id="scenarioAbout"></p>
+    </div>
+    <div class="cards" id="cards"></div>
+    <div class="callout" id="verdict"></div>
+    <div style="display:grid; gap:8px">
+      <h3>Depositors' profit, hour by hour (run 1 of <span class="runs"></span>)</h3>
+      <div class="chartbox" id="pnlChart"></div>
+      <div class="legend" id="pnlLegend"></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <header>
+      <div class="eyebrow">4 · Who got what</div>
+      <h2 id="ledgerTitle">Who got what</h2>
+      <p class="muted">Averages over all runs, for the strategy picked above. Every dollar someone gained, someone else lost, so the bottom line is zero.</p>
+    </header>
+    <div class="two">
+      <div style="display:grid; gap:8px; min-width:0">
+        <h3>Traders on Turbopump</h3>
+        <div class="tablewrap"><table id="tradersTable"></table></div>
+        <h3>Everyone else</h3>
+        <div class="tablewrap"><table id="othersTable"></table></div>
+        <p class="check" id="zeroCheck"></p>
+      </div>
+      <div style="display:grid; gap:8px; min-width:0">
+        <h3>Vault depositors, line by line</h3>
+        <div class="tablewrap"><table id="depTable"></table></div>
+        <h3>The hedge account on Hyperliquid</h3>
+        <div class="tablewrap"><table id="hedgeTable"></table></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <header>
+      <div class="eyebrow">5 · Trade log</div>
+      <h2>Every copier trade and hedge order in run 1</h2>
+      <p class="muted">The crowd's thousands of small trades are left out; the tables above include them. Times are UTC.</p>
+    </header>
+    <div class="ctl-row"><div class="seg" id="logSeg"></div><span class="dim" id="logCount"></span></div>
+    <div class="tablewrap"><table id="logTable"></table></div>
+    <button class="btn more" id="logMore" type="button">Show 100 more</button>
+  </section>
+
+  <section class="panel" id="income">
+    <header>
+      <div class="eyebrow">6 · Income for depositors · added Oct 29</div>
+      <h2>New fees: what they add for depositors</h2>
+      <p class="muted" id="incomeIntro"></p>
+    </header>
+    <div class="ctl-row"><span class="eyebrow">Market</span><div class="seg" id="incomeSeg"></div></div>
+    <p class="about" id="incomeAbout"></p>
+    <div id="incomeRows"></div>
+    <div class="legend"><span><i class="dot" style="background:var(--tp)"></i>average of all runs</span><span><i style="background:var(--dim)"></i>worst run to best run</span><span><i style="background:var(--line-2);width:2px;height:12px"></i>$0</span></div>
+    <div class="callout" id="incomeVerdict"></div>
+    <div class="tablewrap"><table id="incomeTable"></table></div>
+    <div class="two">
+      <div class="callout"><h3>Built and live on X1 testnet and devnet</h3><ul class="plain">
+        <li><b>Holding fee.</b> When the vault's position on a market passes 10% of its limit, the crowded side pays a fee for every hour it holds, rising to 0.01% an hour at the limit (about 88% a year). Under 10%, nobody pays.</li>
+        <li><b>Crowded-side fee.</b> 0.05% extra on any trade that makes the vault's position bigger. Closing your own position never pays it.</li>
+        <li><b>Liquidation fee.</b> 0.5% of what a liquidation closes.</li>
+        <li>All of it goes to depositors. What a trader owes counts against their margin right away and is paid into the vault before they can withdraw.</li>
+      </ul></div>
+      <div class="callout"><h3>Not built, and why</h3><ul class="plain">
+        <li><b>Profit share</b> (10% of copier profits, 40% of that to depositors): only about $100 per two weeks for depositors.</li>
+        <li><b>Part of the copy fee to depositors:</b> the fee is in XNT and the vault holds USDC, so it needs a swap.</li>
+        <li><b>Staking part of the vault:</b> the vault holds USDC, which can't be staked, and X1 unstaking waits about one epoch (~22 h).</li>
+      </ul></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <header>
+      <div class="eyebrow">7 · What this tells us</div>
+      <h2>Takeaways and limits</h2>
+    </header>
+    <div class="two">
+      <div style="display:grid; gap:8px"><h3>Takeaways</h3><ul class="plain" id="takeaways"></ul></div>
+      <div style="display:grid; gap:8px"><h3>Limits of this simulation</h3><ul class="plain" id="limits"></ul></div>
+    </div>
+  </section>
+</div>
+
+<script>
+const D = /*DATA*/null;
+const STRATS = [
+  { k: "none", name: "No hedge", rule: "The vault keeps all the risk. Nothing is traded on Hyperliquid.", c: "--s1" },
+  { k: "all", name: "Hedge everything", rule: "Mirror the vault's whole position on Hyperliquid, crowd and copiers alike.", c: "--s2" },
+  { k: "copy", name: "Hedge all copiers", rule: "Mirror only the copiers' trades. The crowd's risk stays with the vault.", c: "--s3" },
+  { k: "smart", name: "Hedge proven winners", rule: "Mirror only copiers of leaders who are winning on Turbopump so far (8+ trades).", c: "--s4" },
+];
+const PRICING = {
+  taker: { label: `Market orders: ${D.pricing.taker.fee} bps fee + ${D.pricing.taker.spread} bp spread`, short: "market orders" },
+  maker: { label: `Resting orders: ${D.pricing.maker.fee} bps, no spread (optimistic)`, short: "resting orders" },
+};
+const st = { sc: "big-star", pr: "maker", sg: "smart", log: "all", logN: 100 };
+try { const s = JSON.parse(localStorage.getItem("hedgelab") || "{}"); Object.assign(st, s, { logN: 100 }); } catch {}
+const save = () => { try { localStorage.setItem("hedgelab", JSON.stringify({ sc: st.sc, pr: st.pr, sg: st.sg })); } catch {} };
+
+const $ = id => document.getElementById(id);
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const money = (x, sign = false) => { const r = Math.round(x); const s = Math.abs(r).toLocaleString("en-US"); return (r < 0 ? "−$" : sign && r > 0 ? "+$" : "$") + s; };
+const cls = x => (Math.round(x) > 0 ? "good" : Math.round(x) < 0 ? "bad" : "");
+const signed = x => `<span class="num ${cls(x)}">${money(x, true)}</span>`;
+const px = x => x >= 1000 ? "$" + x.toLocaleString("en-US", { maximumFractionDigits: 0 }) : "$" + x.toLocaleString("en-US", { maximumFractionDigits: 2 });
+const M = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const when = t => { const d = new Date(t); return `${M[d.getUTCMonth()]} ${d.getUTCDate()}, ${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`; };
+const day = t => { const d = new Date(t); return `${M[d.getUTCMonth()]} ${d.getUTCDate()}`; };
+const scen = () => D.scenarios.find(s => s.name === st.sc) || D.scenarios[0];
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+// ---------- hero ----------
+const p0 = D.period.prices;
+$("heroText").textContent = `We replayed real BTC, ETH and SOL prices from ${day(D.period.from)} to ${day(D.period.to)} (BTC went ${px(p0.BTC[0])} → ${px(p0.BTC[1])}, a mostly sideways two weeks). Simulated traders traded against three vaults of $100,000 each, and the real hedger ran against a simulated Hyperliquid account with $${D.hedge.equity.toLocaleString("en-US")}. Every setup ran ${D.runs} times with different random traders.`;
+$("opPct").textContent = `${D.hedge.operatorFeeBps / 100}%`;
+document.querySelectorAll(".runs").forEach(e => e.textContent = D.runs);
+$("runsText").textContent = `Pick who trades and how much the hedge pays per trade. The cards show the depositors' result after ${Math.round((D.period.to - D.period.from) / 86400000)} days: the average of ${D.runs} runs, and the worst run. Click a card to see its details below.`;
+
+// ---------- story ----------
+function renderStory() {
+  const S = D.story;
+  if (!S) { $("storyPanel").hidden = true; return; }
+  const sym = S.o.sym, buy = S.o.usd > 0, size = Math.abs(S.o.usd);
+  const verb = b => (b ? "buy" : "sell"), past = b => (b ? "bought" : "sold");
+  const fills = h => h.reduce((a, f) => ({ usd: a.usd + f[2], fee: a.fee + f[4], q: a.q + f[2] / f[3], t: a.t ?? f[0] }), { usd: 0, fee: 0, q: 0, t: null });
+  const hO = fills(S.hOpen), hC = fills(S.hClose);
+  const hOpx = hO.usd / hO.q, hCpx = hC.usd / hC.q;
+  const hedgePnl = -(hO.usd + hC.usd) + (hO.q + hC.q) * S.c.px - hO.fee - hC.fee;
+  const copFees = S.o.fee + S.c.fee, share = copFees * 0.8, opener = copFees * 0.2, op = share * D.hedge.operatorFeeBps / 10000;
+  const posRes = -S.c.pnl;
+  const hours = ((S.c.t - S.o.t) / 3600000);
+  $("storyTitle").textContent = `The popular star's ${sym} trade on ${day(S.o.t)}`;
+  $("storyIntro").textContent = `A real trade from the simulation: setup "Popular star", run 1, hedging proven winners with resting orders. The star picks the right side ${Math.round(S.skill * 100)}% of the time, and their copiers together put $${S.copyUsd.toLocaleString("en-US")} on each trade. By this point the star had a winning record, so the hedger covered their copiers.`;
+  const where = w => w === "tp" ? '<span class="chip tp">Turbopump</span>' : '<span class="chip hl">Hyperliquid</span>';
+  const steps = [
+    [S.o.t - 60000, "hl", `<b>The star ${verb(buy)}s ${sym}</b> on their own Hyperliquid account. Not our money; we only see it.`],
+    [S.o.t, "tp", `<b>Copiers ${verb(buy)} ${money(size)} of ${sym}</b> at ${px(S.o.px)}. They pay ${money(S.o.fee)} in trading fees.`],
+    [S.o.t, "tp", `<b>The vault takes the other side.</b> Depositors are now ${buy ? "short" : "long"} ${money(size)} of ${sym}: if the price ${buy ? "rises" : "falls"}, they lose.`],
+    [hO.t, "hl", `<b>The hedger ${verb(buy)}s ${money(Math.abs(hO.usd))} of ${sym}</b> with the hedge account at ${px(hOpx)}, paying ${money(hO.fee)} in fees. The vault is ${buy ? "short" : "long"} on Turbopump and ${buy ? "long" : "short"} on Hyperliquid, so price moves now cancel out.`],
+    [S.c.t, "tp", `<b>${hours.toFixed(1)} hours later the star closes; copiers ${verb(!buy)}</b> at ${px(S.c.px)}. They made ${money(S.c.pnl)} before fees, which the vault lost.`],
+    [hC.t, "hl", `<b>The hedger closes the hedge</b> at ${px(hCpx)}: it made ${money(hedgePnl)} after fees, roughly what the vault lost.`],
+  ];
+  $("storySteps").innerHTML = steps.map(([t, w, h]) => `<li><div style="display:grid;gap:3px"><div class="when">${when(t)} ${where(w)}</div><div>${h}</div></div></li>`).join("");
+
+  const noHedge = posRes + share;
+  const withHedge = posRes + share + hedgePnl - op;
+  $("storyTable").innerHTML = `<thead><tr><th>Result of this one trade</th><th class="r">No hedge</th><th class="r">With hedge</th></tr></thead><tbody>
+    <tr><td>Copiers <small>${money(S.c.pnl)} price gain − ${money(copFees)} fees</small></td><td class="r">${signed(S.c.pnl - copFees)}</td><td class="r">${signed(S.c.pnl - copFees)}</td></tr>
+    <tr><td>Vault: position on Turbopump <small>the other side of the copiers</small></td><td class="r">${signed(posRes)}</td><td class="r">${signed(posRes)}</td></tr>
+    <tr><td>Vault: its 80% of the fees</td><td class="r">${signed(share)}</td><td class="r">${signed(share)}</td></tr>
+    <tr><td>Vault: hedge result on Hyperliquid <small>after ${money(hO.fee + hC.fee)} Hyperliquid fees</small></td><td class="r dim">—</td><td class="r">${signed(hedgePnl)}</td></tr>
+    <tr><td>Vault: pay to the hedge operator (us) <small>${D.hedge.operatorFeeBps / 100}% of the vault's fees</small></td><td class="r dim">—</td><td class="r">${signed(-op)}</td></tr>
+    <tr class="total"><td>Depositors, from this trade</td><td class="r">${signed(noHedge)}</td><td class="r">${signed(withHedge)}</td></tr>
+  </tbody>`;
+
+  // price chart with the six moments
+  const box = $("storyChart"), W = Math.max(320, box.clientWidth || 520), H = 230, m = { l: 62, r: 14, t: 14, b: 26 };
+  const xs = S.series.map(p => p[0]), ys = S.series.map(p => p[1]);
+  const x0 = xs[0], x1 = xs[xs.length - 1];
+  let y0 = Math.min(...ys, hOpx, hCpx), y1 = Math.max(...ys, hOpx, hCpx); const pad = (y1 - y0) * .08 || 1; y0 -= pad; y1 += pad;
+  const X = t => m.l + (t - x0) / (x1 - x0) * (W - m.l - m.r), Y = v => m.t + (1 - (v - y0) / (y1 - y0)) * (H - m.t - m.b);
+  const ticks = 4, yt = [...Array(ticks + 1)].map((_, i) => y0 + (y1 - y0) * i / ticks);
+  const hh = t => { const d = new Date(t); return `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`; };
+  const xt = [...Array(5)].map((_, i) => x0 + (x1 - x0) * i / 4);
+  const line = S.series.map((p, i) => `${i ? "L" : "M"}${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`).join("");
+  const mk = (t, v, col, ring) => `<circle cx="${X(t).toFixed(1)}" cy="${Y(v).toFixed(1)}" r="6" fill="${col}" stroke="${css("--panel")}" stroke-width="2"${ring ? ' stroke-dasharray="2 2"' : ""}/>`;
+  box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${sym} price during the trade, with the copiers' and the hedge's fills marked">
+    ${yt.map(v => `<line class="grid" x1="${m.l}" x2="${W - m.r}" y1="${Y(v)}" y2="${Y(v)}"/><text class="ax" x="${m.l - 8}" y="${Y(v) + 4}" text-anchor="end">${px(v)}</text>`).join("")}
+    ${xt.map(t => `<text class="ax" x="${X(t)}" y="${H - 6}" text-anchor="middle">${hh(t)}</text>`).join("")}
+    <rect x="${X(S.o.t)}" y="${m.t}" width="${Math.max(1, X(S.c.t) - X(S.o.t))}" height="${H - m.t - m.b}" fill="${css("--tp-soft")}"/>
+    <path d="${line}" fill="none" stroke="${css("--muted")}" stroke-width="2" stroke-linejoin="round"/>
+    ${mk(S.o.t, S.o.px, css("--tp"))}${mk(S.c.t, S.c.px, css("--tp"))}
+    ${mk(hO.t, hOpx, css("--hl"))}${mk(hC.t, hCpx, css("--hl"))}
+  </svg>`;
+  $("storyLegend").innerHTML = `<span><i style="background:${css("--muted")}"></i>${sym} price (UTC)</span><span><i class="dot" style="background:${css("--tp")}"></i>Copiers' fills on Turbopump</span><span><i class="dot" style="background:${css("--hl")}"></i>Hedge fills on Hyperliquid</span><span><i style="background:${css("--tp-soft")};height:10px"></i>Trade open</span>`;
+}
+
+// ---------- controls ----------
+function seg(el, items, cur, on) {
+  el.innerHTML = items.map(([k, label]) => `<button type="button" data-k="${k}" aria-pressed="${k === cur}">${esc(label)}</button>`).join("");
+  el.onclick = e => { const b = e.target.closest("button"); if (b) on(b.dataset.k); };
+}
+function renderControls() {
+  seg($("scenarioSeg"), D.scenarios.map(s => [s.name, s.label]), st.sc, k => { st.sc = k; if (!scen().res[st.pr][st.sg]) st.sg = "none"; st.logN = 100; save(); renderAll(); });
+  seg($("pricingSeg"), Object.entries(PRICING).map(([k, v]) => [k, v.label]), st.pr, k => { st.pr = k; st.logN = 100; save(); renderAll(); });
+  const s = scen();
+  const lead = s.leaders.length ? " Leaders: " + s.leaders.map(l => `${l.name} (right ${Math.round(l.skill * 100)}% of the time, $${(l.copyUsd / 1000).toFixed(0)}k copied per trade)`).join(", ") + "." : "";
+  $("scenarioAbout").textContent = `${s.about[0].toUpperCase() + s.about.slice(1)}. Our trading fee: ${s.feeBps} bps.${lead}`;
+}
+
+// ---------- cards + verdict ----------
+function renderCards() {
+  const s = scen(), R = s.res[st.pr];
+  const avail = STRATS.filter(x => R[x.k]);
+  const best = avail.reduce((a, x) => (R[x.k].avg > R[a.k].avg ? x : a), avail[0]);
+  $("cards").innerHTML = STRATS.map(x => {
+    const r = R[x.k];
+    if (!r) return `<div class="card" style="cursor:default;opacity:.55"><div class="name"><i style="background:var(${x.c})"></i>${x.name}</div><div class="rule">${x.rule}</div><div class="meta">Same as "Hedge everything" here: there are no copiers.</div></div>`;
+    return `<button type="button" class="card" data-k="${x.k}" aria-pressed="${x.k === st.sg}">
+      <div class="name"><i style="background:var(${x.c})"></i>${x.name}</div>
+      <div class="rule">${x.rule}</div>
+      ${x.k === best.k ? '<div class="best">Most profit on average</div>' : '<div class="best" style="visibility:hidden">.</div>'}
+      <div class="big ${cls(r.avg)}">${money(r.avg, true)}</div>
+      <div class="meta"><span>average for depositors</span><span>worst run <b class="num ${cls(r.worst)}">${money(r.worst, true)}</b> · worst day <b class="num ${cls(r.worstDay)}">${money(r.worstDay, true)}</b></span><span>${r.lossRuns} of ${r.perSeed.length} runs lost money</span></div>
+    </button>`;
+  }).join("");
+  $("cards").onclick = e => { const b = e.target.closest("button.card"); if (b) { st.sg = b.dataset.k; st.logN = 100; save(); renderAll(); } };
+
+  const n = R.none, sm = R.smart, al = R.all;
+  let v = "";
+  if (!s.leaders.length) v = `With no copy trading, the crowd's trades are random and mostly cancel out, so the vault mostly earns fees. Hedging everything turns ${money(n.avg)} into ${money(al.avg)}: the hedge's Hyperliquid fees and our operator pay cost more than the risk it removes.`;
+  else {
+    const winner = best.k === "none" ? "Not hedging" : `"${best.name}"`;
+    v = `${winner} left depositors the most on average (${money(R[best.k].avg, true)}). `;
+    if (sm && best.k === "smart") v += `That is about the same as no hedge (${money(n.avg, true)}), but its worst run was ${money(sm.worst, true)} against ${money(n.worst, true)} unhedged. `;
+    else if (sm) v += `"Hedge proven winners" ${sm.avg >= n.avg - 150 ? "earned about the same" : `earned ${money(n.avg - sm.avg)} less`}, and its worst run was ${money(sm.worst, true)} against ${money(n.worst, true)} unhedged. `;
+    v += `"Hedge everything" makes the result very steady (worst day ${money(al.worstDay, true)}), but costs ${money(n.avg - al.avg)} of profit: think of it as insurance.`;
+  }
+  $("verdict").innerHTML = `<h3>In this setup</h3><p>${v}</p>`;
+}
+
+// ---------- hourly chart ----------
+function renderPnl() {
+  const s = scen(), R = s.res[st.pr];
+  const series = STRATS.filter(x => R[x.k]).map(x => ({ ...x, v: R[x.k].hourly }));
+  const box = $("pnlChart"), W = Math.max(320, box.clientWidth || 900), H = 300, m = { l: 66, r: 132, t: 12, b: 28 };
+  if (W < 560) m.r = 16;
+  const n = series[0].v.length;
+  const all = series.flatMap(s => s.v);
+  let y0 = Math.min(0, ...all), y1 = Math.max(0, ...all);
+  const step = niceStep((y1 - y0) / 5); y0 = Math.floor(y0 / step) * step; y1 = Math.ceil(y1 / step) * step;
+  const X = i => m.l + i / (n - 1) * (W - m.l - m.r), Y = v => m.t + (1 - (v - y0) / (y1 - y0)) * (H - m.t - m.b);
+  const yt = []; for (let v = y0; v <= y1 + 1e-9; v += step) yt.push(v);
+  const days = []; for (let h = 0; h < n; h += 48) days.push(h);
+  const t0 = D.period.from;
+  // end labels, nudged apart
+  const ends = series.map(s => ({ s, y: Y(s.v[n - 1]) })).sort((a, b) => a.y - b.y);
+  for (let i = 1; i < ends.length; i++) if (ends[i].y - ends[i - 1].y < 30) ends[i].y = ends[i - 1].y + 30;
+  const showEnd = W >= 560;
+  box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Depositors' cumulative profit per hour for each strategy">
+    ${yt.map(v => `<line class="grid" x1="${m.l}" x2="${W - m.r}" y1="${Y(v)}" y2="${Y(v)}" ${v === 0 ? `style="stroke:${css("--dim")}"` : ""}/><text class="ax" x="${m.l - 8}" y="${Y(v) + 4}" text-anchor="end">${money(v)}</text>`).join("")}
+    ${days.map(h => `<text class="ax" x="${X(h)}" y="${H - 8}" text-anchor="middle">${day(t0 + h * 3600000)}</text>`).join("")}
+    ${series.map(s => `<path d="${s.v.map((v, i) => `${i ? "L" : "M"}${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join("")}" fill="none" stroke="var(${s.c})" stroke-width="${s.k === st.sg ? 2.6 : 1.8}" stroke-linejoin="round" ${s.k === st.sg ? "" : 'opacity=".75"'}/>`).join("")}
+    ${showEnd ? ends.map(e => `<circle cx="${X(n - 1)}" cy="${Y(e.s.v[n - 1])}" r="4" fill="var(${e.s.c})" stroke="var(--panel)" stroke-width="2"/><text class="lbl" x="${X(n - 1) + 10}" y="${e.y - 2}">${e.s.name}</text><text class="lbl sub num" x="${X(n - 1) + 10}" y="${e.y + 13}">${money(e.s.v[n - 1], true)}</text>`).join("") : ""}
+    <line id="xh" class="grid" y1="${m.t}" y2="${H - m.b}" style="stroke:${css("--dim")}" hidden/>
+    <rect id="hit" x="${m.l}" y="${m.t}" width="${W - m.l - m.r}" height="${H - m.t - m.b}" fill="transparent"/>
+  </svg><div class="tooltip" id="tip" hidden></div>`;
+  $("pnlLegend").innerHTML = series.map(s => `<span><i style="background:var(${s.c})"></i>${s.name}</span>`).join("");
+  const svg = box.querySelector("svg"), tip = $("tip"), xh = svg.querySelector("#xh");
+  const move = e => {
+    const r = svg.getBoundingClientRect(), sx = (e.clientX - r.left) * W / r.width;
+    const i = Math.max(0, Math.min(n - 1, Math.round((sx - m.l) / (W - m.l - m.r) * (n - 1))));
+    xh.setAttribute("x1", X(i)); xh.setAttribute("x2", X(i)); xh.hidden = false;
+    tip.innerHTML = `<b>${when(t0 + (i + 1) * 3600000)} UTC</b>` + series.slice().sort((a, b) => b.v[i] - a.v[i]).map(s => `<div class="row"><span><i style="background:var(${s.c})"></i>${s.name}</span><span class="num">${money(s.v[i], true)}</span></div>`).join("");
+    tip.hidden = false;
+    const left = X(i) * r.width / W;
+    tip.style.left = Math.min(r.width - tip.offsetWidth, Math.max(0, left + 12 + tip.offsetWidth > r.width ? left - tip.offsetWidth - 12 : left + 12)) + "px";
+    tip.style.top = "8px";
+  };
+  svg.addEventListener("pointermove", move);
+  svg.addEventListener("pointerleave", () => { tip.hidden = true; xh.hidden = true; });
+}
+function niceStep(raw) { const p = 10 ** Math.floor(Math.log10(raw || 1)); const f = raw / p; return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10) * p; }
+
+// ---------- ledger ----------
+function renderLedger() {
+  const s = scen(), r = s.res[st.pr][st.sg], S = STRATS.find(x => x.k === st.sg);
+  const f = s.feeBps / 10000;
+  $("ledgerTitle").textContent = `Who got what: "${S.name}", ${PRICING[st.pr].short}`;
+  const rows = [{ who: "Crowd traders", note: "random direction", vol: s.crowd.vol, pnl: s.crowd.pnl }]
+    .concat(s.leaders.map(l => ({ who: `Copiers of ${l.name}`, note: `leader right ${Math.round(l.skill * 100)}% of the time · ${l.trades.toFixed(0)} trades`, vol: l.vol, pnl: l.pnl })));
+  let tNet = 0;
+  $("tradersTable").innerHTML = `<thead><tr><th>Who</th><th class="r">Traded</th><th class="r">Price gains</th><th class="r">Fees paid</th><th class="r">Result</th></tr></thead><tbody>` +
+    rows.map(x => { const fee = x.vol * f, net = x.pnl - fee; tNet += net; return `<tr><td>${x.who}<small>${x.note}</small></td><td class="r num">${money(x.vol)}</td><td class="r">${signed(x.pnl)}</td><td class="r">${signed(-fee)}</td><td class="r">${signed(net)}</td></tr>`; }).join("") +
+    `<tr class="total"><td>All traders</td><td></td><td></td><td></td><td class="r">${signed(tNet)}</td></tr></tbody>`;
+
+  const fees = (s.crowd.vol + s.leaders.reduce((a, l) => a + l.vol, 0)) * f;
+  const opener = fees * 0.2;
+  const hedgeSide = -(r.hedgePnl + r.hedgeFees);
+  $("depTable").innerHTML = `<thead><tr><th>Line</th><th>Where</th><th class="r">Amount</th></tr></thead><tbody>
+    <tr><td>80% of the trading fees</td><td><span class="chip tp">Turbopump</span></td><td class="r">${signed(r.feeIncome)}</td></tr>
+    <tr><td>The vault's position <small>the other side of every trade: minus the traders' price gains</small></td><td><span class="chip tp">Turbopump</span></td><td class="r">${signed(r.vaultPnl)}</td></tr>
+    <tr><td>Hedge result <small>${st.sg === "none" ? "no hedge" : "all of the hedge account's gain or loss"}</small></td><td><span class="chip hl">Hyperliquid</span></td><td class="r">${st.sg === "none" ? '<span class="dim">—</span>' : signed(r.hedgePnl)}</td></tr>
+    <tr><td>Pay to the hedge operator <small>${st.sg === "none" ? "no hedge, no pay" : `${D.hedge.operatorFeeBps / 100}% of the fee line`}</small></td><td><span class="chip hl">Hyperliquid</span></td><td class="r">${st.sg === "none" ? '<span class="dim">—</span>' : signed(-r.operatorPay)}</td></tr>
+    <tr class="total"><td>Depositors' result</td><td></td><td class="r">${signed(r.avg)}</td></tr>
+    <tr><td colspan="2" class="dim">As a yearly rate on the $300,000 deposited</td><td class="r num ${cls(r.avg)}">${(r.avg / 300000 * 365 / 14 * 100).toFixed(1)}%</td></tr>
+  </tbody>`;
+
+  $("hedgeTable").innerHTML = st.sg === "none"
+    ? `<tbody><tr><td class="dim">No hedge: nothing is traded on Hyperliquid.</td></tr></tbody>`
+    : `<thead><tr><th>Line</th><th class="r">Amount</th></tr></thead><tbody>
+      <tr><td>Orders sent</td><td class="r num">${r.orders.toLocaleString("en-US")}</td></tr>
+      <tr><td>Dollars traded</td><td class="r num">${money(r.hedgeVolume)}</td></tr>
+      <tr><td>Gains from price moves</td><td class="r">${signed(r.hedgePnl + r.hedgeFees + r.hedgeSpread + r.hedgeFunding)}</td></tr>
+      <tr><td>Hyperliquid fees</td><td class="r">${signed(-r.hedgeFees)}</td></tr>
+      <tr><td>Spread paid <small>buying a bit above, selling a bit below the middle price</small></td><td class="r">${signed(-r.hedgeSpread)}</td></tr>
+      <tr><td>Funding <small>real hourly Hyperliquid rates</small></td><td class="r">${signed(-r.hedgeFunding)}</td></tr>
+      <tr class="total"><td>Hedge result (goes to depositors)</td><td class="r">${signed(r.hedgePnl)}</td></tr>
+    </tbody>`;
+
+  const others = [
+    ["Market opener", "tp", "20% of the trading fees", opener],
+    ["Hedge operator (us)", "hl", "paid by the depositors for running the hedge", st.sg === "none" ? 0 : r.operatorPay],
+    ["Hyperliquid (the exchange)", "hl", "fees on our hedge orders", st.sg === "none" ? 0 : r.hedgeFees],
+    ["Other Hyperliquid traders", "hl", "the other side of our hedge: spread, funding, price moves", st.sg === "none" ? 0 : hedgeSide],
+  ];
+  $("othersTable").innerHTML = `<thead><tr><th>Who</th><th>Where</th><th class="r">Result</th></tr></thead><tbody>` +
+    others.map(([w, p, n, v]) => `<tr><td>${w}<small>${n}</small></td><td><span class="chip ${p}">${p === "tp" ? "Turbopump" : "Hyperliquid"}</span></td><td class="r">${signed(v)}</td></tr>`).join("") + `</tbody>`;
+  const sum = tNet + r.avg + others.reduce((a, o) => a + o[3], 0);
+  $("zeroCheck").textContent = `Check: traders ${money(tNet, true)} + depositors ${money(r.avg, true)} + everyone else ${money(others.reduce((a, o) => a + o[3], 0), true)} = ${money(sum)} (zero, up to rounding).`;
+}
+
+// ---------- trade log ----------
+function renderLog() {
+  const s = scen();
+  const hedge = (s.log.hedge[st.pr] || {})[st.sg];
+  const names = s.leaders.map(l => l.name);
+  seg($("logSeg"), [["all", "Everything"], ["copy", "Copiers (Turbopump)"], ["hedge", "Hedge orders (Hyperliquid)"]], st.log, k => { st.log = k; st.logN = 100; renderLog(); });
+  let rows = [];
+  if (st.log !== "hedge") rows = rows.concat(s.log.copy.map(e => ({ t: e.t, where: "tp", who: `Copiers of ${names[e.who]}`, what: `${e.kind === "open" ? "Open" : "Close"}: ${e.usd > 0 ? "buy" : "sell"} ${e.sym}`, usd: Math.abs(e.usd), px: e.px, fee: e.fee, pnl: e.pnl })));
+  if (st.log !== "copy" && hedge) rows = rows.concat(hedge.map(h => ({ t: h[0], where: "hl", who: "Hedge account (us)", what: `${h[2] > 0 ? "buy" : "sell"} ${h[1]}`, usd: Math.abs(h[2]), px: h[3], fee: h[4] })));
+  rows.sort((a, b) => a.t - b.t || (a.where === "tp" ? -1 : 1));
+  const note = !s.leaders.length && st.log !== "hedge" ? "No copiers in this setup." : "";
+  const hnote = st.log !== "copy" && !hedge ? (st.sg === "all" ? `"Hedge everything" sends thousands of small orders, so they are not listed (${scen().res[st.pr].all.orders.toLocaleString("en-US")} orders on average).` : st.sg === "none" ? "No hedge orders: the strategy picked above is \"No hedge\"." : "") : "";
+  $("logCount").textContent = [`${rows.length.toLocaleString("en-US")} rows`, note, hnote].filter(Boolean).join(" · ");
+  const shown = rows.slice(0, st.logN);
+  $("logTable").innerHTML = `<thead><tr><th>Time</th><th>Where</th><th>Who</th><th>What</th><th class="r">Size</th><th class="r">Price</th><th class="r">Fee</th><th class="r">Result</th></tr></thead><tbody>` +
+    shown.map(r => `<tr><td class="num">${when(r.t)}</td><td><span class="chip ${r.where}">${r.where === "tp" ? "Turbopump" : "Hyperliquid"}</span></td><td>${r.who}</td><td>${r.what}</td><td class="r num">${money(r.usd)}</td><td class="r num">${px(r.px)}</td><td class="r num">${money(r.fee)}</td><td class="r">${r.pnl === undefined ? '<span class="dim">—</span>' : signed(r.pnl) + '<small>before fees</small>'}</td></tr>`).join("") + `</tbody>`;
+  $("logMore").hidden = rows.length <= st.logN;
+  $("logMore").onclick = () => { st.logN += 100; renderLog(); };
+}
+
+// ---------- takeaways ----------
+function renderTakeaways() {
+  const g = (sc, pr, k) => D.scenarios.find(s => s.name === sc).res[pr][k];
+  const bsN = g("big-star", "maker", "none"), bsS = g("big-star", "maker", "smart"), bsT = g("big-star", "taker", "smart");
+  const fN = g("one-star-10bps", "taker", "none");
+  $("takeaways").innerHTML = [
+    `Hedging every trade loses money. On Hyperliquid a round trip costs about ${2 * (D.pricing.taker.fee) + D.pricing.taker.spread} bps; our 5 bps fee leaves the vault 8 bps per round trip. You pay more to protect a trade than it earns.`,
+    `Most copiers don't need hedging. Copiers of coin-flip or losing leaders lose money, and the vault keeps it. Hedging them throws that away.`,
+    `Hedge only proven winners, and hedge cheaply. With a popular star and resting orders, "Hedge proven winners" averaged ${money(bsS.avg, true)} against ${money(bsN.avg, true)} with no hedge, and its worst run was ${money(bsS.worst, true)} instead of ${money(bsN.worst, true)}. With market orders it averaged ${money(bsT.avg, true)}.`,
+    `Our fee matters more than the hedge. At 10 bps, no hedge averaged ${money(fN.avg, true)} and no run lost money.`,
+    `Fees for holding the crowded side fix the rising-market leak. With prices up 10% and 3 in 4 holders long, depositors went from ${money(D.income.cases.find(c => c.name === "holders-rise").v.today.avg, true)} to ${money(D.income.cases.find(c => c.name === "holders-rise").v["all three"].avg, true)}. The holding, crowded-side and liquidation fees are now live.`,
+    `Profit and safety are both the goal. A vault that averages a profit but sometimes loses thousands in two weeks scares depositors away; the same average with a small worst case is the better product.`,
+  ].map(x => `<li>${x}</li>`).join("");
+  $("limits").innerHTML = [
+    `Resting orders are optimistic here: the simulated Hyperliquid fills them at once. In reality some would wait or not fill.`,
+    `Only ${Math.round((D.period.to - D.period.from) / 86400000)} days, in a sideways market. A strong trend with a winning leader could cost an unhedged vault much more.`,
+    `The traders are simulated. A leader's skill is a set probability of picking the right side, not a real record.`,
+    `Copiers fill 1 minute after the leader; the real delay is shorter (about 4–15 s), which helps copiers a little.`,
+    `The copy fee (10 XNT per follow) is not counted. It would add income.`,
+    `The hedge account's money ($${D.hedge.equity.toLocaleString("en-US")}) earns nothing while it waits; that cost is not counted.`,
+  ].map(x => `<li>${x}</li>`).join("");
+}
+
+// ---------- income (new fees) ----------
+const IV = [
+  ["today", "Before today", "trading fee only", ""],
+  ["holding fee", "Holding fee", "crowded side pays per hour", "live"],
+  ["side fee", "Crowded-side fee", "+0.05% on trades that grow the vault's side", "live"],
+  ["profit share", "Profit share", "10% of copier profits", "no"],
+  ["all three", "All three", "", "mix"],
+];
+const ICASES = { "popular-star": "Popular star", "holders-flat": "Holders, flat prices", "holders-rise": "Holders, prices +10%", "rise-and-star": "Prices +10% and a star", "holders-fall": "Holders, prices −10%" };
+st.ic = st.ic && ICASES[st.ic] ? st.ic : "holders-rise";
+function renderIncome() {
+  const I = D.income, c = I.cases.find(x => x.name === st.ic) || I.cases[0];
+  $("incomeIntro").textContent = `The vault takes the other side of every trade. If prices keep rising and most traders hold longs, the vault loses, and with funding off nothing charges them for holding. We ran the same trades ${I.runs} times with each new fee to see what depositors would keep after ${Math.round((D.period.to - D.period.from) / 86400000)} days. No hedge here.`;
+  seg($("incomeSeg"), I.cases.map(x => [x.name, ICASES[x.name] ?? x.name]), st.ic, k => { st.ic = k; try { localStorage.setItem("hedgelab-ic", k); } catch {} renderIncome(); });
+  $("incomeAbout").textContent = c.about[0].toUpperCase() + c.about.slice(1) + ". Trading fee 5 bps, three vaults of $100,000.";
+  const all = IV.flatMap(([k]) => [c.v[k].worst, c.v[k].best]);
+  let lo = Math.min(0, ...all), hi = Math.max(0, ...all); const pad = (hi - lo) * 0.04; lo -= pad; hi += pad;
+  const W = 600, x = v => ((v - lo) / (hi - lo)) * W;
+  const ink = css("--dim"), zero = css("--line-2"), dot = css("--tp"), ring = css("--panel");
+  $("incomeRows").innerHTML = IV.map(([k, name, sub, status]) => {
+    const r = c.v[k];
+    const chip = status === "live" ? '<span class="chip live">Live</span>' : status === "no" ? '<span class="chip no">Not built</span>' : status === "mix" ? '<span class="chip no">Profit share not built</span>' : "";
+    return `<div class="irow" title="${esc(name)}: average ${money(r.avg, true)}, worst run ${money(r.worst, true)}, best run ${money(r.best, true)}">
+      <div class="nm"><span style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">${name} ${chip}</span><small>${sub || "holding + crowded-side + profit share"}</small></div>
+      <div class="bar"><svg viewBox="0 0 ${W} 34" preserveAspectRatio="none" role="img" aria-label="${esc(name)} worst ${money(r.worst)} average ${money(r.avg)} best ${money(r.best)}">
+        <line x1="${x(0)}" x2="${x(0)}" y1="2" y2="32" stroke="${zero}" stroke-width="2" vector-effect="non-scaling-stroke"/>
+        <line x1="${x(r.worst)}" x2="${x(r.best)}" y1="17" y2="17" stroke="${ink}" stroke-width="2" stroke-linecap="round" vector-effect="non-scaling-stroke"/>
+      </svg><div style="position:relative;height:0"><span style="position:absolute;left:${(x(r.avg) / W) * 100}%;top:-22px;width:12px;height:12px;margin-left:-6px;border-radius:50%;background:${dot};box-shadow:0 0 0 2px ${ring}"></span></div></div>
+      <div class="val"><b class="${cls(r.avg)}">${money(r.avg, true)}</b><small>${r.loss} of ${r.perSeed.length} runs lost</small></div>
+    </div>`;
+  }).join("");
+  const t = c.v.today, a = c.v["all three"], h = c.v["holding fee"];
+  let v;
+  if (t.loss > 0 && a.loss === 0) v = `Before the new fees, depositors averaged ${money(t.avg, true)} and ${t.loss} of ${t.perSeed.length} runs lost money. With them, ${money(a.avg, true)} and no losing run. The holding fee alone adds ${money(h.hold)}.`;
+  else v = `The new fees take depositors from ${money(t.avg, true)} to ${money(a.avg, true)} on average, and the worst run from ${money(t.worst, true)} to ${money(a.worst, true)}.`;
+  if (c.v["profit share"].share > 0) v += ` The profit share adds only ${money(c.v["profit share"].share)} for depositors.`;
+  $("incomeVerdict").innerHTML = `<h3>In this market</h3><p>${v}</p>`;
+  $("incomeTable").innerHTML = `<thead><tr><th>Where depositors' money came from</th>${IV.map(([, n]) => `<th class="r">${n}</th>`).join("")}</tr></thead><tbody>` +
+    [["Trading fees", "fees"], ["Vault's positions (other side of traders)", "positions"], ["Holding fee", "hold"], ["Crowded-side fee", "side"], ["Profit share", "share"]]
+      .map(([n, f]) => `<tr><td>${n}</td>${IV.map(([k]) => `<td class="r">${c.v[k][f] ? signed(c.v[k][f]) : '<span class="dim">—</span>'}</td>`).join("")}</tr>`).join("") +
+    `<tr class="total"><td>Depositors, average</td>${IV.map(([k]) => `<td class="r">${signed(c.v[k].avg)}</td>`).join("")}</tr></tbody>`;
+}
+try { const k = localStorage.getItem("hedgelab-ic"); if (k && ICASES[k]) st.ic = k; } catch {}
+
+function renderAll() { renderControls(); renderCards(); renderPnl(); renderLedger(); renderLog(); }
+renderStory(); renderAll(); renderIncome(); renderTakeaways();
+let rt; addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(() => { renderStory(); renderPnl(); }, 150); });
+matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", () => { renderStory(); renderPnl(); });
+new MutationObserver(() => { renderStory(); renderPnl(); }).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+</script>

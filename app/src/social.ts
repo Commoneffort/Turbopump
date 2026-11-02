@@ -390,3 +390,22 @@ export async function loadNotes(conn: Connection, wallet: PublicKey, limit = 60)
   }
   return out;
 }
+
+
+// ---------------------------------------------------------------- reading a record
+
+/** Share of trading days that ended up (undefined with none). */
+export const winRatio = (r: TraderRow) => (r.daysUp + r.daysDown ? r.daysUp / (r.daysUp + r.daysDown) : undefined);
+
+/** How bullish an account is, 0 (all bearish) to 1 (all bullish): its open positions' value long
+ *  against short, or with nothing open, the share of buying in its recent trades. */
+export function leanOf(r: TraderRow): { bull: number; from: "positions" | "trades" | "none" } {
+  const long = r.positions.filter(p => p.size > 0).reduce((t, p) => t + Math.abs(p.notional), 0);
+  const short = r.positions.filter(p => p.size < 0).reduce((t, p) => t + Math.abs(p.notional), 0);
+  if (long + short > 0) return { bull: long / (long + short), from: "positions" };
+  const fills = r.stats?.fills ?? [];
+  const buy = fills.filter(f => f.size > 0).reduce((t, f) => t + Math.abs(f.size * f.price), 0);
+  const all = fills.reduce((t, f) => t + Math.abs(f.size * f.price), 0);
+  return all > 0 ? { bull: buy / all, from: "trades" } : { bull: 0.5, from: "none" };
+}
+export const leanName = (bull: number) => (bull >= 0.55 ? "Bullish" : bull <= 0.45 ? "Bearish" : "Neutral");

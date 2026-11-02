@@ -7,7 +7,7 @@ import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "reac
 import { useWallet } from "@solana/wallet-adapter-react";
 import * as C from "./chain";
 import * as S from "./social";
-import { Badge, nameOf, tagOf, useActions, useBoard, useMe } from "./Traders";
+import { Badge, Lean, nameOf, tagOf, useActions, useBoard, useMe } from "./Traders";
 import { Send, ago, explorer, fmt, priceDp, useCards } from "./shared";
 import { view } from "./view";
 
@@ -49,7 +49,7 @@ export function TraderModalHost({ send, busy, tick, go }: { send: Send; busy?: s
 }
 
 /** The market account, for every asset's margins and prices (read once a minute). */
-function useMarket(tick: number) {
+export function useMarket(tick: number) {
   const [m, setM] = useState<Uint8Array>();
   const at = useRef(0);
   useEffect(() => {
@@ -77,24 +77,11 @@ function TraderIntel({ wallet, send, busy, tick, go }: { wallet: string; send: S
 
   // Positions with their prices, margins and liquidation prices (cross margin: each one's price
   // moving alone, the account's other positions held where they are).
-  const positions = useMemo(() => {
-    if (!r) return [];
-    const lv = (a: number) => (market ? C.levels(market, a) : undefined);
-    const priceOf = (a: number, fallback: number) => (market ? Number(C.decodeAsset(market, a).price) / 1e6 : fallback);
-    return r.positions.filter(p => p.size !== 0).map(p => {
-      const price = priceOf(p.asset, Math.abs(p.notional / p.size));
-      const l = lv(p.asset) ? Number(lv(p.asset)!.liq) / 10_000 : 0.035;
-      const otherFloor = r.positions.filter(q => q.asset !== p.asset).reduce((t, q) => t + Math.abs(q.notional) * (lv(q.asset) ? Number(lv(q.asset)!.liq) / 10_000 : 0.035), 0);
-      const x = (otherFloor - r.equity + p.size * price) / (p.size - l * Math.abs(p.size));
-      const liq = Number.isFinite(x) && x > 0 ? x : undefined;
-      const open = lv(p.asset) ? Number(lv(p.asset)!.open) / 10_000 : 0.05;
-      return { ...p, sym: symbol(p.asset), price, liq, dist: liq ? (p.size > 0 ? (price - liq) / price : (liq - price) / price) : undefined, margin: Math.abs(p.notional) * open };
-    }).sort((a, b) => Math.abs(b.notional) - Math.abs(a.notional));
-  }, [r, market, cards]);
+  const positions = useMemo(() => (r ? positionsOf(r, market, symbol) : []), [r, market, cards]);
 
   const header = (
     <div className="ti-head">
-      <Badge wallet={wallet} profile={r?.profile ?? board?.profiles.get(wallet)} size={46} />
+      <Badge wallet={wallet} profile={r?.profile ?? board?.profiles.get(wallet)} size={56} />
       <div className="ti-name">
         <h2>{name}{tag && <em>{tag}</em>}{isMe && <em>you</em>}{r?.liquidatable && <em className="bad">below its liquidation level</em>}</h2>
         <div className="ti-addr mono">
@@ -105,6 +92,7 @@ function TraderIntel({ wallet, send, busy, tick, go }: { wallet: string; send: S
         </div>
       </div>
       <div className="ti-acts">
+        {r && <Lean row={r} big />}
         {!isMe && publicKey && (me.following.has(wallet)
           ? <button className="btn ghost" disabled={!!busy} onClick={() => act.unfollow(wallet, name)}>Following ✓</button>
           : <button className="btn ghost" disabled={!!busy} onClick={() => act.follow(wallet, name)}>Follow</button>)}
@@ -134,6 +122,7 @@ function TraderIntel({ wallet, send, busy, tick, go }: { wallet: string; send: S
   const month = dailies.reduce((a, b) => a + b, 0);
   const atWork = s.startEquity + s.deposited;
   const markets = [...new Set(fills.map(f => symbol(f.asset)))];
+  const win = S.winRatio(r), lean = S.leanOf(r);
   const tile = (label: string, value: string, cls = "", sub?: string, title?: string) => <div className="ti-tile" title={title}><span>{label}</span><b className={`mono ${cls}`}>{value}</b>{sub && <i>{sub}</i>}</div>;
 
   return (
@@ -143,16 +132,30 @@ function TraderIntel({ wallet, send, busy, tick, go }: { wallet: string; send: S
         {tile("Account value", money(r.equity), "", `${money(atWork, 0)} paid in`, "Equity now: capital plus profit, positions marked at the oracle price")}
         {tile("Profit, all time", signed(r.pnl), tone(r.pnl), `since ${new Date(s.startTime * 1000).toISOString().slice(0, 10)}`)}
         {tile("Return", pct(r.roi), tone(r.roi), "on the money at work")}
+        {tile("Win ratio", win === undefined ? "—" : `${fmt(win * 100, 0)}%`, win === undefined ? "" : win >= 0.5 ? "up" : "down", `${r.daysUp} of ${r.daysUp + r.daysDown} days up`, "Share of its trading days that ended up")}
         {tile("Last 30 trading days", signed(month), tone(month), `${s.days.length} day${s.days.length === 1 ? "" : "s"} with fills`)}
         {tile("Leverage", r.leverage > 0 ? `${fmt(r.leverage, 1)}×` : "flat", r.leverage > 10 ? "down" : "", `${money(notional, 0)} in positions`, "Everything it holds divided by its equity")}
         {tile("Margin used", `${fmt(marginUsed * 100, 0)}%`, marginUsed > 0.8 ? "down" : "", "of its equity", "The margin its positions need to stay open, against what it has")}
-        {tile("Direction now", notional ? (longN >= shortN ? `${fmt(longN / notional * 100, 0)}% long` : `${fmt(shortN / notional * 100, 0)}% short`) : "flat", notional ? (longN >= shortN ? "up" : "down") : "", notional ? `${money(longN, 0)} long · ${money(shortN, 0)} short` : undefined)}
         {tile("Following it", `${r.copiers} copy`, "", `${r.followers} follow`)}
       </div>
 
-      <div className="ti-top">
+      <div className="ti-main">
         <section className="ti-card ti-chart">
           <PnlChart stats={s} now={r.pnl} />
+        </section>
+        <section className="ti-card ti-dials">
+          <div className="ti-dial">
+            <h3>Win ratio</h3>
+            <Ring value={win} />
+            <div className="ti-dial-l mono"><span className="up">{r.daysUp} up</span><span className="down">{r.daysDown} down</span></div>
+            <p className="muted small">{r.profitFactor === undefined ? "No losing day yet." : `Makes ${fmt(r.profitFactor, 2)} for every 1 it loses.`}</p>
+          </div>
+          <div className="ti-dial">
+            <h3>Sentiment</h3>
+            <Gauge bull={lean.bull} none={lean.from === "none"} />
+            <div className="ti-dial-l mono"><span className="down">Bearish {fmt((1 - lean.bull) * 100, 0)}%</span><span className="up">Bullish {fmt(lean.bull * 100, 0)}%</span></div>
+            <p className="muted small">{lean.from === "positions" ? `From its open positions: ${money(longN, 0)} long, ${money(shortN, 0)} short.` : lean.from === "trades" ? `Nothing open: from its last ${fills.length} trades (${fmt(buyShare * 100, 0)}% buying).` : "No positions or trades yet."}</p>
+          </div>
         </section>
         <section className="ti-card ti-book">
           <div className="ti-tabs">
@@ -259,7 +262,7 @@ function readOf(x: { r: S.TraderRow; s: S.Stats; perDay: number; buyShare: numbe
 
 /** The profit since the record started, day by day (cumulative, with each day's result as bars),
  *  ending at the live value. Hover for the day. */
-function PnlChart({ stats, now }: { stats: S.Stats; now: number }) {
+export function PnlChart({ stats, now }: { stats: S.Stats; now: number }) {
   const [hover, setHover] = useState<number>();
   const [span, setSpan] = useState<"7" | "30" | "all">("all");
   const box = useRef<SVGSVGElement>(null);
@@ -328,4 +331,49 @@ function PnlChart({ stats, now }: { stats: S.Stats; now: number }) {
       </svg>
     </div>
   );
+}
+
+/** A ring filled to a share (the win ratio). */
+export function Ring({ value }: { value?: number }) {
+  const R = 46, C2 = 2 * Math.PI * R, v = value ?? 0;
+  return (
+    <svg viewBox="0 0 120 120" className="ti-ring" role="img" aria-label={value === undefined ? "No trading days yet" : `${Math.round(v * 100)}% of trading days up`}>
+      <circle cx="60" cy="60" r={R} className="ti-ring-bg" />
+      {value !== undefined && <circle cx="60" cy="60" r={R} className={`ti-ring-fg ${v >= 0.5 ? "up" : "down"}`} strokeDasharray={`${C2 * v} ${C2}`} transform="rotate(-90 60 60)" />}
+      <text x="60" y="66" textAnchor="middle" className="ti-ring-t">{value === undefined ? "—" : `${Math.round(v * 100)}%`}</text>
+    </svg>
+  );
+}
+
+/** A half dial from bearish (left) to bullish (right) with a needle. */
+export function Gauge({ bull, none }: { bull: number; none?: boolean }) {
+  const a = Math.PI * (1 - bull), cx = 70, cy = 66, R = 54;
+  const arc = (from: number, to: number) => { const x1 = cx + R * Math.cos(from), y1 = cy - R * Math.sin(from), x2 = cx + R * Math.cos(to), y2 = cy - R * Math.sin(to); return `M${x1},${y1} A${R},${R} 0 0 1 ${x2},${y2}`; };
+  const name = none ? "—" : S.leanName(bull);
+  return (
+    <svg viewBox="0 0 140 84" className="ti-gauge" role="img" aria-label={none ? "No direction yet" : `${name}: ${Math.round(bull * 100)}% bullish`}>
+      <path d={arc(Math.PI, Math.PI * 0.55)} className="ti-g-down" />
+      <path d={arc(Math.PI * 0.53, Math.PI * 0.47)} className="ti-g-mid" />
+      <path d={arc(Math.PI * 0.45, 0)} className="ti-g-up" />
+      {!none && <line x1={cx} y1={cy} x2={cx + (R - 12) * Math.cos(a)} y2={cy - (R - 12) * Math.sin(a)} className="ti-g-needle" />}
+      <circle cx={cx} cy={cy} r="4" className="ti-g-hub" />
+      <text x={cx} y={cy + 16} textAnchor="middle" className={`ti-g-t ${name === "Bullish" ? "up" : name === "Bearish" ? "down" : ""}`}>{name}</text>
+    </svg>
+  );
+}
+
+/** An account's positions with their prices, margins and liquidation prices (cross margin: each
+ *  one's price moving alone, the account's other positions held where they are). */
+export function positionsOf(r: S.TraderRow, market: Uint8Array | undefined, symbol: (asset: number) => string) {
+  const lv = (a: number) => (market ? C.levels(market, a) : undefined);
+  const priceOf = (a: number, fallback: number) => (market ? Number(C.decodeAsset(market, a).price) / 1e6 : fallback);
+  return r.positions.filter(p => p.size !== 0).map(p => {
+    const price = priceOf(p.asset, Math.abs(p.notional / p.size));
+    const l = lv(p.asset) ? Number(lv(p.asset)!.liq) / 10_000 : 0.035;
+    const otherFloor = r.positions.filter(q => q.asset !== p.asset).reduce((t, q) => t + Math.abs(q.notional) * (lv(q.asset) ? Number(lv(q.asset)!.liq) / 10_000 : 0.035), 0);
+    const x = (otherFloor - r.equity + p.size * price) / (p.size - l * Math.abs(p.size));
+    const liq = Number.isFinite(x) && x > 0 ? x : undefined;
+    const open = lv(p.asset) ? Number(lv(p.asset)!.open) / 10_000 : 0.05;
+    return { ...p, sym: symbol(p.asset), price, liq, dist: liq ? (p.size > 0 ? (price - liq) / price : (liq - price) / price) : undefined, margin: Math.abs(p.notional) * open };
+  }).sort((a, b) => Math.abs(b.notional) - Math.abs(a.notional));
 }

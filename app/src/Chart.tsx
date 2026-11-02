@@ -179,12 +179,15 @@ export type Trade = { key: string; time: number; price: number; size: number };
 
 /** What the chart can show on top of the candles. Each one can be switched off, and "Clear chart"
  *  switches them all off at once (and the same button brings them back). */
-type Layers = { mine: boolean; follow: boolean; whales: boolean; lines: boolean; studies: boolean; drawings: boolean };
-const ALL_ON: Layers = { mine: true, follow: true, whales: false, lines: true, studies: true, drawings: true };
-const NOTHING: Layers = { mine: false, follow: false, whales: false, lines: false, studies: false, drawings: false };
+type Layers = { mine: boolean; follow: boolean; whales: boolean; lines: boolean; studies: boolean; drawings: boolean; heat: boolean };
+const ALL_ON: Layers = { mine: true, follow: true, whales: false, lines: true, studies: true, drawings: true, heat: false };
+const NOTHING: Layers = { mine: false, follow: false, whales: false, lines: false, studies: false, drawings: false, heat: false };
 const shown = (l: Layers) => Object.values(l).some(Boolean);
 
-export default function Chart({ symbol, label, price, lines, marks = [], mine, whales, slot = 0, compact = false, dense = false, head }: { symbol: string; label?: string; price: number; lines: Line[]; marks?: Mark[]; mine?: Trade[]; whales?: Whale[]; slot?: number; compact?: boolean; dense?: boolean; head?: ReactNode }) {
+/** A price at which open positions would be liquidated, and how much (dollars). */
+export type HeatLevel = { price: number; value: number };
+
+export default function Chart({ symbol, label, price, lines, marks = [], mine, whales, heat, slot = 0, compact = false, dense = false, head }: { symbol: string; label?: string; price: number; lines: Line[]; marks?: Mark[]; mine?: Trade[]; whales?: Whale[]; heat?: HeatLevel[]; slot?: number; compact?: boolean; dense?: boolean; head?: ReactNode }) {
   const name = label ?? `${symbol}`, spot = isSpot(symbol);
   const own = slot ? `:${slot}` : "";
   const el = useRef<HTMLDivElement>(null);
@@ -370,6 +373,16 @@ export default function Chart({ symbol, label, price, lines, marks = [], mine, w
     }
   }, [lineKey, symbol, res, layers.lines]);
 
+  // Liquidation heatmap (one overlay that draws every level as a band).
+  const heatKey = useMemo(() => (heat ?? []).map(h => `${h.price.toFixed(dp)}:${Math.round(h.value)}`).join("|"), [heat, dp]);
+  useEffect(() => {
+    const c = chart.current;
+    if (!c) return;
+    c.removeOverlay({ groupId: "heat" });
+    if (!layers.heat || !heat?.length) return;
+    c.createOverlay({ name: "liqHeat", groupId: "heat", lock: true, points: [{ value: price || heat[0].price }], extendData: { levels: heat } } as any);
+  }, [heatKey, symbol, res, layers.heat]);
+
   // Trades of the traders this wallet follows or copies: their badge at the candle and price of
   // each fill, under the candle for a buy and over it for a sell.
   const markKey = useMemo(() => marks.map(m => m.key).join("|"), [marks]);
@@ -490,6 +503,7 @@ export default function Chart({ symbol, label, price, lines, marks = [], mine, w
                   )}
                 </>}
                 <div className="studies-h">On the price</div>
+                {heat && <button className={layers.heat ? "on" : ""} onClick={() => layer("heat", !layers.heat)} title="Where open positions on this market would be liquidated: brighter bands hold more. Estimated from each account's equity and positions now."><span className="lay-dots"><b className="heat" /></span>Liquidation heatmap<em>{heat.length}</em><i /></button>}
                 <button className={layers.lines ? "on" : ""} onClick={() => layer("lines", !layers.lines)}><span className="lay-dots"><b className="line" /></span>Position and order lines<em>{lines.filter(l => l.price > 0).length}</em><i /></button>
                 <button className={layers.studies ? "on" : ""} onClick={() => layer("studies", !layers.studies)}><span className="lay-dots"><b className="line" /></span>Indicators<em>{studies.length}</em><i /></button>
                 <button className={layers.drawings ? "on" : ""} onClick={() => layer("drawings", !layers.drawings)}><span className="lay-dots"><b className="line" /></span>My drawings<em /><i /></button>
@@ -499,6 +513,14 @@ export default function Chart({ symbol, label, price, lines, marks = [], mine, w
                 </div>
               </div>
             )}
+          </div>
+        )}
+        {!spot && heat && (
+          <div className="studies">
+            <button className={layers.heat ? "on" : ""} onClick={() => layer("heat", !layers.heat)} title="Liquidation heatmap: bands where open positions would be liquidated, brighter where more would be">
+              <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden><path d="M2 3h12M2 6.5h12M2 10h12M2 13.5h12" stroke="currentColor" strokeWidth="2" opacity="0.9" /></svg>
+              Heatmap
+            </button>
           </div>
         )}
         {spot && <div className="chart-src" title="Where the candles come from: xDEX's record of this pair's swaps. The last one follows the pool's own price.">xDEX swaps · live pool price</div>}

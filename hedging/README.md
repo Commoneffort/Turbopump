@@ -430,3 +430,20 @@ Not done, on purpose:
 - The test network's prices are its own. Where they are further from Percolator's than
   `maxBasisBps`, the hedger holds; that is the limit working, not a fault.
 - Mainnet prices, sizes and venue lot sizes: the defaults are sized for the devnet vaults.
+
+## Demo: does hedging pay the depositors? (`npm run demo`)
+
+`npx tsx demo/fetch-hl.ts` downloads 14 days of Hyperliquid's public 5-minute prices and hourly
+funding for BTC, ETH and SOL (read-only; it lives outside `src/` so nothing in `src/` names the
+real exchange). `npm run demo [-- seeds=8 venueFee=5 spread=1 only=<scenario>]` replays them
+minute by minute with a simulated crowd and copiers of "leaders" of chosen skill, and runs four
+strategies through the real engine on the same trades: `none`, `all` (the whole vault),
+`copy` (only the vault's position against copiers), `smart` (only copiers of leaders whose
+record on our platform is winning). Model: `src/copyflow.ts`; results in `demo/results-*.json`.
+
+Result of 2026-10-29 (Oct 15-29, a sideways market; 3 vaults of $100k, 5 bps trading fee, 8 runs):
+no hedge earned the most on average in every scenario; hedging everything removed almost all
+risk (worst day about $0) but cost 40-75% of the profit; `smart` with maker-priced hedging (2 bps)
+matched no hedge on average when a popular winning leader was copied (big-star: $3,907 vs $3,865)
+and cut the worst run from -$3,307 to -$172. Taker hedging (5 bps + spread) costs more than the
+fee income it protects.

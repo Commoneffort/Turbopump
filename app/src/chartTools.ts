@@ -227,6 +227,57 @@ export function registerChartTools() {
   // A position, or one of its levels (liquidation, TP, SL): a dashed line across the chart with its
   // label in a badge at the plot's left edge, clear of the newest candles (all of it readable: "▲ ETH LONG 0.42 · +$1.20 (+0.1%)"), and
   // the price in the axis. extendData: { text, color }.
+  // Liquidation heatmap: where open positions would be liquidated, as glowing bands across the
+  // price pane (dim purple for a little, bright yellow for the most). Levels are bucketed into
+  // rows of a few pixels and softened a little, so close levels read as one band.
+  registerOverlay({
+    name: "liqHeat",
+    totalStep: 1,
+    needDefaultPointFigure: false,
+    needDefaultXAxisFigure: false,
+    needDefaultYAxisFigure: false,
+    createPointFigures: ({ bounding, overlay, yAxis }) => {
+      const levels = ((overlay.extendData ?? {}) as { levels?: { price: number; value: number }[] }).levels ?? [];
+      if (!yAxis || !levels.length) return [];
+      const ROW = 4, n = Math.ceil(bounding.height / ROW);
+      const rows = new Array<number>(n + 2).fill(0);
+      let above = 0, below = 0, nearUp = Infinity, nearDown = -Infinity;
+      for (const l of levels) {
+        const y = yAxis.convertToPixel(l.price);
+        if (y < 0) { above += l.value; nearUp = Math.min(nearUp, l.price); continue; }
+        if (!(y < bounding.height)) { below += l.value; nearDown = Math.max(nearDown, l.price); continue; }
+        rows[Math.floor(y / ROW)] += l.value;
+      }
+      const usd = (v: number) => (v >= 1e6 ? `$${(v / 1e6).toFixed(2)}M` : v >= 1e3 ? `$${(v / 1e3).toFixed(1)}k` : `$${v.toFixed(0)}`);
+      const px = (p: number) => (p >= 1000 ? p.toFixed(0) : p >= 1 ? p.toFixed(2) : p.toPrecision(4));
+      const tag = (y: number, text: string, base: "top" | "bottom") => ({ type: "text", ignoreEvent: true, attrs: { x: bounding.width / 2, y, text, align: "center", baseline: base }, styles: { color: "#000", size: 11, weight: 600, family: FONT, backgroundColor: "#FFD614", borderColor: "#FFD614", borderRadius: 4, paddingLeft: 8, paddingRight: 8, paddingTop: 3, paddingBottom: 3 } });
+      const out: any[] = [];
+      // Levels outside the visible prices: say where they are, so the heatmap never looks empty.
+      if (above > 0) out.push(tag(6, `▲ ${usd(above)} liquidated above, nearest ${px(nearUp)}: zoom out to see`, "top"));
+      if (below > 0) out.push(tag(bounding.height - 6, `▼ ${usd(below)} liquidated below, nearest ${px(nearDown)}: zoom out to see`, "bottom"));
+      const soft = rows.map((v, i) => v + 0.45 * ((rows[i - 1] ?? 0) + (rows[i + 1] ?? 0)) + 0.15 * ((rows[i - 2] ?? 0) + (rows[i + 2] ?? 0)));
+      const top = Math.max(...soft);
+      if (!(top > 0)) return out;
+      soft.forEach((v, i) => {
+        if (v <= top * 0.02) return;
+        const f = Math.sqrt(v / top);
+        // purple (little) -> orange -> yellow (most)
+        const r = Math.round(110 + 145 * f), g = Math.round(40 + 174 * f * f), b = Math.round(170 * (1 - f) + 20 * f);
+        out.unshift({ type: "rect", ignoreEvent: true, attrs: { x: 0, y: i * ROW, width: bounding.width, height: ROW }, styles: { style: "fill", color: `rgba(${r},${g},${b},${(0.16 + 0.55 * f).toFixed(3)})` } });
+      });
+      // Dollar labels on the strongest bands (at most four, kept apart).
+      const picked: number[] = [];
+      for (const i of soft.map((v, i) => i).filter(i => rows[i] > 0).sort((a, b) => soft[b] - soft[a])) {
+        if (picked.length >= 4) break;
+        if (picked.some(j => Math.abs(j - i) < 5)) continue;
+        picked.push(i);
+        const yy = i * ROW + ROW / 2, v = rows.slice(Math.max(0, i - 2), i + 3).reduce((t, x) => t + x, 0);
+        out.push({ type: "text", ignoreEvent: true, attrs: { x: bounding.width - 8, y: yy, text: `${usd(v)} liq.`, align: "right", baseline: "middle" }, styles: { color: "#FFFFFF", size: 10.5, weight: 600, family: FONT, backgroundColor: "rgba(0,0,0,0.65)", borderColor: "rgba(0,0,0,0)", borderRadius: 3, paddingLeft: 5, paddingRight: 5, paddingTop: 2, paddingBottom: 2 } });
+      }
+      return out;
+    },
+  });
+
   registerOverlay({
     name: "positionLine",
     totalStep: 1,

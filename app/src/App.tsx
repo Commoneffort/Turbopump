@@ -5,11 +5,13 @@ import { PublicKey, Transaction } from "@solana/web3.js";
 import bs58 from "bs58";
 import { createAssociatedTokenAccountIdempotentInstruction } from "@solana/spl-token";
 import * as C from "./chain";
+import * as S from "./social";
 import { readDirect, view } from "./view";
 import Desk from "./Desk";
 import Docs from "./Docs";
 import HealthPage from "./Health";
 import ExecutionPage from "./Execution";
+import PortfolioPage from "./Portfolio";
 import SpotDesk from "./Spot";
 import { TraderPage, TradersPage } from "./Traders";
 import { TraderModalHost } from "./TraderIntel";
@@ -129,8 +131,9 @@ export default function App() {
           <a className={tab(desk && !spot)} href="#/">Trade</a>
           <a className={tab(spot)} href="#/spot">Spot</a>
           <a className={tab(page === "markets")} href="#/markets">Markets</a>
+          <a className={tab(page === "portfolio")} href="#/portfolio">Portfolio</a>
           <a className={tab(page === "launch")} href="#/launch">Open a market</a>
-          <a className={tab(page === "traders" || page === "trader" || page === "leaderboard")} href="#/leaderboard">Leaderboard</a>
+          <a className={tab(page === "traders" || page === "trader" || page === "leaderboard")} href="#/leaderboard">Leaderboard<em className="tab-prize" title="Weekly trading contest">🏆 ${S.CONTEST.prizes.reduce((a, b) => a + b, 0)}</em></a>
           <a className={tab(page === "execution")} href="#/execution">Execution</a>
           <a className={tab(page === "health")} href="#/health">Health</a>
           <a className={tab(page === "how" || page === "docs")} href="#/docs">Docs</a>
@@ -149,7 +152,7 @@ export default function App() {
       ) : desk ? (
         <Desk route={route} send={send} busy={busy} tick={tick} go={go} />
       ) : (
-        <div className="page">
+        <div className={`page${page === "how" || page === "docs" ? "" : " wide"}`}>
           {C.X1 && (
             <p className="muted small net-note">
               X1 testnet: the same programs as on Solana devnet, with test USDC as collateral. X1 has no Pyth, so prices here are posted by the
@@ -161,6 +164,8 @@ export default function App() {
             <LaunchPage key={route[1] ?? ""} send={send} busy={busy} go={go} initial={route[1]} />
           ) : page === "health" ? (
             <HealthPage tick={tick} />
+          ) : page === "portfolio" ? (
+            <PortfolioPage tick={tick} go={go} />
           ) : page === "execution" ? (
             <ExecutionPage tick={tick} />
           ) : page === "how" || page === "docs" ? (

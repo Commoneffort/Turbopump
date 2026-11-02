@@ -7,11 +7,15 @@ import { useWallet } from "@solana/wallet-adapter-react";
 import * as C from "./chain";
 import * as S from "./social";
 import { Crowd, Queue, Trades, Who, Whale, useExecReport, useMarketOrders } from "./Pulse";
-import { Card, ago, explorer, fmt, num, useActivity } from "./shared";
+import { Card, Send, ago, explorer, fmt, num, useActivity } from "./shared";
+import { useConnection } from "@solana/wallet-adapter-react";
+import * as Chat from "./chat";
+import { fetchCandles } from "./Chart";
+import { useMemo } from "react";
 
-type Ctx = { state: C.State; tick: number; board?: S.Board; fills: Whale[]; markets: Card[]; go: (to: string) => void };
+type Ctx = { state: C.State; tick: number; board?: S.Board; fills: Whale[]; markets: Card[]; go: (to: string) => void; send?: Send; busy?: string; onHide?: () => void };
 /** `big`: drawn in the full-screen view (more rows, more detail). */
-type Widget = { id: string; title: string; about: string; render: (c: Ctx, big?: boolean) => ReactNode };
+type Widget = { id: string; title: string; about: string; accent?: string; render: (c: Ctx, big?: boolean) => ReactNode };
 
 const money = (x: number, dp?: number) => {
   const a = Math.abs(x), s = x < 0 ? "−" : "";
@@ -21,15 +25,17 @@ const money0 = (x: number) => money(x, 0);
 const qty = (x: number) => fmt(Math.abs(x), Math.abs(x) >= 100 ? 1 : Math.abs(x) >= 1 ? 3 : 4);
 
 const WIDGETS: Widget[] = [
-  { id: "crowd", title: "Long / short", about: "How traders lean on this market", render: c => <Crowd state={c.state} board={c.board} /> },
-  { id: "queue", title: "Queue", about: "Trades waiting a few seconds for their price", render: c => <Queue state={c.state} fills={c.fills} board={c.board} go={c.go} bare /> },
-  { id: "trades", title: "Trades", about: "Every fill on this market, newest first", render: (c, big) => <Trades fills={c.fills} board={c.board} sym={c.state.vault.feed?.symbol ?? ""} go={c.go} limit={big ? 300 : 40} /> },
-  { id: "liqs", title: "Liquidations", about: "Where open positions would be liquidated, by price, and the liquidations so far", render: (c, big) => <Liquidations state={c.state} board={c.board} big={big} /> },
-  { id: "twaps", title: "TWAPs", about: "Large orders being traded in slices, by anyone", render: c => <Twaps state={c.state} tick={c.tick} board={c.board} go={c.go} /> },
-  { id: "positions", title: "Open positions", about: "The largest positions on this market, with their liquidation prices", render: (c, big) => <Positions state={c.state} board={c.board} go={c.go} big={big} /> },
-  { id: "top", title: "Top traders", about: "Most profit across all markets", render: (c, big) => <TopTraders board={c.board} go={c.go} big={big} /> },
-  { id: "calc", title: "Position size calculator", about: "How big a trade to make for the risk you choose", render: c => <SizeCalc state={c.state} /> },
-  { id: "vault", title: "Vault events", about: "Deposits, withdrawals and the vault's own trades", render: c => <VaultEvents state={c.state} tick={c.tick} /> },
+  { id: "crowd", accent: "#2BD67B", title: "Long / short", about: "How traders lean on this market", render: c => <Crowd state={c.state} board={c.board} /> },
+  { id: "queue", accent: "#8B9BB4", title: "Queue", about: "Trades waiting a few seconds for their price", render: c => <Queue state={c.state} fills={c.fills} board={c.board} go={c.go} bare /> },
+  { id: "trades", accent: "#5AA9FF", title: "Trades", about: "Every fill on this market, newest first", render: (c, big) => <Trades fills={c.fills} board={c.board} sym={c.state.vault.feed?.symbol ?? ""} go={c.go} limit={big ? 300 : 40} /> },
+  { id: "liqs", accent: "#FF8A1E", title: "Liquidations", about: "Where open positions would be liquidated, by price, and the liquidations so far", render: (c, big) => <Liquidations state={c.state} board={c.board} big={big} /> },
+  { id: "twaps", accent: "#B98CFF", title: "TWAPs", about: "Large orders being traded in slices, by anyone", render: c => <Twaps state={c.state} tick={c.tick} board={c.board} go={c.go} /> },
+  { id: "positions", accent: "#F0B90B", title: "Open positions", about: "The largest positions on this market, with their liquidation prices", render: (c, big) => <Positions state={c.state} board={c.board} go={c.go} big={big} /> },
+  { id: "top", accent: "#FFD614", title: "Top traders", about: "Most profit across all markets", render: (c, big) => <TopTraders board={c.board} go={c.go} big={big} /> },
+  { id: "chat", accent: "#4FD1C5", title: "Messages", about: "What traders post about this market (public, on chain)", render: (c, big) => <Messages state={c.state} board={c.board} send={c.send} busy={c.busy} big={big} /> },
+  { id: "x", accent: "#E7E9EA", title: "X FEED", about: "Latest posts from big, reputable crypto accounts on X (Saylor, Bitcoin Magazine, Solana, Vitalik, Kobeissi…)", render: (c, big) => <XFeed sym={c.state.vault.feed?.symbol ?? ""} big={big} /> },
+  { id: "calc", accent: "#FF6670", title: "Position size calculator", about: "How big a trade to make for the risk you choose", render: c => <SizeCalc state={c.state} send={c.send} busy={c.busy} board={c.board} /> },
+  { id: "vault", accent: "#7C8CF8", title: "Vault events", about: "Deposits, withdrawals and the vault's own trades", render: c => <VaultEvents state={c.state} tick={c.tick} /> },
 ];
 const DEFAULT = ["crowd", "queue", "trades"];
 const KEY = "pv:widgets";
@@ -66,6 +72,7 @@ export function WidgetPanel(ctx: Ctx) {
     <div className="wgs">
       <div className="wg-bar" ref={box}>
         <h3>Widgets</h3>
+        {ctx.onHide && <button className="wg-hide" onClick={ctx.onHide} title="Hide the widgets column: the chart and market bar take its place. The white Widgets button brings it back.">Hide</button>}
         <button className={`wg-add${menu ? " on" : ""}`} onClick={() => setMenu(m => !m)} aria-expanded={menu} title="Add or remove widgets">
           <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden><path d="M6 1.5v9M1.5 6h9" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" /></svg>
           Add
@@ -88,7 +95,7 @@ export function WidgetPanel(ctx: Ctx) {
       {ids.map((id, i) => {
         const w = WIDGETS.find(x => x.id === id)!;
         return (
-          <section key={id} className={`wg wg-${id}`}>
+          <section key={id} className={`wg wg-${id}`} style={{ ["--wg-accent" as any]: w.accent ?? "var(--accent-green)" }}>
             <div className="wg-h">
               <h4 title={w.about}>{w.title}</h4>
               <span className="wg-tools">
@@ -172,7 +179,7 @@ function Liquidations({ state, board, big }: { state: C.State; board?: S.Board; 
     <div className={`liqw${big ? " big" : ""}`}>
       {!big && (
         <div className="liqw-tabs">
-          <button className={tab === "map" ? "on" : ""} onClick={() => setTab("map")}>Levels</button>
+          <button className={tab === "map" ? "on" : ""} onClick={() => setTab("map")}>Heatmap</button>
           <button className={tab === "history" ? "on" : ""} onClick={() => setTab("history")}>Happened</button>
         </div>
       )}
@@ -182,7 +189,9 @@ function Liquidations({ state, board, big }: { state: C.State; board?: S.Board; 
           <span className="muted">Range</span>
           {RANGES.map(r => <button key={r} className={r === range ? "on" : ""} onClick={() => setRange(r)}>±{r * 100}%</button>)}
         </div>
-        <LiqMap levels={levels} price={p0} range={range} big={!!big} dp={dp} sym={sym} />
+        <LiqChart levels={levels} price={p0} range={range} big={!!big} dp={dp} sym={sym} />
+        {big && <h4 className="liqw-sub">Liquidations by price</h4>}
+        {big && <LiqMap levels={levels} price={p0} range={range} big dp={dp} sym={sym} />}
         {big && <p className="liqw-note muted">
           {levels.length} open position{levels.length === 1 ? "" : "s"} on {sym}. Each bar is how much would be liquidated if the price reached that range
           (estimated from each account's equity and positions now; profit, fees and other markets moving change it). Hover a bar for details.
@@ -254,6 +263,90 @@ function LiqMap({ levels, price, range, big, dp, sym }: { levels: LiqLevel[]; pr
         <span><i className="sw short" />shorts liquidated</span>
         {big && <span className="muted">lines: running total from the price · largest bar {money(top)}</span>}
         {outside > 0 && <span className="muted">{outside} level{outside === 1 ? "" : "s"} outside ±{range * 100}%</span>}
+      </div>}
+    </div>
+  );
+}
+
+/** The price over the last hours, and on the right the liquidation profile: one bar per price
+ *  range, as long as the value that would be liquidated there (longs in red below the price,
+ *  shorts in green above it). Levels beyond the range are totalled under the chart. */
+function LiqChart({ levels, price, range, big, dp, sym }: { levels: LiqLevel[]; price: number; range: number; big: boolean; dp: number; sym: string }) {
+  const res = big ? 3600 : 900, limit = big ? 168 : 96;
+  const [candles, setCandles] = useState<[number, number, number, number, number, number][]>([]);
+  const [hover, setHover] = useState<number>();
+  useEffect(() => {
+    let on = true;
+    fetchCandles(sym, res, limit).then(h => on && setCandles(h.candles.slice(-limit) as any)).catch(() => undefined);
+    return () => { on = false; };
+  }, [sym, res, limit]);
+  const W = big ? 1100 : 320, H = big ? 420 : 190, padR = big ? 62 : 46, padB = 16, padT = 6, plotW = W - padR, plotH = H - padB - padT;
+  const lo = price * (1 - range), hi = price * (1 + range);
+  const ROWS = big ? 40 : 24, step = (hi - lo) / ROWS;
+  const rows = useMemo(() => {
+    const r = Array.from({ length: ROWS }, (_, i) => ({ from: lo + i * step, to: lo + (i + 1) * step, long: 0, short: 0, n: 0 }));
+    for (const x of levels) { if (x.liq < lo || x.liq >= hi) continue; const b = r[Math.min(ROWS - 1, Math.floor((x.liq - lo) / step))]; if (x.size > 0) b.long += x.value; else b.short += x.value; b.n++; }
+    return r;
+  }, [levels, lo, hi, ROWS]);
+  const top = Math.max(...rows.map(b => b.long + b.short), 1e-9);
+  const y = (p: number) => padT + plotH - ((p - lo) / (hi - lo)) * plotH;
+  const rowY = (i: number) => padT + plotH - (i + 1) / ROWS * plotH;
+  const rowH = plotH / ROWS;
+  // Price on the left 60%, the profile on the right 40% (its bars grow to the right).
+  const lineW = plotW * 0.6, profX = lineW + 8, profW = plotW - profX - (big ? 52 : 40);
+  const pts = candles.filter(k => k[4] > 0);
+  const t0 = pts[0]?.[0] ?? 0, t1 = pts[pts.length - 1]?.[0] ?? 1;
+  const x = (t: number) => ((t - t0) / Math.max(1, t1 - t0)) * lineW;
+  const clampY = (p: number) => Math.max(padT, Math.min(padT + plotH, y(p)));
+  const path = pts.map((k, i) => `${i ? "L" : "M"}${x(k[0]).toFixed(1)},${clampY(k[4]).toFixed(1)}`).join(" ");
+  const area = path && `${path} L${lineW.toFixed(1)},${padT + plotH} L0,${padT + plotH} Z`;
+  const above = levels.filter(l => l.liq >= hi).reduce((t, l) => t + l.value, 0), below = levels.filter(l => l.liq < lo).reduce((t, l) => t + l.value, 0);
+  const strongest = new Set(rows.map((b, i) => ({ v: b.long + b.short, i })).filter(z => z.v > 0).sort((a, b) => b.v - a.v).slice(0, big ? 5 : 3).map(z => z.i));
+  const ticks = big ? [0, 0.25, 0.5, 0.75, 1] : [0, 0.5, 1];
+  const hv = hover !== undefined ? rows[hover] : undefined;
+  const grad = `liqfill${big ? "b" : "s"}`;
+  const time = (t: number) => new Date(t * 1000).toLocaleString([], big ? { month: "short", day: "numeric" } : { hour: "2-digit", minute: "2-digit" });
+  return (
+    <div className="liqc">
+      <svg viewBox={`0 0 ${W} ${H}`} className="liqc-svg" role="img" aria-label={`${sym} price and where open positions would be liquidated, ±${range * 100}%`} onMouseLeave={() => setHover(undefined)}
+        onMouseMove={e => { const r = (e.currentTarget as SVGSVGElement).getBoundingClientRect(); const py = (e.clientY - r.top) / r.height * H; const i = Math.floor((padT + plotH - py) / plotH * ROWS); setHover(i >= 0 && i < ROWS ? i : undefined); }}>
+        <defs>
+          <linearGradient id={grad} x1="0" x2="0" y1="0" y2="1"><stop offset="0" stopColor="#E8EDF4" stopOpacity="0.07" /><stop offset="1" stopColor="#E8EDF4" stopOpacity="0" /></linearGradient>
+        </defs>
+        {ticks.map(f => <line key={f} x1="0" x2={plotW} y1={y(lo + (hi - lo) * f)} y2={y(lo + (hi - lo) * f)} className="liqc-grid" />)}
+        {hv && <rect x="0" y={rowY(hover!)} width={plotW} height={rowH} className="liqc-hrow" />}
+        {area && <path d={area} fill={`url(#${grad})`} />}
+        {path && <path d={path} className="liqc-price" />}
+        <line x1={profX - 4} x2={profX - 4} y1={padT} y2={padT + plotH} className="liqc-base" />
+        {rows.map((b, i) => {
+          const v = b.long + b.short;
+          if (v <= 0) return null;
+          const w = Math.max(2, (v / top) * profW), h = Math.max(1.5, rowH - (big ? 2 : 1.5)), yy = rowY(i) + (rowH - h) / 2;
+          const lw = (b.long / v) * w;
+          return <g key={i} opacity={hover === undefined || hover === i ? 1 : 0.45}>
+            {b.long > 0 && <rect x={profX} y={yy} width={lw} height={h} rx={Math.min(2, h / 2)} className="liqc-bar long" />}
+            {b.short > 0 && <rect x={profX + lw} y={yy} width={w - lw} height={h} rx={Math.min(2, h / 2)} className="liqc-bar short" />}
+            {strongest.has(i) && <text x={profX + w + 4} y={yy + h / 2 + 3.5} className="liqc-val">{money0(v)}</text>}
+          </g>;
+        })}
+        {top < 1e-6 && <text x={profX + profW / 2} y={y(price) + (y(price) > padT + plotH / 2 ? -14 : 22)} textAnchor="middle" className="liqc-axis">{`nothing within ±${range * 100}%`}</text>}
+        <line x1="0" x2={plotW} y1={y(price)} y2={y(price)} className="liqc-pline" />
+        {pts.length > 0 && <circle cx={lineW} cy={y(price)} r="3" className="liqc-dot" />}
+        {ticks.map(f => { const p = lo + (hi - lo) * f; return Math.abs(y(p) - y(price)) < 12 ? null : <text key={f} x={plotW + 6} y={Math.min(padT + plotH - 1, Math.max(padT + 8, y(p) + 3.5))} className="liqc-axis">{fmt(p, dp)}</text>; })}
+        <rect x={plotW + 2} y={y(price) - 8} width={padR - 3} height="16" rx="4" className="liqc-ptag" />
+        <text x={plotW + 6} y={y(price) + 4} className="liqc-ptag-t">{fmt(price, dp)}</text>
+        {pts.length > 1 && <>
+          <text x="0" y={H - 3} className="liqc-axis">{time(t0)}</text>
+          <text x={lineW} y={H - 3} textAnchor="end" className="liqc-axis">now</text>
+        </>}
+      </svg>
+      <div className="liqc-foot">
+        <span className="liqc-key"><i className="long" />Longs<i className="short" />Shorts</span>
+        <span className="mono muted">{hv ? `${fmt(hv.from, dp)}–${fmt(hv.to, dp)}: ${hv.long + hv.short ? `${hv.long ? `longs ${money(hv.long)}` : ""}${hv.long && hv.short ? ", " : ""}${hv.short ? `shorts ${money(hv.short)}` : ""} (${hv.n})` : "nothing"}` : levels.length ? `${levels.length} open position${levels.length === 1 ? "" : "s"} · ${big ? "1h" : "15m"} price` : "no open positions"}</span>
+      </div>
+      {(above > 0 || below > 0) && <div className="liqc-out mono">
+        {above > 0 && <span>▲ {money0(above)} above +{range * 100}%</span>}
+        {below > 0 && <span>▼ {money0(below)} below −{range * 100}%</span>}
       </div>}
     </div>
   );
@@ -421,7 +514,9 @@ function TopTraders({ board, go, big }: { board?: S.Board; go: (to: string) => v
 
 /** How big a position to open so that, if the stop-loss is hit, the loss is the share of the
  *  account chosen. Loss = size × |entry − stop| (+ the fee each way). */
-function SizeCalc({ state }: { state: C.State }) {
+function SizeCalc({ state, send, busy, board }: { state: C.State; send?: Send; busy?: string; board?: S.Board }) {
+  const { publicKey } = useWallet();
+  const [withStop, setWithStop] = useState(true);
   const sym = state.vault.feed?.symbol ?? "";
   const mark = num(state.asset.price, 1e6);
   const dp = mark >= 1000 ? 2 : mark >= 1 ? 3 : 5;
@@ -467,6 +562,25 @@ function SizeCalc({ state }: { state: C.State }) {
           {liqFirst && <p className="calc-warn">The position would be liquidated before the stop is reached. Use a closer stop or a smaller risk.</p>}
           {lev > maxLev && !liqFirst && <p className="calc-warn">This needs more leverage than {sym} allows.</p>}
           <p className="muted small">Includes the {C.TRADE_FEE_PCT} fee each way. The liquidation price assumes this is the account's only position.</p>
+          {(() => {
+            const units = BigInt(Math.floor(size * 1e6)), freeSlot = Array.from({ length: C.MAX_ORDERS }, (_, i) => i).find(i => !state.orders.some(o => o.index === i));
+            const why = !publicKey ? "Connect a wallet to send it" : !send ? undefined : !state.trader ? "Create your trading account in the Trade panel first"
+              : state.trader.hasPending ? "An order of yours is already waiting to fill" : units <= 0n ? "The size rounds to nothing" : lev > maxLev ? `Too much leverage for ${sym}` : liqFirst ? "It would be liquidated before the stop" : withStop && freeSlot === undefined ? "No free order slot for the stop: cancel an order first" : undefined;
+            const go = () => {
+              if (!publicKey || !send || why) return;
+              const ixs = [...(state.trader && !state.trader.hasLedger ? [C.openLedger(publicKey, publicKey)] : []), C.requestTrade(publicKey, state.vault.key, long ? units : -units)];
+              if (withStop && freeSlot !== undefined) ixs.push(C.placeOrder(publicKey, state.vault.key, { index: freeSlot, kind: C.ORDER.STOP, size: 0n, trigger: BigInt(Math.round(Sl * 1e6)) }));
+              send(`${long ? "Long" : "Short"} ${qty(size)} ${sym}${withStop ? ` with stop at ${fmt(Sl, dp)}` : ""}`, ixs);
+            };
+            return (
+              <div className="calc-send">
+                <label className="check"><input type="checkbox" checked={withStop} onChange={e => setWithStop(e.target.checked)} />Also set the stop loss at {fmt(Sl, dp)}</label>
+                <button className={`submit ${long ? "up" : "down"}`} disabled={!!why || !!busy || !send} onClick={go}>{busy ? `${busy}…` : `${long ? "Long" : "Short"} ${qty(size)} ${sym} now`}</button>
+                {why && <div className="why">{why}</div>}
+                {publicKey && board?.copies.some(c => c.follower.equals(publicKey)) && <p className="calc-warn">You are copying a trader: copying keeps your account in line with theirs, so this trade would be undone within seconds. Stop copying in the Trade panel first.</p>}
+              </div>
+            );
+          })()}
         </div>
       ) : <div className="quiet">Enter an account size, a risk, and a stop that differs from the entry.</div>}
     </div>
@@ -487,6 +601,111 @@ function VaultEvents({ state, tick }: { state: C.State; tick: number }) {
           <span className="mono">{r.when ? ago(Date.now() / 1000 - r.when) : ""}</span>
         </a>
       ))}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------- messages
+
+/** Public posts about this market, newest first, and a box to post one (see chat.ts). */
+function Messages({ state, board, send, busy, big }: { state: C.State; board?: S.Board; send?: Send; busy?: string; big?: boolean }) {
+  const sym = state.vault.feed?.symbol ?? "";
+  const { connection } = useConnection();
+  const { publicKey } = useWallet();
+  const [posts, setPosts] = useState<Chat.Post[]>();
+  const [err, setErr] = useState<string>();
+  const [text, setText] = useState("");
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    let on = true;
+    const read = () => Chat.readPosts(connection, sym).then(p => { if (on) { setPosts(p); setErr(undefined); } }).catch(e => on && setErr(String(e?.message ?? e)));
+    read();
+    const id = setInterval(() => document.hidden || read(), 20_000);
+    return () => { on = false; clearInterval(id); };
+  }, [connection, sym, n]);
+  const body = Chat.clean(text);
+  const post = async () => {
+    if (!publicKey || !send || !body) return;
+    const sig = await send(`Post on ${sym}`, Chat.postIxs(publicKey, sym, body));
+    if (sig) { setText(""); setTimeout(() => setN(x => x + 1), 1500); }
+  };
+  return (
+    <div className={`chat${big ? " big" : ""}`}>
+      <div className="chat-new">
+        <textarea value={text} maxLength={Chat.MAX_MSG} rows={2} placeholder={publicKey ? `Say something about ${sym}…` : "Connect a wallet to post"} disabled={!publicKey}
+          onChange={e => setText(e.target.value)} onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); post(); } }} />
+        <div className="chat-act">
+          <span className="muted small">{body.length}/{Chat.MAX_MSG} · public and permanent · {Chat.chatNetworkNote}</span>
+          <button className="btn tiny" disabled={!publicKey || !send || !body || !!busy} onClick={post}>Post</button>
+        </div>
+      </div>
+      {!posts ? <div className="quiet">{err ? "Messages could not be read just now." : "Loading…"}</div>
+        : posts.length === 0 ? <div className="quiet">No messages on {sym} yet. Be the first.</div>
+        : <div className="chat-list">{posts.slice(0, big ? 200 : 30).map(p => (
+            <div key={p.sig} className={`chat-msg${publicKey?.toBase58() === p.from ? " me" : ""}`}>
+              <div className="chat-meta"><Who wallet={p.from} board={board} /><a className="muted small" href={explorer("tx", p.sig)} target="_blank" rel="noreferrer" title="See it on chain">{p.time ? ago(Date.now() / 1000 - p.time) : ""}</a></div>
+              <p>{p.text}</p>
+            </div>
+          ))}</div>}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------- X feed
+
+type XPost = { id: string; time: number; text: string; handle: string; name: string; avatar: string; likes: number; reposts: number; replies: number; image?: string; repost?: boolean; followers?: number };
+/** Words that count as a mention of a market besides its cashtag. */
+const X_WORDS: Record<string, string[]> = { BTC: ["bitcoin", "btc"], SOL: ["solana"], ETH: ["ethereum", "ether"], HYPE: ["hyperliquid"], DOGE: ["dogecoin"], ZEC: ["zcash"], XAU: ["gold"], XAG: ["silver"] };
+const mentions = (p: XPost, sym: string) => {
+  const t = p.text.toLowerCase();
+  return new RegExp(`\\$${sym.toLowerCase()}\\b`).test(t) || (X_WORDS[sym] ?? []).some(w => new RegExp(`\\b${w}\\b`).test(t));
+};
+let xCache: { at: number; posts: XPost[]; off?: boolean } | undefined;
+function useXPosts() {
+  const [d, setD] = useState(xCache);
+  const [err, setErr] = useState<string>();
+  useEffect(() => {
+    let on = true;
+    const read = () => fetch("/api/xfeed").then(r => r.json()).then(j => { if (!on) return; xCache = { at: Date.now(), posts: j.posts ?? [], off: j.off }; setD(xCache); setErr(j.error); }).catch(e => on && setErr(String(e?.message ?? e)));
+    if (!xCache || Date.now() - xCache.at > 120_000) read();
+    const id = setInterval(() => document.hidden || read(), 300_000);
+    return () => { on = false; clearInterval(id); };
+  }, []);
+  return { d, err };
+}
+/** Text with cashtags and @names picked out. */
+function XText({ text }: { text: string }) {
+  const parts = text.split(/(\$[A-Za-z]{2,10}\b|@[A-Za-z0-9_]{1,15})/g);
+  return <p>{parts.map((x, i) => (/^\$[A-Za-z]/.test(x) ? <b key={i} className="xtag">{x}</b> : /^@/.test(x) ? <a key={i} href={`https://x.com/${x.slice(1)}`} target="_blank" rel="noreferrer">{x}</a> : x))}</p>;
+}
+
+function XFeed({ sym, big }: { sym: string; big?: boolean }) {
+  const tabs = [...new Set([sym, "BTC", "SOL", "ETH"].filter(Boolean))];
+  const [tab, setTab] = useState<string>("all");
+  const { d, err } = useXPosts();
+  const posts = (d?.posts ?? []).filter(p => tab === "all" || mentions(p, tab));
+  const q = encodeURIComponent(`$${tab === "all" ? sym : tab}`);
+  return (
+    <div className={`xfeed${big ? " big" : ""}`}>
+      <div className="xfeed-tabs">
+        {tabs.map(t => <button key={t} className={tab === t ? "on" : ""} onClick={() => setTab(t)}>${t}</button>)}
+        <button className={tab === "all" ? "on" : ""} onClick={() => setTab("all")}>All</button>
+        <a className="xfeed-more" href={`https://x.com/search?q=${q}&f=live`} target="_blank" rel="noreferrer" title="Every post on X with this cashtag, live">Search X ↗</a>
+      </div>
+      {!d ? <div className="quiet">{err ? "The X feed could not be read just now." : "Loading…"}</div>
+        : d.off || !d.posts.length ? <div className="quiet">The X feed is not running yet. Use “Search X” for the latest posts.</div>
+        : posts.length === 0 ? <div className="quiet">No recent post from these accounts mentions {tab === "all" ? "anything" : `$${tab}`}. Try another tab or “Search X”.</div>
+        : <div className="xfeed-list">{posts.slice(0, big ? 120 : 30).map(p => (
+            <a key={p.id} className="xpost" href={`https://x.com/${p.handle}/status/${p.id}`} target="_blank" rel="noreferrer">
+              {p.avatar ? <img className="xpost-av" src={p.avatar} alt="" loading="lazy" referrerPolicy="no-referrer" /> : <i className="xpost-av" />}
+              <div className="xpost-b">
+                <div className="xpost-h"><b>{p.name}</b><span className="muted">@{p.handle}{p.followers ? ` · ${p.followers >= 1e6 ? `${fmt(p.followers / 1e6, 1)}M` : `${fmt(p.followers / 1e3, 0)}k`} followers` : ""} · {ago(Date.now() / 1000 - p.time)}</span>{p.repost && <em className="muted">repost</em>}</div>
+                <XText text={p.text} />
+                {p.image && <img className="xpost-img" src={p.image} alt="" loading="lazy" referrerPolicy="no-referrer" />}
+                <div className="xpost-f muted mono"><span>♥ {fmt(p.likes, 0)}</span><span>⟲ {fmt(p.reposts, 0)}</span><span>💬 {fmt(p.replies, 0)}</span></div>
+              </div>
+            </a>
+          ))}</div>}
     </div>
   );
 }

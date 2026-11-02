@@ -1,0 +1,21 @@
+# X accounts whose posts feed the "On X" widget (one per line, no @). Edit freely; the
+# collector (deploy/xfeed.sh) reads this file again on every round.
+# News and data
+WatcherGuru
+whale_alert
+lookonchain
+WuBlockchain
+Cointelegraph
+CoinDesk
+TheBlock__
+BitcoinMagazine
+# Markets we list
+solana
+SolanaFloor
+aeyakovenko
+ethereum
+VitalikButerin
+saylor
+HyperliquidX
+# X1
+x1_chain

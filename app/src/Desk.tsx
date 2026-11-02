@@ -11,11 +11,11 @@ import { Connection, PublicKey, TransactionInstruction } from "@solana/web3.js";
 import { createAssociatedTokenAccountIdempotentInstruction } from "@solana/spl-token";
 import * as C from "./chain";
 import { T } from "./theme";
-import Chart, { DayStats, Trade, useDayStats } from "./Chart";
+import Chart, { DayStats, HeatLevel, Trade, useDayStats } from "./Chart";
 import * as S from "./social";
 import { Mark, marksFor, useBoard, useMe, useNotes, usePictures } from "./Traders";
-import { Liquidations, ORDER_KINDS, PULSE, PULSE_BOARD_MS, Whale, marketFills, useExecReport, useMarketOrders, useVolume } from "./Pulse";
-import { WidgetPanel } from "./Widgets";
+import { Liquidations, PULSE, PULSE_BOARD_MS, Whale, marketFills, useVolume } from "./Pulse";
+import { WidgetPanel, liqLevels } from "./Widgets";
 import { Card, Faucet, Fill, Icon, LiquidityPanel, OpenerPanel, Send, ago, capUnits, entryPrice, explorer, fmt, num, priceDp, px, realizedPnl, short, units, usd, useActivity, useCards, useDeepFills, useVault, useWalletFills } from "./shared";
 
 const UP = T.green, DOWN = T.red;
@@ -29,7 +29,7 @@ const arrow = (x: number) => (x > 0 ? "▲" : x < 0 ? "▼" : "•");
 /** One open position with what it is up or down: entry from the wallet's fills on record (its
  *  transaction history, else the last fills its track record keeps), PnL against the mark. */
 export type Held = { asset: number; sym: string; size: number; mark: number; value: number; entry?: number; pnl?: number; ret?: number };
-function heldPositions(state: C.State, markets: Card[], fills: Fill[], row: S.TraderRow | undefined): Held[] {
+export function heldPositions(state: C.State, markets: Card[], fills: Fill[], row: S.TraderRow | undefined): Held[] {
   return (state.health?.positions ?? []).map(x => {
     const c = markets.find(m => m.v.assetIndex === x.asset && (m.v.canonical || m.v.key.equals(state.vault.key)));
     const sym = c?.v.feed?.symbol ?? `asset ${x.asset}`;
@@ -77,6 +77,7 @@ function DeskInner({ vaultKey, markets, day, send, busy, tick, go }: { vaultKey:
   const { publicKey } = useWallet();
   const { state, err, reload } = useVault(vaultKey, tick);
   const [panel, setPanel] = useState<"trade" | "earn">("trade");
+  const [wgHidden, setWgHidden] = useState(() => { try { return localStorage.getItem("pv:widgets-hidden") === "1"; } catch { return false; } });
   const wrapped: Send = async (l, ixs) => { const r = await send(l, ixs); reload(); return r; };
   const recentFills = useWalletFills(publicKey, state?.portfolio?.position ?? 0n);
   // Each position held, by vault, so its whole history back to the opening fill can be read.
@@ -134,18 +135,24 @@ function DeskInner({ vaultKey, markets, day, send, busy, tick, go }: { vaultKey:
       : { price: num(o.trigger, 1e6), title: o.kind === C.ORDER.STOP ? "SL" : o.kind === C.ORDER.TAKE ? "TP" : o.size > 0n ? "Buy" : "Sell", color: o.kind === C.ORDER.STOP ? DOWN : o.kind === C.ORDER.TAKE ? UP : T.textSecondary }),
   ];
 
+  const heat = board ? liqLevels(state, board).map(x => ({ price: x.liq, value: x.value })) : undefined;
+  const hideWidgets = (on: boolean) => { setWgHidden(on); try { localStorage.setItem("pv:widgets-hidden", on ? "1" : "0"); } catch { /* storage unavailable */ } };
+
   return (
-    <main className="desk">
-      <MarketBar state={state} markets={markets} day={day} go={go} tick={tick} />
-      <section className="desk-chart panel"><Charts sym={sym} price={price} lines={lines} linesOf={linesOf} marks={marks} mine={mine} whales={PULSE.whales ? marketTrades : undefined} markets={markets} go={go} /></section>
-      <section className="desk-book panel"><WidgetPanel state={state} tick={tick} board={board} fills={marketTrades} markets={markets} go={go} /></section>
+    <main className={`desk${wgHidden ? " nowg" : ""}`}>
+      <MarketBar state={state} markets={markets} day={day} go={go} tick={tick} showWidgets={wgHidden ? () => hideWidgets(false) : undefined} />
+      <section className="desk-chart panel"><Charts sym={sym} price={price} lines={lines} linesOf={linesOf} marks={marks} mine={mine} whales={PULSE.whales ? marketTrades : undefined} heat={heat} markets={markets} go={go} /></section>
+      {!wgHidden && <section className="desk-book panel"><WidgetPanel state={state} tick={tick} board={board} fills={marketTrades} markets={markets} go={go} send={wrapped} busy={busy} onHide={() => hideWidgets(true)} /></section>}
       {PULSE.liqs && <Liquidations board={board} markets={markets} go={go} />}
       <section className="desk-ticket panel">
         <div className="ptabs">
           <button className={panel === "trade" ? "on" : ""} onClick={() => setPanel("trade")}>Trade</button>
           <button className={panel === "earn" ? "on" : ""} onClick={() => setPanel("earn")}>Earn</button>
         </div>
-        {panel === "trade" ? <Ticket state={state} send={wrapped} busy={busy} /> : <div className="earn"><LiquidityPanel state={state} send={wrapped} busy={busy} /></div>}
+        {panel === "trade" ? <Ticket state={state} send={wrapped} busy={busy} copying={me.copy ? { leader: me.copy.leader.toBase58(), name: board?.profiles.get(me.copy.leader.toBase58())?.name ?? short(me.copy.leader.toBase58()) } : undefined} /> : <div className="earn"><LiquidityPanel state={state} send={wrapped} busy={busy} /></div>}
+        <button className="portfolio-btn" onClick={() => go("/portfolio")} title="Your positions, results and trading statistics across every market">
+          <span>Portfolio</span><em>positions, results and stats</em><b aria-hidden>→</b>
+        </button>
         <div className="ticket-acct"><Account state={state} send={wrapped} busy={busy} held={held} row={myRow} vaults={markets.map(c => c.v)} /></div>
       </section>
       <section className="desk-bottom panel"><Bottom state={state} markets={markets} fills={allFills} held={held} liq={liq} send={wrapped} busy={busy} go={go} tick={tick} /></section>
@@ -163,7 +170,7 @@ const LAYOUTS: [id: string, label: string, panes: number, icon: string][] = [
   ["2v", "Two charts, one over the other", 2, "M2.5 2.5h11v11h-11zM2.5 8h11"],
   ["4", "Four charts", 4, "M2.5 2.5h11v11h-11zM8 2.5v11M2.5 8h11"],
 ];
-function Charts({ sym, price, lines, linesOf, marks, mine, whales, markets, go }: { sym: string; price: number; lines: { price: number; title: string; color: string }[]; linesOf: (sym: string) => { price: number; title: string; color: string }[]; marks: Mark[]; mine: Trade[]; whales?: Whale[]; markets: Card[]; go: (to: string) => void }) {
+function Charts({ sym, price, lines, linesOf, marks, mine, whales, heat, markets, go }: { sym: string; price: number; heat?: HeatLevel[]; lines: { price: number; title: string; color: string }[]; linesOf: (sym: string) => { price: number; title: string; color: string }[]; marks: Mark[]; mine: Trade[]; whales?: Whale[]; markets: Card[]; go: (to: string) => void }) {
   const [layout, setLayout] = useState(() => { const l = localStorage.getItem("pv:chart-layout"); return LAYOUTS.some(x => x[0] === l) ? l! : "1"; });
   const [others, setOthers] = useState<string[]>(() => { try { const v = JSON.parse(localStorage.getItem("pv:chart-panes") ?? "[]"); return Array.isArray(v) ? v : []; } catch { return []; } });
   const n = LAYOUTS.find(l => l[0] === layout)?.[2] ?? 1;
@@ -189,7 +196,7 @@ function Charts({ sym, price, lines, linesOf, marks, mine, whales, markets, go }
   );
   return (
     <div className={`charts l-${layout}`}>
-      <Chart symbol={sym} price={price} lines={lines} marks={marks} mine={mine} whales={whales} dense={n > 1} head={<>{picker}{n > 1 && <div className="pane-sym main"><b>{sym}</b></div>}</>} />
+      <Chart symbol={sym} price={price} lines={lines} marks={marks} mine={mine} whales={whales} heat={heat} dense={n > 1} head={<>{picker}{n > 1 && <div className="pane-sym main"><b>{sym}</b></div>}</>} />
       {Array.from({ length: n - 1 }, (_, k) => {
         const i = k + 1, s = paneSym(i);
         return (
@@ -221,7 +228,7 @@ function liquidationPrice(state: C.State, posN: number): number | undefined {
 
 // ---------------------------------------------------------------- market bar
 
-function MarketBar({ state, markets, day, go, tick }: { state: C.State; markets: Card[]; day: Record<string, DayStats>; go: (to: string) => void; tick: number }) {
+function MarketBar({ state, markets, day, go, tick, showWidgets }: { state: C.State; markets: Card[]; day: Record<string, DayStats>; go: (to: string) => void; tick: number; showWidgets?: () => void }) {
   const v = state.vault, sym = v.feed?.symbol ?? "?";
   const [open, setOpen] = useState(false);
   const box = useRef<HTMLDivElement>(null);
@@ -247,11 +254,6 @@ function MarketBar({ state, markets, day, go, tick }: { state: C.State; markets:
   const published = (feedNewer ? state.pyth!.publish : b?.markPublish) || undefined;
   const age = published ? Math.max(0, now - published) : undefined;
   const queued = b?.pending.length ?? 0;
-  const nextDue = queued ? Math.min(...b!.pending.map(p => p.target)) : undefined;
-  const orders = useMarketOrders(v.key, tick);
-  const byKind = orders ? ORDER_KINDS.map((_, k) => orders.filter(o => o.kind === k).length) : undefined;
-  const { report } = useExecReport();
-  const fillStats = report?.markets.find(x => x.symbol === sym)?.stats.latency;
   const vol = useVolume();
   const dp = priceDp(price);
   return (
@@ -288,17 +290,14 @@ function MarketBar({ state, markets, day, go, tick }: { state: C.State; markets:
         <Cell label="24h change" value={change === undefined ? "—" : pct(change)} tone={change === undefined ? undefined : change >= 0 ? "up" : "down"} />
         <Cell label="24h high" value={d ? fmt(Math.max(d.high, price), dp) : "—"} />
         <Cell label="24h low" value={d ? fmt(Math.min(d.low, price), dp) : "—"} />
-        <Cell label="24h volume" value={vol?.markets[sym] && v.canonical ? compact(vol.markets[sym].volume) : "—"} sub={vol?.markets[sym] && v.canonical ? `${fmt(vol.markets[sym].trades, 0)} trades${vol.markets[sym].hours < 23.5 ? ` in ${fmt(vol.markets[sym].hours, 0)} h` : ""}` : undefined} title="Everything traded on this market in the last 24 hours, counted from its fills on chain (refreshed every ten minutes)" />
-        <Cell label="Open interest" value={money(oiUsd, 0)} sub={`${units(state.asset.oiLong)} ${sym}`} />
+        <Cell label="24h volume" value={vol?.markets[sym] && v.canonical ? compact(vol.markets[sym].volume) : "—"} title="Everything traded on this market in the last 24 hours, counted from its fills on chain (refreshed every ten minutes)" />
+        <Cell label="Open interest" value={money(oiUsd, 0)} />
         <Cell label="Vault liquidity" value={usd(C.navOf(state), 0)} title="What the vault, which takes the other side of every trade, is worth now" />
         <Cell label="Oracle price" value={`$${fmt(mark, dp)}`} sub={age === undefined ? undefined : age < 1.5 ? "just now" : `${Math.round(age)}s ago`} tone={age !== undefined && age > 30 && queued > 0 ? "down" : undefined} title={`Every fill is at this price: the first oracle price after a request's target time. ${C.X1 ? "On X1 a new price is put on chain when a trade, order or liquidation needs one, so on a quiet market its age grows; it is late only if a trade is waiting." : "Published by Pyth and put on chain."}`} />
-        <Cell label="Pending orders" value={orders ? String(orders.length) : "…"} sub={byKind ? ORDER_KINDS.map((n, k) => (byKind[k] ? `${byKind[k]} ${n}` : "")).filter(Boolean).join(" · ") || "none" : undefined} title="Stop losses, take profits, trailing stops, limits and TWAPs waiting for their price, by every trader on this market" />
-        <Cell label="Awaiting execution" value={String(queued)} sub={nextDue && nextDue > now ? `next in ${Math.ceil(nextDue - now)}s` : queued ? "due" : undefined} title="Requests in this market's queue, waiting for the oracle price at their target time" />
-        <a className="cell cell-link" href="#/execution" title={`From a request landing on chain to its fill, over the last hours (the designed wait is ${C.ROUTER_DELAY_SECS}–${C.ROUTER_DELAY_SECS + C.ROUTER_BATCH_SECS} s). Opens the Execution page.`}>
-          <div className="cell-l">Time to fill</div>
-          <div className="cell-v mono">{fillStats ? `${fmt(fillStats.median, 0)}s` : "—"}{fillStats && <span className="cell-s">p90 {fmt(fillStats.p90, 0)}s →</span>}</div>
-        </a>
       </div>
+      {showWidgets && <button className="wg-show" onClick={showWidgets} title="Bring back the widgets column">
+        <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden><path d="M6 1.5v9M1.5 6h9" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" /></svg>Widgets
+      </button>}
     </header>
   );
 }
@@ -370,7 +369,7 @@ function Stress({ state }: { state: C.State }) {
 
 // ---------------------------------------------------------------- order ticket
 
-function Ticket({ state, send, busy }: { state: C.State & { readFor?: string }; send: Send; busy?: string }) {
+function Ticket({ state, send, busy, copying }: { state: C.State & { readFor?: string }; send: Send; busy?: string; copying?: { leader: string; name: string } }) {
   const { publicKey } = useWallet();
   const { connection } = useConnection();
   // The wallet's coins: an order takes a bond and a deposit (0.1% of its value) in the chain's
@@ -511,11 +510,13 @@ function Ticket({ state, send, busy }: { state: C.State & { readFor?: string }; 
     const ledger = state.trader && !state.trader.hasLedger ? [C.openLedger(publicKey, publicKey)] : [];
     sendNoted(`${side > 0n ? "Long" : "Short"} ${units(sent)} ${sym}`, [...ledger, C.requestTrade(publicKey, v.key, sent * side)]);
   };
-  const closeAll = () => {
+  // Close all of the position, or a share of it (a smaller trade the other way).
+  const closeAll = (share = 100) => {
     if (!publicKey || !state.book || held === 0n) return;
-    // A close-only market has no counterparty for a close: the position is closed out instead.
+    // A close-only market has no counterparty for a close: the position is closed out instead (whole only).
     if (state.closeOnly) sendNoted("Close position", [C.requestClose(publicKey, publicKey, v.key)]);
-    else sendNoted("Close position", [C.requestTrade(publicKey, v.key, -held)]);
+    else if (share >= 100) sendNoted("Close position", [C.requestTrade(publicKey, v.key, -held)]);
+    else { const part = held * BigInt(share) / 100n; if (part !== 0n) sendNoted(`Close ${share}% (${units(abs(part))} ${sym})`, [C.requestTrade(publicKey, v.key, -part)]); }
   };
 
   return (
@@ -585,15 +586,25 @@ function Ticket({ state, send, busy }: { state: C.State & { readFor?: string }; 
           {note && <em>{S.NOTE_MAX - [...note].length}</em>}
         </label>
       )}
+      {publicKey && state.trader && copying && (
+        <div className="copy-warn">
+          <b>You are copying {copying.name}</b>
+          <span>Copying keeps every market in your account in line with theirs, so a trade you make here is undone within seconds. Stop copying to trade on your own; your open positions stay as they are.</span>
+          <button disabled={!!busy} onClick={() => send("Stop copying", [S.stopCopy(publicKey)])}>Stop copying</button>
+        </div>
+      )}
       <div className="ticket-go">
       {!publicKey ? <div className="connect"><WalletMultiButton /></div>
         : !mine ? <button className="submit neutral" disabled>Reading your account…</button>
         : !state.trader ? <button className="submit neutral" disabled={!!busy} onClick={() => send("Create trading account", [C.openTradingAccount(publicKey), C.openLedger(publicKey, publicKey), S.openStats(publicKey, publicKey)])}>Create trading account</button>
         : <button className={`submit ${side > 0n ? "up" : "down"}`} disabled={!!blocker || !!busy} onClick={submit}>{busy ? `${busy}…` : `${side > 0n ? "Long" : "Short"} ${want > 0n ? `${units(sent)} ` : ""}${sym}`}</button>}
       {state.trader && held !== 0n && (
-        <button className="closepos" disabled={locked || !!busy} onClick={closeAll}>
-          Close {held > 0n ? "long" : "short"} {units(abs(held))} {sym}
-        </button>
+        <div className="closeparts">
+          <button className="closepos" disabled={locked || !!busy} onClick={() => closeAll()}>
+            Close {held > 0n ? "long" : "short"} {units(abs(held))} {sym}
+          </button>
+          {!state.closeOnly && [25, 50].map(f => <button key={f} className="closepos part" disabled={locked || !!busy} onClick={() => closeAll(f)} title={`Close ${f}% of the position (${units(abs(held * BigInt(f) / 100n))} ${sym}); the rest stays open`}>{f}%</button>)}
+        </div>
       )}
       {blocker && publicKey && <div className="why">{blocker}</div>}
       </div>
@@ -926,12 +937,13 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go, tick }: {
   const positions = held;
   const byAsset = new Map(markets.filter(c => c.v.canonical || c.v.key.equals(v.key)).map(c => [c.v.assetIndex, c]));
   const locked = !!state.trader?.hasPending;
-  const close = () => {
+  const close = (share = 100) => {
     const p = state.portfolio;
     if (!publicKey || !state.book || !p || p.position === 0n) return;
-    // A close-only market has no counterparty for a close: the position is closed out instead.
+    // A close-only market has no counterparty for a close: the position is closed out instead (whole only).
     if (state.closeOnly) send("Close position", [C.requestClose(publicKey, publicKey, v.key)]);
-    else send("Close position", [C.requestTrade(publicKey, v.key, -p.position)]);
+    else if (share >= 100) send("Close position", [C.requestTrade(publicKey, v.key, -p.position)]);
+    else { const part = p.position * BigInt(share) / 100n; if (part !== 0n) send(`Close ${share}% (${units(abs(part))} ${sym})`, [C.requestTrade(publicKey, v.key, -part)]); }
   };
   const nav = C.navOf(state);
   return (
@@ -964,7 +976,7 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go, tick }: {
                     <td className={`r mono pnl ${pnl === undefined ? "" : pnl >= 0 ? "up" : "down"}`} title={pnl === undefined ? "The entry price is not known: this wallet's earlier fills on this market are not on record" : "Against the average entry price, before fees; the percentage is the price move in your favour"}>{pnl === undefined ? "—" : <>{arrow(pnl)} {signedMoney(pnl)} <i>({pct(x.ret ?? 0)})</i></>}</td>
                     <td className="r mono">{here && liq ? fmt(liq, priceDp(mark)) : "—"}</td>
                     <td><Protection orders={here ? state.orders : (c && others.get(c.v.key.toBase58())) ?? []} dp={priceDp(mark)} /></td>
-                    <td className="r">{here ? <button className="btn tiny" disabled={locked || !!busy} onClick={close}>Close</button> : <button className="btn tiny ghost" onClick={() => c && go(`/trade/${s}`)}>Open</button>}</td>
+                    <td className="r">{here ? <span className="closeset">{!state.closeOnly && [25, 50].map(f => <button key={f} className="btn tiny ghost" disabled={locked || !!busy} onClick={() => close(f)} title={`Close ${f}% of this position; the rest stays open`}>{f}%</button>)}<button className="btn tiny" disabled={locked || !!busy} onClick={() => close()}>Close</button></span> : <button className="btn tiny ghost" onClick={() => c && go(`/trade/${s}`)}>Open</button>}</td>
                   </tr>
                 );
               })}

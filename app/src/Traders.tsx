@@ -101,6 +101,20 @@ function takePictures(pictures: Map<string, Uint8Array>) {
 }
 export const usePictures = () => useSyncExternalStore(f => { watchers.add(f); return () => { watchers.delete(f); }; }, () => shownVersion);
 
+/** "Bullish 72%" / "Bearish 64%" / "Neutral", with a small long-against-short bar. */
+export function Lean({ row, big }: { row: S.TraderRow; big?: boolean }) {
+  const { bull, from } = S.leanOf(row);
+  if (from === "none") return <span className="muted">—</span>;
+  const name = S.leanName(bull), cls = name === "Bullish" ? "up" : name === "Bearish" ? "down" : "";
+  const share = name === "Bearish" ? 1 - bull : name === "Bullish" ? bull : Math.max(bull, 1 - bull);
+  return (
+    <span className={`lean ${cls}${big ? " big" : ""}`} title={`${fmt(bull * 100, 0)}% bullish · ${fmt((1 - bull) * 100, 0)}% bearish, from ${from === "positions" ? "its open positions" : "its recent trades"}`}>
+      <b>{name === "Bullish" ? "▲" : name === "Bearish" ? "▼" : "•"} {name}{name !== "Neutral" ? ` ${fmt(share * 100, 0)}%` : ""}</b>
+      <i className="lean-bar"><i style={{ width: `${bull * 100}%` }} /></i>
+    </span>
+  );
+}
+
 export function Badge({ wallet, profile, size = 18, picture }: { wallet: string; profile?: S.Profile; size?: number; picture?: string | null }) {
   usePictures();
   const b = badgeOf(wallet, profile);
@@ -385,33 +399,55 @@ function ContestBox({ rows, me, go }: { rows: S.TraderRow[]; me?: string; go: (t
   // Our own test and demo accounts take no place (contest.ts pays nobody among them either).
   const standings = useMemo(() => S.contestStandings(rows.filter(r => r.stats && !tagOf(r.wallet)).map(r => ({ wallet: r.wallet, stats: r.stats! })), week), [rows, week.start]);
   const byWallet = new Map(rows.map(r => [r.wallet, r]));
-  const left = week.end - Date.now() / 1000;
+  const [now, setNow] = useState(Date.now() / 1000);
+  useEffect(() => { const id = setInterval(() => setNow(Date.now() / 1000), 1000); return () => clearInterval(id); }, []);
+  const left = Math.max(0, week.end - now);
   const mine = me ? standings.findIndex(r => r.wallet === me) : -1;
   const pool = S.CONTEST.prizes.reduce((a, b) => a + b, 0);
+  const parts: [number, string][] = [[Math.floor(left / 86_400), "days"], [Math.floor(left % 86_400 / 3600), "hours"], [Math.floor(left % 3600 / 60), "min"], [Math.floor(left % 60), "sec"]];
+  const place = ["1st", "2nd", "3rd", "4th", "5th"];
   return (
-    <section className="contest">
-      <div className="contest-head">
-        <div>
-          <b>Weekly contest</b>
-          <span className="muted small"> · ${pool.toLocaleString()} in prizes · ends in {Math.floor(left / 86_400)} d {Math.floor(left % 86_400 / 3600)} h (Sunday 24:00 UTC)</span>
+    <section className="contest2" id="contest">
+      <div className="c2-hero">
+        <div className="c2-title">
+          <svg className="c2-cup" viewBox="0 0 64 64" aria-hidden><path d="M18 8h28v8c0 10-6 18-14 18S18 26 18 16zM18 12H9c0 9 4 14 10 15M46 12h9c0 9-4 14-10 15M32 34v10M22 56h20M25 56l2-12h10l2 12" fill="none" stroke="currentColor" strokeWidth="3" strokeLinejoin="round" strokeLinecap="round" /></svg>
+          <div>
+            <span className="c2-kicker">Weekly trading contest</span>
+            <h2><b>${pool.toLocaleString()}</b> in prizes</h2>
+            <p>Most profit this week wins. Paid from the treasury after the week, once the winners are checked; one prize per owner.</p>
+          </div>
         </div>
-        <span className="muted small">Most profit this week, among accounts (not our test bots) funded with ${S.CONTEST.minBase.toLocaleString()}+, open {S.CONTEST.minAgeDays}+ days, that made {S.CONTEST.minTrades}+ trades this week. Prizes: {S.CONTEST.prizes.map(p => `$${p}`).join(" · ")}, paid from the treasury after the week once the winners are checked, one prize per owner.</span>
+        <div className="c2-clock" aria-label="Time left this week">
+          <span className="c2-clock-l">Ends Sunday 24:00 UTC</span>
+          <div>{parts.map(([v, l]) => <span key={l} className="c2-cell"><b className="mono">{String(v).padStart(2, "0")}</b><em>{l}</em></span>)}</div>
+        </div>
       </div>
-      {standings.length === 0 ? <div className="quiet small">Nobody qualifies yet this week. To enter: ${S.CONTEST.minBase.toLocaleString()} in the account, a record {S.CONTEST.minAgeDays} days old, {S.CONTEST.minTrades} trades this week.</div> : (
-        <ol className="contest-list">
-          {standings.slice(0, S.CONTEST.prizes.length).map((r, i) => (
-            <li key={r.wallet}>
-              <button className="link" onClick={() => openTrader(r.wallet)}>
-                <span className="mono muted">{i + 1}.</span> {nameOf(r.wallet, byWallet.get(r.wallet)?.profile)}
-              </button>
-              <span className={`mono ${tone(r.pnl)}`}>{signed(r.pnl)}</span>
-              <span className="mono muted">{pct(r.ret)}</span>
-              <span className="mono">${S.CONTEST.prizes[i]}</span>
-            </li>
-          ))}
-        </ol>
-      )}
-      {me && <div className="muted small">{mine >= 0 ? `You are ${mine + 1} of ${standings.length} (${signed(standings[mine].pnl)}).` : `You are not ranked yet this week.`}</div>}
+      <div className="c2-prizes">
+        {S.CONTEST.prizes.map((p, i) => {
+          const r = standings[i];
+          return (
+            <div key={i} className={`c2-prize p${i + 1}`}>
+              <span className="c2-place">{place[i]}</span>
+              <b className="c2-amt mono">${p}</b>
+              {r ? <button className="c2-who" onClick={() => openTrader(r.wallet)}><Badge wallet={r.wallet} profile={byWallet.get(r.wallet)?.profile} size={16} /><span>{nameOf(r.wallet, byWallet.get(r.wallet)?.profile)}</span><em className={`mono ${tone(r.pnl)}`}>{signed(r.pnl)}</em></button>
+                : <span className="c2-open">Open: could be you</span>}
+            </div>
+          );
+        })}
+      </div>
+      <div className="c2-foot">
+        <div className="c2-rules">
+          <span>💰 ${S.CONTEST.minBase.toLocaleString()}+ in the account</span>
+          <span>📅 account {S.CONTEST.minAgeDays}+ days old</span>
+          <span>🔁 {S.CONTEST.minTrades}+ trades this week</span>
+          <span>🤖 test bots excluded</span>
+        </div>
+        <div className="c2-me">
+          {me ? <span>{mine >= 0 ? <>You are <b>#{mine + 1}</b> of {standings.length} with <b className={tone(standings[mine].pnl)}>{signed(standings[mine].pnl)}</b></> : "You are not ranked yet this week."}</span> : <span>Connect a wallet to see your place.</span>}
+          <button className="btn primary" onClick={() => go("/")}>Trade to enter</button>
+        </div>
+      </div>
+      {standings.length > S.CONTEST.prizes.length && <div className="muted small">{standings.length} traders qualify this week.</div>}
     </section>
   );
 }
@@ -467,6 +503,8 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
         <Search board={board} go={go} />
       </div>
 
+      {board && <ContestBox rows={board.rows} me={me.wallet} go={go} />}
+
       <section className="mecard">
         {!publicKey ? <div className="quiet">Connect a wallet to set your name and badge, follow traders and copy them.</div> : editing ? <ProfileEditor me={me} has={!!me.wallet && !!board?.pictures.has(me.wallet)} send={send} busy={busy} done={() => { setEditing(false); reload(); }} reload={reload} /> : (
           <>
@@ -495,7 +533,6 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
         )}
       </section>
 
-      {board && <ContestBox rows={board.rows} me={me.wallet} go={go} />}
 
       <div className="traders-bar">
         <div className="seg-tf">
@@ -506,7 +543,7 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
           {PERIODS.map(([k, l]) => <button key={k} className={period === k ? "on" : ""} onClick={() => setPeriod(k)}>{l}</button>)}
         </div>
         <div className="seg-tf">
-          {([["pnl", "Profit"], ["roi", "Return"], ["days", "Profitable days"], ["volume", "Volume"], ["copiers", "Copiers"]] as const).map(([k, l]) => <button key={k} className={sort === k ? "on" : ""} onClick={() => setSort(k)}>{l}</button>)}
+          {([["pnl", "Profit"], ["roi", "Return"], ["days", "Win ratio"], ["volume", "Volume"], ["copiers", "Copiers"]] as const).map(([k, l]) => <button key={k} className={sort === k ? "on" : ""} onClick={() => setSort(k)}>{l}</button>)}
         </div>
       </div>
 
@@ -552,7 +589,7 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
         )}
         <div className="traders-table">
           <table className="tbl">
-            <thead><tr><th>#</th><th>Trader</th><th className="r">Profit{period === "all" ? "" : `, ${periodName}`}</th><th className="r">Return</th><th className="r">Profitable days</th><th>Last 30 trading days</th><th className="r">Largest fall</th><th className="r">Volume</th><th className="r">Trades</th><th className="r">Copiers</th><th /></tr></thead>
+            <thead><tr><th>#</th><th>Trader</th><th className="r">Profit{period === "all" ? "" : `, ${periodName}`}</th><th className="r">Return</th><th className="r" title="Share of its trading days that ended up">Win ratio</th><th title="Bullish or bearish: its open positions long against short, or with none open, how much of its recent trading was buying">Sentiment</th><th>Last 30 trading days</th><th className="r">Largest fall</th><th className="r">Volume</th><th className="r">Trades</th><th className="r">Copiers</th><th /></tr></thead>
             <tbody>
               {rows.map((r, i) => {
                 const name = nameOf(r.wallet, r.profile), isMe = r.wallet === me.wallet, copying = me.copy?.leader.toBase58() === r.wallet, tag = tagOf(r.wallet), o = over(r, period);
@@ -569,7 +606,8 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
                     </td>
                     <td className={`r mono ${tone(o.pnl)}`}>{signed(o.pnl)}</td>
                     <td className={`r mono ${tone(o.roi)}`}>{pct(o.roi)}</td>
-                    <td className="r mono">{r.daysUp} of {r.daysUp + r.daysDown}</td>
+                    <td className="r mono" title={`${r.daysUp} of ${r.daysUp + r.daysDown} trading days up`}>{S.winRatio(r) === undefined ? "—" : <>{fmt(S.winRatio(r)! * 100, 0)}% <span className="muted small">{r.daysUp}/{r.daysUp + r.daysDown}</span></>}</td>
+                    <td><Lean row={r} /></td>
                     <td><DayBars days={r.days} /></td>
                     <td className="r mono">{r.drawdownPct >= 0.0005 ? `−${fmt(r.drawdownPct * 100, 1)}%` : "—"}</td>
                     <td className="r mono">${fmt(r.stats!.volume, 0)}</td>
