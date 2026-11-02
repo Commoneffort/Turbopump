@@ -718,7 +718,13 @@ export function crankPlan(s: MarketSnapshot, payer: PublicKey, vehicle: PublicKe
   };
   const mine = trader && routerPortfolio(trader);
   const held = s.portfolios.map(p => ({ key: p.pubkey, legs: legs(p.data) })).filter(p => p.legs.length);
-  let holders = held.filter(p => focus === undefined || p.legs.some(l => l.asset === focus) || (mine && p.key.equals(mine)));
+  // Percolator refuses a trade while any asset the trader holds has an out-of-date account
+  // (loss-stale: `account_has_loss_stale_live_leg`), not only the asset traded. So a fill on
+  // `focus` also settles the holders of the trader's other assets. (Without this, a settle that
+  // missed one SOL account blocked every BTC fill of a trader who also held SOL until it expired.)
+  const scope = new Set<number>(focus === undefined ? [] : [focus]);
+  for (const l of (mine && held.find(p => p.key.equals(mine))?.legs) || []) scope.add(l.asset);
+  let holders = held.filter(p => focus === undefined || p.legs.some(l => scope.has(l.asset)) || (mine && p.key.equals(mine)));
   // A crank names at most `MAX_CRANK_ASSETS`. Routine upkeep on a market with more assets than
   // that works on the ones it was given (the caller rotates through them) and settles only the
   // portfolios whose every position is among them.
@@ -749,7 +755,7 @@ export function crankPlan(s: MarketSnapshot, payer: PublicKey, vehicle: PublicKe
   return {
     lag: s.slot - Number(oldest),
     lagCrank: crank(payer, vehicle, all),
-    settle: due.map(p => crank(payer, p.key, [focus ?? p.legs[0].asset])),
+    settle: due.map(p => crank(payer, p.key, [focus !== undefined && p.legs.some(l => l.asset === focus) ? focus : p.legs[0].asset])),
     settleAlone: due.map(p => crank(payer, p.key, own(p))),
     resets: focus === undefined ? all.flatMap(a => finalizeResets(s.market, a)) : finalizeResets(s.market, focus),
   };

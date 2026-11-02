@@ -142,6 +142,15 @@ export default async function handler(req: any, res: any) {
       posts.push(...((await r.json()).posts ?? []));
     } catch (e: any) { errors.push(String(e?.message ?? e)); }
   }
+  // Only plain fields go out: an id of digits, a real handle, pictures from X's own image host
+  // (the collector's answer is not trusted further than X's is).
+  const pic = (u: unknown) => (typeof u === "string" && /^https:\/\/pbs\.twimg\.com\/[\w./?=&%-]+$/.test(u) ? u : undefined);
+  const clean = posts.filter(p => p && /^\d{1,25}$/.test(String(p.id)) && valid(String(p.handle))).map((p): XPost => ({
+    id: String(p.id), time: Number(p.time) || 0, text: String(p.text ?? "").slice(0, 1200), handle: String(p.handle), name: String(p.name ?? p.handle).slice(0, 60),
+    avatar: pic(p.avatar) ?? "", likes: Number(p.likes) || 0, reposts: Number(p.reposts) || 0, replies: Number(p.replies) || 0,
+    image: pic(p.image), repost: !!p.repost, followers: Number(p.followers) || undefined,
+  }));
+  posts.length = 0; posts.push(...clean);
   const seen = new Set<string>();
   // At most 8 posts per account, so a few very busy ones do not fill the feed.
   const per = new Map<string, number>();

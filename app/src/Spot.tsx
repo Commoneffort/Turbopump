@@ -155,7 +155,7 @@ function SpotInner({ pool, list, send, busy, tick, go }: { pool: S.Pool; list?: 
     <main className="desk spot">
       <SpotBar pair={pair} list={list} day={day} go={go} />
       <section className="desk-chart panel"><Chart symbol={symbol} label={label} price={pair.price} lines={[]} /></section>
-      <section className="desk-book panel"><PoolDepth pair={pair} trades={trades} /></section>
+      <section className="desk-book panel spot-book"><PoolDepth pair={pair} trades={trades} /></section>
       <section className="desk-ticket panel">
         <div className="ptabs"><button className="on">Spot</button></div>
         <SpotTicket pair={pair} wallet={wallet} send={send} busy={busy} />

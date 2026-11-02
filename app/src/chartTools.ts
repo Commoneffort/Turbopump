@@ -1,9 +1,9 @@
 // Drawing tools the chart library does not ship: a Fibonacci retracement with a colour per level,
 // a measure tool, and a text note. Registered once, then started by name like the built-in ones.
-import { registerFigure, registerOverlay } from "klinecharts";
+import { KLineData, registerFigure, registerIndicator, registerOverlay } from "klinecharts";
 import { T, rgbOf } from "./theme";
 
-const FONT = '"JetBrains Mono", ui-monospace, monospace';
+const FONT = 'Inter, system-ui, sans-serif';
 const GREEN = rgbOf(T.green), CORAL = rgbOf(T.red), WHITE = rgbOf(T.textPrimary), GREY = rgbOf(T.textSecondary);
 const rgba = (c: string, a: number) => `rgba(${c},${a})`;
 const label = (color: string) => ({ color, size: 10.5, family: FONT, backgroundColor: "transparent", borderColor: "transparent", paddingLeft: 4, paddingRight: 4, paddingTop: 2, paddingBottom: 2 });
@@ -44,9 +44,62 @@ const pictures = new Map<string, HTMLImageElement>();
 export const rememberPicture = (img: HTMLImageElement) => { pictures.set(img.src, img); return img.src; };
 
 let done = false;
+/** Colours of the compared markets' lines (none of them is a position, order or liquidation colour). */
+export const COMPARE_COLORS = ["#4FD1C5", "#F6E05E", "#F687B3", "#9AE6B4", "#90CDF4", "#FBD38D"];
+/** Another market's prices, for the "COMPARE" indicator: seconds -> close, sorted by time. */
+export type CompareSeries = { sym: string; long: boolean; points: [number, number][] };
+
 export function registerChartTools() {
   if (done) return;
   done = true;
+
+  // Other markets drawn over this one's candles, the way a "compare" works elsewhere: each line is
+  // that market's price rescaled so it meets this market's price at the last candle, so the
+  // lines show how each moved against this one over the time on screen. The tooltip gives the
+  // real prices.
+  registerIndicator({
+    name: "COMPARE",
+    shortName: "Compare",
+    series: "price" as any,
+    figures: COMPARE_COLORS.map((color, i) => ({ key: `c${i}`, title: "", type: "line", styles: () => ({ color }) })),
+    calc: (list: KLineData[], ind: any) => {
+      const series: CompareSeries[] = ind.extendData?.series ?? [];
+      // Each market's latest close at or before each candle (its last candle may be a little older).
+      const at = series.map(s => {
+        const out: (number | undefined)[] = [];
+        let j = 0, last: number | undefined;
+        for (const k of list) {
+          const t = k.timestamp / 1000;
+          while (j < s.points.length && s.points[j][0] <= t) last = s.points[j++][1];
+          out.push(last);
+        }
+        return out;
+      });
+      const n = list.length, mainLast = list[n - 1]?.close ?? 0;
+      return list.map((_: KLineData, i: number) => {
+        const row: Record<string, number> = {};
+        at.forEach((vals, m) => {
+          const v = vals[i], end = vals[n - 1];
+          if (v === undefined || !end) return;
+          row[`c${m}`] = v * mainLast / end;
+          row[`r${m}`] = v;
+          row[`p${m}`] = v / end - 1;
+        });
+        return row;
+      });
+    },
+    createTooltipDataSource: ({ indicator, crosshair }: any) => {
+      const series = (indicator.extendData?.series ?? []) as CompareSeries[];
+      const row = (indicator.result as Record<string, number>[])[crosshair.dataIndex ?? indicator.result.length - 1] ?? {};
+      return {
+        name: "", calcParamsText: "", features: [],
+        legends: series.map((s, m) => ({
+          title: { text: `${s.sym} `, color: COMPARE_COLORS[m % COMPARE_COLORS.length] },
+          value: { text: row[`r${m}`] === undefined ? "—" : `${row[`r${m}`].toLocaleString(undefined, { maximumFractionDigits: row[`r${m}`] >= 100 ? 2 : 4 })} (${row[`p${m}`] >= 0 ? "+" : ""}${(row[`p${m}`] * 100).toFixed(2)}% to now)`, color: T.textSecondary },
+        })),
+      };
+    },
+  } as any);
 
   registerOverlay({
     name: "fib",

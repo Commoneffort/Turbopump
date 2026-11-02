@@ -102,7 +102,10 @@ function overdue(work: string): boolean {
 }
 // The step the executor entered last, for the watchdog's message when a pass never finishes.
 let stage = "start", stageAt = Date.now();
-const enter = (s: string) => { stage = s; stageAt = Date.now(); };
+// A step that held the loop up for long is logged: while it runs, no price is posted and no fill
+// is sent, so it shows up directly as time to fill.
+const SLOW_STEP_MS = Number(process.env.SLOW_STEP_MS ?? 1500);
+const enter = (s: string) => { const took = Date.now() - stageAt; if (took > SLOW_STEP_MS && stage !== "idle") log("slow", `${stage} took ${(took / 1000).toFixed(1)} s`); stage = s; stageAt = Date.now(); };
 // A rate-limited RPC call must not take the executor down: log it and carry on next pass.
 process.on("unhandledRejection", e => log("rpc", String((e as any)?.message ?? e).split("\n")[0].slice(0, 120)));
 
@@ -1525,6 +1528,7 @@ setInterval(() => {
       log("error", String(e?.message ?? e).slice(0, 140));
     }
     lastPass = Date.now();
+    enter("idle");
     await new Promise(r => setTimeout(r, waiting ? (C.X1 ? 200 : 500) : 1500));
   }
 })();

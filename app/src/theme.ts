@@ -2,10 +2,10 @@
 // Keep these equal to the tokens at the top of styles.css.
 export const T = {
   bgPrimary: "#010001",
-  bgSecondary: "#0D1117",
+  bgSecondary: "#010001",
   bgPanel: "#111013",
-  bgElevated: "#151B24",
-  bgHover: "#1C2430",
+  bgElevated: "#2C2C30",
+  bgHover: "#2C2C30",
   borderPrimary: "#202A36",
   borderSubtle: "#17212B",
   textPrimary: "#E8EDF4",
@@ -16,6 +16,10 @@ export const T = {
   red: "#FF4D5A",
   redBg: "#35191F",
   blue: "#7AA7FF",
+  // Chart lines that must not be mistaken for each other: entry (blue), liquidation (orange),
+  // trailing stop (purple), current price (white); TP green and SL red.
+  orange: "#FF9F1C",
+  purple: "#B48CFF",
   chartGrid: "#18212B",
 };
 /** "r,g,b" of a "#rrggbb" colour, for rgba() strings. */

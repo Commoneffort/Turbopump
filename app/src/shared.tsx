@@ -473,7 +473,6 @@ export function LiquidityPanel({ state, send, busy }: { state: C.State; send: Se
             ...(claimable ? claimIxs(publicKey) : []),
             C.requestWithdraw(v, publicKey, out ? BigInt(Math.floor(Number(out) * 10 ** C.SHARE_DECIMALS)) : state.userShares),
           ])}>Request withdrawal</button>
-        <p className="muted small">Requests settle together at one price when the epoch ends, so nobody trades against a stale share price. Withdrawals can't be blocked: if a trader holds a position to stop the vault going flat, anyone can make the vault close it six epoch lengths after it was told to.</p>
       </section>
       <PastResults state={state} />
     </>

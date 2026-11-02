@@ -1,7 +1,7 @@
 // The leaderboard and copy trading: who trades well here, by a record the router keeps itself;
 // names and badges; following (their trades show on your chart) and copying (your account
 // mirrors theirs).
-import { openTrader } from "./TraderIntel";
+import { PnlSpark, openTrader } from "./TraderIntel";
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { Connection, PublicKey, TransactionInstruction } from "@solana/web3.js";
@@ -120,11 +120,15 @@ export function Badge({ wallet, profile, size = 18, picture }: { wallet: string;
   const b = badgeOf(wallet, profile);
   // `picture`: a preview (null = show the shape even if the wallet has a picture).
   const url = picture === undefined ? shown.get(wallet)?.url : picture ?? undefined;
-  if (url) return <img className="badge badge-pic" src={url} width={size} height={size} alt="" draggable={false} />;
+  // Every user icon sits in a bordered square of `size`; a picture fills it, a shape sits inside.
+  if (url) return <span className="badge badge-sq" style={{ width: size, height: size }}><img className="badge-pic" src={url} alt="" draggable={false} /></span>;
+  const inner = Math.round(size * 0.66);
   return (
-    <svg className="badge" width={size} height={size} viewBox="-0.06 -0.06 1.12 1.12" aria-hidden>
-      <polygon points={BADGES[b.shape].points.map(p => p.join(",")).join(" ")} fill={b.color} />
-    </svg>
+    <span className="badge badge-sq" style={{ width: size, height: size }} aria-hidden>
+      <svg width={inner} height={inner} viewBox="-0.06 -0.06 1.12 1.12">
+        <polygon points={BADGES[b.shape].points.map(p => p.join(",")).join(" ")} fill={b.color} />
+      </svg>
+    </span>
   );
 }
 export const nameOf = (wallet: string, profile?: S.Profile) => profile?.name ?? short(wallet);
@@ -498,9 +502,12 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
       <div className="traders-head">
         <div>
           <h2>Leaderboard</h2>
-          <p className="muted small">Every trader's record is kept by the router program itself: profit is the account's value minus what was paid in, so it cannot be dressed up. Follow a trader to see their trades on your chart, or copy one ({S.COPY_FEE_TEXT}, once{S.LEADER_PAID ? ": half goes to the trader you copy" : ""}) and your account mirrors theirs.</p>
+          <p className="muted small">
+            Find traders who make money and copy them: pay {S.COPY_FEE_TEXT} once and your account repeats every trade they make, automatically.
+            Every profit here is read from the trader's own account on chain, so nobody can fake their numbers.
+            Good trading pays too: {S.LEADER_PAID ? "you get half of every copier's fee, and " : ""}the weekly contest pays ${S.CONTEST.prizes.reduce((a, b) => a + b, 0)} to its top {S.CONTEST.prizes.length} traders.
+          </p>
         </div>
-        <Search board={board} go={go} />
       </div>
 
       {board && <ContestBox rows={board.rows} me={me.wallet} go={go} />}
@@ -546,6 +553,7 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
           {([["pnl", "Profit"], ["roi", "Return"], ["days", "Win ratio"], ["volume", "Volume"], ["copiers", "Copiers"]] as const).map(([k, l]) => <button key={k} className={sort === k ? "on" : ""} onClick={() => setSort(k)}>{l}</button>)}
         </div>
       </div>
+      <div className="traders-search"><Search board={board} go={go} /></div>
 
       {err && !board ? <div className="quiet">Cannot read the chain: {err}</div> : !board ? <div className="quiet">Reading the chain…</div> : rows.length === 0 ? (
         <div className="quiet">{view === "following" ? "You follow nobody yet. Follow a trader and their trades appear on your chart." : "No track records on this network yet. A record starts with an account's first trade."}</div>
@@ -569,19 +577,25 @@ export function TradersPage({ send, busy, tick, go }: { send: Send; busy?: strin
               const name = nameOf(r.wallet, r.profile), o = over(r, period), isMe = r.wallet === me.wallet, copying = me.copy?.leader.toBase58() === r.wallet;
               return (
                 <div key={r.wallet} className={`podium-card p${i + 1}`}>
-                  <span className="podium-rank mono">{i + 1}</span>
-                  <button className="trader" onClick={() => openTrader(r.wallet)}>
-                    <Badge wallet={r.wallet} profile={r.profile} size={44} />
-                    <span className="podium-name"><b>{name}</b>{r.profile && <i className="mono muted">{short(r.wallet)}</i>}</span>
-                  </button>
-                  <div className="podium-nums">
-                    <div><span>Profit, {periodName}</span><b className={`mono ${tone(o.pnl)}`}>{signed(o.pnl)}</b></div>
-                    <div><span>Return</span><b className={`mono ${tone(o.roi)}`}>{pct(o.roi)}</b></div>
-                    <div><span>Copiers</span><b className="mono">{r.copiers}</b></div>
+                  <div className="podium-l">
+                    <button className="trader" onClick={() => openTrader(r.wallet)}>
+                      <Badge wallet={r.wallet} profile={r.profile} size={44} />
+                      <span className="podium-name"><b>{name}</b>{r.profile && <i className="mono muted">{short(r.wallet)}</i>}</span>
+                    </button>
+                    <div className="podium-nums">
+                      <div><span>Profit, {periodName}</span><b className={`mono ${tone(o.pnl)}`}>{signed(o.pnl)}</b></div>
+                      <div><span>Return</span><b className={`mono ${tone(o.roi)}`}>{pct(o.roi)}</b></div>
+                      <div><span>Copiers</span><b className="mono">{r.copiers}</b></div>
+                    </div>
+                    {!isMe && publicKey && (copying
+                      ? <button className="btn tiny" disabled={!!busy} onClick={() => act.stop()}>Stop copying</button>
+                      : <button className="btn tiny primary" disabled={!!busy} onClick={() => act.copy(r.wallet, name)}>Copy · {S.COPY_FEE_TEXT}</button>)}
                   </div>
-                  {!isMe && publicKey && (copying
-                    ? <button className="btn tiny" disabled={!!busy} onClick={() => act.stop()}>Stop copying</button>
-                    : <button className="btn tiny primary" disabled={!!busy} onClick={() => act.copy(r.wallet, name)}>Copy · {S.COPY_FEE_TEXT}</button>)}
+                  <div className="podium-r">
+                    <span className="podium-rank mono">{i + 1}</span>
+                    <span className="podium-all">All-time profit <b className={`mono ${tone(r.pnl)}`}>{signed(r.pnl)}</b></span>
+                    {r.stats && <PnlSpark stats={r.stats} now={r.pnl} up={r.pnl >= 0} height={88} />}
+                  </div>
                 </div>
               );
             })}
@@ -757,11 +771,11 @@ export function TraderPage({ wallet, send, busy, tick, go }: { wallet: string; s
 /** For other pages: a wallet's trades as chart marks (see Chart `marks`). */
 /** `picture`: the trader's badge picture, already checked and loaded, where they have one.
  *  `note`: what the trader wrote with that trade for their followers, if anything. */
-export type Mark = { key: string; time: number; price: number; size: number; name: string; shape: number; color: string; picture?: HTMLImageElement; note?: string };
+export type Mark = { key: string; time: number; price: number; size: number; name: string; shape: number; color: string; picture?: HTMLImageElement; note?: string; copy?: boolean };
 /** A note belongs to the trader's first fill (on any market) that came after it, within 5 minutes:
  *  the note rides on the request, and the fill follows a few seconds to a minute later. */
 const NOTE_REACH_SECS = 300;
-export function marksFor(board: S.Board | undefined, leaders: Iterable<string>, asset: number, notes?: Map<string, S.Note[]>): Mark[] {
+export function marksFor(board: S.Board | undefined, leaders: Iterable<string>, asset: number, notes?: Map<string, S.Note[]>, copied?: string): Mark[] {
   const out: Mark[] = [];
   for (const w of leaders) {
     const r = board?.rows.find(x => x.wallet === w);
@@ -776,7 +790,7 @@ export function marksFor(board: S.Board | undefined, leaders: Iterable<string>, 
     fills.forEach((f, i) => {
       if (f.asset !== asset) return;
       const note = noteAt.get(i);
-      out.push({ key: `${w}:${f.time}:${f.size}${picture ? ":p" : ""}${note ? `:n${note.length}` : ""}`, time: f.time, price: f.price, size: f.size, name: nameOf(w, r.profile), shape: b.shape, color: b.color === UNSET ? T.textSecondary : b.color, picture, note });
+      out.push({ key: `${w}:${f.time}:${f.size}${picture ? ":p" : ""}${note ? `:n${note.length}` : ""}`, time: f.time, price: f.price, size: f.size, name: nameOf(w, r.profile), shape: b.shape, color: b.color === UNSET ? T.textSecondary : b.color, picture, note, copy: w === copied });
     });
   }
   return out.sort((a, b) => a.time - b.time);

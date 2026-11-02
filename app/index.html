@@ -16,7 +16,7 @@
         window.__state = { net: n, res: fetch("/api/state?network=" + n).then(function (r) { return r.ok ? r.json().then(function (j) { j.age = 1000 * (Number(r.headers.get("age")) || 0); return j; }) : null; }).catch(function () { return null; }) };
       } catch (e) {}
     </script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
   </head>
   <body>
     <div id="root"></div>

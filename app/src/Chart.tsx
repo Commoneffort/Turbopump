@@ -4,9 +4,9 @@
 // candle follows the market's own price as the page reads it.
 import { ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { Chart as KChart, KLineData, dispose, init } from "klinecharts";
-import { Candle, exchangeCandles, hasHistory } from "../api/_candles";
+import { Candle, MONTH, WEEK, bucketStart, exchangeCandles, hasHistory } from "../api/_candles";
 import * as C from "./chain";
-import { registerChartTools, rememberPicture } from "./chartTools";
+import { COMPARE_COLORS, CompareSeries, registerChartTools, rememberPicture } from "./chartTools";
 import { priceDp } from "./shared";
 import { isSpot, spotCandles } from "./swap";
 import { BADGES, Mark } from "./Traders";
@@ -14,7 +14,11 @@ import { T, alpha } from "./theme";
 import { PULSE, WHALE_MINS, Whale, whaleRadius } from "./Pulse";
 
 const UP = T.green, DOWN = T.red;
-export const TIMEFRAMES: [label: string, res: number][] = [["1m", 60], ["5m", 300], ["15m", 900], ["1H", 3600], ["4H", 14400], ["1D", 86400]];
+/** "All": the whole history, in week candles, fitted to the chart's width. */
+export const ALL = 1;
+export const TIMEFRAMES: [label: string, tf: number][] = [["1m", 60], ["5m", 300], ["15m", 900], ["1h", 3600], ["4h", 14400], ["1d", 86400], ["1w", WEEK], ["1M", MONTH], ["All", ALL]];
+/** The ones with a button of their own on the chart bar; the rest are in its menu. */
+const QUICK = [60, 3600, 86400];
 
 type History = { source: string; candles: Candle[]; at: number };
 // Histories this browser has had, by network, symbol and timeframe: a chart seen before draws
@@ -104,9 +108,9 @@ function saveBuilt(symbol: string, res: number, built: Map<number, Candle>) {
 type Line = { price: number; title: string; color: string };
 
 const GREY = T.textSecondary, LINE = T.borderPrimary, TEXT = T.textPrimary, DIM = T.textMuted;
-const period = (res: number) => (res >= 86400 ? { type: "day" as const, span: res / 86400 } : res >= 3600 ? { type: "hour" as const, span: res / 3600 } : { type: "minute" as const, span: res / 60 });
+const period = (res: number) => (res === MONTH ? { type: "month" as const, span: 1 } : res === WEEK ? { type: "week" as const, span: 1 } : res >= 86400 ? { type: "day" as const, span: res / 86400 } : res >= 3600 ? { type: "hour" as const, span: res / 3600 } : { type: "minute" as const, span: res / 60 });
 const bar = (c: Candle): KLineData => ({ timestamp: c[0] * 1000, open: c[1], high: c[2], low: c[3], close: c[4], volume: c[5] });
-const FONT = '"JetBrains Mono", ui-monospace, monospace';
+const FONT = 'Inter, system-ui, sans-serif';
 const txt = (color: string, size = 11) => ({ color, size, family: FONT });
 const STYLES = {
   grid: { horizontal: { color: T.chartGrid }, vertical: { color: T.chartGrid } },
@@ -114,7 +118,7 @@ const STYLES = {
     bar: { upColor: UP, downColor: DOWN, noChangeColor: GREY, upBorderColor: UP, downBorderColor: DOWN, noChangeBorderColor: GREY, upWickColor: UP, downWickColor: DOWN, noChangeWickColor: GREY },
     priceMark: {
       high: { color: DIM, textSize: 10, textFamily: FONT }, low: { color: DIM, textSize: 10, textFamily: FONT },
-      last: { upColor: DOWN, downColor: DOWN, noChangeColor: DOWN, line: { show: true, style: "dashed", dashedValue: [4, 3], size: 1 }, text: { ...txt("#FFFFFF"), paddingLeft: 4, paddingRight: 4 } },
+      last: { upColor: T.textPrimary, downColor: T.textPrimary, noChangeColor: T.textPrimary, line: { show: true, style: "dashed", dashedValue: [4, 3], size: 1 }, text: { ...txt(T.bgPrimary), paddingLeft: 4, paddingRight: 4 } },
     },
     tooltip: { title: txt(TEXT), legend: txt(GREY) },
   },
@@ -179,15 +183,15 @@ export type Trade = { key: string; time: number; price: number; size: number };
 
 /** What the chart can show on top of the candles. Each one can be switched off, and "Clear chart"
  *  switches them all off at once (and the same button brings them back). */
-type Layers = { mine: boolean; follow: boolean; whales: boolean; lines: boolean; studies: boolean; drawings: boolean; heat: boolean };
-const ALL_ON: Layers = { mine: true, follow: true, whales: false, lines: true, studies: true, drawings: true, heat: false };
-const NOTHING: Layers = { mine: false, follow: false, whales: false, lines: false, studies: false, drawings: false, heat: false };
+type Layers = { mine: boolean; follow: boolean; copy: boolean; compare: boolean; whales: boolean; lines: boolean; studies: boolean; drawings: boolean; heat: boolean };
+const ALL_ON: Layers = { mine: true, follow: true, copy: true, compare: true, whales: false, lines: true, studies: true, drawings: true, heat: false };
+const NOTHING: Layers = { mine: false, follow: false, copy: false, compare: false, whales: false, lines: false, studies: false, drawings: false, heat: false };
 const shown = (l: Layers) => Object.values(l).some(Boolean);
 
 /** A price at which open positions would be liquidated, and how much (dollars). */
 export type HeatLevel = { price: number; value: number };
 
-export default function Chart({ symbol, label, price, lines, marks = [], mine, whales, heat, slot = 0, compact = false, dense = false, head }: { symbol: string; label?: string; price: number; lines: Line[]; marks?: Mark[]; mine?: Trade[]; whales?: Whale[]; heat?: HeatLevel[]; slot?: number; compact?: boolean; dense?: boolean; head?: ReactNode }) {
+export default function Chart({ symbol, label, price, lines, marks = [], mine, whales, heat, compare, slot = 0, compact = false, dense = false, head }: { symbol: string; label?: string; price: number; lines: Line[]; marks?: Mark[]; mine?: Trade[]; whales?: Whale[]; heat?: HeatLevel[]; compare?: { sym: string; long: boolean }[]; slot?: number; compact?: boolean; dense?: boolean; head?: ReactNode }) {
   const name = label ?? `${symbol}`, spot = isSpot(symbol);
   const own = slot ? `:${slot}` : "";
   const el = useRef<HTMLDivElement>(null);
@@ -195,10 +199,15 @@ export default function Chart({ symbol, label, price, lines, marks = [], mine, w
   const last = useRef<Candle>();
   const built = useRef(new Map<number, Candle>());
   const push = useRef<((b: KLineData) => void) | null>(null);
-  const [res, setRes] = useState(() => Number(localStorage.getItem(`pv:chart-res${own}`)) || (slot ? 3600 : 900));
+  const [tf, setTf] = useState(() => { const v = Number(localStorage.getItem(`pv:chart-res${own}`)); return TIMEFRAMES.some(t => t[1] === v) ? v : slot ? 3600 : 900; });
+  const res = tf === ALL ? WEEK : tf, limit = tf === ALL ? 1000 : 600;
+  const [tfMenu, setTfMenu] = useState(false);
+  const tfBox = useRef<HTMLDivElement>(null);
+  const pickTf = (v: number) => { setTf(v); setTfMenu(false); try { localStorage.setItem(`pv:chart-res${own}`, String(v)); } catch { /* storage unavailable */ } };
   const [source, setSource] = useState<string>();
   const [empty, setEmpty] = useState(false);
-  const [studies, setStudies] = useState(() => saved(`pv:chart-studies${own}`, slot ? ["MA"] : ["MA", "VOL"]));
+  // (Moving averages were on by default until 2026-11-02; earlier saved choices drop them once.)
+  const [studies, setStudies] = useState(() => saved(`pv:chart-studies2${own}`, saved(`pv:chart-studies${own}`, slot ? [] : ["VOL"]).filter(n => n !== "MA")));
   const [menu, setMenu] = useState(false);
   const [kind, setKind] = useState(() => localStorage.getItem("pv:chart-kind") ?? "candle_solid");
   const [magnet, setMagnet] = useState(() => localStorage.getItem("pv:chart-magnet") === "1");
@@ -226,6 +235,8 @@ export default function Chart({ symbol, label, price, lines, marks = [], mine, w
   const root = useRef<HTMLDivElement>(null);
   const drawn = useRef<string[]>([]);
   const menuBox = useRef<HTMLDivElement>(null);
+  const kindBox = useRef<HTMLDivElement>(null);
+  const [kinds, setKinds] = useState(false);
   const dp = priceDp(price || 1);
 
   useEffect(() => {
@@ -237,6 +248,8 @@ export default function Chart({ symbol, label, price, lines, marks = [], mine, w
     const close = (e: MouseEvent) => {
       if (!menuBox.current?.contains(e.target as Node)) setMenu(false);
       if (!showBox.current?.contains(e.target as Node)) setShow(false);
+      if (!kindBox.current?.contains(e.target as Node)) setKinds(false);
+      if (!tfBox.current?.contains(e.target as Node)) setTfMenu(false);
     };
     document.addEventListener("mousedown", close);
     return () => { ro.disconnect(); document.removeEventListener("mousedown", close); dispose(el.current!); chart.current = null; };
@@ -256,9 +269,9 @@ export default function Chart({ symbol, label, price, lines, marks = [], mine, w
         if (type !== "init") return callback([], false);
         // A history had before is drawn at once; if it is not a recent one, a new one is read
         // meanwhile and the chart is set again from it (this is then asked again, and finds it).
-        const before = candlesBefore(symbol, res);
-        if (before && Date.now() - before.at >= 15_000) fetchCandles(symbol, res).then(h => { if (live && chart.current === c && h !== before) c.resetData(); }).catch(() => undefined);
-        const r = before ?? await fetchCandles(symbol, res).catch(() => undefined);
+        const before = candlesBefore(symbol, res, limit);
+        if (before && Date.now() - before.at >= 15_000) fetchCandles(symbol, res, limit).then(h => { if (live && chart.current === c && h !== before) c.resetData(); }).catch(() => undefined);
+        const r = before ?? await fetchCandles(symbol, res, limit).catch(() => undefined);
         if (!live) return;
         setSource(r?.source);
         // History first; where this page drew a candle itself and history has none (or it is
@@ -275,19 +288,21 @@ export default function Chart({ symbol, label, price, lines, marks = [], mine, w
         last.current = rows[rows.length - 1] ?? last.current;
         setEmpty(rows.length === 0 && !last.current);
         callback(rows.map(bar), false);
+        // "All": the whole history across the chart's width.
+        if (tf === ALL && rows.length) setTimeout(() => { const w = c.getSize()?.width ?? 0; if (w && live) c.setBarSpace(Math.max(1, (w - 70) / rows.length)); }, 0);
       },
       subscribeBar: ({ callback }) => { push.current = callback; },
       unsubscribeBar: () => { push.current = null; },
     });
     return () => { live = false; };
-  }, [symbol, res]);
+  }, [symbol, tf]);
 
   useEffect(() => { chart.current?.setSymbol({ ticker: name, pricePrecision: dp, volumePrecision: 2 }); }, [dp]);
 
   // The candle in progress follows the market's own price.
   useEffect(() => {
     if (!(price > 0)) return;
-    const now = Math.floor(Date.now() / 1000), t = now - (now % res);
+    const now = Math.floor(Date.now() / 1000), t = bucketStart(now, res);
     const prev = last.current;
     if (prev && t < prev[0]) return;
     // A history that is far from the market's price is another instrument's: leave it alone.
@@ -308,10 +323,36 @@ export default function Chart({ symbol, label, price, lines, marks = [], mine, w
     for (const [name] of [...ON_PRICE, ...BELOW]) c.removeIndicator({ name });
     for (const name of layers.studies ? studies : []) {
       if (ON_PRICE.some(([n]) => n === name)) c.createIndicator({ name, paneId: "candle_pane" } as any, true);
+      // (Volume without its own moving-average lines.)
+      else if (name === "VOL") c.createIndicator({ name, calcParams: [] } as any);
       else if (BELOW.some(([n]) => n === name)) c.createIndicator(name);
     }
-    try { localStorage.setItem(`pv:chart-studies${own}`, JSON.stringify(studies)); } catch { /* storage unavailable */ }
+    try { localStorage.setItem(`pv:chart-studies2${own}`, JSON.stringify(studies)); } catch { /* storage unavailable */ }
   }, [studies.join(","), layers.studies]);
+
+  // The wallet's other open positions' markets over these candles (indicator "COMPARE" in
+  // chartTools): read at this timeframe, and again every half minute.
+  const compareKey = (compare ?? []).map(x => `${x.sym}:${x.long ? 1 : 0}`).join(",");
+  useEffect(() => {
+    const c = chart.current;
+    if (!c) return;
+    c.removeIndicator({ name: "COMPARE" });
+    const want = layers.compare ? (compare ?? []).filter(x => x.sym !== symbol).slice(0, COMPARE_COLORS.length) : [];
+    if (!want.length) return;
+    let live = true;
+    const draw = async () => {
+      const series: CompareSeries[] = await Promise.all(want.map(async x => {
+        const h = await fetchCandles(x.sym, res, 600, 30_000).catch(() => null);
+        return { sym: x.sym, long: x.long, points: (h?.candles ?? []).map(k => [k[0] > 1e12 ? k[0] / 1000 : k[0], k[4]] as [number, number]).sort((a, b) => a[0] - b[0]) };
+      }));
+      if (!live || !chart.current) return;
+      chart.current.removeIndicator({ name: "COMPARE" });
+      chart.current.createIndicator({ name: "COMPARE", paneId: "candle_pane", extendData: { series } } as any, true);
+    };
+    draw();
+    const id = setInterval(() => document.hidden || draw(), 30_000);
+    return () => { live = false; clearInterval(id); };
+  }, [compareKey, symbol, res, layers.compare]);
 
   // Candles, hollow candles, bars or a line; the crosshair; and whether drawings snap to prices.
   useEffect(() => {
@@ -363,7 +404,7 @@ export default function Chart({ symbol, label, price, lines, marks = [], mine, w
   }, [full, note, menu]);
 
   // The wallet's entry and liquidation prices, as locked lines.
-  const lineKey = useMemo(() => lines.map(l => `${l.title}:${l.price.toFixed(dp)}`).join("|"), [lines, dp]);
+  const lineKey = useMemo(() => lines.map(l => `${l.title}:${l.color}:${l.price.toFixed(dp)}`).join("|"), [lines, dp]);
   useEffect(() => {
     const c = chart.current;
     if (!c) return;
@@ -386,6 +427,8 @@ export default function Chart({ symbol, label, price, lines, marks = [], mine, w
   // Trades of the traders this wallet follows or copies: their badge at the candle and price of
   // each fill, under the candle for a buy and over it for a sell.
   const markKey = useMemo(() => marks.map(m => m.key).join("|"), [marks]);
+  const followed = useMemo(() => marks.filter(m => !m.copy), [marks]);
+  const copiedMarks = useMemo(() => marks.filter(m => m.copy), [marks]);
   useEffect(() => {
     const c = chart.current;
     if (!c) return;
@@ -400,8 +443,8 @@ export default function Chart({ symbol, label, price, lines, marks = [], mine, w
     // The pointer can leave the chart straight from a badge, and the chart then reports nothing.
     const left = () => { for (const [id, data] of over) c.overrideOverlay({ id, extendData: { ...data, hover: false } }); over.clear(); };
     root.current?.addEventListener("mouseleave", left);
-    for (const m of layers.follow ? marks : []) {
-      const t = m.time - (m.time % res);
+    for (const m of marks.filter(m => (m.copy ? layers.copy : layers.follow))) {
+      const t = bucketStart(m.time, res);
       c.createOverlay({
         name: "traderMark", groupId: "social", lock: true, points: [{ timestamp: t * 1000, value: m.price }],
         extendData: { points: BADGES[m.shape % BADGES.length].points, color: m.color, picture: m.picture && rememberPicture(m.picture), buy: m.size > 0, label: m.name, what: `${m.size > 0 ? "Bought" : "Sold"} ${Math.abs(m.size).toFixed(4).replace(/\.?0+$/, "")} at ${m.price.toFixed(dp)}`, note: m.note },
@@ -409,7 +452,7 @@ export default function Chart({ symbol, label, price, lines, marks = [], mine, w
       } as any);
     }
     return () => root.current?.removeEventListener("mouseleave", left);
-  }, [markKey, symbol, res, layers.follow, dp]);
+  }, [markKey, symbol, res, layers.follow, layers.copy, dp]);
 
   // This wallet's own fills: a green triangle under the price of each buy, a red one over each sell.
   const mineKey = useMemo(() => (mine ?? []).map(m => m.key).join("|"), [mine]);
@@ -419,7 +462,7 @@ export default function Chart({ symbol, label, price, lines, marks = [], mine, w
     c.removeOverlay({ groupId: "mine" });
     const hover = (on: boolean) => (e: any) => { c.overrideOverlay({ id: e.overlay.id, extendData: { ...e.overlay.extendData, hover: on } }); return true; };
     for (const m of layers.mine ? mine ?? [] : []) {
-      const t = m.time - (m.time % res);
+      const t = bucketStart(m.time, res);
       const size = Math.abs(m.size).toFixed(4).replace(/\.?0+$/, "");
       c.createOverlay({
         name: "tradeDot", groupId: "mine", lock: true, points: [{ timestamp: t * 1000, value: m.price }],
@@ -440,7 +483,7 @@ export default function Chart({ symbol, label, price, lines, marks = [], mine, w
     c.removeOverlay({ groupId: "whales" });
     const hover = (on: boolean) => (e: any) => { c.overrideOverlay({ id: e.overlay.id, extendData: { ...e.overlay.extendData, hover: on } }); return true; };
     for (const w of bigOnes) {
-      const t = w.time - (w.time % res);
+      const t = bucketStart(w.time, res);
       c.createOverlay({
         name: "whaleMark", groupId: "whales", lock: true, points: [{ timestamp: t * 1000, value: w.price }],
         extendData: { r: whaleRadius(w.value, whaleMin), buy: w.size > 0, label: `${w.name}${w.bot ? " (bot)" : ""} ${w.size > 0 ? "bought" : "sold"} $${Math.round(w.value).toLocaleString()}` },
@@ -455,17 +498,36 @@ export default function Chart({ symbol, label, price, lines, marks = [], mine, w
       <div className="chart-bar">
         {!full && head}
         {full && <div className="chart-sym"><b>{name}</b><span>{price > 0 ? price.toFixed(dp) : ""}</span></div>}
-        <div className="seg-tf">
-          {TIMEFRAMES.map(([label, r]) => (
-            <button key={r} className={r === res ? "on" : ""} onClick={() => { setRes(r); try { localStorage.setItem(`pv:chart-res${own}`, String(r)); } catch { /* storage unavailable */ } }}>{label}</button>
-          ))}
-        </div>
-        <div className="kinds">
-          {KINDS.map(([type, label, icon]) => (
-            <button key={type} title={label} aria-label={label} className={type === kind ? "on" : ""} onClick={() => setKind(type)}>
-              <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden><path d={icon} fill={type === "candle_solid" ? "currentColor" : "none"} stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" /></svg>
+        <div className="seg-tf" ref={tfBox}>
+          {QUICK.map(v => <button key={v} className={v === tf ? "on" : ""} onClick={() => pickTf(v)}>{TIMEFRAMES.find(t => t[1] === v)![0]}</button>)}
+          <div className="studies tf-more">
+            <button className={`tf-pick${!QUICK.includes(tf) ? " on" : ""}${tfMenu ? " open" : ""}`} title="More timeframes" aria-label="More timeframes" aria-expanded={tfMenu} onClick={() => setTfMenu(o => !o)}>
+              {!QUICK.includes(tf) && TIMEFRAMES.find(t => t[1] === tf)?.[0]}
+              <svg width="8" height="8" viewBox="0 0 8 8" aria-hidden><path d="M1 2.5 4 5.5 7 2.5" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" /></svg>
             </button>
-          ))}
+            {tfMenu && (
+              <div className="studies-menu tf-menu">
+                {TIMEFRAMES.map(([label, v]) => <button key={v} className={v === tf ? "on" : ""} onClick={() => pickTf(v)}><b>{label}</b><i /></button>)}
+              </div>
+            )}
+          </div>
+        </div>
+        <div className="kinds studies" ref={kindBox}>
+          {(() => {
+            const [type, label, icon] = KINDS.find(k => k[0] === kind) ?? KINDS[0];
+            const glyph = (t: string, d: string) => <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden><path d={d} fill={t === "candle_solid" ? "currentColor" : "none"} stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" /></svg>;
+            return <>
+              <button className={`kind-pick${kinds ? " on" : ""}`} title={`Chart type: ${label}`} aria-label={`Chart type: ${label}`} onClick={() => setKinds(o => !o)}>
+                {glyph(type, icon)}
+                <svg width="8" height="8" viewBox="0 0 8 8" aria-hidden><path d="M1 2.5 4 5.5 7 2.5" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" /></svg>
+              </button>
+              {kinds && (
+                <div className="studies-menu kinds-menu">
+                  {KINDS.map(([t, l, d]) => <button key={t} className={t === kind ? "on" : ""} onClick={() => { setKind(t); setKinds(false); }}>{glyph(t, d)}<span>{l}</span><i /></button>)}
+                </div>
+              )}
+            </>;
+          })()}
         </div>
         <div className="studies" ref={menuBox}>
           <button className={menu ? "on" : ""} onClick={() => setMenu(m => !m)}>
@@ -491,7 +553,12 @@ export default function Chart({ symbol, label, price, lines, marks = [], mine, w
               <div className="studies-menu layers-menu">
                 <div className="studies-h">Trades</div>
                 {mine && <button className={layers.mine ? "on" : ""} onClick={() => layer("mine", !layers.mine)}><span className="lay-dots"><b className="tri up" /><b className="tri down" /></span>My trades<em>{mine.length}</em><i /></button>}
-                <button className={layers.follow ? "on" : ""} onClick={() => layer("follow", !layers.follow)} title={marks.length ? "" : "Follow a trader (click their name anywhere) and their trades on this market show here"}><span className="lay-dots"><b className="badge" /></span>Traders I follow<em>{marks.length}</em><i /></button>
+                <button className={layers.follow ? "on" : ""} onClick={() => layer("follow", !layers.follow)} title={followed.length ? "" : "Follow a trader (click their name anywhere) and their trades on this market show here"}><span className="lay-dots"><b className="badge" /></span>Traders I follow<em>{followed.length}</em><i /></button>
+                <button className={layers.copy ? "on" : ""} onClick={() => layer("copy", !layers.copy)} title={copiedMarks.length ? "The trades of the trader you copy on this market" : "Copy a trader (open their profile) and their trades on this market show here"}><span className="lay-dots"><b className="badge" /></span>Traders I copy<em>{copiedMarks.length}</em><i /></button>
+                {compare && <>
+                  <div className="studies-h">Compare</div>
+                  <button className={layers.compare ? "on" : ""} onClick={() => layer("compare", !layers.compare)} title={compare.filter(x => x.sym !== symbol).length ? "Your other open positions' markets as lines over these candles, rescaled to meet this price at the last candle: they show how each moved against this market" : "Open positions on other markets show here as lines over these candles"}><span className="lay-dots">{compare.filter(x => x.sym !== symbol).slice(0, 3).map((x, i) => <b key={x.sym} className="cmp" style={{ background: COMPARE_COLORS[i] }} />)}{compare.filter(x => x.sym !== symbol).length ? null : <b className="line" />}</span>My other positions<em>{compare.filter(x => x.sym !== symbol).map(x => x.sym).join(" · ") || 0}</em><i /></button>
+                </>}
                 {whales && PULSE.whales && <>
                   <button className={layers.whales ? "on" : ""} onClick={() => layer("whales", !layers.whales)} title="Every fill on this market worth at least the chosen amount, by anyone"><span className="lay-dots"><b className="whale" /></span>Whales{whaleOn ? <em>{bigOnes.length}</em> : <em />}<i /></button>
                   {whaleOn && (
@@ -513,14 +580,6 @@ export default function Chart({ symbol, label, price, lines, marks = [], mine, w
                 </div>
               </div>
             )}
-          </div>
-        )}
-        {!spot && heat && (
-          <div className="studies">
-            <button className={layers.heat ? "on" : ""} onClick={() => layer("heat", !layers.heat)} title="Liquidation heatmap: bands where open positions would be liquidated, brighter where more would be">
-              <svg width="14" height="14" viewBox="0 0 16 16" aria-hidden><path d="M2 3h12M2 6.5h12M2 10h12M2 13.5h12" stroke="currentColor" strokeWidth="2" opacity="0.9" /></svg>
-              Heatmap
-            </button>
           </div>
         )}
         {spot && <div className="chart-src" title="Where the candles come from: xDEX's record of this pair's swaps. The last one follows the pool's own price.">xDEX swaps · live pool price</div>}

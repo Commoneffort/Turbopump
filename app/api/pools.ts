@@ -4,10 +4,12 @@
 //   GET /api/pools?network=…&trades=<pool>[&signer=<wallet>]      a pool's latest swaps
 // Only plain fields are passed on; token pictures are not (the page never shows a picture from a
 // URL), and the page reads each pool's accounts on chain itself before quoting or swapping.
+import { aggregate } from "./_candles.js";
+
 const NAMES: Record<string, string> = { "x1-testnet": "X1 Testnet", devnet: "Solana Devnet" };
 const B58 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const SIG = /^[1-9A-HJ-NP-Za-km-z]{64,90}$/;
-const RESOLUTIONS = new Set([60, 300, 900, 3600, 14400, 86400]);
+const RESOLUTIONS = new Set([60, 300, 900, 3600, 14400, 86400, 604800, 2592000]);
 const API = "https://api.xdex.xyz/api";
 const text = (s: unknown) => String(s ?? "").replace(/[^\p{L}\p{N} ._$-]/gu, "").slice(0, 16);
 const n = (x: unknown) => (Number.isFinite(Number(x)) ? Number(x) : 0);
@@ -25,12 +27,14 @@ export default async function handler(req: any, res: any) {
       if (!B58.test(from) || !B58.test(to) || !RESOLUTIONS.has(resolution)) return res.status(400).json({ error: "from, to and res are required" });
       res.setHeader("Cache-Control", "public, s-maxage=8, stale-while-revalidate=300");
       const now = Math.floor(Date.now() / 1000);
-      const j = await get(`${API}/xdex/chart/history?from_token=${from}&to_token=${to}&resolution=${resolution / 60}&time_from=${now - resolution * limit}&time_to=${now}&network=${net}`);
+      // Weeks and months are rolled up from days.
+      const wide = resolution >= 604800, step = wide ? 86400 : resolution;
+      const j = await get(`${API}/xdex/chart/history?from_token=${from}&to_token=${to}&resolution=${step / 60}&time_from=${now - resolution * limit}&time_to=${now}&network=${net}`);
       const candles = (Array.isArray(j?.bars) ? j.bars : [])
         .map((b: any) => [n(b.t), n(b.o), n(b.h), n(b.l), n(b.c), n(b.v)])
         .filter((c: number[]) => c[0] > 0 && c[1] > 0 && c[4] > 0)
         .sort((a: number[], b: number[]) => a[0] - b[0]);
-      return res.status(200).json({ source: "xdex", candles });
+      return res.status(200).json({ source: "xdex", candles: wide ? aggregate(candles, resolution).slice(-limit) : candles });
     }
     if (q.trades) {
       const pool = String(q.trades), signer = q.signer ? String(q.signer) : "";

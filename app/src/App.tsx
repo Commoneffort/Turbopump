@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
 import { PublicKey, Transaction } from "@solana/web3.js";
@@ -130,13 +130,9 @@ export default function App() {
         <nav className="tabs">
           <a className={tab(desk && !spot)} href="#/">Trade</a>
           <a className={tab(spot)} href="#/spot">Spot</a>
-          <a className={tab(page === "markets")} href="#/markets">Markets</a>
+          <a className={tab(page === "markets" || page === "launch")} href="#/markets">Markets</a>
           <a className={tab(page === "portfolio")} href="#/portfolio">Portfolio</a>
-          <a className={tab(page === "launch")} href="#/launch">Open a market</a>
           <a className={tab(page === "traders" || page === "trader" || page === "leaderboard")} href="#/leaderboard">Leaderboard<em className="tab-prize" title="Weekly trading contest">🏆 ${S.CONTEST.prizes.reduce((a, b) => a + b, 0)}</em></a>
-          <a className={tab(page === "execution")} href="#/execution">Execution</a>
-          <a className={tab(page === "health")} href="#/health">Health</a>
-          <a className={tab(page === "how" || page === "docs")} href="#/docs">Docs</a>
         </nav>
         <div className="top-right">
           <div className="net-switch" title="Which deployment this page shows">
@@ -160,9 +156,7 @@ export default function App() {
               Wallet" when installed), or the burner wallet; you need a little test XNT for fees ("Get test USDC" sends some). See <a href="#/health">Health</a> for live solvency.
             </p>
           )}
-          {page === "launch" ? (
-            <LaunchPage key={route[1] ?? ""} send={send} busy={busy} go={go} initial={route[1]} />
-          ) : page === "health" ? (
+          {page === "health" ? (
             <HealthPage tick={tick} />
           ) : page === "portfolio" ? (
             <PortfolioPage tick={tick} go={go} />
@@ -175,16 +169,28 @@ export default function App() {
           ) : page === "trader" && route[1] ? (
             <TraderPage key={route[1]} wallet={route[1]} send={send} busy={busy} tick={tick} go={go} />
           ) : (
-            <MarketsPage go={go} tick={tick} />
+            // Markets and opening a market are one page; #/launch[/SYMBOL] scrolls to the second part.
+            <>
+              <MarketsPage go={go} tick={tick} />
+              <LaunchPage key={route[1] ?? ""} send={send} busy={busy} go={go} initial={route[1]} focus={page === "launch"} />
+            </>
           )}
-          <footer className="foot">
-            Unaudited experimental software on {C.NETWORK_NAME} · vault program{" "}
-            <a href={explorer("address", C.VAULT_PROGRAM.toString())} target="_blank" rel="noreferrer">{short(C.VAULT_PROGRAM)}</a> · Percolator{" "}
-            <a href={explorer("address", C.PERCOLATOR.toString())} target="_blank" rel="noreferrer">{short(C.PERCOLATOR)}</a> ·{" "}
-            <a href="https://github.com/Commoneffort/Turbopump" target="_blank" rel="noreferrer">source</a>
-          </footer>
         </div>
       )}
+
+      <footer className="sitefoot">
+        <nav>
+          <a className={page === "how" || page === "docs" ? "on" : ""} href="#/docs">Docs</a>
+          <a className={page === "execution" ? "on" : ""} href="#/execution">Execution</a>
+          <a className={page === "health" ? "on" : ""} href="#/health">Health</a>
+        </nav>
+        <span className="sitefoot-r">
+          Unaudited experimental software on {C.NETWORK_NAME} · vault program{" "}
+          <a href={explorer("address", C.VAULT_PROGRAM.toString())} target="_blank" rel="noreferrer">{short(C.VAULT_PROGRAM)}</a> · Percolator{" "}
+          <a href={explorer("address", C.PERCOLATOR.toString())} target="_blank" rel="noreferrer">{short(C.PERCOLATOR)}</a> ·{" "}
+          <a href="https://github.com/Commoneffort/Turbopump" target="_blank" rel="noreferrer">source</a>
+        </span>
+      </footer>
 
       <TraderModalHost send={send} busy={busy} tick={tick} go={go} />
       {toast && (
@@ -276,7 +282,9 @@ function MarketsPage({ go, tick }: { go: (to: string) => void; tick: number }) {
 
 // ---------------------------------------------------------------- launch
 
-function LaunchPage({ send, busy, go, initial }: { send: Send; busy?: string; go: (to: string) => void; initial?: string }) {
+function LaunchPage({ send, busy, go, initial, focus }: { send: Send; busy?: string; go: (to: string) => void; initial?: string; focus?: boolean }) {
+  const box = useRef<HTMLElement>(null);
+  useEffect(() => { if (focus) setTimeout(() => box.current?.scrollIntoView({ block: "start" }), 0); }, [focus, initial]);
   const { connection } = useConnection();
   const { publicKey } = useWallet();
   const [prices, setPrices] = useState<Record<string, bigint>>({});
@@ -332,7 +340,7 @@ function LaunchPage({ send, busy, go, initial }: { send: Send; busy?: string; go
   };
 
   return (
-    <main className="grid">
+    <main className="grid launch" id="open-market" ref={box}>
       <section className="card span2">
         <h2>Open a market</h2>
         <p className="muted">

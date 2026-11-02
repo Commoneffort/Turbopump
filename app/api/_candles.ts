@@ -5,7 +5,15 @@
 // replaces these with candles of the oracle price it recorded.
 export type Candle = [t: number, o: number, h: number, l: number, c: number, v: number]; // t: unix seconds
 
-export const RESOLUTIONS: Record<number, string> = { 60: "1m", 300: "5m", 900: "15m", 3600: "1h", 14400: "4h", 86400: "1d" };
+export const RESOLUTIONS: Record<number, string> = { 60: "1m", 300: "5m", 900: "15m", 3600: "1h", 14400: "4h", 86400: "1d", 604800: "1w", 2592000: "1M" };
+export const WEEK = 604800, MONTH = 2592000; // MONTH stands for calendar months
+/** Start of the candle a time falls in: weeks start Monday 00:00 UTC, months on the 1st (as on
+ *  the exchanges), shorter candles on a multiple of their length. */
+export function bucketStart(t: number, res: number): number {
+  if (res === MONTH) { const d = new Date(t * 1000); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1) / 1000; }
+  if (res === WEEK) return t - ((t - 4 * 86400) % WEEK); // 1970-01-05 was a Monday
+  return t - (t % res);
+}
 /** The exchange market that tracks each symbol. Symbols not listed have no history to borrow. */
 export const EXCHANGE_SYMBOL: Record<string, string> = {
   BTC: "BTCUSDT", ETH: "ETHUSDT", SOL: "SOLUSDT", DOGE: "DOGEUSDT", PYTH: "PYTHUSDT", ZEC: "ZECUSDT", XAU: "PAXGUSDT", EUR: "EURUSDT",
@@ -20,12 +28,15 @@ async function secondExchangeCandles(symbol: string, res: number, limit: number,
   const pair = SECOND_EXCHANGE_PAIR[symbol];
   if (!pair) return [];
   try {
-    const r = await f(`https://api.kraken.com/0/public/OHLC?pair=${pair}&interval=${res / 60}`, { signal: AbortSignal.timeout(8_000) });
+    // Kraken has no month candles: weeks and months are rolled up from its days.
+    const wide = res >= WEEK;
+    const r = await f(`https://api.kraken.com/0/public/OHLC?pair=${pair}&interval=${wide ? 1440 : res / 60}`, { signal: AbortSignal.timeout(8_000) });
     if (!r.ok) return [];
     const j: any = await r.json();
     const key = Object.keys(j.result ?? {}).find(k => k !== "last");
     const rows: any[] = key ? j.result[key] : [];
-    return rows.map(k => [k[0], +k[1], +k[2], +k[3], +k[4], +k[6]] as Candle).slice(-limit);
+    const out = rows.map(k => [k[0], +k[1], +k[2], +k[3], +k[4], +k[6]] as Candle);
+    return (wide ? aggregate(out, res) : out).slice(-limit);
   } catch { return []; }
 }
 
@@ -48,7 +59,7 @@ export async function exchangeCandles(symbol: string, res: number, limit = 500, 
 export function aggregate(candles: Candle[], res: number): Candle[] {
   const out: Candle[] = [];
   for (const c of candles) {
-    const t = c[0] - (c[0] % res);
+    const t = bucketStart(c[0], res);
     const last = out[out.length - 1];
     if (last && last[0] === t) {
       last[2] = Math.max(last[2], c[2]); last[3] = Math.min(last[3], c[3]); last[4] = c[4]; last[5] += c[5];

@@ -65,6 +65,7 @@ export default function ExecutionPage({ tick }: { tick: number }) {
           There is no order book. This page checks, from public data only, whether that actually works out well for traders: how long fills take,
           how close the price is to the outside market, how often trades fail, and whether anyone gets an unfair edge.
         </p>
+        <p className="muted small"><a href="#/execution" onClick={e => { e.preventDefault(); document.getElementById("become-executor")?.scrollIntoView({ behavior: "smooth" }); }}>Anyone can become an executor and earn rewards ↓</a></p>
         <p className="muted small">
           {C.NETWORK_NAME} · last {hours(from, to)} of transactions on {report.markets.length} market{report.markets.length === 1 ? "" : "s"} · {n(t)} requests · read {Math.max(1, Math.round((Date.now() / 1000 - report.at) / 60))} min ago.
           Rebuilt from the chain by a reader separate from our executor; check it yourself with <code>NETWORK={report.network} npx tsx scripts/exec-quality.ts</code>.
@@ -197,6 +198,8 @@ export default function ExecutionPage({ tick }: { tick: number }) {
           <p className="muted small">{C.KEEPER_REWARDS ? "Live on this network." : "Fills are paid today. The other rewards are built and tested and switch on with the next router upgrade on this network."} Expiring always pays less than filling, so letting a trade lapse never pays.</p>
         </section>
       </div>
+
+      <BecomeExecutor />
 
       <h3 className="section-title">Recent executions</h3>
       <div className="table-wrap">
@@ -331,5 +334,34 @@ function Executors({ report }: { report: Report }) {
         </tbody>
       </table>
     </div>
+  );
+}
+
+/** How to run an executor: anyone may, with no sign-up (the programs check every piece of work). */
+function BecomeExecutor() {
+  const net = C.X1 ? "NETWORK=x1-testnet " : "RPC=<your devnet RPC> HERMES_API_KEY=<free Pyth key> ";
+  return (
+    <section className="exec-join" id="become-executor">
+      <h3 className="section-title">Become an executor</h3>
+      <p className="muted small">
+        No sign-up and no permission: the router accepts work from any wallet and checks every step itself. You need a computer that stays online,
+        Node.js, and a wallet with a little {C.COIN} for transaction fees. You are paid per piece of work, at the rates above, straight into that wallet.
+      </p>
+      <ol className="exec-steps">
+        <li><span>Get the code</span><pre>git clone -b audit-2026-10 https://github.com/Commoneffort/Turbopump{"\n"}cd Turbopump/app && npm install</pre></li>
+        <li><span>Make a wallet for it and send it some {C.COIN} for fees</span><pre>solana-keygen new -o executor.json</pre></li>
+        <li><span>Start it</span><pre>{net}KEYPAIR=./executor.json npx tsx scripts/executor.ts</pre></li>
+      </ol>
+      <div className="kv-list">
+        <div><span>Only some of the work</span><b className="mono">EXECUTOR_ROLES=trade · maintenance · liquidation</b></div>
+        <div><span>Stand by as a backup (acts only on work overdue N seconds)</span><b className="mono">BACKUP_AFTER_SECS=N</b></div>
+      </div>
+      <p className="muted small">
+        {C.X1
+          ? "On X1 testnet the price comes from the router's reporter key (X1 has no Pyth), so your executor fills a trade once the posted price reaches its target; standing orders, liquidations and expiries need nothing else."
+          : "On devnet your executor posts Pyth prices itself; Pyth's free plan covers every feed here."}
+        {" "}Several executors can run side by side: the first to do a piece of work is paid, and a duplicate attempt fails without costing more than its transaction fee.
+      </p>
+    </section>
   );
 }

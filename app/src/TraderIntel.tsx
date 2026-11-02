@@ -262,19 +262,64 @@ function readOf(x: { r: S.TraderRow; s: S.Stats; perDay: number; buyShare: numbe
 
 /** The profit since the record started, day by day (cumulative, with each day's result as bars),
  *  ending at the live value. Hover for the day. */
-export function PnlChart({ stats, now }: { stats: S.Stats; now: number }) {
-  const [hover, setHover] = useState<number>();
-  const [span, setSpan] = useState<"7" | "30" | "all">("all");
-  const box = useRef<SVGSVGElement>(null);
+/** A smooth line through points (monotone cubic: it bends between points but never swings past
+ *  them, so a curve never shows a profit or loss that did not happen). */
+export function smoothPath(p: { x: number; y: number }[]): string {
+  if (p.length < 3) return p.map((q, i) => `${i ? "L" : "M"}${q.x.toFixed(1)},${q.y.toFixed(1)}`).join(" ");
+  const n = p.length, d: number[] = [], m: number[] = [];
+  for (let i = 0; i < n - 1; i++) d.push((p[i + 1].y - p[i].y) / Math.max(1e-9, p[i + 1].x - p[i].x));
+  m.push(d[0]);
+  for (let i = 1; i < n - 1; i++) m.push(d[i - 1] * d[i] <= 0 ? 0 : (d[i - 1] + d[i]) / 2);
+  m.push(d[n - 2]);
+  for (let i = 0; i < n - 1; i++) {
+    if (d[i] === 0) { m[i] = 0; m[i + 1] = 0; continue; }
+    const a = m[i] / d[i], b = m[i + 1] / d[i], h = a * a + b * b;
+    if (h > 9) { const t = 3 / Math.sqrt(h); m[i] = t * a * d[i]; m[i + 1] = t * b * d[i]; }
+  }
+  let out = `M${p[0].x.toFixed(1)},${p[0].y.toFixed(1)}`;
+  for (let i = 0; i < n - 1; i++) {
+    const dx = (p[i + 1].x - p[i].x) / 3;
+    out += ` C${(p[i].x + dx).toFixed(1)},${(p[i].y + m[i] * dx).toFixed(1)} ${(p[i + 1].x - dx).toFixed(1)},${(p[i + 1].y - m[i + 1] * dx).toFixed(1)} ${p[i + 1].x.toFixed(1)},${p[i + 1].y.toFixed(1)}`;
+  }
+  return out;
+}
+
+/** Running profit of a track record: one point before its first kept day, one per day, and now. */
+export function pnlPoints(stats: S.Stats, now: number) {
   const days = stats.days;
-  const inDays = days.reduce((t, d) => t + d.pnl, 0);
-  // Profit before the first day kept (a record keeps its last 30 trading days).
-  let run = now - inDays;
+  let run = now - days.reduce((t, d) => t + d.pnl, 0);
   const pts: { t: number; v: number; day?: number }[] = [];
   if (days.length) pts.push({ t: (days[0].day - 1) * DAY, v: run });
   else pts.push({ t: stats.startTime * 1000, v: 0 });
   for (const d of days) { run += d.pnl; pts.push({ t: d.day * DAY, v: run, day: d.pnl }); }
   pts.push({ t: Date.now(), v: now });
+  return pts;
+}
+
+/** A small profit line for a card: smooth, filled faintly to its lowest point, no axes. */
+export function PnlSpark({ stats, now, height = 56, up }: { stats: S.Stats; now: number; height?: number; up?: boolean }) {
+  const pts = pnlPoints(stats, now);
+  if (pts.length < 2) return null;
+  const W = 300, H = height, pad = 3;
+  const t0 = pts[0].t, t1 = pts[pts.length - 1].t;
+  const vs = pts.map(p => p.v), lo = Math.min(...vs), hi = Math.max(...vs), vr = hi - lo || 1;
+  const xy = pts.map(p => ({ x: ((p.t - t0) / Math.max(1, t1 - t0)) * W, y: pad + (1 - (p.v - lo) / vr) * (H - 2 * pad) }));
+  const line = smoothPath(xy);
+  const color = (up ?? pts[pts.length - 1].v >= pts[0].v) ? "var(--green)" : "var(--coral)";
+  return (
+    <svg className="pnl-spark" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" width="100%" height={H} aria-label="Profit over time">
+      <path d={`${line} L${W},${H} L0,${H} Z`} fill={color} opacity="0.08" />
+      <path d={line} fill="none" stroke={color} strokeWidth="1.8" vectorEffect="non-scaling-stroke" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+export function PnlChart({ stats, now }: { stats: S.Stats; now: number }) {
+  const [hover, setHover] = useState<number>();
+  const [span, setSpan] = useState<"7" | "30" | "all">("all");
+  const box = useRef<SVGSVGElement>(null);
+  // (A record keeps its last 30 trading days; the first point is the profit before them.)
+  const pts = pnlPoints(stats, now);
   const from = span === "all" ? -Infinity : Date.now() - Number(span) * DAY;
   const shown = pts.filter((p, i) => p.t >= from || (i < pts.length - 1 && pts[i + 1].t >= from));
   if (shown.length < 2) return <div className="quiet">Not enough history for a chart yet.</div>;
@@ -285,7 +330,7 @@ export function PnlChart({ stats, now }: { stats: S.Stats; now: number }) {
   const y = (v: number) => padT + (1 - (v - vmin) / vr) * (H - padT - padB - barH - 10);
   const up = shown[shown.length - 1].v >= shown[0].v;
   const color = up ? "var(--green)" : "var(--coral)";
-  const line = shown.map((p, i) => `${i ? "L" : "M"}${x(p.t).toFixed(1)},${y(p.v).toFixed(1)}`).join(" ");
+  const line = smoothPath(shown.map(p => ({ x: x(p.t), y: y(p.v) })));
   const area = `${line} L${x(t1)},${y(vmin)} L${x(t0)},${y(vmin)} Z`;
   const bars = shown.filter(p => p.day !== undefined);
   const bmax = Math.max(1, ...bars.map(p => Math.abs(p.day!)));
