@@ -348,7 +348,7 @@ function BecomeExecutor() {
         Node.js, and a wallet with a little {C.COIN} for transaction fees. You are paid per piece of work, at the rates above, straight into that wallet.
       </p>
       <ol className="exec-steps">
-        <li><span>Get the code</span><pre>git clone -b audit-2026-10 https://github.com/Commoneffort/Turbopump{"\n"}cd Turbopump/app && npm install</pre></li>
+        <li><span>Get the code</span><pre>git clone https://github.com/Commoneffort/Turbopump{"\n"}cd Turbopump/app && npm install</pre></li>
         <li><span>Make a wallet for it and send it some {C.COIN} for fees</span><pre>solana-keygen new -o executor.json</pre></li>
         <li><span>Start it</span><pre>{net}KEYPAIR=./executor.json npx tsx scripts/executor.ts</pre></li>
       </ol>
