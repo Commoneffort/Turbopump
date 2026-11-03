@@ -6,6 +6,7 @@
 import { Connection, Keypair, Transaction, TransactionInstruction } from "@solana/web3.js";
 import * as fs from "fs";
 import * as C from "../src/chain";
+import * as S from "../src/social";
 
 const conn = new Connection(process.env.RPC ?? C.RPC_URL, { commitment: "confirmed", disableRetryOnRateLimit: true, fetch: C.politeFetch() });
 const kp = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(process.argv[2] ?? "../keys/seed/seed-trader-2.json", "utf8"))));
@@ -56,11 +57,24 @@ async function until(read: () => Promise<C.State>, done: (s: C.State) => boolean
 say(`wallet ${me.toBase58()}, isolated account ${sub} for ${symbol} at ${C.traderAddress(me, sub).toBase58()}`);
 const mainBefore = pos(await mainState());
 
+const statsOf = async () => { const a = await conn.getAccountInfo(S.statsAddress(me)); return a ? S.decodeStats(new Uint8Array(a.data)) : undefined; };
+const before = await statsOf();
 let s = await st();
-if (!s.trader) await send("open isolated account", [C.openTradingAccount(me, sub), C.openLedger(me, me, sub)]);
+// As the site sends a first isolated order: open the account, move its margin in, and queue the
+// trade, all in one transaction.
+const q0 = BigInt(Math.max(1, Math.floor(20 * 1e12 / Number(s.asset.price))));
+if (!s.trader) {
+  await send("open, fund and trade in one transaction", [C.openTradingAccount(me, sub), C.openLedger(me, me, sub), C.routerDeposit(me, 30_000_000n, sub), C.requestTrade(me, vault, q0, { sub })]);
+  s = (await until(st, x => !x.trader?.hasPending, 120))!;
+  check(pos(s) === q0, "the one-transaction isolated order filled");
+  await send("flatten", [C.requestTrade(me, vault, -q0, { sub, closeOnly: true })]);
+  s = (await until(st, x => !x.trader?.hasPending && pos(x) === 0n, 120))!;
+} else if ((s.portfolio?.capital ?? 0n) < 20_000_000n) await send("fund it", [C.routerDeposit(me, 30_000_000n, sub)]);
 s = await st();
 check(!!s.trader && s.trader.sub === sub, `isolated account ${sub} exists`);
-if ((s.portfolio?.capital ?? 0n) < 20_000_000n) await send("fund it", [C.routerDeposit(me, 30_000_000n, sub)]);
+check(!!(await conn.getAccountInfo(C.equitiesAddress(me))), "the wallet's record of values exists");
+const mid = await statsOf();
+if (before && mid) check(mid.deposited - before.deposited === 30, `the isolated deposit is in the wallet's track record (+${mid.deposited - before.deposited})`);
 if (pos(s) !== 0n) { await send("flatten", [C.requestTrade(me, vault, -pos(s), { sub, closeOnly: true })]); await until(st, x => pos(x) === 0n, 120); }
 
 // A close-only request with nothing to close is refused.

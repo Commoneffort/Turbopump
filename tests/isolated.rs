@@ -212,3 +212,69 @@ fn a_flat_isolated_account_pays_its_money_back_to_the_wallet() {
     w.send(vec![rclient::withdraw(&iso, &dest, &pv, capital as u64)], &[&kp]).unwrap();
     assert_eq!(w.tokens(dest) - before, capital as u64);
 }
+
+fn stats_of(w: &World, wallet: &solana_sdk::pubkey::Pubkey) -> rstate::Stats {
+    let k = rstate::stats_address(&percolator_router::id(), &w.env.market, wallet).0;
+    bytemuck::pod_read_unaligned(&w.env.svm.get_account(&k).unwrap().data)
+}
+
+#[test]
+fn isolated_accounts_count_in_the_wallets_track_record() {
+    let mut w = live();
+    w.trader(0);
+    let main = w.traders[&0].1;
+    let payer = w.payer.insecure_clone();
+    w.send(vec![rclient::open_stats(&payer.pubkey(), &main)], &[]).unwrap();
+    let start = stats_of(&w, &main.wallet);
+    // A deposit into an isolated account is a deposit of the wallet's.
+    let iso = w.isolated(0, 10, 1, 5_000_000);
+    assert_eq!({ stats_of(&w, &main.wallet).deposited } - { start.deposited }, 5_000_000);
+    let t: rstate::TraderState = bytemuck::pod_read_unaligned(&w.env.svm.get_account(&main.trader).unwrap().data);
+    assert_eq!(t.has_equities, 1, "the main account now names the record of values");
+    // A gain made in the isolated account shows in the wallet's record.
+    w.taker_trade(10, 10 * U).unwrap();
+    w.move_price(20, 1_050_000);
+    w.taker_trade(10, -10 * U).unwrap();
+    let after_iso = stats_of(&w, &main.wallet);
+    assert!(after_iso.last_pnl > 300_000 && after_iso.last_pnl < 500_000, "about +0.5 USDC less fees, got {}", { after_iso.last_pnl });
+    assert_eq!(after_iso.trades - start.trades, 2);
+    // A fill of the main account books from the same total: the isolated money is not lost from it.
+    w.taker_trade(0, U).unwrap();
+    let after_main = stats_of(&w, &main.wallet);
+    assert!(({ after_main.last_pnl } - { after_iso.last_pnl }).abs() < 50_000, "{} vs {}", { after_main.last_pnl }, { after_iso.last_pnl });
+}
+
+#[test]
+fn leaving_out_the_record_of_values_is_refused() {
+    let mut w = live();
+    w.trader(0);
+    let main = w.traders[&0].1;
+    let iso = w.isolated(0, 10, 1, 5_000_000);
+    let kp = w.trader_kp(0);
+    let col = w.traders[&0].0.collateral;
+    let pv = w.env.vault;
+    let ek = rstate::equities_address(&percolator_router::id(), &w.env.market, &main.wallet).0;
+    let strip = |mut ix: solana_sdk::instruction::Instruction| { ix.accounts.retain(|a| a.pubkey != ek); ix };
+    // A deposit into either account without it: refused (its value would go stale).
+    expect(w.send(vec![strip(rclient::deposit(&iso, &col, &pv, 1_000_000))], &[&kp]), RouterError::BadAccount);
+    expect(w.send(vec![strip(rclient::deposit(&main, &col, &pv, 1_000_000))], &[&kp]), RouterError::BadAccount);
+    w.send(vec![rclient::deposit(&iso, &col, &pv, 1_000_000)], &[&kp]).unwrap();
+    // A fill of either account without it: refused.
+    let id = w.request(10, U).unwrap();
+    let target = w.request_target(id);
+    let slot = w.env.current_slot() + 1;
+    w.env.set_clock(slot, target.max(w.clock_ts()));
+    let prev = w.pyth_time;
+    w.pyth_time = target;
+    let u = w.pyth_update(w.price, target, prev);
+    w.advance_to(u).unwrap();
+    w.converge();
+    let ix = w.fill_ix(10, id, &payer_key(&w));
+    expect(w.send(vec![strip(ix.clone())], &[]), RouterError::BadAccount);
+    w.send(vec![ix], &[]).unwrap();
+    let _ = Keypair::new();
+}
+
+fn payer_key(w: &World) -> solana_sdk::pubkey::Pubkey {
+    w.payer.pubkey()
+}

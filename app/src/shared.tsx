@@ -260,7 +260,8 @@ function describe(tx: any, v: C.Vault): string {
 
 // ---------------------------------------------------------------- fills
 
-export type Fill = { sig: string; slot: number; vault: string; size: number; price: number; time?: number };
+/** `sub`: which of the wallet's accounts made it (0 or absent: the main one). */
+export type Fill = { sig: string; slot: number; vault: string; size: number; price: number; time?: number; sub?: number };
 
 /** This wallet's fills on a vault, read from the router's fill logs ("fill <id> <size> <price>")
  *  in the trading account's transaction history and cached in this browser. Only a few new
@@ -270,52 +271,106 @@ export function useFills(wallet: PublicKey | null, vault: PublicKey, tick: bigin
   return useMemo(() => fills.filter(f => f.vault === vault.toBase58()), [fills, vault.toBase58()]);
 }
 
+/** Reads one of the wallet's accounts' fills (newest transactions first, a few per call, kept in
+ *  this browser): see `useFills`. Returns them oldest first, each tagged with the account. */
+async function loadFills(connection: Connection, wallet: PublicKey, sub: number): Promise<Fill[]> {
+  const key = `pv:fills2:${C.ROUTER.toBase58().slice(0, 8)}:${wallet.toBase58()}${sub ? `:${sub}` : ""}`;
+  let cache: { seen: string[]; fills: Fill[] } = { seen: [], fills: [] };
+  try { cache = JSON.parse(localStorage.getItem(key) ?? "") ?? cache; } catch { /* first visit */ }
+  try {
+    const sigs = await connection.getSignaturesForAddress(C.traderAddress(wallet, sub), { limit: 40 }, "confirmed");
+    // (X1's RPC is not rate-limited: a first visit there reads the whole recent history at once.)
+    const fresh = sigs.filter(x => !x.err && !cache.seen.includes(x.signature)).reverse().slice(0, C.X1 ? 20 : 5);
+    for (const x of fresh) {
+      const tx = await connection.getTransaction(x.signature, { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
+      if (!tx) continue;
+      cache.seen.push(x.signature);
+      // One transaction can fill several traders (the executor's batched round): only the fill
+      // instruction whose trader account is this account's counts. Each fill logs one line.
+      const lines = (tx.meta?.logMessages ?? []).filter(l => /^Program log: fill \d+ -?\d+ \d+$/.test(l));
+      if (!lines.length) continue;
+      const keys = [...tx.transaction.message.staticAccountKeys, ...(tx.meta?.loadedAddresses?.writable ?? []), ...(tx.meta?.loadedAddresses?.readonly ?? [])].map(k => k.toString());
+      const trader = C.traderAddress(wallet, sub).toString(), router = C.ROUTER.toString();
+      let n = 0;
+      for (const ix of tx.transaction.message.compiledInstructions) {
+        if (keys[ix.programIdIndex] !== router || ix.data[0] !== 6) continue;
+        const line = lines[n++];
+        if (!line || keys[ix.accountKeyIndexes[2]] !== trader) continue;
+        const [, , , , size, price] = line.split(" ");
+        const v = keys[ix.accountKeyIndexes[5]];
+        if (v && Number(size) !== 0) cache.fills.push({ sig: x.signature, slot: x.slot, vault: v, size: Number(size) / 1e6, price: Number(price) / 1e6, time: x.blockTime ?? tx.blockTime ?? undefined });
+      }
+    }
+    cache.seen = cache.seen.slice(-200);
+    cache.fills = cache.fills.sort((a, b) => a.slot - b.slot).slice(-200);
+    try { localStorage.setItem(key, JSON.stringify(cache)); } catch { /* storage unavailable */ }
+  } catch { /* rate-limited: try again on the next refresh */ }
+  return cache.fills.map(f => ({ ...f, sub }));
+}
+
 /** This wallet's fills on every market (see `useFills`), in its main account or (`sub`) one of
  *  its isolated ones. */
 export function useWalletFills(wallet: PublicKey | null, tick: bigint, sub = 0): Fill[] {
   const { connection } = useConnection();
-  const key = wallet ? `pv:fills2:${C.ROUTER.toBase58().slice(0, 8)}:${wallet.toBase58()}${sub ? `:${sub}` : ""}` : "";
   const [fills, setFills] = useState<Fill[]>([]);
+  const who = wallet?.toBase58() ?? "";
   useEffect(() => {
     if (!wallet) { setFills([]); return; }
     let live = true;
+    loadFills(connection, wallet, sub).then(f => { if (live) setFills(f); });
+    return () => { live = false; };
+  }, [who, sub, tick]);
+  return fills;
+}
+
+/** The fills of several of the wallet's isolated accounts, by account number. */
+export function useFillsBySub(wallet: PublicKey | null, subs: number[], tick: number): Map<number, Fill[]> {
+  const { connection } = useConnection();
+  const [fills, setFills] = useState(new Map<number, Fill[]>());
+  const who = wallet?.toBase58() ?? "", list = [...new Set(subs)].filter(n => n > 0).sort((a, b) => a - b).join(",");
+  useEffect(() => {
+    if (!wallet || !list) { setFills(new Map()); return; }
+    let live = true;
     (async () => {
-      let cache: { seen: string[]; fills: Fill[] } = { seen: [], fills: [] };
-      try { cache = JSON.parse(localStorage.getItem(key) ?? "") ?? cache; } catch { /* first visit */ }
-      setFills(cache.fills);
-      try {
-        const sigs = await connection.getSignaturesForAddress(C.traderAddress(wallet, sub), { limit: 40 }, "confirmed");
-        // (X1's RPC is not rate-limited: a first visit there reads the whole recent history at once.)
-        const fresh = sigs.filter(x => !x.err && !cache.seen.includes(x.signature)).reverse().slice(0, C.X1 ? 20 : 5);
-        for (const x of fresh) {
-          const tx = await connection.getTransaction(x.signature, { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
-          if (!tx) continue;
-          cache.seen.push(x.signature);
-          // One transaction can fill several traders (the executor's batched round): only the fill
-          // instruction whose trader account is this wallet's counts. Each fill logs one line.
-          const lines = (tx.meta?.logMessages ?? []).filter(l => /^Program log: fill \d+ -?\d+ \d+$/.test(l));
-          if (!lines.length) continue;
-          const keys = [...tx.transaction.message.staticAccountKeys, ...(tx.meta?.loadedAddresses?.writable ?? []), ...(tx.meta?.loadedAddresses?.readonly ?? [])].map(k => k.toString());
-          const trader = C.traderAddress(wallet, sub).toString(), router = C.ROUTER.toString();
-          let n = 0;
-          for (const ix of tx.transaction.message.compiledInstructions) {
-            if (keys[ix.programIdIndex] !== router || ix.data[0] !== 6) continue;
-            const line = lines[n++];
-            if (!line || keys[ix.accountKeyIndexes[2]] !== trader) continue;
-            const [, , , , size, price] = line.split(" ");
-            const v = keys[ix.accountKeyIndexes[5]];
-            if (v && Number(size) !== 0) cache.fills.push({ sig: x.signature, slot: x.slot, vault: v, size: Number(size) / 1e6, price: Number(price) / 1e6, time: x.blockTime ?? tx.blockTime ?? undefined });
-          }
-        }
-        cache.seen = cache.seen.slice(-200);
-        cache.fills = cache.fills.sort((a, b) => a.slot - b.slot).slice(-200);
-        try { localStorage.setItem(key, JSON.stringify(cache)); } catch { /* storage unavailable */ }
-        if (live) setFills(cache.fills);
-      } catch { /* rate-limited: try again on the next refresh */ }
+      const m = new Map<number, Fill[]>();
+      for (const n of list.split(",").map(Number)) m.set(n, await loadFills(connection, wallet, n));
+      if (live) setFills(m);
     })();
     return () => { live = false; };
-  }, [key, tick]);
+  }, [who, list, Math.floor(tick / 2)]);
   return fills;
+}
+
+/** One of the wallet's accounts on the market: its number (0 the main, cross-margin one) and its
+ *  health (equity, positions, liquidation floor). */
+export type AcctView = { sub: number; health: ReturnType<typeof C.accountHealth>; capital: bigint; pnl: bigint };
+/** Every one of the wallet's accounts that exists: the main one and each market's isolated one
+ *  (`C.isolatedSub`), read together with the market in one call. The wallet's money is all of it. */
+export function useAccounts(markets: Card[], tick: number): { accounts: AcctView[]; market?: Uint8Array } {
+  const { connection } = useConnection();
+  const { publicKey } = useWallet();
+  const [out, setOut] = useState<{ accounts: AcctView[]; market?: Uint8Array }>({ accounts: [] });
+  const assets = [...new Set(markets.map(c => c.v.assetIndex))].sort((a, b) => a - b).join(",");
+  useEffect(() => {
+    if (!publicKey) { setOut({ accounts: [] }); return; }
+    let on = true;
+    const subs = [0, ...assets.split(",").filter(Boolean).map(a => C.isolatedSub(Number(a)))];
+    const keys = [C.MARKET, ...subs.map(n => C.routerPortfolio(publicKey, n))];
+    connection.getMultipleAccountsInfo(keys, "confirmed").then(accs => {
+      if (!on || !accs[0]) return;
+      const m = new Uint8Array(accs[0].data);
+      const accounts: AcctView[] = [];
+      subs.forEach((n, i) => {
+        const a = accs[i + 1];
+        if (!a) return;
+        const d = new Uint8Array(a.data), p = C.decodePortfolio(d, 0, m);
+        accounts.push({ sub: n, health: C.accountHealth(m, d), capital: p.capital, pnl: p.pnl });
+      });
+      setOut({ accounts, market: m });
+    }).catch(() => { /* kept as last read */ });
+    return () => { on = false; };
+  }, [connection, publicKey?.toBase58(), assets, Math.floor(tick / 2)]);
+  return out;
 }
 
 /** The wallet's fills back to the opening of each position it holds (api/fills.ts reads its whole

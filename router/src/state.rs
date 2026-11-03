@@ -49,7 +49,10 @@ pub struct TraderState {
     /// 0 for the wallet's main (cross-margin) account on the market; 1..=255 for one of its
     /// isolated accounts (`OpenAccount` with a number): its own margin, one asset at a time.
     pub sub: u8,
-    pub _pad: [u8; 3],
+    /// Main account only: 1 once the wallet has an `Equities` record on the market (it has, or
+    /// had, an isolated account). Its deposits, withdrawals and fills must then name it.
+    pub has_equities: u8,
+    pub _pad: [u8; 2],
     pub pending_vault: Pubkey,
     pub pending_id: u64,
 }
@@ -228,6 +231,27 @@ pub const SEED_PROFILE: &[u8] = b"profile";
 pub const SEED_NAME: &[u8] = b"name";
 pub const SEED_FOLLOW: &[u8] = b"follow";
 pub const SEED_COPY: &[u8] = b"copy";
+pub const EQUITIES_MAGIC: u64 = u64::from_le_bytes(*b"PREQUIT1");
+pub const SEED_EQUITIES: &[u8] = b"equities";
+/// A wallet's trading accounts on one market as one: the last known value (equity less what it
+/// owes the vaults, collateral atoms) of each, by account number (0 the main one). Written at
+/// each account's fills, deposits and withdrawals. A fill books the wallet's profit from the
+/// total, so its track record counts its isolated accounts too.
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+#[repr(C, packed)]
+pub struct Equities {
+    pub magic: u64,
+    pub wallet: Pubkey,
+    pub market: Pubkey,
+    pub bump: u8,
+    pub _pad: [u8; 7],
+    pub equity: [i64; 256],
+}
+pub const EQUITIES_LEN: usize = core::mem::size_of::<Equities>();
+pub fn equities_address(program_id: &Pubkey, market: &Pubkey, wallet: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[SEED_EQUITIES, market.as_ref(), wallet.as_ref()], program_id)
+}
+const _: () = assert!(core::mem::offset_of!(Equities, equity) == 80);
 pub const REFERRAL_MAGIC: u64 = u64::from_le_bytes(*b"PRREFER1");
 pub const BADGE_MAGIC: u64 = u64::from_le_bytes(*b"PRBADGE1");
 pub const SEED_BADGE: &[u8] = b"badge";

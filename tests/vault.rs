@@ -696,7 +696,7 @@ fn export_layout_for_frontend() {
             "order_len": size_of::<percolator_router::state::Order>(),
             "max_orders": percolator_router::state::MAX_ORDERS,
             "request_len": size_of::<percolator_router::state::Request>(),
-            "trader": f!(percolator_router::state::TraderState, 0, market, wallet, portfolio, collateral, has_pending, has_stats, has_ledger, sub, pending_vault, pending_id),
+            "trader": f!(percolator_router::state::TraderState, 0, market, wallet, portfolio, collateral, has_pending, has_stats, has_ledger, sub, has_equities, pending_vault, pending_id),
             "trader_len": size_of::<percolator_router::state::TraderState>(),
             "max_pending": percolator_router::state::MAX_PENDING,
             "delay_secs": percolator_router::DELAY_SECS,

@@ -173,7 +173,7 @@ fn money_cannot_move_past_a_track_record() {
     let vault = w.env.vault;
     // Without a record the old form of a deposit (no record named) still works.
     let mut bare = rclient::deposit(&t, &source, &vault, 1_000_000);
-    bare.accounts.pop();
+    bare.accounts.truncate(bare.accounts.len() - 2); // (the record of values, then the track record)
     w.send(vec![bare.clone()], &[&kp]).unwrap();
     open_stats(&mut w, 0);
     // With one, a deposit or withdrawal that does not name it is refused, and so is another account.
@@ -183,7 +183,7 @@ fn money_cannot_move_past_a_track_record() {
     other.accounts[9].pubkey = rstate::stats_address(&RID(), &t.market, &w.payer.pubkey()).0;
     expect(w.send(vec![other], &[&kp]), RouterError::BadAccount);
     let mut out = rclient::withdraw(&t, &source, &vault, 1_000_000);
-    out.accounts.truncate(out.accounts.len() - 2); // (the copy address, then the ledger)
+    out.accounts.truncate(out.accounts.len() - 3); // (the record of values, the copy address, then the ledger)
     expect(w.send(vec![out], &[&kp]), RouterError::BadAccount);
     // A second record for the same account cannot be opened (it would reset the first).
     let again = rclient::open_stats(&w.payer.pubkey(), &t);

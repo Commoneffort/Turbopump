@@ -231,6 +231,7 @@ export default {
     "trade_room_bps": 8000,
     "trader": {
       "collateral": 104,
+      "has_equities": 141,
       "has_ledger": 139,
       "has_pending": 137,
       "has_stats": 138,

@@ -71,13 +71,15 @@ buf_auth=$(solana program show -k "$KEY" -u "$RPC" "$BUF_PK" 2>/dev/null | sed -
 if [ -n "$buf_auth" ] && [ "$buf_auth" != "$SIGNER_PK" ]; then
   solana program set-buffer-authority -u "$RPC" -k "$KEY" "$BUF_PK" --buffer-authority "$KEY" --new-buffer-authority "$SIGNER_PK" >/dev/null
 fi
-if [ "$2" = devnet ] && [ -z "$FAST_UPLOAD" ]; then
+# (X1 too: its RPC limits requests per address, and the CLI's burst of ~1,300 writes for an engine
+# upload hit the limit on 2026-11-03, failed with "Max retries exceeded" and starved our executors.)
+if [ -z "$FAST_UPLOAD" ]; then
   # The public devnet RPC blocks this server for minutes after the CLI's burst of uploads: a
   # throttled upload instead (only missing pieces are sent; rerun it until the buffer matches).
   # (Run from app/: a relative binary path gets one more ../, an absolute one is kept.)
   case "$SO" in /*) SO_APP=$SO ;; *) SO_APP=../$SO ;; esac
-  (cd app && RPC=$RPC npx tsx scripts/write-buffer.ts "../$BUF" "$SO_APP" "$SIGNER") | tail -3
-  (cd app && RPC=$RPC npx tsx scripts/write-buffer.ts "../$BUF" "$SO_APP" "$SIGNER") | grep -q "buffer matches binary" || { echo "upload not finished: run this again to continue"; exit 1; }
+  (cd app && PAYER=$KEY RPC=$RPC npx tsx scripts/write-buffer.ts "../$BUF" "$SO_APP" "$SIGNER") | tail -3
+  (cd app && PAYER=$KEY RPC=$RPC npx tsx scripts/write-buffer.ts "../$BUF" "$SO_APP" "$SIGNER") | grep -q "buffer matches binary" || { echo "upload not finished: run this again to continue"; exit 1; }
 else
   solana program write-buffer -u "$RPC" -k "$KEY" --use-rpc --max-sign-attempts 50 --buffer "$BUF" --buffer-authority "$SIGNER" "$SO"
 fi

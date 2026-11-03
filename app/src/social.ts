@@ -76,7 +76,8 @@ export const decodeCopy = (k: PublicKey, d: Uint8Array): Copy => ({ key: k, mark
 /** Opens `wallet`'s track record (anyone may, and pays its rent). */
 export const openStats = (payer: PublicKey, wallet: PublicKey) => new TransactionInstruction({
   programId: C.ROUTER,
-  keys: [rw(payer, true), rw(C.traderAddress(wallet)), ro(wallet), rw(statsAddress(wallet)), ro(C.MARKET), ro(C.routerPortfolio(wallet)), ro(SystemProgram.programId)],
+  // (Last: the wallet's record of values, whether or not it exists; its isolated accounts count from the start.)
+  keys: [rw(payer, true), rw(C.traderAddress(wallet)), ro(wallet), rw(statsAddress(wallet)), ro(C.MARKET), ro(C.routerPortfolio(wallet)), ro(SystemProgram.programId), rw(C.equitiesAddress(wallet))],
   data: Buffer.from([15]),
 });
 /** Sets the wallet's name and badge; `oldName` is the name it holds now, if any. Taking a name,
@@ -280,7 +281,7 @@ export type Board = {
 export async function loadBoard(conn: Connection): Promise<Board> {
   // Each kind of account starts with its own eight letters: other router accounts can have the same size.
   const kind = (tag: string) => ({ memcmp: { offset: 0, bytes: bs58.encode(Buffer.from(tag, "ascii")) } });
-  const [statAccs, profAccs, followAccs, copyAccs, market, badgeAccs, portfolioAccs] = await Promise.all([
+  const [statAccs, profAccs, followAccs, copyAccs, market, badgeAccs, portfolioAccs, traderAccs] = await Promise.all([
     conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: STATS_LEN }, kind("PRSTATS1"), { memcmp: { offset: 40, bytes: C.MARKET.toBase58() } }] }),
     conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: PROFILE_LEN }, kind("PRPROFL1")] }),
     conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: FOLLOW_LEN }, kind("PRFOLLW1")] }),
@@ -290,6 +291,8 @@ export async function loadBoard(conn: Connection): Promise<Board> {
     conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: BADGE_LEN }, kind("PRBADGE1")] }).catch(() => []),
     // Every portfolio on the market, in one scan (the traders' are picked out below by address).
     conn.getProgramAccounts(C.PERCOLATOR, { filters: [{ dataSize: C.PORTFOLIO_LEN }, { memcmp: { offset: 16, bytes: C.MARKET.toBase58() } }] }),
+    // The trading accounts on the market: a wallet's isolated accounts count in its results too.
+    conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: C.TRADER_LEN }, { memcmp: { offset: 8, bytes: C.MARKET.toBase58() } }] }).catch(() => []),
   ]);
   const pictures = new Map<string, Uint8Array>();
   for (const a of badgeAccs) {
@@ -303,10 +306,14 @@ export async function loadBoard(conn: Connection): Promise<Board> {
   const copies = copyAccs.map(a => decodeCopy(a.pubkey, new Uint8Array(a.account.data)));
   const wallets = [...new Set([...stats.map(s => s.wallet.toBase58()), ...profiles.keys()])];
   const byAddress = new Map(portfolioAccs.map(a => [a.pubkey.toBase58(), new Uint8Array(a.account.data)] as const));
-  const portfolios = new Map<string, Uint8Array>();
-  for (const w of wallets) {
-    const d = byAddress.get(C.routerPortfolio(new PublicKey(w)).toBase58());
-    if (d) portfolios.set(w, d);
+  // Every one of a wallet's accounts: its main one, and its isolated ones (from the trader accounts).
+  const portfolios = new Map<string, Uint8Array[]>();
+  const add = (w: string, d?: Uint8Array) => { if (d) portfolios.set(w, [...(portfolios.get(w) ?? []), d]); };
+  for (const w of wallets) add(w, byAddress.get(C.routerPortfolio(new PublicKey(w)).toBase58()));
+  const known = new Set(wallets);
+  for (const a of traderAccs) {
+    const t = C.decodeTrader(new Uint8Array(a.account.data));
+    if (t.sub !== 0 && known.has(t.wallet.toBase58())) add(t.wallet.toBase58(), byAddress.get(t.portfolio.toBase58()));
   }
   const m = market ? new Uint8Array(market.data) : undefined;
   const byWallet = new Map(stats.map(s => [s.wallet.toBase58(), s]));
@@ -316,8 +323,13 @@ export async function loadBoard(conn: Connection): Promise<Board> {
   return { rows, follows, copies, profiles, pictures, at: Date.now() };
 }
 
-function row(wallet: string, s: Stats | undefined, profile: Profile | undefined, portfolio: Uint8Array | undefined, market: Uint8Array | undefined, followers: number, copiers: number, copying?: string): TraderRow {
-  const h = portfolio && market ? C.accountHealth(market, portfolio) : undefined;
+/** `portfolios`: every account of the wallet (main and isolated), counted as one. */
+function row(wallet: string, s: Stats | undefined, profile: Profile | undefined, portfolios: Uint8Array[] | undefined, market: Uint8Array | undefined, followers: number, copiers: number, copying?: string): TraderRow {
+  const hs = market ? (portfolios ?? []).map(p => C.accountHealth(market, p)) : [];
+  const h = hs.length ? {
+    equity: hs.reduce((t, x) => t + x.equity, 0n), notional: hs.reduce((t, x) => t + x.notional, 0n),
+    positions: hs.flatMap(x => x.positions), liquidatable: hs.some(x => x.liquidatable),
+  } : undefined;
   const equity = h ? Number(h.equity) / C.USDC : 0;
   const base = s ? s.startEquity + s.deposited : 0;
   const pnl = s ? equity - s.startEquity - s.deposited + s.withdrawn : 0;

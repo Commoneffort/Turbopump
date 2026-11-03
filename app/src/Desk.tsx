@@ -18,7 +18,7 @@ import { Mark, marksFor, useBoard, useMe, useNotes, usePictures } from "./Trader
 import { Liquidations, PULSE, PULSE_BOARD_MS, Whale, marketFills, useVolume } from "./Pulse";
 import { WidgetPanel, liqLevels } from "./Widgets";
 import { CloseSlider } from "./PositionTools";
-import { Card, Faucet, Fill, Icon, LiquidityPanel, OpenerPanel, Send, ago, capUnits, entryPrice, explorer, fmt, num, priceDp, px, realizedPnl, short, units, usd, useActivity, useCards, useDeepFills, useVault, useWalletFills } from "./shared";
+import { AcctView, Card, Faucet, Fill, Icon, LiquidityPanel, OpenerPanel, Send, ago, capUnits, entryPrice, explorer, fmt, num, priceDp, px, realizedPnl, short, units, usd, useAccounts, useActivity, useCards, useDeepFills, useFillsBySub, useVault, useWalletFills } from "./shared";
 
 const UP = T.green, DOWN = T.red;
 const pct = (x: number, dp = 2) => `${x >= 0 ? "+" : "−"}${fmt(Math.abs(x) * 100, dp)}%`;
@@ -30,7 +30,11 @@ const arrow = (x: number) => (x > 0 ? "▲" : x < 0 ? "▼" : "•");
 
 /** One open position with what it is up or down: entry from the wallet's fills on record (its
  *  transaction history, else the last fills its track record keeps), PnL against the mark. */
-export type Held = { asset: number; sym: string; q: bigint; size: number; mark: number; value: number; entry?: number; pnl?: number; ret?: number };
+export type Held = {
+  asset: number; sym: string; q: bigint; size: number; mark: number; value: number; entry?: number; pnl?: number; ret?: number;
+  /** Which of the wallet's accounts holds it (0 the main, cross-margin one), and that account's health. */
+  sub: number; acct?: AcctView;
+};
 /** The wallet's position on an asset as the chain has it now (not as last drawn). A close is
  *  sized from this: a position the page shows can be seconds old, and a stop or take-profit that
  *  filled meanwhile would turn a close of the old size into a new position the other way. */
@@ -48,16 +52,64 @@ async function closeSize(conn: Connection, wallet: PublicKey, asset: number, sha
 }
 
 export function heldPositions(state: C.State, markets: Card[], fills: Fill[], row: S.TraderRow | undefined): Held[] {
-  return (state.health?.positions ?? []).map(x => {
-    const c = markets.find(m => m.v.assetIndex === x.asset && (m.v.canonical || m.v.key.equals(state.vault.key)));
+  return heldIn(state.health, state.sub, markets, fills, row, state.vault.key);
+}
+/** The positions of one of the wallet's accounts. `fills`: that account's fills (entries come from
+ *  them; for the main account, from its track record's last fills too). */
+export function heldIn(health: ReturnType<typeof C.accountHealth> | undefined, sub: number, markets: Card[], fills: Fill[], row: S.TraderRow | undefined, here?: PublicKey, acct?: AcctView): Held[] {
+  return (health?.positions ?? []).map(x => {
+    const c = markets.find(m => m.v.assetIndex === x.asset && (m.v.canonical || (here && m.v.key.equals(here))));
     const sym = c?.v.feed?.symbol ?? `asset ${x.asset}`;
     const size = num(x.size, 1e6), mark = num(x.price, 1e6);
-    const mine = c ? fills.filter(f => f.vault === c.v.key.toBase58()) : [];
-    const recent: Fill[] = (row?.stats?.fills ?? []).filter(f => f.asset === x.asset).map(f => ({ sig: "", slot: f.time, vault: "", size: f.size, price: f.price }));
+    const mine = c ? fills.filter(f => f.vault === c.v.key.toBase58() && (f.sub ?? 0) === sub) : [];
+    const recent: Fill[] = sub ? [] : (row?.stats?.fills ?? []).filter(f => f.asset === x.asset).map(f => ({ sig: "", slot: f.time, vault: "", size: f.size, price: f.price }));
     const entry = entryPrice(mine, size) ?? entryPrice(recent, size);
     const pnl = entry !== undefined ? (mark - entry) * size : undefined;
-    return { asset: x.asset, sym, q: x.size, size, mark, value: num(x.notional, 1e6), entry, pnl, ret: pnl !== undefined && entry ? pnl / (Math.abs(size) * entry) : undefined };
+    return { asset: x.asset, sym, q: x.size, size, mark, value: num(x.notional, 1e6), entry, pnl, ret: pnl !== undefined && entry ? pnl / (Math.abs(size) * entry) : undefined, sub, acct };
   });
+}
+/** Every position the wallet holds, in every one of its accounts. */
+export function heldEverywhere(accounts: AcctView[], markets: Card[], fills: Fill[], row: S.TraderRow | undefined): Held[] {
+  return accounts.flatMap(a => heldIn(a.health, a.sub, markets, fills, row, undefined, a));
+}
+/** Each fill with what it booked (see `realizedPnl`), worked out for each account on its own
+ *  (the same market can be held in several), then merged in time order. `now`: positions held
+ *  now, by account and vault (key "<sub>:<vault>"). */
+export function realizedAll(fills: Fill[], now: Map<string, number>) {
+  const subs = [...new Set(fills.map(f => f.sub ?? 0))];
+  return subs.flatMap(n => {
+    const mine = fills.filter(f => (f.sub ?? 0) === n);
+    const pos = new Map([...now].filter(([k]) => k.startsWith(`${n}:`)).map(([k, v]) => [k.slice(k.indexOf(":") + 1), v] as [string, number]));
+    return realizedPnl(mine, pos);
+  }).sort((a, b) => a.slot - b.slot);
+}
+/** Liquidation price of one position in an account, everything else there staying as it is. */
+export function liqIn(h: ReturnType<typeof C.accountHealth>, market: Uint8Array, asset: number, sizeN: number, priceN: number): number | undefined {
+  if (sizeN === 0) return undefined;
+  const level = Number(C.levels(market, asset).liq) / 10_000;
+  const otherFloor = num(h.floor, 1e6) - Math.abs(sizeN) * priceN * level;
+  const x = (otherFloor - num(h.equity, 1e6) + sizeN * priceN) / (sizeN - level * Math.abs(sizeN));
+  return x > 0 && Number.isFinite(x) ? x : undefined;
+}
+/** Everything that brings an account's money back to the wallet, read from the chain now: its
+ *  released profit turned into capital, what it owes the vaults paid, the rest withdrawn. Only for
+ *  an account with no position (the router allows nothing else). */
+export async function returnMargin(conn: Connection, wallet: PublicKey, sub: number, vaults: C.Vault[]): Promise<TransactionInstruction[]> {
+  const [pf, led, m] = await conn.getMultipleAccountsInfo([C.routerPortfolio(wallet, sub), C.ledgerAddress(wallet, sub), C.MARKET], "confirmed");
+  if (!pf || !m) return [];
+  const p = C.decodePortfolio(new Uint8Array(pf.data), 0, new Uint8Array(m.data));
+  const owed = C.decodeLedger(led ? new Uint8Array(led.data) : null).filter(o => o.owed > 0n);
+  const vaultOf = (asset: number) => vaults.find(x => x.assetIndex === asset && x.canonical) ?? vaults.find(x => x.assetIndex === asset);
+  const total = owed.reduce((t, o) => t + o.owed, 0n);
+  const profit = p.pnl > 0n ? p.pnl : 0n;
+  const out = p.capital + profit - total;
+  if (out <= 0n) return [];
+  return [
+    createAssociatedTokenAccountIdempotentInstruction(wallet, C.ata(wallet, C.MINT), wallet, C.MINT),
+    ...(profit > 0n && vaults[0] ? [C.crank(wallet, C.routerPortfolio(wallet, sub), [vaults[0].assetIndex]), C.routerConvertPnl(wallet, sub)] : []),
+    ...owed.flatMap(o => { const x = vaultOf(o.asset); return x ? [C.payFees(x, wallet, sub)] : []; }),
+    C.routerWithdraw(wallet, out, sub),
+  ];
 }
 const abs = (q: bigint) => (q < 0n ? -q : q);
 const e6 = (x: number) => BigInt(Math.round(x * 1e6));
@@ -72,37 +124,6 @@ export type MarginMode = "cross" | "isolated";
 const MARGIN_KEY = (vault: PublicKey) => `pv:margin:${C.NETWORK}:${vault.toBase58()}`;
 export function savedMargin(vault: PublicKey): MarginMode { try { return localStorage.getItem(MARGIN_KEY(vault)) === "isolated" ? "isolated" : "cross"; } catch { return "cross"; } }
 export function saveMargin(vault: PublicKey, m: MarginMode) { try { localStorage.setItem(MARGIN_KEY(vault), m); } catch { /* storage unavailable */ } }
-
-/** One position in one of the wallet's accounts: its main one (`sub` 0) or an isolated one. */
-type AcctPos = { sub: number; asset: number; size: bigint; equity: bigint };
-/** The wallet's positions in every one of its accounts on the market: the main account and the
- *  isolated account of each listed asset (one read). */
-function useAllAccounts(markets: Card[], tick: number) {
-  const { connection } = useConnection();
-  const { publicKey } = useWallet();
-  const [rows, setRows] = useState<AcctPos[]>([]);
-  const assets = [...new Set(markets.map(c => c.v.assetIndex))].sort((a, b) => a - b).join(",");
-  useEffect(() => {
-    if (!publicKey) { setRows([]); return; }
-    let on = true;
-    const subs = [0, ...assets.split(",").filter(Boolean).map(a => C.isolatedSub(Number(a)))];
-    const keys = [C.MARKET, ...subs.map(n => C.routerPortfolio(publicKey, n))];
-    connection.getMultipleAccountsInfo(keys, "confirmed").then(accs => {
-      if (!on || !accs[0]) return;
-      const m = new Uint8Array(accs[0].data);
-      const out: AcctPos[] = [];
-      subs.forEach((n, i) => {
-        const a = accs[i + 1];
-        if (!a) return;
-        const h = C.accountHealth(m, new Uint8Array(a.data));
-        for (const x of h.positions) out.push({ sub: n, asset: x.asset, size: x.size, equity: h.equity });
-      });
-      setRows(out);
-    }).catch(() => { /* kept as last read */ });
-    return () => { on = false; };
-  }, [connection, publicKey?.toBase58(), assets, Math.floor(tick / 2)]);
-  return rows;
-}
 
 export default function Desk({ route, send, busy, tick, go }: { route: string[]; send: Send; busy?: string; tick: number; go: (to: string) => void }) {
   const { cards, err } = useCards(tick);
@@ -137,19 +158,24 @@ function DeskInner({ vaultKey, markets, day, send, busy, tick, go }: { vaultKey:
   const assetHere = markets.find(c => c.v.key.equals(vaultKey))?.v.assetIndex;
   const sub = margin === "isolated" && assetHere !== undefined ? C.isolatedSub(assetHere) : 0;
   const { state, err, reload } = useVault(vaultKey, tick, sub);
-  const accounts = useAllAccounts(markets, tick);
+  const { accounts } = useAccounts(markets, tick);
   const [panel, setPanel] = useState<"trade" | "earn">("trade");
   const [wgHidden, setWgHidden] = useState(() => { try { return localStorage.getItem("pv:widgets-hidden") !== "0"; } catch { return true; } });
   const wrapped: Send = async (l, ixs) => { const r = await send(l, ixs); reload(); return r; };
-  const recentFills = useWalletFills(publicKey, state?.portfolio?.position ?? 0n, sub);
-  // Each position held, by vault, so its whole history back to the opening fill can be read.
-  const need = useMemo(() => (state?.health?.positions ?? []).map(x => {
-    const c = markets.find(m => m.v.assetIndex === x.asset && (m.v.canonical || m.v.key.equals(state!.vault.key)));
+  // Fills of every account: the main one's (its whole history for each position it holds, from
+  // the server) and each isolated account's that holds a position or is on screen.
+  const mainAcct = accounts.find(a => a.sub === 0);
+  const mainKey = (mainAcct?.health.positions ?? []).map(x => `${x.asset}:${x.size}`).join(",");
+  const recentFills = useWalletFills(publicKey, BigInt(mainKey.length + Math.floor(tick / 3)), 0);
+  const need = useMemo(() => (mainAcct?.health.positions ?? []).map(x => {
+    const c = markets.find(m => m.v.assetIndex === x.asset && m.v.canonical);
     return c ? `${c.v.key.toBase58()}:${x.size}` : "";
-  }).filter(Boolean).sort().join(","), [state, markets]);
-  // (The server's full history is read for the main account only.)
-  const allFills = useDeepFills(sub ? null : publicKey, need, recentFills);
-  const fills = useMemo(() => allFills.filter(f => f.vault === vaultKey.toBase58()), [allFills, vaultKey.toBase58()]);
+  }).filter(Boolean).sort().join(","), [mainKey, markets]);
+  const mainFills = useDeepFills(publicKey, need, recentFills);
+  const isoFills = useFillsBySub(publicKey, [...accounts.filter(a => a.sub && a.health.positions.length).map(a => a.sub), sub], tick);
+  const allFills = useMemo(() => [...mainFills.map(f => ({ ...f, sub: 0 })), ...[...isoFills.values()].flat()].sort((a, b) => a.slot - b.slot), [mainFills, isoFills]);
+  // This account's fills on this market (the chart's dots).
+  const fills = useMemo(() => allFills.filter(f => f.vault === vaultKey.toBase58() && (f.sub ?? 0) === sub), [allFills, vaultKey.toBase58(), sub]);
   // The traders this wallet follows or copies: their fills on this market are marked on the chart.
   const { board } = useBoard(tick, Object.values(PULSE).some(Boolean) ? PULSE_BOARD_MS : undefined);
   const me = useMe(board, tick);
@@ -181,6 +207,8 @@ function DeskInner({ vaultKey, markets, day, send, busy, tick, go }: { vaultKey:
   const posN = num(state.portfolio?.position ?? 0n, 1e6);
   const myRow = publicKey ? board?.rows.find(r => r.wallet === publicKey.toBase58()) : undefined;
   const held = heldPositions(state, markets, allFills, myRow);
+  // Every position in every account, for the positions table (until the accounts are read: this one's).
+  const heldAll = accounts.length ? heldEverywhere(accounts, markets, allFills, myRow) : held;
   const here = held.find(h => h.asset === v.assetIndex);
   const entry = here?.entry;
   const liq = liquidationPrice(state, posN);
@@ -213,13 +241,13 @@ function DeskInner({ vaultKey, markets, day, send, busy, tick, go }: { vaultKey:
           <button className={panel === "trade" ? "on" : ""} onClick={() => setPanel("trade")}>Trade</button>
           <button className={panel === "earn" ? "on" : ""} onClick={() => setPanel("earn")}>Earn</button>
         </div>
-        {panel === "trade" ? <Ticket state={state} send={wrapped} busy={busy} margin={margin} setMargin={setMargin} copying={me.copy && !state.sub ? { leader: me.copy.leader.toBase58(), name: board?.profiles.get(me.copy.leader.toBase58())?.name ?? short(me.copy.leader.toBase58()) } : undefined} /> : <div className="earn"><LiquidityPanel state={state} send={wrapped} busy={busy} /></div>}
+        {panel === "trade" ? <Ticket state={state} send={wrapped} busy={busy} vaults={markets.map(c => c.v)} margin={margin} setMargin={setMargin} copying={me.copy && !state.sub ? { leader: me.copy.leader.toBase58(), name: board?.profiles.get(me.copy.leader.toBase58())?.name ?? short(me.copy.leader.toBase58()) } : undefined} /> : <div className="earn"><LiquidityPanel state={state} send={wrapped} busy={busy} /></div>}
         <button className="portfolio-btn" onClick={() => go("/portfolio")} title="Your positions, results and trading statistics across every market">
           <span>Portfolio</span><b aria-hidden>→</b>
         </button>
-        <div className="ticket-acct"><Account state={state} send={wrapped} busy={busy} held={held} row={myRow} vaults={markets.map(c => c.v)} /></div>
+        <div className="ticket-acct"><Account state={state} send={wrapped} busy={busy} held={held} row={myRow} vaults={markets.map(c => c.v)} accounts={accounts} /></div>
       </section>
-      <section className="desk-bottom panel"><Bottom state={state} markets={markets} fills={allFills} held={held} liq={liq} send={wrapped} busy={busy} go={go} tick={tick} accounts={accounts} setMargin={setMargin} /></section>
+      <section className="desk-bottom panel"><Bottom state={state} markets={markets} fills={allFills} held={heldAll} liq={liq} send={wrapped} busy={busy} go={go} tick={tick} accounts={accounts} setMargin={setMargin} /></section>
     </main>
   );
 }
@@ -468,7 +496,7 @@ function Stress({ state }: { state: C.State }) {
 
 // ---------------------------------------------------------------- order ticket
 
-function Ticket({ state, send, busy, copying, margin, setMargin }: { state: C.State & { readFor?: string }; send: Send; busy?: string; copying?: { leader: string; name: string }; margin: MarginMode; setMargin: (m: MarginMode) => void }) {
+function Ticket({ state, send, busy, copying, margin, setMargin, vaults }: { state: C.State & { readFor?: string }; send: Send; busy?: string; copying?: { leader: string; name: string }; margin: MarginMode; setMargin: (m: MarginMode) => void; vaults: C.Vault[] }) {
   const { publicKey } = useWallet();
   const { connection } = useConnection();
   // The wallet's coins: an order takes a bond and a deposit (0.1% of its value) in the chain's
@@ -514,7 +542,9 @@ function Ticket({ state, send, busy, copying, margin, setMargin }: { state: C.St
   const shrinks = held !== 0n && (held > 0n) !== (side > 0n) && want <= abs(held);
   const closeRoom = shrinks ? C.depth(state, held, true) : room;
   const vaultMax = side > 0n ? closeRoom.long : closeRoom.short;
-  const most = marginMax(side) < vaultMax ? marginMax(side) : vaultMax;
+  const iso = sub !== 0;
+  // (An isolated order brings its own margin from the wallet: only the vault limits its size.)
+  const most = iso ? vaultMax : marginMax(side) < vaultMax ? marginMax(side) : vaultMax;
   const sent = want > vaultMax ? vaultMax : want; // an order above what the vault takes is cut to it
   // (No shares outstanding and no position: every deposit was withdrawn. Such a market is not serviced, so an
   // order sent to it would wait until it expired, and block the wallet's other trades meanwhile.)
@@ -563,7 +593,8 @@ function Ticket({ state, send, busy, copying, margin, setMargin }: { state: C.St
   const reduces = !sameSide; // an order against the position shrinks it first
   // Margin free for new positions, in dollars: what the margin rule leaves at the market's maximum leverage.
   const newRoom = sameSide ? (cap > abs(held) ? cap - abs(held) : 0n) : cap;
-  const freeMargin = num(newRoom, 1e6) * priceN * openRate;
+  // Isolated: what the account holds plus what the wallet could move into it.
+  const freeMargin = iso ? num((state.health?.equity ?? 0n) + state.userCollateral, 1e6) : num(newRoom, 1e6) * priceN * openRate;
   const orderMargin = notional / lev;
   const h = state.health;
   const equityN = num(h?.equity ?? p?.capital ?? 0n, 1e6);
@@ -584,23 +615,35 @@ function Ticket({ state, send, busy, copying, margin, setMargin }: { state: C.St
     if (share !== undefined && !reduces) { const q = sizeFor(share, l); setUnit("coin"); setText(q > 0 ? String(+q.toFixed(6)) : ""); }
   };
   // An opening order whose margin at the chosen leverage is more than the account has free.
-  const overLev = !reduces && want > 0n && !shrinks && orderMargin > freeMargin * 1.0001 && lev < maxLev;
+  const overLev = !iso && !reduces && want > 0n && !shrinks && orderMargin > freeMargin * 1.0001 && lev < maxLev;
+  // Isolated: the margin the account needs after this order (the larger of the chosen leverage's
+  // and what the router asks, plus 1% and the fee), less what it holds, moves from the wallet in
+  // the same transaction. An order that only shrinks the position moves nothing.
+  const isoTopUp = (() => {
+    if (!iso || shrinks || sent === 0n || !state.marketData) return 0n;
+    const afterQ = held + sent * side;
+    const byLev = abs(afterQ) * state.asset.price / C.UNIT / BigInt(lev);
+    const byRule = C.isolatedNeed(state.marketData, v.assetIndex, afterQ);
+    const fee = sent * state.asset.price / C.UNIT * BigInt(C.TRADE_FEE_BPS) / 10_000n;
+    const target = (byLev > byRule ? byLev : byRule) * 101n / 100n + fee;
+    const has = state.health?.equity ?? 0n;
+    return target > has ? ((target - has + 9_999n) / 10_000n) * 10_000n : 0n;
+  })();
 
   // Deposit + bond + a little for the fee.
   // (Once the router pays liquidators, the first trade also tops up the account's keeper deposit.)
   const coinsNeeded = Number(C.expiryDeposit(sent, state.asset.price)) + C.ROUTER_BOND_LAMPORTS + 1_000_000 + (C.KEEPER_REWARDS ? C.KEEPER_DEPOSIT : 0);
   // The one thing that stops this order, if anything does.
-  const blockerBase = !publicKey || !state.trader || !state.book || locked || state.closeOnly || noLiquidity || vaultMax === 0n;
   const blocker = !publicKey ? "Connect a wallet to trade"
-    : !state.trader ? (sub ? `Open your isolated ${sym} account first` : "Create a trading account first")
+    : !state.trader && !iso ? "Create a trading account first"
     : !state.book ? "This market's queue is not open yet"
     : locked ? (pendingHere ? "Your queued order has to fill or expire first" : "You have an order queued on another market")
     : state.closeOnly ? "This market is close-only until its remaining positions are closed"
     : noLiquidity ? "This market has no liquidity yet"
     : vaultMax === 0n ? (reduceOnly ? "The vault is settling an epoch: it only takes orders that reduce its position or close yours" : `The vault is at its limit for ${side > 0n ? "longs" : "shorts"}`)
     : want <= 0n ? "Enter a size"
-    : sub && (p?.capital ?? 0n) === 0n && held === 0n ? `Your isolated ${sym} account has no margin yet: deposit some below (Account)`
-    : sent > marginMax(side) ? `Your margin covers at most ${units(marginMax(side))} ${sym} here: add margin or lower the size`
+    : iso && isoTopUp > state.userCollateral ? `This order moves ${money(num(isoTopUp, 1e6))} of margin from your wallet, which has ${money(num(state.userCollateral, 1e6))} of test USDC`
+    : !iso && sent > marginMax(side) ? `Your margin covers at most ${units(marginMax(side))} ${sym} here: add margin or lower the size`
     : overLev ? `At ${lev}× this order needs ${money(orderMargin)} of margin and ${money(freeMargin)} is free: raise the leverage or lower the size`
     : coins !== undefined && coins < coinsNeeded ? `This order needs ${(coinsNeeded / 1e9).toFixed(3)} ${C.COIN} in your wallet for its deposit and bond (they come back when it fills); the wallet has ${(coins / 1e9).toFixed(3)}`
     : undefined;
@@ -608,9 +651,12 @@ function Ticket({ state, send, busy, copying, margin, setMargin }: { state: C.St
   const submit = () => {
     if (!publicKey || !state.book || blocker) return;
     // An account opened before the fee ledgers existed gets one with its first trade (it can only
-    // reduce without one).
+    // reduce without one). An isolated account is opened by its first order, and each order
+    // brings the margin it needs from the wallet.
+    const open = iso && !state.trader ? [C.openTradingAccount(publicKey, sub), C.openLedger(publicKey, publicKey, sub)] : [];
     const ledger = state.trader && !state.trader.hasLedger ? [C.openLedger(publicKey, publicKey, sub)] : [];
-    sendNoted(`${side > 0n ? "Long" : "Short"} ${units(sent)} ${sym}${sub ? " (isolated)" : ""}`, [...ledger, C.requestTrade(publicKey, v.key, sent * side, { sub })]);
+    const fund = isoTopUp > 0n ? [createAssociatedTokenAccountIdempotentInstruction(publicKey, C.ata(publicKey, C.MINT), publicKey, C.MINT), C.routerDeposit(publicKey, isoTopUp, sub)] : [];
+    sendNoted(`${side > 0n ? "Long" : "Short"} ${units(sent)} ${sym}${iso ? ` isolated${isoTopUp > 0n ? `, ${money(num(isoTopUp, 1e6))} margin` : ""}` : ""}`, [...open, ...ledger, ...fund, C.requestTrade(publicKey, v.key, sent * side, { sub })]);
   };
   // Close all of the position, or a share of it (a smaller trade the other way).
   const closeAll = (share = 100) => {
@@ -660,7 +706,7 @@ function Ticket({ state, send, busy, copying, margin, setMargin }: { state: C.St
         <input value={text} onChange={e => { setShareState(undefined); setText(e.target.value.replace(/[^0-9.]/g, "")); }} placeholder="0.00" inputMode="decimal" />
         <button className="unit" onClick={() => { setText(typed > 0 && priceN > 0 ? String(unit === "coin" ? +(typed * priceN).toFixed(2) : +(typed / priceN).toFixed(6)) : ""); setUnit(unit === "coin" ? "usd" : "coin"); }} title="Switch between the asset and dollars">{unit === "coin" ? sym : "USD"}</button>
       </label>
-      {state.trader && !reduces && (
+      {(state.trader || iso) && !reduces && (
         <div className="lev">
           <div className="lev-l">
             <span className="hint" title={`How many times the margin you put behind this order it is worth. ${maxLev}× is the most this market allows. A lower leverage uses less of your free margin for the same size: the quick buttons size the order from your free margin times this leverage.`}>Leverage</span>
@@ -678,8 +724,9 @@ function Ticket({ state, send, busy, copying, margin, setMargin }: { state: C.St
 
       <div className="sum">
         <div><span>Order value</span><b className="mono">{money(notional)}</b></div>
-        {!reduces && <div title={`The order's value divided by your leverage (${lev}×), out of ${money(freeMargin)} of free margin`}><span>Margin for this order ({lev}×)</span><b className={`mono ${overLev ? "down" : ""}`}>{money(orderMargin)}<i className="muted"> of {money(freeMargin)} free</i></b></div>}
-        {state.trader && <div title="What all your positions are worth divided by your equity, now and after this order (one account covers every market)"><span>Account leverage</span><b className="mono">{want > 0n ? `${fmt(levNow, 1)}× → ${fmt(levAfter, 1)}×` : `${fmt(levNow, 1)}×`}</b></div>}
+        {!reduces && !iso && <div title={`The order's value divided by your leverage (${lev}×), out of ${money(freeMargin)} of free margin`}><span>Margin for this order ({lev}×)</span><b className={`mono ${overLev ? "down" : ""}`}>{money(orderMargin)}<i className="muted"> of {money(freeMargin)} free</i></b></div>}
+        {!reduces && iso && <div title={`Isolated: this position's own margin. What it needs at ${lev}× (or the market's minimum, if more), less what its account already holds, moves from your wallet with the order. A loss can take only this margin.`}><span>Margin moved from wallet ({lev}×)</span><b className="mono">{money(num(isoTopUp, 1e6))}{state.health && state.health.equity > 0n ? <i className="muted"> + {money(num(state.health.equity, 1e6))} already in</i> : null}</b></div>}
+        {state.trader && !iso && <div title="What all your positions are worth divided by your equity, now and after this order (one account covers every market)"><span>Account leverage</span><b className="mono">{want > 0n ? `${fmt(levNow, 1)}× → ${fmt(levAfter, 1)}×` : `${fmt(levNow, 1)}×`}</b></div>}
         <div><span>Fee ({C.TRADE_FEE_PCT})</span><b className="mono">{money(notional * C.TRADE_FEE_BPS / 10_000)}</b></div>
         {sideFee > 0 && <div title={`This order makes the vault's position bigger: ${C.CARRY.sideFeeBps / 100}% of that part is owed to the vault's depositors, paid when you next withdraw. Orders that shrink the vault's position, and closes of your own position, owe nothing.`}><span>Crowded-side fee ({C.CARRY.sideFeeBps / 100}%)</span><b className="mono">{money(sideFee)}</b></div>}
         {state.carry && (
@@ -715,9 +762,7 @@ function Ticket({ state, send, busy, copying, margin, setMargin }: { state: C.St
       <div className="ticket-go">
       {!publicKey ? <div className="connect"><WalletMultiButton /></div>
         : !mine ? <button className="submit neutral" disabled>Reading your account…</button>
-        : !state.trader ? (sub
-          ? <button className="submit neutral" disabled={!!busy} onClick={() => send(`Open isolated ${sym} account`, [C.openTradingAccount(publicKey, sub), C.openLedger(publicKey, publicKey, sub)])}>Open isolated {sym} account</button>
-          : <button className="submit neutral" disabled={!!busy} onClick={() => send("Create trading account", [C.openTradingAccount(publicKey), C.openLedger(publicKey, publicKey), S.openStats(publicKey, publicKey)])}>Create trading account</button>)
+        : !state.trader && !iso ? <button className="submit neutral" disabled={!!busy} onClick={() => send("Create trading account", [C.openTradingAccount(publicKey), C.openLedger(publicKey, publicKey), S.openStats(publicKey, publicKey)])}>Create trading account</button>
         : <button className={`submit ${side > 0n ? "up" : "down"}`} disabled={!!blocker || !!busy} onClick={submit}>{busy ? `${busy}…` : `${side > 0n ? "Long" : "Short"} ${want > 0n ? `${units(sent)} ` : ""}${sym}`}</button>}
       {state.trader && held !== 0n && (
         <div className="closeparts">
@@ -729,7 +774,7 @@ function Ticket({ state, send, busy, copying, margin, setMargin }: { state: C.St
       {state.trader && held !== 0n && !state.closeOnly && (
         <CloseSlider pct={closePct} onChange={setClosePct} disabled={locked || !!busy} />
       )}
-      {blocker && publicKey && state.trader && blocker !== "Enter a size" && <div className="why">{blocker}</div>}
+      {blocker && publicKey && (state.trader || iso) && blocker !== "Enter a size" && <div className="why">{blocker}</div>}
       </div>
       {!blocker && want > vaultMax && <div className="why">The vault takes {units(vaultMax)} {sym} on this side right now, so the order is cut to that.</div>}
 
@@ -891,8 +936,11 @@ function Pending({ r, sym, send, busy }: { r: C.RouterRequest; sym: string; send
 
 // ---------------------------------------------------------------- account
 
-function Account({ state, send, busy, held, row, vaults }: { state: C.State; send: Send; busy?: string; held: Held[]; row?: S.TraderRow; vaults: C.Vault[] }) {
+function Account({ state, send, busy, held, row, vaults, accounts }: { state: C.State; send: Send; busy?: string; held: Held[]; row?: S.TraderRow; vaults: C.Vault[]; accounts: AcctView[] }) {
   const { publicKey } = useWallet();
+  const { connection } = useConnection();
+  // Every account of the wallet together (main and isolated): its money is all of it.
+  const totalEquity = accounts.reduce((t, a) => t + a.health.equity, 0n);
   const [amount, setAmount] = useState("100");
   const p = state.portfolio, h = state.health;
   const atoms = BigInt(Math.max(0, Math.floor(Number(amount || 0) * C.USDC)));
@@ -917,7 +965,8 @@ function Account({ state, send, busy, held, row, vaults }: { state: C.State; sen
       <div className="ph"><h3>{sub ? `Isolated ${state.vault.feed?.symbol ?? ""} account` : "Account"}{h && h.notional > 0n && <span className="lev mono">{fmt(num(h.notional, 1e6) / Math.max(num(h.equity, 1e6), 0.01), 1)}×</span>}</h3><Faucet compact /></div>
       {!publicKey ? <div className="quiet">Connect a wallet to see your account.</div> : (
         <div className="acct">
-          <div className="acct-row"><span>Equity</span><b className="mono">{usd(equity)}</b></div>
+          {accounts.length > 1 && <div className="acct-row" title="Your main account and every isolated account added up"><span>All accounts</span><b className="mono">{usd(totalEquity)}</b></div>}
+          <div className="acct-row"><span>{accounts.length > 1 ? (state.sub ? "This isolated account" : "Cross account") : "Equity"}</span><b className="mono">{usd(equity)}</b></div>
           <div className="acct-row"><span>In positions</span><b className="mono">{usd(h?.notional ?? 0n)}</b></div>
           {(() => {
             // What the open positions are up or down now, today's result and the account's whole
@@ -947,6 +996,9 @@ function Account({ state, send, busy, held, row, vaults }: { state: C.State; sen
                 <button className="btn white" disabled={!!busy || atoms <= 0n || atoms > state.userCollateral} onClick={() => send(sub ? `Add margin to isolated ${state.vault.feed?.symbol ?? ""}` : "Add margin", [ata(publicKey), C.routerDeposit(publicKey, atoms, sub)])}>Deposit</button>
                 <button className="btn" disabled={!!busy || locked || state.openPositions > 0 || atoms <= 0n || atoms + owed > (p?.capital ?? 0n) + profit} onClick={() => send(owed > 0n ? "Pay fees and withdraw" : "Withdraw margin", [ata(publicKey), ...(profit > 0n ? [C.crank(publicKey, C.routerPortfolio(publicKey, sub), [state.vault.assetIndex]), C.routerConvertPnl(publicKey, sub)] : []), ...payAll(publicKey), C.routerWithdraw(publicKey, atoms, sub)])}>Withdraw</button>
               </div>
+              {state.sub !== 0 && state.openPositions === 0 && equity > 0n && !locked && (
+                <button className="btn white wide" disabled={!!busy} onClick={() => returnMargin(connection, publicKey, state.sub, vaults).then(ixs => { if (ixs.length) send(`Return ${usd(equity)} to wallet`, ixs); })} title="The position is closed: everything left in this isolated account (after any fees it owes the vault) goes back to your wallet">Return {usd(equity)} to wallet</button>
+              )}
               {locked ? <div className="fine">Withdrawals are paused while an order is queued.</div>
                 : state.openPositions > 0 && <div className="fine">{sub ? "Margin can be withdrawn once this position is closed." : "Margin can be withdrawn once no position is open on any market."} Deposits always work.</div>}
               {owed > 0n && state.openPositions === 0 && <div className="fine">A withdrawal first pays the {usd(owed)} owed to the vaults, out of your margin.</div>}
@@ -964,20 +1016,20 @@ const REDUCE_ONLY_HELP = "The order may only shrink the position you hold. If yo
 
 /** The wallet's standing orders on other markets than the one on screen (that one's come with
  *  its state), so each position can show its take-profit, stop and trail. */
-function useOrdersOn(vaults: PublicKey[], tick: number) {
+function useOrdersOn(where: { vault: PublicKey; sub: number }[], tick: number) {
   const { connection } = useConnection();
   const { publicKey } = useWallet();
   const [orders, setOrders] = useState(new Map<string, C.StandingOrder[]>());
-  const keys = vaults.map(v => v.toBase58()).sort().join(",");
+  const keys = [...new Set(where.map(w => `${w.vault.toBase58()}:${w.sub}`))].sort().join(",");
   useEffect(() => {
     if (!publicKey || !keys) { setOrders(new Map()); return; }
     let on = true;
-    const vs = keys.split(",").map(k => new PublicKey(k));
-    const addrs = vs.flatMap(v => Array.from({ length: C.MAX_ORDERS }, (_, i) => C.orderAddress(v, publicKey, i)));
+    const vs = keys.split(",").map(k => { const [v, n] = k.split(":"); return { vault: new PublicKey(v), sub: Number(n) }; });
+    const addrs = vs.flatMap(w => Array.from({ length: C.MAX_ORDERS }, (_, i) => C.orderAddress(w.vault, C.accountOwner(publicKey, w.sub), i)));
     connection.getMultipleAccountsInfo(addrs, "confirmed").then(accs => {
       if (!on) return;
       const m = new Map<string, C.StandingOrder[]>();
-      accs.forEach((a, i) => { if (a?.data.length === C.ORDER_LEN) { const o = C.decodeOrder(addrs[i], new Uint8Array(a.data)); const k = o.vault.toBase58(); m.set(k, [...(m.get(k) ?? []), o]); } });
+      accs.forEach((a, i) => { if (a?.data.length === C.ORDER_LEN) { const o = C.decodeOrder(addrs[i], new Uint8Array(a.data)); const k = `${o.vault.toBase58()}:${o.sub}`; m.set(k, [...(m.get(k) ?? []), o]); } });
       setOrders(m);
     }).catch(() => { /* kept as last read */ });
     return () => { on = false; };
@@ -1055,14 +1107,16 @@ function Protection({ orders, dp }: { orders: C.StandingOrder[]; dp: number }) {
 }
 
 function Bottom({ state, markets, fills, held, liq, send, busy, go, tick, accounts, setMargin }: {
-  state: C.State; markets: Card[]; fills: Fill[]; held: Held[]; liq?: number; send: Send; busy?: string; go: (to: string) => void; tick: number; accounts: AcctPos[]; setMargin: (m: MarginMode) => void;
+  state: C.State; markets: Card[]; fills: Fill[]; held: Held[]; liq?: number; send: Send; busy?: string; go: (to: string) => void; tick: number; accounts: AcctView[]; setMargin: (m: MarginMode) => void;
 }) {
   const { publicKey } = useWallet();
   const { connection } = useConnection();
   const [tab, setTab] = useState<"positions" | "orders" | "twap" | "history" | "vault" | "market">("positions");
-  const [rowPct, setRowPct] = useState<Map<number, number>>(new Map());
-  const pctOf = (asset: number) => rowPct.get(asset) ?? 100;
-  const others = useOrdersOn(held.flatMap(x => { const c = markets.find(m => m.v.assetIndex === x.asset && (m.v.canonical || m.v.key.equals(state.vault.key))); return c && !c.v.key.equals(state.vault.key) ? [c.v.key] : []; }), tick);
+  const [rowPct, setRowPct] = useState<Map<string, number>>(new Map());
+  const rk = (x: { sub: number; asset: number }) => `${x.sub}:${x.asset}`;
+  const pctOf = (x: { sub: number; asset: number }) => rowPct.get(rk(x)) ?? 100;
+  const isHere = (x: Held) => x.asset === state.vault.assetIndex && x.sub === state.sub;
+  const others = useOrdersOn(held.flatMap(x => { const c = markets.find(m => m.v.assetIndex === x.asset && (m.v.canonical || m.v.key.equals(state.vault.key))); return c && !isHere(x) ? [{ vault: c.v.key, sub: x.sub }] : []; }), tick);
   const standing = state.orders.filter(o => o.kind !== C.ORDER.TWAP), twaps = state.orders.filter(o => o.kind === C.ORDER.TWAP);
   const plans = useTwapPlans(twaps);
   const v = state.vault, sym = v.feed?.symbol ?? "";
@@ -1071,28 +1125,22 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go, tick, accoun
   const locked = !!state.trader?.hasPending;
 
   // Close a share of a position on any market (a close-only market closes it out instead, whole).
-  const closeShare = async (vault: PublicKey, asset: number, q: bigint, shut: boolean, s: string, pct: number) => {
+  const closeShare = async (vault: PublicKey, asset: number, sub: number, q: bigint, shut: boolean, s: string, pct: number) => {
     if (!publicKey || q === 0n) return;
-    if (shut) { send(`Close ${s} position`, [C.requestClose(publicKey, publicKey, vault, state.sub)]); return; }
-    const part = await closeSize(connection, publicKey, asset, pct, state.sub);
-    if (part !== 0n) send(pct >= 100 ? `Close ${s} position` : `Close ${pct}% of ${s} (${units(abs(part))})`, [C.requestTrade(publicKey, vault, part, { sub: state.sub, closeOnly: true })]);
+    const tag = sub ? " isolated" : "";
+    if (shut) { send(`Close ${s}${tag} position`, [C.requestClose(publicKey, publicKey, vault, sub)]); return; }
+    const part = await closeSize(connection, publicKey, asset, pct, sub);
+    if (part !== 0n) send(pct >= 100 ? `Close ${s}${tag} position` : `Close ${pct}% of ${s}${tag} (${units(abs(part))})`, [C.requestTrade(publicKey, vault, part, { sub, closeOnly: true })]);
   };
-  // Positions in the wallet's other accounts (cross while an isolated one is shown, and every
-  // other market's isolated account): listed under the table, one click away.
-  const elsewhere = accounts.filter(a => a.sub !== state.sub);
-  const open = (a: AcctPos) => {
-    const c = byAsset.get(a.asset);
-    if (!c) return;
-    if (c.v.key.equals(state.vault.key)) { setMargin(a.sub ? "isolated" : "cross"); return; }
-    saveMargin(c.v.key, a.sub ? "isolated" : "cross");
-    go(c.v.canonical ? `/trade/${c.v.feed?.symbol}` : `/m/${c.v.key.toString()}`);
-  };
-  const otherList = elsewhere.length > 0 && (
+  // Isolated accounts with no position but money left in them: one click brings it back.
+  const idle = accounts.filter(a => a.sub !== 0 && a.health.positions.length === 0 && a.health.equity > 10_000n);
+  const vaultsList = markets.map(c => c.v);
+  const idleList = publicKey && idle.length > 0 && (
     <div className="elsewhere">
-      <span>{state.sub ? "Also open:" : "Also open in isolated accounts:"}</span>
-      {elsewhere.map(a => {
-        const c = byAsset.get(a.asset), s2 = c?.v.feed?.symbol ?? `asset ${a.asset}`;
-        return <button key={`${a.sub}:${a.asset}`} className={`link ${a.size > 0n ? "up" : "down"}`} onClick={() => open(a)} title={`Open ${s2} with its ${a.sub ? "isolated" : "cross"} account`}>{s2} {a.size > 0n ? "long" : "short"} {units(abs(a.size))} <i>{a.sub ? "isolated" : "cross"}</i></button>;
+      <span>Margin left in closed isolated accounts:</span>
+      {idle.map(a => {
+        const c = markets.find(m => C.isolatedSub(m.v.assetIndex) === a.sub && m.v.canonical);
+        return <button key={a.sub} className="link" disabled={!!busy} onClick={() => returnMargin(connection, publicKey, a.sub, vaultsList).then(ixs => { if (ixs.length) send(`Return ${usd(a.health.equity)} to wallet`, ixs); })} title="Back to your wallet (after any fees it owes the vault)">{c?.v.feed?.symbol ?? `#${a.sub}`} {usd(a.health.equity)} <i>return to wallet</i></button>;
       })}
     </div>
   );
@@ -1108,35 +1156,35 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go, tick, accoun
         <button className={tab === "market" ? "on" : ""} onClick={() => setTab("market")}>Market details</button>
       </div>
       <div className="bottom-body">
-        {tab === "positions" && (!publicKey ? <div className="quiet">Connect a wallet to see your positions.</div> : positions.length === 0 ? <div className="quiet">No open positions{state.sub ? ` in your isolated ${sym} account` : ""}.{otherList}</div> : (<>
+        {tab === "positions" && (!publicKey ? <div className="quiet">Connect a wallet to see your positions.</div> : positions.length === 0 ? <div className="quiet">No open positions.{idleList}</div> : (<>
           <table className="tbl lefts">
-            <thead><tr><th>Market</th><th>Size</th><th>Value</th>{state.sub
-              ? <th title="Everything in this isolated account stands behind this one position, and nothing else does.">Margin (isolated)</th>
-              : <th title="Margin behind this position: its value divided by the leverage you chose for this market. One cross-margin account covers every market, so all of your equity stands behind every position.">Margin (cross)</th>}<th>Entry price</th><th>Mark price</th><th>PnL</th><th>Liq. price</th><th title="Take profit, stop loss and trailing stop set on this position">TP / SL</th><th>Close</th></tr></thead>
+            <thead><tr><th>Market</th><th>Size</th><th>Value</th><th title="Cross: the position's value divided by the leverage you chose for the market; all of your cross account stands behind every cross position. Isolated: everything in that position's own account, which is all that stands behind it.">Margin</th><th>Entry price</th><th>Mark price</th><th>PnL</th><th>Liq. price</th><th title="Take profit, stop loss and trailing stop set on this position">TP / SL</th><th>Close</th></tr></thead>
             <tbody>
               {positions.map(x => {
-                const here = x.asset === v.assetIndex;
+                const here = isHere(x);
                 const c = byAsset.get(x.asset), s = x.sym;
                 const { size, mark, entry: e, pnl } = x;
-                const lev = leverageOf(state, s, x.asset);
-                const liqX = here ? liq : liquidationPriceOf(state, x.asset, size, mark);
+                const acctEq = x.acct ? num(x.acct.health.equity, 1e6) : 0;
+                // An isolated position's leverage is its account's: value over the margin in it.
+                const lev = x.sub ? Math.max(1, Math.round(x.value / Math.max(acctEq, 1e-9))) : leverageOf(state, s, x.asset);
+                const liqX = here ? liq : x.acct && state.marketData ? liqIn(x.acct.health, state.marketData, x.asset, size, mark) : liquidationPriceOf(state, x.asset, size, mark);
                 const shut = !!state.marketData && C.closeOnly(state.marketData, x.asset);
                 const dp = priceDp(mark);
                 return (
-                  <Fragment key={x.asset}>
+                  <Fragment key={rk(x)}>
                   <tr className={here ? "here" : ""}>
-                    <td><button className={`link pos-name ${size > 0 ? "up" : "down"}`} title={`${size > 0 ? "Long" : "Short"} ${s} at ${lev}× (open this market)`} onClick={() => c && go(c.v.canonical ? `/trade/${s}` : `/m/${c.v.key.toString()}`)}>{s} <i>{lev}×</i></button></td>
+                    <td><button className={`link pos-name ${size > 0 ? "up" : "down"}`} title={`${size > 0 ? "Long" : "Short"} ${s} at ${lev}×, ${x.sub ? "isolated" : "cross"} margin (open this market)`} onClick={() => { if (!c) return; if (c.v.key.equals(state.vault.key)) { setMargin(x.sub ? "isolated" : "cross"); return; } saveMargin(c.v.key, x.sub ? "isolated" : "cross"); go(c.v.canonical ? `/trade/${s}` : `/m/${c.v.key.toString()}`); }}>{s} <i>{lev}×</i><em className={`mtag${x.sub ? " iso" : ""}`}>{x.sub ? "Isolated" : "Cross"}</em></button></td>
                     <td className={`mono ${size > 0 ? "up" : "down"}`}>{fmt(Math.abs(size), 4).replace(/\.?0+$/, "")} {s}</td>
                     <td className="mono">{money(x.value)}</td>
-                    <td className="mono">{money(state.sub ? num(state.health?.equity ?? 0n, 1e6) : x.value / lev)}</td>
+                    <td className="mono">{money(x.sub ? acctEq : x.value / lev)}</td>
                     <td className="mono">{e !== undefined ? fmt(e, dp) : "—"}</td>
                     <td className="mono">{fmt(mark, dp)}</td>
                     <td className={`mono pnl ${pnl === undefined ? "" : pnl >= 0 ? "up" : "down"}`} title={pnl === undefined ? "The entry price is not known: this wallet's earlier fills on this market are not on record" : "Against the average entry price, before fees; the percentage is the price move in your favour"}>{pnl === undefined ? "—" : <>{arrow(pnl)} {signedMoney(pnl)} <i>({pct(x.ret ?? 0)})</i></>}</td>
                     <td className="mono liqp">{liqX ? fmt(liqX, dp) : "—"}</td>
-                    <td><Protection orders={here ? state.orders : (c && others.get(c.v.key.toBase58())) ?? []} dp={dp} /></td>
+                    <td><Protection orders={here ? state.orders : (c && others.get(`${c.v.key.toBase58()}:${x.sub}`)) ?? []} dp={dp} /></td>
                     <td><span className="closeset">
-                      {!shut && <CloseSlider compact pct={pctOf(x.asset)} onChange={p => setRowPct(m => new Map(m).set(x.asset, p))} disabled={locked || !!busy || !c} />}
-                      <button className="btn tiny" disabled={locked || !!busy || !c} onClick={() => c && closeShare(c.v.key, x.asset, x.q, shut, s, shut ? 100 : pctOf(x.asset))} title="Closes this share of the position at the next oracle price; slide to choose it">Close {shut || pctOf(x.asset) >= 100 ? "all" : `${pctOf(x.asset)}%`}</button>
+                      {!shut && <CloseSlider compact pct={pctOf(x)} onChange={p => setRowPct(m => new Map(m).set(rk(x), p))} disabled={(here && locked) || !!busy || !c} />}
+                      <button className="btn tiny" disabled={(here && locked) || !!busy || !c} onClick={() => c && closeShare(c.v.key, x.asset, x.sub, x.q, shut, s, shut ? 100 : pctOf(x))} title="Closes this share of the position at the next oracle price; slide to choose it">Close {shut || pctOf(x) >= 100 ? "all" : `${pctOf(x)}%`}</button>
                     </span></td>
                   </tr>
                   </Fragment>
@@ -1144,12 +1192,13 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go, tick, accoun
               })}
               {positions.length > 1 && (() => {
                 const known = positions.filter(x => x.pnl !== undefined), total = known.reduce((t, x) => t + x.pnl!, 0);
-                const margin = positions.reduce((t, x) => t + x.value / leverageOf(state, x.sym, x.asset), 0);
+                const margin = positions.filter(x => !x.sub).reduce((t, x) => t + x.value / leverageOf(state, x.sym, x.asset), 0)
+                  + accounts.filter(a => a.sub && a.health.positions.length).reduce((t, a) => t + num(a.health.equity, 1e6), 0);
                 return <tr className="total"><td colSpan={2}>Total</td><td className="mono">{money(positions.reduce((t, x) => t + x.value, 0))}</td><td className="mono">{money(margin)}</td><td colSpan={2} /><td className={`mono pnl ${total >= 0 ? "up" : "down"}`}>{known.length ? <>{arrow(total)} {signedMoney(total)}</> : "—"}</td><td colSpan={3} /></tr>;
               })()}
             </tbody>
           </table>
-          {otherList}
+          {idleList}
         </>))}
         {tab === "orders" && (!publicKey ? <div className="quiet">Connect a wallet to see your orders.</div> : standing.length === 0 ? <div className="quiet">No open orders on {sym}. Limit, TP / SL and trailing stop orders are placed from the order ticket; TWAP orders are in their own tab.</div> : (
           <table className="tbl lefts">
@@ -1211,8 +1260,8 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go, tick, accoun
         {tab === "history" && (!publicKey ? <div className="quiet">Connect a wallet to see your trades.</div> : fills.length === 0 ? <div className="quiet">No trades from this wallet on record yet.</div> : (() => {
           const symOf = (vault: string) => markets.find(c => c.v.key.toBase58() === vault)?.v.feed?.symbol ?? "?";
           // Positions now, by vault: the history is worked out backwards from them.
-          const now = new Map(held.flatMap(x => { const c = byAsset.get(x.asset); return c ? [[c.v.key.toBase58(), x.size] as [string, number]] : []; }));
-          const rows = realizedPnl(fills, now);
+          const now = new Map(held.flatMap(x => { const c = byAsset.get(x.asset); return c ? [[`${x.sub}:${c.v.key.toBase58()}`, x.size] as [string, number]] : []; }));
+          const rows = realizedAll(fills, now);
           const fee = (f: Fill) => Math.abs(f.size) * f.price * C.feeBpsAt(f.slot) / 10_000;
           const booked = rows.reduce((t, f) => t + f.realized, 0), fees = rows.reduce((t, f) => t + fee(f), 0);
           return (

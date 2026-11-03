@@ -70,6 +70,9 @@ pub fn open_account(t: &TraderKeys, mint: &Pubkey) -> Instruction {
             ro(perc::PERCOLATOR_PROGRAM_ID),
             ro(system_program::ID),
             ro(spl_token::ID),
+            w(equities_address(&id(), &t.market, &t.wallet).0),
+            w(trader_address(&id(), &t.market, &t.wallet).0),
+            ro(portfolio_address(&id(), &t.market, &t.wallet).0),
         ],
         data: if t.sub == 0 { vec![TAG_OPEN_ACCOUNT] } else { vec![TAG_OPEN_ACCOUNT, t.sub] },
     }
@@ -91,6 +94,7 @@ pub fn deposit(t: &TraderKeys, source: &Pubkey, percolator_vault: &Pubkey, amoun
             ro(spl_token::ID),
             ro(perc::PERCOLATOR_PROGRAM_ID),
             w(stats_address(&id(), &t.market, &t.wallet).0),
+            w(equities_address(&id(), &t.market, &t.wallet).0),
         ],
         data,
     }
@@ -118,6 +122,7 @@ pub fn withdraw(t: &TraderKeys, dest: &Pubkey, percolator_vault: &Pubkey, amount
             ro(ledger_address(&id(), &t.trader).0),
             // The copy address: empty (no copy running), the keeper deposit can go back.
             ro(copy_address(&id(), &t.market, &t.wallet).0),
+            w(equities_address(&id(), &t.market, &t.wallet).0),
         ],
         data,
     }
@@ -301,6 +306,8 @@ pub fn fill(executor: &Pubkey, k: &VaultKeys, t: &TraderKeys) -> Instruction {
             w(carry_address(&id(), &k.vault).0),
             w(ledger_address(&id(), &t.trader).0),
             ro(tiers_address(&id(), &k.market).0),
+            // The wallet's record of values (see `Equities`), then last its track record.
+            w(equities_address(&id(), &t.market, &t.wallet).0),
             w(stats_address(&id(), &t.market, &t.wallet).0),
         ],
         data: vec![TAG_FILL],
@@ -486,6 +493,7 @@ pub fn open_stats(payer: &Pubkey, t: &TraderKeys) -> Instruction {
             ro(t.market),
             ro(t.portfolio),
             ro(system_program::ID),
+            w(equities_address(&id(), &t.market, &t.wallet).0),
         ],
         data: vec![TAG_OPEN_STATS],
     }

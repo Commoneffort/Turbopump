@@ -958,6 +958,17 @@ export function marginRoom(market: Uint8Array, portfolio: Uint8Array, asset: num
   return total > 0n && p > 0n ? total * UNIT * 999n / (p * 1000n) : 0n;
 }
 
+/** What an isolated account holding only `size` of `asset` needs as equity for the router to
+ *  take it (its opening margin and the fee on the notional, plus Percolator's minimum). */
+export function isolatedNeed(market: Uint8Array, asset: number, size: bigint): bigint {
+  const q = size < 0n ? -size : size;
+  if (q === 0n) return 0n;
+  const p = u64(market, L.market.slots + asset * L.market.slot_len + L.market.engine + L.market.effective_price);
+  const stress = BigInt(L.router.stress_bps), fee = marketRates(market).feeBps;
+  const perUnit = (10_000n + stress) * (levels(market, asset).open + fee) + stress * 10_000n;
+  return u128(market, L.router.min_im_off) + q * p / UNIT * perUnit / 100_000_000n;
+}
+
 /** The market's trading fee and Percolator's own initial margin, in basis points of notional
  *  (what a position needs is per asset: `levels`). */
 export const marketRates = (market: Uint8Array) => ({ feeBps: u64(market, L.router.fee_bps_off), marginBps: u64(market, L.router.im_bps_off) });
@@ -1024,6 +1035,10 @@ export const routerPortfolio = (wallet: PublicKey, sub = 0) => sub
 export const routerCollateral = (wallet: PublicKey, sub = 0) => sub
   ? cached(`c${wallet.toBase58()}:${sub}`, () => rpda(Buffer.from("collateral"), isolatedAddress(wallet, sub).toBuffer()))
   : cached(`c${wallet.toBase58()}`, () => rpda(Buffer.from("collateral"), MARKET.toBuffer(), wallet.toBuffer()));
+/** The wallet's record of every one of its accounts' values on the market (router `Equities`):
+ *  its track record counts its isolated accounts through it. Instructions name it whether or not
+ *  it exists (the router requires it once it does). */
+export const equitiesAddress = (wallet: PublicKey) => cached(`e${wallet.toBase58()}`, () => rpda(Buffer.from("equities"), MARKET.toBuffer(), wallet.toBuffer()));
 /** What a trading account's request and order addresses are derived from: the wallet for its
  *  main account, the isolated account itself otherwise (router `TraderState::owner`). */
 export const accountOwner = (wallet: PublicKey, sub = 0) => (sub ? isolatedAddress(wallet, sub) : wallet);
@@ -1224,12 +1239,15 @@ export function controlSequences(market: Uint8Array, asset: number) {
 /** Opens the wallet's main trading account (`sub` 0) or one of its isolated ones. */
 export const openTradingAccount = (wallet: PublicKey, sub = 0) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [rw(wallet, true), rw(traderAddress(wallet, sub)), rw(routerPortfolio(wallet, sub)), rw(routerCollateral(wallet, sub)), rw(MARKET), ro(MINT), ro(PERCOLATOR), ro(SystemProgram.programId), ro(TOKEN_PROGRAM_ID)],
+  keys: [rw(wallet, true), rw(traderAddress(wallet, sub)), rw(routerPortfolio(wallet, sub)), rw(routerCollateral(wallet, sub)), rw(MARKET), ro(MINT), ro(PERCOLATOR), ro(SystemProgram.programId), ro(TOKEN_PROGRAM_ID),
+    // The wallet's record of values, its main trader account and main portfolio (an isolated
+    // account creates the record and marks the main account; a main account only looks).
+    rw(equitiesAddress(wallet)), ...(sub ? [rw(traderAddress(wallet)), ro(routerPortfolio(wallet))] : [])],
   data: sub ? new W().u8(0).u8(sub).done() : new W().u8(0).done(),
 });
 export const routerDeposit = (wallet: PublicKey, amount: bigint, sub = 0) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [ro(wallet, true), ro(traderAddress(wallet, sub)), rw(ata(wallet, MINT)), rw(routerCollateral(wallet, sub)), rw(routerPortfolio(wallet, sub)), rw(MARKET), rw(PERC_VAULT), ro(TOKEN_PROGRAM_ID), ro(PERCOLATOR), rw(statsAddress(wallet))],
+  keys: [ro(wallet, true), ro(traderAddress(wallet, sub)), rw(ata(wallet, MINT)), rw(routerCollateral(wallet, sub)), rw(routerPortfolio(wallet, sub)), rw(MARKET), rw(PERC_VAULT), ro(TOKEN_PROGRAM_ID), ro(PERCOLATOR), rw(statsAddress(wallet)), rw(equitiesAddress(wallet))],
   data: new W().u8(1).u64(amount).done(),
 });
 export const routerWithdraw = (wallet: PublicKey, amount: bigint, sub = 0) => new TransactionInstruction({
@@ -1239,7 +1257,7 @@ export const routerWithdraw = (wallet: PublicKey, amount: bigint, sub = 0) => ne
   // deposit (see `KEEPER_DEPOSIT`).
   keys: [rw(wallet, true), rw(traderAddress(wallet, sub)), rw(routerPortfolio(wallet, sub)), rw(MARKET), rw(routerCollateral(wallet, sub)), rw(ata(wallet, MINT)), rw(PERC_VAULT), ro(PERC_VAULT_AUTH), ro(TOKEN_PROGRAM_ID), ro(PERCOLATOR), rw(statsAddress(wallet)), ro(ledgerAddress(wallet, sub)),
     // The copy address: only while it is empty (no copy running) does a flat withdrawal return the keeper deposit.
-    ro(rpda(Buffer.from("copy"), MARKET.toBuffer(), wallet.toBuffer()))],
+    ro(rpda(Buffer.from("copy"), MARKET.toBuffer(), wallet.toBuffer())), rw(equitiesAddress(wallet))],
   data: new W().u8(2).u64(amount).done(),
 });
 /** Turns a trading account's released profit into capital (what a withdrawal pays out). Anyone
@@ -1411,6 +1429,7 @@ export const fillRequest = (executor: PublicKey, v: Vault, r: RouterRequest) => 
     // as an isolated account always does).
     rw(carryAddress(v.key)), rw(ledgerAddress(r.wallet, r.sub)),
     ro(tiersAddress()),
+    rw(equitiesAddress(r.wallet)),
     rw(statsAddress(r.wallet)),
   ],
   data: new W().u8(6).done(),

@@ -594,8 +594,14 @@ macro_rules! trader_seeds {
 /// cannot reach it. Its addresses: `isolated_address`, `isolated_portfolio_address`,
 /// `isolated_collateral_address`.
 ///
+/// The wallet's accounts on the market count as one in its track record (see `Equities`): an
+/// isolated account creates the wallet's record of values the first time, and marks the main
+/// account as having one.
+///
 /// Accounts: 0 wallet [s, w], 1 trader [w], 2 portfolio [w], 3 collateral [w], 4 market [w],
-/// 5 collateral mint, 6 Percolator program, 7 system program, 8 token program.
+/// 5 collateral mint, 6 Percolator program, 7 system program, 8 token program, then
+/// 9 the wallet's record of values [w] (optional for a main account), and for an isolated one
+/// 10 the wallet's main trader account [w] and 11 its main portfolio (whether or not they exist).
 /// Data: optionally `sub` (u8, 1..=255).
 #[inline(never)]
 fn open_account(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
@@ -633,6 +639,47 @@ fn open_account(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
     key_is(portfolio, &pk)?;
     key_is(collateral, &ck)?;
 
+    // The wallet's record of values: an isolated account needs it (created now if it is the
+    // first); a main account opened after it is marked as having one.
+    let mut has_equities = 0u8;
+    let (ek, ebump) = equities_address(program_id, market.key, wallet.key);
+    if sub != 0 {
+        let eq_ai = acc(accounts, 9)?;
+        let main_ai = acc(accounts, 10)?;
+        let main_pf = acc(accounts, 11)?;
+        key_is(eq_ai, &ek)?;
+        key_is(main_ai, &trader_address(program_id, market.key, wallet.key).0)?;
+        key_is(main_pf, &portfolio_address(program_id, market.key, wallet.key).0)?;
+        writable(eq_ai)?;
+        if eq_ai.owner != program_id {
+            create_pda(wallet, eq_ai, system, program_id, EQUITIES_LEN, 0, &[SEED_EQUITIES, market.key.as_ref(), wallet.key.as_ref(), &[ebump]])?;
+            // (Written in place: the record does not fit on the stack.)
+            {
+                let mut d = eq_ai.try_borrow_mut_data()?;
+                d[..8].copy_from_slice(&EQUITIES_MAGIC.to_le_bytes());
+                d[8..40].copy_from_slice(wallet.key.as_ref());
+                d[40..72].copy_from_slice(market.key.as_ref());
+                d[72] = ebump;
+            }
+            if *main_pf.owner == PERCOLATOR_PROGRAM_ID {
+                let (capital, pnl, _) = perc::portfolio_exposure(&main_pf.try_borrow_data()?)?;
+                social::set_equity(program_id, eq_ai, 0, Some((capital as i128).saturating_add(pnl)), 0)?;
+            }
+        }
+        if main_ai.owner == program_id {
+            writable(main_ai)?;
+            let mut m = load_trader(program_id, main_ai, wallet.key)?;
+            if m.has_equities == 0 {
+                m.has_equities = 1;
+                store(main_ai, &m)?;
+            }
+        }
+    } else if let Some(eq_ai) = accounts.get(9) {
+        key_is(eq_ai, &ek)?;
+        if eq_ai.owner == program_id {
+            has_equities = 1;
+        }
+    }
     let t = TraderState {
         magic: TRADER_MAGIC,
         market: *market.key,
@@ -644,7 +691,8 @@ fn open_account(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> P
         has_stats: 0,
         has_ledger: 0,
         sub,
-        _pad: [0; 3],
+        has_equities,
+        _pad: [0; 2],
         pending_vault: Pubkey::default(),
         pending_id: 0,
     };
@@ -710,7 +758,7 @@ fn deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -> Progra
         &[trader_ai.clone(), market.clone(), portfolio.clone(), collateral.clone(), perc_vault.clone(), token.clone(), percolator.clone()],
         &[trader_seeds!(t)],
     )?;
-    social::book_flow(program_id, &t, acc(accounts, 9), amount, 0)
+    social::book_flow_of(program_id, &t, accounts, acc(accounts, 9), amount, 0)
 }
 
 /// Moves collateral from the trader's portfolio back to a token account the wallet owns. Refused
@@ -780,7 +828,7 @@ fn withdraw(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -> Progr
     if no_copy && wallet.is_writable && trader_ai.is_writable && perc::positions(&market.try_borrow_data()?, &portfolio.try_borrow_data()?)?.iter().all(|p| p.size == 0) {
         pay(trader_ai, wallet, spare(trader_ai, TRADER_LEN)?)?;
     }
-    social::book_flow(program_id, &t, acc(accounts, 10), 0, received)
+    social::book_flow_of(program_id, &t, accounts, acc(accounts, 10), 0, received)
 }
 
 /// Turns the trader's released profit into capital, which is what a withdrawal pays out and what
@@ -1848,9 +1896,17 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let traded = held(portfolio, market)? - before;
     msg!("fill {} {} {}", { r.id }, traded, effective);
     let owed = book_fees(fees, vault_ai, portfolio, v.asset_index, market_id, v.inventory, before, traded, effective, liquidation_fee)?;
+    // This account's value in the wallet's record of values (required once the wallet has one),
+    // and the others', which the track record counts too.
+    let mut others = 0i128;
+    if let Some(e) = social::equities_for(program_id, accounts, &t)? {
+        let (capital, pnl, _) = perc::portfolio_exposure(&portfolio.try_borrow_data()?)?;
+        let here = (capital as i128).saturating_add(pnl).saturating_sub(owed as i128);
+        others = social::set_equity(program_id, e, t.sub, Some(here), 0)?;
+    }
     // The trader's track record, when the fill names it (its last account).
     if let Some(stats_ai) = accounts.last() {
-        social::record_fill(program_id, stats_ai, &t, portfolio, v.asset_index, traded, effective, owed);
+        social::record_fill(program_id, stats_ai, &t, portfolio, v.asset_index, traded, effective, owed, others);
     }
 
     b.remove(r.id)?;

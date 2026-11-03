@@ -1,15 +1,16 @@
 // The wallet's own portfolio: every open position, what the account is worth and how it got
 // there, results by market and by day, and trading statistics. Read from the same public accounts
-// as the Trade page (one account covers every market) plus this wallet's own fill history.
+// as the Trade page plus this wallet's own fill history. The wallet's main (cross-margin) account
+// and its isolated accounts count as one: equity, positions, results and history add them up.
 import { useMemo } from "react";
 import { useWallet } from "@solana/wallet-adapter-react";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
 import * as C from "./chain";
 import * as S from "./social";
-import { heldPositions, Held } from "./Desk";
+import { heldEverywhere, realizedAll, Held } from "./Desk";
 import { Gauge, PnlChart, Ring, openTrader, positionsOf, useMarket } from "./TraderIntel";
 import { Lean, useBoard } from "./Traders";
-import { Card, fmt, num, priceDp, realizedPnl, useCards, useDeepFills, useVault, useWalletFills } from "./shared";
+import { Card, fmt, num, priceDp, useAccounts, useCards, useDeepFills, useFillsBySub, useVault, useWalletFills } from "./shared";
 
 const money = (x: number, dp?: number) => {
   const a = Math.abs(x), s = x < 0 ? "−" : "";
@@ -38,8 +39,9 @@ export default function PortfolioPage({ tick, go }: { tick: number; go: (to: str
 function Inner({ markets, tick, go }: { markets: Card[]; tick: number; go: (to: string) => void }) {
   const { publicKey } = useWallet();
   const wallet = publicKey!.toBase58();
-  // Any market's state carries the whole account (cross margin): its equity and every position.
+  // Any market's state carries the main account (cross margin); the isolated ones are read too.
   const { state } = useVault(markets[0].v.key, tick);
+  const { accounts } = useAccounts(markets, tick);
   const { board } = useBoard(tick);
   const row = board?.rows.find(r => r.wallet === wallet);
   const recent = useWalletFills(publicKey, BigInt(tick));
@@ -47,23 +49,26 @@ function Inner({ markets, tick, go }: { markets: Card[]; tick: number; go: (to: 
     const c = markets.find(m => m.v.assetIndex === x.asset);
     return c ? `${c.v.key.toBase58()}:${x.size}` : "";
   }).filter(Boolean).sort().join(","), [state, markets]);
-  const fills = useDeepFills(publicKey, need, recent);
+  const mainFills = useDeepFills(publicKey, need, recent);
+  const isoFills = useFillsBySub(publicKey, accounts.filter(a => a.sub).map(a => a.sub), tick);
+  const fills = useMemo(() => [...mainFills.map(f => ({ ...f, sub: 0 })), ...[...isoFills.values()].flat()].sort((a, b) => a.slot - b.slot), [mainFills, isoFills]);
   const symOfVault = useMemo(() => new Map(markets.map(c => [c.v.key.toBase58(), c.v.feed!.symbol])), [markets]);
   const market = useMarket(tick);
 
   if (!state) return <div className="desk-msg">Reading your account…</div>;
-  if (!state.trader) return (
+  if (!state.trader && !accounts.length) return (
     <main className="pf">
       <h1>Portfolio</h1>
       <div className="card pf-empty"><p>This wallet has no trading account yet. Make your first trade and your portfolio fills in here.</p><button className="btn primary" onClick={() => go("/")}>Trade</button></div>
     </main>
   );
 
-  const held = heldPositions(state, markets, fills, row);
-  const h = state.health, p = state.portfolio;
-  const equity = num(h?.equity ?? p?.capital ?? 0n, C.USDC);
-  const inPos = num(h?.notional ?? 0n, 1e6);
-  const floor = num(h?.floor ?? 0n, 1e6);
+  // Every account together: the main one and each isolated one.
+  const all = accounts.length ? accounts : [];
+  const held = heldEverywhere(all, markets, fills, row);
+  const equity = num(all.reduce((t, a) => t + a.health.equity, 0n), C.USDC);
+  const inPos = num(all.reduce((t, a) => t + a.health.notional, 0n), 1e6);
+  const floor = num(all.reduce((t, a) => t + a.health.floor, 0n), 1e6);
   const lev = equity > 0 ? inPos / equity : 0;
   const used = inPos > 0 ? Math.min(100, Math.max(0, (floor / Math.max(equity, 1e-9)) * 100)) : 0;
   const openPnl = held.reduce((t, x) => t + (x.pnl ?? 0), 0);
@@ -71,8 +76,8 @@ function Inner({ markets, tick, go }: { markets: Card[]; tick: number; go: (to: 
 
   // Closed results from this wallet's own fills (positions now known, so each fill's effect is too).
   const nowPos = new Map<string, number>();
-  for (const x of held) { const c = markets.find(m => m.v.assetIndex === x.asset); if (c) nowPos.set(c.v.key.toBase58(), x.size); }
-  const rows = realizedPnl(fills, nowPos);
+  for (const x of held) { const c = markets.find(m => m.v.assetIndex === x.asset); if (c) nowPos.set(`${x.sub}:${c.v.key.toBase58()}`, x.size); }
+  const rows = realizedAll(fills, nowPos);
   const closes = rows.filter(r => r.known && r.close !== undefined && Math.abs(r.realized) > 1e-9);
   const wins = closes.filter(r => r.realized > 0), losses = closes.filter(r => r.realized < 0);
   const sumWin = wins.reduce((t, r) => t + r.realized, 0), sumLoss = -losses.reduce((t, r) => t + r.realized, 0);
@@ -108,7 +113,7 @@ function Inner({ markets, tick, go }: { markets: Card[]; tick: number; go: (to: 
       </div>
 
       <section className="pf-kpis">
-        <Kpi label="Equity" value={money(equity)} sub={`${money(inPos)} in positions`} />
+        <Kpi label="Equity" value={money(equity)} sub={`${money(inPos)} in positions${all.length > 1 ? ` · ${all.length} accounts` : ""}`} />
         <Kpi label="Open PnL" value={signed(openPnl)} tone={tone(openPnl)} sub={`${held.length} position${held.length === 1 ? "" : "s"}`} />
         <Kpi label="Today" value={signed(today)} tone={tone(today)} sub="UTC day" />
         <Kpi label="All-time PnL" value={row ? signed(row.pnl) : "—"} tone={row ? tone(row.pnl) : ""} sub={row ? `${pct(row.roi)} return` : undefined} />
@@ -307,8 +312,8 @@ function Exposure({ held, equity, go }: { held: Held[]; equity: number; go: (to:
       </div>
       <div className="pf-split-l small"><span className="up">Long {money(longV)}</span><span className="muted">net {signed(longV - shortV)}</span><span className="down">Short {money(shortV)}</span></div>
       {[...held].sort((a, b) => b.value - a.value).map(x => (
-        <button key={x.asset} className="pf-bar" onClick={() => go(`/trade/${x.sym}`)} title={`${x.sym} ${x.size > 0 ? "long" : "short"} ${fmt(Math.abs(x.size), 4)} · value ${money(x.value)} (${equity > 0 ? fmt(x.value / equity * 100, 0) : "—"}% of equity)${x.entry ? ` · entry ${fmt(x.entry, priceDp(x.mark))}` : ""} · mark ${fmt(x.mark, priceDp(x.mark))}`}>
-          <span className="pf-bar-n"><b>{x.sym}</b><em className={x.size > 0 ? "up" : "down"}>{x.size > 0 ? "Long" : "Short"}</em></span>
+        <button key={`${x.sub}:${x.asset}`} className="pf-bar pf-pos" onClick={() => go(`/trade/${x.sym}`)} title={`${x.sym} ${x.size > 0 ? "long" : "short"} ${fmt(Math.abs(x.size), 4)} · value ${money(x.value)} (${equity > 0 ? fmt(x.value / equity * 100, 0) : "—"}% of equity)${x.entry ? ` · entry ${fmt(x.entry, priceDp(x.mark))}` : ""} · mark ${fmt(x.mark, priceDp(x.mark))}`}>
+          <span className="pf-bar-n"><b>{x.sym}</b><em className={x.size > 0 ? "up" : "down"}>{x.size > 0 ? "Long" : "Short"}</em>{x.sub ? <em className="mtag">Isolated</em> : null}</span>
           <span className="pf-bar-t"><i className={x.size > 0 ? "up" : "down"} style={{ width: `${Math.max(2, x.value / top * 100)}%` }} /></span>
           <span className="mono pf-bar-v">{money(x.value, 0)}</span>
           <span className={`mono pf-bar-p ${x.pnl === undefined ? "" : tone(x.pnl)}`}>{x.pnl === undefined ? "—" : `${signed(x.pnl)} (${pct(x.ret ?? 0)})`}</span>
@@ -338,7 +343,7 @@ function ByMarket({ list }: { list: { sym: string; realized: number; trades: num
   );
 }
 
-function TradeList({ rows, symOf }: { rows: ReturnType<typeof realizedPnl>; symOf: (vault: string) => string }) {
+function TradeList({ rows, symOf }: { rows: ReturnType<typeof realizedAll>; symOf: (vault: string) => string }) {
   if (!rows.length) return <div className="quiet">No trades read yet (your history is read from your wallet's transactions, a few at a time).</div>;
   return (
     <div className="pf-table">

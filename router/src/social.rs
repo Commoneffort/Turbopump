@@ -36,6 +36,73 @@ pub fn min_copy_part(delta: i128, follower_equity: i128, price: u64) -> u128 {
 /// Largest share of the leader's leverage a follower can ask for (3x).
 pub const MAX_COPY_RATIO_BPS: u32 = 30_000;
 
+// ---- one record for all of a wallet's accounts (see `Equities`) ----
+
+/// The wallet's `Equities` record among `accounts`, found by its contents (only the router writes
+/// an account with its magic, at the address of its wallet and market).
+pub(crate) fn equities_in<'a, 'b>(program_id: &Pubkey, accounts: &'a [AccountInfo<'b>], market: &Pubkey, wallet: &Pubkey) -> Option<&'a AccountInfo<'b>> {
+    accounts.iter().find(|a| {
+        a.owner == program_id
+            && a.data_len() == EQUITIES_LEN
+            && a.try_borrow_data().is_ok_and(|d| d[..8] == EQUITIES_MAGIC.to_le_bytes() && d[8..40] == wallet.to_bytes() && d[40..72] == market.to_bytes())
+    })
+}
+/// The record an instruction on trading account `t` must name: always for an isolated account,
+/// and for a main account once the wallet has one. Leaving it out is refused, or a trader could
+/// leave a stale value standing for an account and book a profit it did not make.
+pub(crate) fn equities_for<'a, 'b>(program_id: &Pubkey, accounts: &'a [AccountInfo<'b>], t: &TraderState) -> Result<Option<&'a AccountInfo<'b>>, ProgramError> {
+    match equities_in(program_id, accounts, &t.market, &t.wallet) {
+        Some(a) => {
+            writable(a)?;
+            Ok(Some(a))
+        }
+        None if t.sub != 0 || t.has_equities != 0 => Err(RouterError::BadAccount.into()),
+        None => Ok(None),
+    }
+}
+/// Where account `sub`'s value is in the record's bytes. (The record is read and written in
+/// place: a copy of it would not fit on the program's stack.)
+const EQUITY_AT: usize = 80;
+/// Sets account `sub`'s value in the record, or moves it by `delta`; returns the sum of the
+/// other accounts' values.
+pub(crate) fn set_equity(program_id: &Pubkey, ai: &AccountInfo, sub: u8, value: Option<i128>, delta: i128) -> Result<i128, ProgramError> {
+    if ai.owner != program_id || ai.data_len() != EQUITIES_LEN {
+        return Err(RouterError::BadAccount.into());
+    }
+    let mut d = ai.try_borrow_mut_data()?;
+    if d[..8] != EQUITIES_MAGIC.to_le_bytes() {
+        return Err(RouterError::BadAccount.into());
+    }
+    let at = |i: usize| EQUITY_AT + 8 * i;
+    let read = |d: &[u8], i: usize| i64::from_le_bytes(d[at(i)..at(i) + 8].try_into().unwrap()) as i128;
+    let i = sub as usize;
+    let v = clamp_i64(value.unwrap_or(read(&d, i)).saturating_add(delta));
+    d[at(i)..at(i) + 8].copy_from_slice(&v.to_le_bytes());
+    Ok((0..256).filter(|j| *j != i).map(|j| read(&d, j)).sum())
+}
+/// Books a deposit or withdrawal of trading account `t`: in the wallet's track record (an
+/// isolated account's go into its main account's, which must be named whenever it exists, for the
+/// same reason as the record of values) and in the record of values.
+pub(crate) fn book_flow_of(program_id: &Pubkey, t: &TraderState, accounts: &[AccountInfo], main_stats: Result<&AccountInfo, RouterError>, paid_in: u64, paid_out: u64) -> ProgramResult {
+    if t.sub == 0 {
+        book_flow(program_id, t, main_stats, paid_in, paid_out)?;
+    } else {
+        let sk = stats_address(program_id, &t.market, &t.wallet).0;
+        let stats_ai = accounts.iter().find(|a| *a.key == sk).ok_or(RouterError::BadAccount)?;
+        if stats_ai.owner == program_id {
+            writable(stats_ai)?;
+            let mut s: Stats = load(stats_ai, program_id, STATS_MAGIC)?;
+            s.deposited = s.deposited.saturating_add(paid_in);
+            s.withdrawn = s.withdrawn.saturating_add(paid_out);
+            store(stats_ai, &s)?;
+        }
+    }
+    if let Some(e) = equities_for(program_id, accounts, t)? {
+        set_equity(program_id, e, t.sub, None, paid_in as i128 - paid_out as i128)?;
+    }
+    Ok(())
+}
+
 fn equity(portfolio: &AccountInfo) -> Result<i128, ProgramError> {
     let (capital, pnl, _) = perc::portfolio_exposure(&portfolio.try_borrow_data()?)?;
     Ok((capital as i128).checked_add(pnl).ok_or(RouterError::Overflow)?)
@@ -72,16 +139,27 @@ pub(crate) fn open_stats(program_id: &Pubkey, accounts: &[AccountInfo]) -> Progr
     }
     key_is(market, &t.market)?;
     key_is(portfolio, &t.portfolio)?;
+    // The wallet's record of values (account 7, whether or not it exists): its isolated
+    // accounts' money is in the record from its start.
+    let eq_ai = acc(accounts, 7)?;
+    key_is(eq_ai, &equities_address(program_id, &t.market, wallet.key).0)?;
     let (sk, bump) = stats_address(program_id, &t.market, wallet.key);
     key_is(stats_ai, &sk)?;
     create_pda(payer, stats_ai, system, program_id, STATS_LEN, 0, &[SEED_STATS, t.market.as_ref(), wallet.key.as_ref(), &[bump]])?;
+    let mine = equity(portfolio)?;
+    let mut start = mine;
+    if eq_ai.owner == program_id {
+        writable(eq_ai)?;
+        start = start.saturating_add(set_equity(program_id, eq_ai, 0, Some(mine), 0)?);
+        t.has_equities = 1;
+    }
     let mut s = Stats::zeroed();
     s.magic = STATS_MAGIC;
     s.wallet = *wallet.key;
     s.market = t.market;
     s.bump = bump;
     s.start_time = Clock::get()?.unix_timestamp;
-    s.start_equity = clamp_i64(equity(portfolio)?);
+    s.start_equity = clamp_i64(start);
     store(stats_ai, &s)?;
     t.has_stats = 1;
     store(trader_ai, &t)
@@ -107,14 +185,17 @@ pub(crate) fn book_flow(program_id: &Pubkey, t: &TraderState, stats_ai: Result<&
 /// `owed`: what the account owes the vaults (see `carry`), counted as already lost: paying it
 /// later then changes nothing in the record.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn record_fill(program_id: &Pubkey, stats_ai: &AccountInfo, t: &TraderState, portfolio: &AccountInfo, asset: u16, traded: i128, price: u64, owed: u64) {
-    if t.has_stats == 0 || !stats_ai.is_writable || *stats_ai.key != stats_address(program_id, &t.market, &t.wallet).0 {
+/// `others`: the value of the wallet's other accounts on the market (see `Equities`): the record
+/// is the wallet's, isolated accounts included.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_fill(program_id: &Pubkey, stats_ai: &AccountInfo, t: &TraderState, portfolio: &AccountInfo, asset: u16, traded: i128, price: u64, owed: u64, others: i128) {
+    if !stats_ai.is_writable || *stats_ai.key != stats_address(program_id, &t.market, &t.wallet).0 || (t.sub == 0 && t.has_stats == 0) {
         return;
     }
     let Ok(mut s) = load::<Stats>(stats_ai, program_id, STATS_MAGIC) else { return };
     let (Ok(eq), Ok(clock)) = (equity(portfolio), Clock::get()) else { return };
     let now = clock.unix_timestamp;
-    let pnl = clamp_i64(eq - owed as i128 - s.start_equity as i128 - s.deposited as i128 + s.withdrawn as i128);
+    let pnl = clamp_i64(eq - owed as i128 + others - s.start_equity as i128 - s.deposited as i128 + s.withdrawn as i128);
     let today = (now / 86_400).max(0) as u32;
     let mut days = s.days;
     let mut at = s.day_at as usize % STATS_DAYS;
