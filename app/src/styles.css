@@ -281,6 +281,15 @@ a.cell-link:hover .cell-l, a.cell-link:hover .cell-s { color: var(--accent-green
 .side button:hover:not(.on) { color: var(--text); background: var(--control-2); }
 .side button.on.up { background: var(--green); color: var(--bg-primary); }
 .side button.on.down { background: var(--accent-red); color: #FFFFFF; }
+/* cross or isolated margin for this market */
+.mmode { display: grid; grid-template-columns: 1fr 1fr; gap: 2px; background: var(--control); border-radius: 8px; padding: 2px; margin-bottom: 10px; }
+.mmode button { background: none; border: 0; border-radius: 6px; padding: 6px 0; color: var(--muted); font-weight: 600; font-size: 12px; cursor: pointer; }
+.mmode button:hover:not(.on) { color: var(--text); background: var(--control-2); }
+.mmode button.on { background: var(--control-2); color: var(--text); box-shadow: inset 0 0 0 1px var(--line); }
+/* positions held in the wallet's other accounts, under the positions table */
+.elsewhere { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; padding: 10px 12px 2px; font-size: 12px; color: var(--muted); }
+.elsewhere .link { font-size: 12px; font-weight: 600; }
+.elsewhere .link i { font-style: normal; font-weight: 400; color: var(--muted); margin-left: 2px; }
 .otabs { display: grid; grid-template-columns: repeat(4, 1fr); gap: 2px; margin-bottom: 10px; }
 .otabs button { background: none; border: 0; border-bottom: 2px solid var(--line); padding: 0 0 8px; color: var(--muted); font-size: 12px; font-weight: 600; cursor: pointer; }
 .otabs button:hover { color: var(--text); }
@@ -680,12 +689,12 @@ h3 { margin: 0 0 12px; font-size: 15px; font-weight: 600; }
 .badge-sq svg { display: block; }
 .badge-pic { display: block; width: 100%; height: 100%; object-fit: cover; user-select: none; }
 .podium { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 14px; }
-.podium-card { position: relative; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; min-width: 0; }
+.podium-card { position: relative; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; display: grid; grid-template-columns: minmax(0, auto) minmax(0, 1fr); gap: 20px; min-width: 0; }
 .podium-l { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 .podium-l > .btn { align-self: flex-start; }
 .podium-r { display: flex; flex-direction: column; justify-content: flex-end; gap: 6px; min-width: 0; }
-.podium-all { font-size: 11px; color: var(--muted); display: flex; justify-content: space-between; gap: 8px; padding-right: 26px; }
-.podium-all b { font-size: 12.5px; font-weight: 500; }
+.podium-all { font-size: 11px; color: var(--muted); display: flex; flex-direction: column; gap: 2px; padding-right: 30px; }
+.podium-all b { font-size: 22px; font-weight: 600; line-height: 1.2; }
 .podium-card.p1 { border-color: var(--line-2); }
 .podium-rank { position: absolute; top: 10px; right: 14px; font-size: 22px; color: var(--muted); }
 .podium-card.p1 .podium-rank { color: var(--text); }

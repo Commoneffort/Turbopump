@@ -568,8 +568,9 @@ function SizeCalc({ state, send, busy, board }: { state: C.State; send?: Send; b
               : state.trader.hasPending ? "An order of yours is already waiting to fill" : units <= 0n ? "The size rounds to nothing" : lev > maxLev ? `Too much leverage for ${sym}` : liqFirst ? "It would be liquidated before the stop" : withStop && freeSlot === undefined ? "No free order slot for the stop: cancel an order first" : undefined;
             const go = () => {
               if (!publicKey || !send || why) return;
-              const ixs = [...(state.trader && !state.trader.hasLedger ? [C.openLedger(publicKey, publicKey)] : []), C.requestTrade(publicKey, state.vault.key, long ? units : -units)];
-              if (withStop && freeSlot !== undefined) ixs.push(C.placeOrder(publicKey, state.vault.key, { index: freeSlot, kind: C.ORDER.STOP, size: 0n, trigger: BigInt(Math.round(Sl * 1e6)) }));
+              // (Into the account the desk shows: cross, or this market's isolated one.)
+              const ixs = [...(state.trader && !state.trader.hasLedger ? [C.openLedger(publicKey, publicKey, state.sub)] : []), C.requestTrade(publicKey, state.vault.key, long ? units : -units, { sub: state.sub })];
+              if (withStop && freeSlot !== undefined) ixs.push(C.placeOrder(publicKey, state.vault.key, { index: freeSlot, kind: C.ORDER.STOP, size: 0n, trigger: BigInt(Math.round(Sl * 1e6)) }, state.sub));
               send(`${long ? "Long" : "Short"} ${qty(size)} ${sym}${withStop ? ` with stop at ${fmt(Sl, dp)}` : ""}`, ixs);
             };
             return (

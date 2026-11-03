@@ -24,6 +24,10 @@ pub struct TraderKeys {
     pub trader: Pubkey,
     pub portfolio: Pubkey,
     pub collateral: Pubkey,
+    /// 0: the main account; 1..=255: an isolated one.
+    pub sub: u8,
+    /// What its request and order addresses are derived from (`TraderState::owner`).
+    pub owner: Pubkey,
 }
 
 impl TraderKeys {
@@ -34,6 +38,21 @@ impl TraderKeys {
             trader: trader_address(&id(), &market, &wallet).0,
             portfolio: portfolio_address(&id(), &market, &wallet).0,
             collateral: collateral_address(&id(), &market, &wallet).0,
+            sub: 0,
+            owner: wallet,
+        }
+    }
+    /// The wallet's isolated account number `sub` (1..=255) on `market`.
+    pub fn isolated(market: Pubkey, wallet: Pubkey, sub: u8) -> Self {
+        let trader = isolated_address(&id(), &market, &wallet, sub).0;
+        Self {
+            wallet,
+            market,
+            trader,
+            portfolio: isolated_portfolio_address(&id(), &trader).0,
+            collateral: isolated_collateral_address(&id(), &trader).0,
+            sub,
+            owner: trader,
         }
     }
 }
@@ -52,7 +71,7 @@ pub fn open_account(t: &TraderKeys, mint: &Pubkey) -> Instruction {
             ro(system_program::ID),
             ro(spl_token::ID),
         ],
-        data: vec![TAG_OPEN_ACCOUNT],
+        data: if t.sub == 0 { vec![TAG_OPEN_ACCOUNT] } else { vec![TAG_OPEN_ACCOUNT, t.sub] },
     }
 }
 
@@ -113,8 +132,20 @@ pub fn open_book(payer: &Pubkey, vault: &Pubkey) -> Instruction {
 }
 
 pub fn request(t: &TraderKeys, vault: &Pubkey, size: i128) -> Instruction {
+    request_with(t, vault, size, false)
+}
+
+/// A request that may only shrink the position (a close): see `Request::reduce_only`.
+pub fn request_close_only(t: &TraderKeys, vault: &Pubkey, size: i128) -> Instruction {
+    request_with(t, vault, size, true)
+}
+
+fn request_with(t: &TraderKeys, vault: &Pubkey, size: i128, reduce_only: bool) -> Instruction {
     let mut data = vec![TAG_REQUEST];
     data.extend_from_slice(&size.to_le_bytes());
+    if reduce_only {
+        data.push(1);
+    }
     Instruction {
         program_id: crate::id(),
         accounts: vec![
@@ -122,7 +153,7 @@ pub fn request(t: &TraderKeys, vault: &Pubkey, size: i128) -> Instruction {
             w(t.trader),
             ro(*vault),
             w(book_address(&crate::id(), vault).0),
-            w(request_address(&crate::id(), vault, &t.wallet, false).0),
+            w(request_address(&crate::id(), vault, &t.owner, false).0),
             ro(t.market),
             ro(t.portfolio),
             ro(system_program::ID),
@@ -142,7 +173,7 @@ pub fn request_close(payer: &Pubkey, t: &TraderKeys, vault: &Pubkey) -> Instruct
             ro(t.wallet),
             ro(*vault),
             w(book_address(&crate::id(), vault).0),
-            w(request_address(&crate::id(), vault, &t.wallet, false).0),
+            w(request_address(&crate::id(), vault, &t.owner, false).0),
             ro(t.market),
             ro(system_program::ID),
             ro(t.portfolio),
@@ -252,7 +283,7 @@ pub fn fill(executor: &Pubkey, k: &VaultKeys, t: &TraderKeys) -> Instruction {
         program_id: id(),
         accounts: vec![
             AccountMeta::new(*executor, true),
-            w(request_address(&id(), &k.vault, &t.wallet, false).0),
+            w(request_address(&id(), &k.vault, &t.owner, false).0),
             w(t.trader),
             w(t.wallet),
             w(book_address(&id(), &k.vault).0),
@@ -282,7 +313,7 @@ pub fn expire(caller: &Pubkey, vault: &Pubkey, t: &TraderKeys) -> Instruction {
         accounts: vec![
             // Writable, so the router can pay the caller its share of the bond.
             AccountMeta::new(*caller, true),
-            w(request_address(&id(), vault, &t.wallet, false).0),
+            w(request_address(&id(), vault, &t.owner, false).0),
             w(t.trader),
             w(t.wallet),
             w(book_address(&id(), vault).0),
@@ -384,7 +415,7 @@ pub fn place_order(t: &TraderKeys, vault: &Pubkey, o: &OrderParams) -> Instructi
             ro(t.trader),
             ro(*vault),
             ro(book_address(&id(), vault).0),
-            w(order_address(&id(), vault, &t.wallet, o.index).0),
+            w(order_address(&id(), vault, &t.owner, o.index).0),
             ro(t.market),
             ro(t.portfolio),
             ro(system_program::ID),
@@ -394,9 +425,14 @@ pub fn place_order(t: &TraderKeys, vault: &Pubkey, o: &OrderParams) -> Instructi
 }
 
 pub fn cancel_order(wallet: &Pubkey, vault: &Pubkey, index: u8) -> Instruction {
+    cancel_order_of(&TraderKeys { owner: *wallet, wallet: *wallet, ..TraderKeys::new(Pubkey::default(), *wallet) }, vault, index)
+}
+
+/// Cancels an order of `t` (the main account or an isolated one).
+pub fn cancel_order_of(t: &TraderKeys, vault: &Pubkey, index: u8) -> Instruction {
     Instruction {
         program_id: id(),
-        accounts: vec![AccountMeta::new(*wallet, true), w(order_address(&id(), vault, wallet, index).0)],
+        accounts: vec![AccountMeta::new(t.wallet, true), w(order_address(&id(), vault, &t.owner, index).0)],
         data: vec![TAG_CANCEL_ORDER],
     }
 }
@@ -407,12 +443,12 @@ pub fn trigger_order(payer: &Pubkey, t: &TraderKeys, vault: &Pubkey, index: u8) 
         program_id: crate::id(),
         accounts: vec![
             AccountMeta::new(*payer, true),
-            w(order_address(&crate::id(), vault, &t.wallet, index).0),
+            w(order_address(&crate::id(), vault, &t.owner, index).0),
             w(t.trader),
             w(t.wallet),
             ro(*vault),
             w(book_address(&crate::id(), vault).0),
-            w(request_address(&crate::id(), vault, &t.wallet, false).0),
+            w(request_address(&crate::id(), vault, &t.owner, false).0),
             ro(t.market),
             ro(t.portfolio),
             ro(system_program::ID),
@@ -425,14 +461,14 @@ pub fn trigger_order(payer: &Pubkey, t: &TraderKeys, vault: &Pubkey, index: u8) 
 /// `fill` for a request that a standing order queued.
 pub fn fill_order(executor: &Pubkey, k: &VaultKeys, t: &TraderKeys, index: u8) -> Instruction {
     let mut ix = fill(executor, k, t);
-    ix.accounts.insert(13, w(order_address(&id(), &k.vault, &t.wallet, index).0));
+    ix.accounts.insert(13, w(order_address(&id(), &k.vault, &t.owner, index).0));
     ix
 }
 
 /// `expire` for a request that a standing order queued.
 pub fn expire_order(caller: &Pubkey, vault: &Pubkey, t: &TraderKeys, index: u8) -> Instruction {
     let mut ix = expire(caller, vault, t);
-    ix.accounts.push(w(order_address(&id(), vault, &t.wallet, index).0));
+    ix.accounts.push(w(order_address(&id(), vault, &t.owner, index).0));
     ix
 }
 
@@ -578,7 +614,7 @@ pub fn trigger_copy(payer: &Pubkey, t: &TraderKeys, leader: &Pubkey, vault: &Pub
             ro(t.wallet),
             ro(*vault),
             w(book_address(&id(), vault).0),
-            w(request_address(&id(), vault, &t.wallet, false).0),
+            w(request_address(&id(), vault, &t.owner, false).0),
             ro(t.market),
             ro(t.portfolio),
             ro(l.trader),

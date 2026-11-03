@@ -415,6 +415,11 @@ pub enum RouterError {
     WitnessDisagrees,
     /// `Withdraw` while the account owes the vaults fees: `PayFees` first (see `carry`).
     FeesOwed,
+    /// A close-only request (`Request` with the flag) when there is no position it would shrink.
+    NotReducing,
+    /// A trade that would add a second asset to an isolated account (one asset at a time), or a
+    /// copy or track record asked of an isolated account (they belong to the main account).
+    Isolated,
 }
 
 impl From<RouterError> for ProgramError {
@@ -429,13 +434,18 @@ pub fn process_instruction(program_id: &Pubkey, accounts: &[AccountInfo], data: 
         rest.get(i..i + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap())).ok_or(RouterError::InvalidInstruction)
     };
     match *tag {
-        TAG_OPEN_ACCOUNT => open_account(program_id, accounts),
+        TAG_OPEN_ACCOUNT => open_account(program_id, accounts, rest),
         TAG_DEPOSIT => deposit(program_id, accounts, u64_at(0)?),
         TAG_WITHDRAW => withdraw(program_id, accounts, u64_at(0)?),
         TAG_OPEN_BOOK => open_book(program_id, accounts),
         TAG_REQUEST => {
             let b = rest.get(..16).ok_or(RouterError::InvalidInstruction)?;
-            request(program_id, accounts, i128::from_le_bytes(b.try_into().unwrap()))
+            let reduce_only = match rest.get(16..) {
+                None | Some([]) => false,
+                Some([f]) if *f <= 1 => *f == 1,
+                _ => return Err(RouterError::InvalidInstruction.into()),
+            };
+            request(program_id, accounts, i128::from_le_bytes(b.try_into().unwrap()), reduce_only)
         }
         TAG_ADVANCE => advance(program_id, accounts, u64_at(0)?, u64_at(8)?),
         TAG_FILL => fill(program_id, accounts),
@@ -569,7 +579,7 @@ fn load_trader(program_id: &Pubkey, ai: &AccountInfo, wallet: &Pubkey) -> Result
 
 macro_rules! trader_seeds {
     ($t:expr) => {
-        &[SEED_TRADER, $t.market.as_ref(), $t.wallet.as_ref(), &[$t.bump]]
+        &$t.signer().seeds()[..]
     };
 }
 
@@ -578,10 +588,17 @@ macro_rules! trader_seeds {
 /// Creates the trader's router account, its Percolator portfolio and its collateral account,
 /// all owned by the trader's program address.
 ///
+/// With a number `sub` (1..=255) it creates one of the wallet's isolated accounts on the market
+/// instead: a second, separate trading account with its own margin, which holds a position on one
+/// asset at a time. A loss there can only take the money in it, and a loss in the main account
+/// cannot reach it. Its addresses: `isolated_address`, `isolated_portfolio_address`,
+/// `isolated_collateral_address`.
+///
 /// Accounts: 0 wallet [s, w], 1 trader [w], 2 portfolio [w], 3 collateral [w], 4 market [w],
 /// 5 collateral mint, 6 Percolator program, 7 system program, 8 token program.
+/// Data: optionally `sub` (u8, 1..=255).
 #[inline(never)]
-fn open_account(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+fn open_account(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let wallet = acc(accounts, 0)?;
     let trader_ai = acc(accounts, 1)?;
     let portfolio = acc(accounts, 2)?;
@@ -601,20 +618,21 @@ fn open_account(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
     if perc::market_collateral_mint(market)? != *mint.key {
         return Err(RouterError::BadAccount.into());
     }
-    let (tk, bump) = trader_address(program_id, market.key, wallet.key);
-    let (pk, pbump) = portfolio_address(program_id, market.key, wallet.key);
-    let (ck, cbump) = collateral_address(program_id, market.key, wallet.key);
+    let sub = match data {
+        [] => 0,
+        [n] if *n != 0 => *n,
+        _ => return Err(RouterError::InvalidInstruction.into()),
+    };
+    let (tk, bump) = if sub == 0 { trader_address(program_id, market.key, wallet.key) } else { isolated_address(program_id, market.key, wallet.key, sub) };
+    let ((pk, pbump), (ck, cbump)) = if sub == 0 {
+        (portfolio_address(program_id, market.key, wallet.key), collateral_address(program_id, market.key, wallet.key))
+    } else {
+        (isolated_portfolio_address(program_id, &tk), isolated_collateral_address(program_id, &tk))
+    };
     key_is(trader_ai, &tk)?;
     key_is(portfolio, &pk)?;
     key_is(collateral, &ck)?;
 
-    create_pda(wallet, trader_ai, system, program_id, TRADER_LEN, 0, &[SEED_TRADER, market.key.as_ref(), wallet.key.as_ref(), &[bump]])?;
-    create_pda(wallet, portfolio, system, &PERCOLATOR_PROGRAM_ID, perc::PORTFOLIO_ACCOUNT_LEN, 0, &[SEED_PORTFOLIO, market.key.as_ref(), wallet.key.as_ref(), &[pbump]])?;
-    create_pda(wallet, collateral, system, &spl_token::ID, spl_token::state::Account::LEN, 0, &[SEED_COLLATERAL, market.key.as_ref(), wallet.key.as_ref(), &[cbump]])?;
-    invoke(
-        &spl_token::instruction::initialize_account3(&spl_token::ID, collateral.key, mint.key, trader_ai.key)?,
-        &[collateral.clone(), mint.clone(), token.clone()],
-    )?;
     let t = TraderState {
         magic: TRADER_MAGIC,
         market: *market.key,
@@ -625,16 +643,35 @@ fn open_account(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
         has_pending: 0,
         has_stats: 0,
         has_ledger: 0,
-        _pad: [0; 4],
+        sub,
+        _pad: [0; 3],
         pending_vault: Pubkey::default(),
         pending_id: 0,
     };
+    create_pda(wallet, trader_ai, system, program_id, TRADER_LEN, 0, trader_seeds!(t))?;
+    if sub == 0 {
+        create_pda(wallet, portfolio, system, &PERCOLATOR_PROGRAM_ID, perc::PORTFOLIO_ACCOUNT_LEN, 0, &[SEED_PORTFOLIO, market.key.as_ref(), wallet.key.as_ref(), &[pbump]])?;
+        create_pda(wallet, collateral, system, &spl_token::ID, spl_token::state::Account::LEN, 0, &[SEED_COLLATERAL, market.key.as_ref(), wallet.key.as_ref(), &[cbump]])?;
+    } else {
+        create_pda(wallet, portfolio, system, &PERCOLATOR_PROGRAM_ID, perc::PORTFOLIO_ACCOUNT_LEN, 0, &[SEED_PORTFOLIO, tk.as_ref(), &[pbump]])?;
+        create_pda(wallet, collateral, system, &spl_token::ID, spl_token::state::Account::LEN, 0, &[SEED_COLLATERAL, tk.as_ref(), &[cbump]])?;
+    }
+    invoke(
+        &spl_token::instruction::initialize_account3(&spl_token::ID, collateral.key, mint.key, trader_ai.key)?,
+        &[collateral.clone(), mint.clone(), token.clone()],
+    )?;
     store(trader_ai, &t)?;
     invoke_signed(
         &perc::init_portfolio(trader_ai.key, market.key, portfolio.key),
         &[trader_ai.clone(), market.clone(), portfolio.clone(), percolator.clone()],
         &[trader_seeds!(t)],
     )
+}
+
+/// Whether an isolated account (see `open_account`) holds a position on an asset other than
+/// `asset`: it may then only reduce, not trade `asset` (one asset at a time).
+fn holds_other_asset(t: &TraderState, market: &[u8], portfolio: &[u8], asset: u16) -> Result<bool, ProgramError> {
+    Ok(t.sub != 0 && perc::positions(market, portfolio)?.iter().any(|p| p.asset != asset && p.size != 0))
 }
 
 /// Moves collateral from the wallet into the trader's Percolator portfolio.
@@ -738,7 +775,8 @@ fn withdraw(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -> Progr
     // A copy, while it runs, can open a position for the account at any time without the wallet:
     // the deposit stays then. So the refund needs the account's copy address passed, and empty.
     let copy_key = state::copy_address(program_id, &t.market, wallet.key).0;
-    let no_copy = accounts.iter().any(|a| *a.key == copy_key && a.owner != program_id);
+    // (An isolated account is never copied into.)
+    let no_copy = t.sub != 0 || accounts.iter().any(|a| *a.key == copy_key && a.owner != program_id);
     if no_copy && wallet.is_writable && trader_ai.is_writable && perc::positions(&market.try_borrow_data()?, &portfolio.try_borrow_data()?)?.iter().all(|p| p.size == 0) {
         pay(trader_ai, wallet, spare(trader_ai, TRADER_LEN)?)?;
     }
@@ -960,10 +998,15 @@ fn set_tier(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
 /// Queues a trade. It fills at the first Pyth price published at or after its target time, which
 /// is set here and cannot be changed or cancelled.
 ///
+/// With `reduce_only` (a close) the trade may only shrink the position held: it must be on the
+/// other side of it, is cut to its size here, and again at the fill to what is held then (a stop
+/// or take-profit that filled in between leaves it nothing to do).
+///
 /// Accounts: 0 wallet [s, w], 1 trader [w], 2 vault, 3 book [w], 4 request [w], 5 market,
-/// 6 trader portfolio, 7 system program. Data: size (i128, + = buy).
+/// 6 trader portfolio, 7 system program. Data: size (i128, + = buy), then optionally a flag
+/// (u8, 1 = close only).
 #[inline(never)]
-fn request(program_id: &Pubkey, accounts: &[AccountInfo], size: i128) -> ProgramResult {
+fn request(program_id: &Pubkey, accounts: &[AccountInfo], mut size: i128, reduce_only: bool) -> ProgramResult {
     let wallet = acc(accounts, 0)?;
     let trader_ai = acc(accounts, 1)?;
     let vault_ai = acc(accounts, 2)?;
@@ -996,8 +1039,20 @@ fn request(program_id: &Pubkey, accounts: &[AccountInfo], size: i128) -> Program
         return Err(RouterError::BookFull.into());
     }
     perc::expect_market(market)?;
+    if reduce_only {
+        let held = position_on(market, portfolio, v.asset_index)?;
+        if held == 0 || (held > 0) == (size > 0) {
+            return Err(RouterError::NotReducing.into());
+        }
+        if size.unsigned_abs() > held.unsigned_abs() {
+            size = held.checked_neg().ok_or(RouterError::Overflow)?;
+        }
+    }
     if perc::asset_close_only(&market.try_borrow_data()?, v.asset_index)? {
         return Err(RouterError::CloseOnly.into());
+    }
+    if !reduce_only && holds_other_asset(&t, &market.try_borrow_data()?, &portfolio.try_borrow_data()?, v.asset_index)? {
+        return Err(RouterError::Isolated.into());
     }
     if !margin_covers(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, &v, size, tiers_in(program_id, accounts, market.key).as_ref())? {
         return Err(RouterError::InsufficientMargin.into());
@@ -1007,7 +1062,13 @@ fn request(program_id: &Pubkey, accounts: &[AccountInfo], size: i128) -> Program
     // The account's keeper deposit: what whoever liquidates it is paid (see `keeper_deposit`),
     // topped up from the wallet when a liquidation has used it. Paid once; it stays the trader's.
     top_up_deposit(wallet, trader_ai, system)?;
-    enqueue(program_id, wallet, wallet.key, Some((trader_ai, &mut t)), vault_ai, book_ai, &mut b, request_ai, system, size, None, expiry_deposit(size, price))
+    enqueue(program_id, wallet, wallet.key, Some((trader_ai, &mut t)), vault_ai, book_ai, &mut b, request_ai, system, size, None, expiry_deposit(size, price))?;
+    if reduce_only {
+        let mut r: Request = load(request_ai, program_id, REQUEST_MAGIC)?;
+        r.reduce_only = 1;
+        store(request_ai, &r)?;
+    }
+    Ok(())
 }
 
 /// Stores a request for `owner`'s trading account (paid for by `payer`) and adds it to the book.
@@ -1053,9 +1114,11 @@ fn enqueue_after<'a>(
     let target = target_time(clock.unix_timestamp, b.mark_publish_time, delay).ok_or(RouterError::Overflow)?;
     let id = b.next_id;
     let settlement = trader.is_none();
-    let (rk, rbump) = request_address(program_id, vault_ai.key, owner, settlement);
+    // An isolated account's requests live at addresses of its own (see `TraderState::owner`).
+    let at = trader.as_ref().map_or(*owner, |(ai, t)| t.owner(ai.key));
+    let (rk, rbump) = request_address(program_id, vault_ai.key, &at, settlement);
     key_is(request_ai, &rk)?;
-    create_pda(payer, request_ai, system, program_id, REQUEST_LEN, BOND_LAMPORTS.saturating_add(deposit), &[SEED_REQUEST, vault_ai.key.as_ref(), owner.as_ref(), &[settlement as u8], &[rbump]])?;
+    create_pda(payer, request_ai, system, program_id, REQUEST_LEN, BOND_LAMPORTS.saturating_add(deposit), &[SEED_REQUEST, vault_ai.key.as_ref(), at.as_ref(), &[settlement as u8], &[rbump]])?;
     store(
         request_ai,
         &Request {
@@ -1070,7 +1133,8 @@ fn enqueue_after<'a>(
             kind: if trader.is_none() { KIND_SETTLE } else if order.is_some() { KIND_ORDER } else { KIND_TRADE },
             order_index: order.unwrap_or(0),
             funded: 0,
-            _pad: [0; 4],
+            reduce_only: 0,
+            _pad: [0; 3],
         },
     )?;
     b.next_id = id.checked_add(1).ok_or(RouterError::Overflow)?;
@@ -1230,7 +1294,8 @@ fn place_order(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     if index >= MAX_ORDERS || reduce_only > 1 || size == i128::MIN || (expiry != 0 && expiry <= now) {
         return Err(RouterError::BadOrder.into());
     }
-    let (bk, bump) = order_address(program_id, vault_ai.key, wallet.key, index);
+    let at = t.owner(trader_ai.key);
+    let (bk, bump) = order_address(program_id, vault_ai.key, &at, index);
     key_is(order_ai, &bk)?;
     let mut o = Order::zeroed();
     o.magic = ORDER_MAGIC;
@@ -1275,7 +1340,7 @@ fn place_order(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         }
         _ => return Err(RouterError::BadOrder.into()),
     }
-    create_pda(wallet, order_ai, system, program_id, ORDER_LEN, budget, &[SEED_ORDER, vault_ai.key.as_ref(), wallet.key.as_ref(), &[index], &[bump]])?;
+    create_pda(wallet, order_ai, system, program_id, ORDER_LEN, budget, &[SEED_ORDER, vault_ai.key.as_ref(), at.as_ref(), &[index], &[bump]])?;
     store(order_ai, &o)
 }
 
@@ -1338,6 +1403,8 @@ fn trigger_order(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
     key_is(wallet, &o.wallet)?;
     key_is(vault_ai, &o.vault)?;
     let mut t = load_trader(program_id, trader_ai, wallet.key)?;
+    // The order belongs to this trading account (a wallet may have isolated ones too).
+    key_is(order_ai, &order_address(program_id, vault_ai.key, &t.owner(trader_ai.key), o.index).0)?;
     let v = load_vault(vault_ai)?;
     let mut b: Book = load(book_ai, program_id, BOOK_MAGIC)?;
     key_is(market, &v.market)?;
@@ -1412,6 +1479,9 @@ fn trigger_order(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
     }
     if perc::asset_close_only(&market.try_borrow_data()?, v.asset_index)? {
         return Err(RouterError::CloseOnly.into());
+    }
+    if !protective && o.reduce_only == 0 && holds_other_asset(&t, &market.try_borrow_data()?, &portfolio.try_borrow_data()?, v.asset_index)? {
+        return Err(RouterError::Isolated.into());
     }
     if !margin_covers(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, &v, size, tiers_in(program_id, accounts, market.key).as_ref())? {
         return Err(RouterError::InsufficientMargin.into());
@@ -1649,11 +1719,14 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     }
     let mut t = load_trader(program_id, trader_ai, &r.wallet)?;
     key_is(wallet, &r.wallet)?;
+    if t.has_pending == 0 {
+        return Err(RouterError::BadAccount.into());
+    }
     // A request queued by a standing order comes with that order (account 13).
     let order = if r.kind == KIND_ORDER {
         let order_ai = acc(accounts, 13)?;
         writable(order_ai)?;
-        key_is(order_ai, &order_address(program_id, &r.vault, &r.wallet, r.order_index).0)?;
+        key_is(order_ai, &order_address(program_id, &r.vault, &t.owner(trader_ai.key), r.order_index).0)?;
         let o: Order = load(order_ai, program_id, ORDER_MAGIC)?;
         if o.queued_id != r.id.wrapping_add(1) {
             return Err(RouterError::BadAccount.into());
@@ -1713,6 +1786,15 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             size = 0;
         }
     }
+    // A close-only request likewise only shrinks what is held now, and does nothing on a
+    // position that is gone or has changed side since it was queued.
+    if r.reduce_only != 0 && size != 0 {
+        if before == 0 || (before > 0) == (size > 0) {
+            size = 0;
+        } else if size.unsigned_abs() > before.unsigned_abs() {
+            size = before.checked_neg().ok_or(RouterError::Overflow)?;
+        }
+    }
     if r.size != 0 && size != 0 {
         // A trade Percolator would refuse is not attempted: the request ends here having traded
         // nothing, instead of staying in the queue (unfillable, and in the way of every request
@@ -1730,6 +1812,9 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             liquidated = before != 0;
             liquidation_fee = liquidated;
             size = liquidation_size(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, tiers.as_ref(), v.asset_index, before, debt)?;
+        } else if !reduces && holds_other_asset(&t, &market.try_borrow_data()?, &portfolio.try_borrow_data()?, v.asset_index)? {
+            // An isolated account holds one asset at a time.
+            size = 0;
         } else if (close_only && !reduces) || !margin_covers_owing(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, &v, size, 0, tiers.as_ref(), debt)? {
             size = 0;
         } else if !reduces && !fees.can_book(v.asset_index, market_id)? {
@@ -2065,11 +2150,13 @@ fn expire(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         return Err(RouterError::TooEarly.into());
     }
     // A settlement request belongs to no trader (account 2 is then ignored).
+    let mut owner = r.wallet;
     if r.kind != KIND_SETTLE {
         let mut t = load_trader(program_id, trader_ai, &r.wallet)?;
         if t.pending_vault != r.vault || t.pending_id != r.id {
             return Err(RouterError::BadAccount.into());
         }
+        owner = t.owner(trader_ai.key);
         t.has_pending = 0;
         store(trader_ai, &t)?;
     }
@@ -2087,7 +2174,7 @@ fn expire(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if r.kind == KIND_ORDER {
         let order_ai = acc(accounts, 5)?;
         writable(order_ai)?;
-        key_is(order_ai, &order_address(program_id, &r.vault, &r.wallet, r.order_index).0)?;
+        key_is(order_ai, &order_address(program_id, &r.vault, &owner, r.order_index).0)?;
         let mut o: Order = load(order_ai, program_id, ORDER_MAGIC)?;
         o.queued_id = 0;
         store(order_ai, &o)?;

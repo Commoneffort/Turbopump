@@ -697,7 +697,8 @@ export const crank = (payer: PublicKey, portfolio: PublicKey, assets: number[]) 
  *  of them can be sent side by side. */
 export type CrankPlan = { lag: number; lagCrank: TransactionInstruction; settle: TransactionInstruction[]; settleAlone: TransactionInstruction[]; resets: TransactionInstruction[] };
 
-export function crankPlan(s: MarketSnapshot, payer: PublicKey, vehicle: PublicKey, focus: number | undefined, trader?: PublicKey, assets: number[] = []): CrankPlan {
+/** `trader`, `sub`: the account a fill is for (its wallet, and which of its accounts). */
+export function crankPlan(s: MarketSnapshot, payer: PublicKey, vehicle: PublicKey, focus: number | undefined, trader?: PublicKey, assets: number[] = [], sub = 0): CrankPlan {
   const at = (a: number) => L.market.slots + a * L.market.slot_len + L.market.engine;
   const legs = (d: Uint8Array) => {
     const out: { asset: number; stale: boolean; losing: boolean }[] = [];
@@ -716,7 +717,7 @@ export function crankPlan(s: MarketSnapshot, payer: PublicKey, vehicle: PublicKe
     }
     return out;
   };
-  const mine = trader && routerPortfolio(trader);
+  const mine = trader && routerPortfolio(trader, sub);
   const held = s.portfolios.map(p => ({ key: p.pubkey, legs: legs(p.data) })).filter(p => p.legs.length);
   // Percolator refuses a trade while any asset the trader holds has an out-of-date account
   // (loss-stale: `account_has_loss_stale_live_leg`), not only the asset traded. So a fill on
@@ -785,20 +786,21 @@ export async function listVaults(conn: Connection): Promise<Vault[]> {
     .sort((a, b) => Number(b.createdSlot - a.createdSlot));
 }
 
-export async function fetchVault(conn: Connection, vaultKey: PublicKey, user?: PublicKey) {
+/** `sub`: which of the user's trading accounts to read (0 main, else an isolated one). */
+export async function fetchVault(conn: Connection, vaultKey: PublicKey, user?: PublicKey, sub = 0) {
   const va = await conn.getAccountInfo(vaultKey, "confirmed");
   if (!va) throw new Error("vault not found");
   const v = decodeVault(vaultKey, new Uint8Array(va.data));
   // Traders trade through the router: their portfolio belongs to the router's address for them.
-  const pf = user ? routerPortfolio(user) : undefined;
+  const pf = user ? routerPortfolio(user, sub) : undefined;
   const keys = [MARKET, v.lpPortfolio, v.buffer, v.shareMint, v.oracle, bookAddress(v.key)];
-  if (user) keys.push(ticketAddress(v.key, user), ata(user, MINT), ata(user, v.shareMint), pf!, traderAddress(user));
+  if (user) keys.push(ticketAddress(v.key, user), ata(user, MINT), ata(user, v.shareMint), pf!, traderAddress(user, sub));
   const firstOrder = keys.length;
-  if (user) for (let i = 0; i < MAX_ORDERS; i++) keys.push(orderAddress(v.key, user, i));
-  // The vault's holding-fee meter, and the wallet's fee ledger (router `carry`).
+  if (user) for (let i = 0; i < MAX_ORDERS; i++) keys.push(orderAddress(v.key, accountOwner(user, sub), i));
+  // The vault's holding-fee meter, and the account's fee ledger (router `carry`).
   const carryAt = keys.length;
   keys.push(carryAddress(v.key));
-  if (user) keys.push(ledgerAddress(user));
+  if (user) keys.push(ledgerAddress(user, sub));
   keys.push(tiersAddress()); // last: the market's tier record (margins depend on it)
   const [accs, slot] = await Promise.all([conn.getMultipleAccountsInfo(keys, "confirmed"), conn.getSlot("confirmed")]);
   const data = (i: number) => (accs[i] ? new Uint8Array(accs[i]!.data) : undefined);
@@ -808,11 +810,13 @@ export async function fetchVault(conn: Connection, vaultKey: PublicKey, user?: P
   const trader = user && data(10) ? decodeTrader(data(10)!) : undefined;
   let pending: RouterRequest | undefined;
   if (trader?.hasPending && trader.pendingVault.equals(v.key)) {
-    const k = requestAddress(v.key, user!);
+    const k = requestAddress(v.key, accountOwner(user!, sub));
     const ra = await conn.getAccountInfo(k, "confirmed");
-    if (ra) pending = decodeRequest(k, new Uint8Array(ra.data));
+    if (ra) pending = decodeRequest(k, new Uint8Array(ra.data), sub);
   }
   return {
+    /** Which of the user's trading accounts this is (0 main, else isolated). */
+    sub,
     slot: BigInt(slot),
     vault: v,
     asset: decodeAsset(data(0)!, v.assetIndex),
@@ -1006,9 +1010,38 @@ export const expiryDeposit = (size: bigint, priceE6: bigint) => { const d = (siz
 export const TRADER_LEN = R.trader_len;
 const rpda = (...seeds: (Uint8Array | Buffer)[]) => PublicKey.findProgramAddressSync(seeds, ROUTER)[0];
 export const routerAuthority = () => rpda(Buffer.from("authority"));
-export const traderAddress = (wallet: PublicKey) => rpda(Buffer.from("trader"), MARKET.toBuffer(), wallet.toBuffer());
-export const routerPortfolio = (wallet: PublicKey) => rpda(Buffer.from("portfolio"), MARKET.toBuffer(), wallet.toBuffer());
-export const routerCollateral = (wallet: PublicKey) => rpda(Buffer.from("collateral"), MARKET.toBuffer(), wallet.toBuffer());
+// A wallet has one main trading account on the market (`sub` 0: cross margin, every position
+// shares its money) and may open isolated ones (`sub` 1..255): each its own money and margin,
+// one asset at a time (router `OpenAccount` with a number). The site gives each asset slot its
+// own isolated account (`isolatedSub`). Addresses are cached: they are derived on every render.
+const pdaCache = new Map<string, PublicKey>();
+const cached = (k: string, f: () => PublicKey) => { let v = pdaCache.get(k); if (!v) { v = f(); pdaCache.set(k, v); } return v; };
+export const isolatedAddress = (wallet: PublicKey, sub: number) => cached(`i${wallet.toBase58()}:${sub}`, () => rpda(Buffer.from("isolated"), MARKET.toBuffer(), wallet.toBuffer(), Buffer.from([sub])));
+export const traderAddress = (wallet: PublicKey, sub = 0) => sub ? isolatedAddress(wallet, sub) : cached(`t${wallet.toBase58()}`, () => rpda(Buffer.from("trader"), MARKET.toBuffer(), wallet.toBuffer()));
+export const routerPortfolio = (wallet: PublicKey, sub = 0) => sub
+  ? cached(`p${wallet.toBase58()}:${sub}`, () => rpda(Buffer.from("portfolio"), isolatedAddress(wallet, sub).toBuffer()))
+  : cached(`p${wallet.toBase58()}`, () => rpda(Buffer.from("portfolio"), MARKET.toBuffer(), wallet.toBuffer()));
+export const routerCollateral = (wallet: PublicKey, sub = 0) => sub
+  ? cached(`c${wallet.toBase58()}:${sub}`, () => rpda(Buffer.from("collateral"), isolatedAddress(wallet, sub).toBuffer()))
+  : cached(`c${wallet.toBase58()}`, () => rpda(Buffer.from("collateral"), MARKET.toBuffer(), wallet.toBuffer()));
+/** What a trading account's request and order addresses are derived from: the wallet for its
+ *  main account, the isolated account itself otherwise (router `TraderState::owner`). */
+export const accountOwner = (wallet: PublicKey, sub = 0) => (sub ? isolatedAddress(wallet, sub) : wallet);
+/** The isolated account the site uses for an asset slot. */
+export const isolatedSub = (assetIndex: number) => (assetIndex % 255) + 1;
+/** Which of `wallet`'s accounts a request or order at `key` belongs to: the main one (0) when
+ *  `derive(wallet)` is `key`, else the isolated number whose `derive` gives it (-1: none). */
+const subCache = new Map<string, number>();
+export function subOf(key: PublicKey, wallet: PublicKey, derive: (owner: PublicKey) => PublicKey, hint?: number): number {
+  const k = key.toBase58();
+  const known = subCache.get(k);
+  if (known !== undefined) return known;
+  let found = -1;
+  if (derive(wallet).equals(key)) found = 0;
+  else for (const n of [...(hint ? [hint] : []), ...Array.from({ length: 255 }, (_, i) => i + 1)]) if (derive(isolatedAddress(wallet, n)).equals(key)) { found = n; break; }
+  if (found >= 0) subCache.set(k, found);
+  return Math.max(found, 0);
+}
 export const bookAddress = (vault: PublicKey) => rpda(Buffer.from("book"), vault.toBuffer());
 /** A trading account's track record (see social.ts). Deposits, withdrawals and fills name it. */
 export const statsAddress = (wallet: PublicKey) => rpda(Buffer.from("stats"), MARKET.toBuffer(), wallet.toBuffer());
@@ -1027,11 +1060,19 @@ export function decodeBook(d: Uint8Array): Book {
 }
 /** `settle`: an epoch settlement of the vault (then `wallet` is whoever queued it), not a trade.
  *  `order`: the index of the standing order that queued it, if one did. */
-export type RouterRequest = { key: PublicKey; vault: PublicKey; wallet: PublicKey; id: bigint; size: bigint; target: number; settle: boolean; order?: number };
-export const decodeRequest = (k: PublicKey, d: Uint8Array): RouterRequest => ({
-  key: k, vault: key(d, R.request.vault), wallet: key(d, R.request.wallet), id: u64(d, R.request.id), size: i128(d, R.request.size), target: Number(i64(d, R.request.target_time)),
-  settle: d[R.request.kind] === 1, order: d[R.request.kind] === 2 ? d[R.request.order_index] : undefined,
-});
+/** `sub`: which of the wallet's trading accounts it is for (0 main, else isolated: see
+ *  `traderAddress`). `closeOnly`: it may only shrink the position (never open, grow or flip one). */
+export type RouterRequest = { key: PublicKey; vault: PublicKey; wallet: PublicKey; id: bigint; size: bigint; target: number; settle: boolean; order?: number; sub: number; closeOnly: boolean };
+export const decodeRequest = (k: PublicKey, d: Uint8Array, hint?: number): RouterRequest => {
+  const vault = key(d, R.request.vault), wallet = key(d, R.request.wallet), settle = d[R.request.kind] === 1;
+  const RQ = R.request as any;
+  return {
+    key: k, vault, wallet, id: u64(d, R.request.id), size: i128(d, R.request.size), target: Number(i64(d, R.request.target_time)),
+    settle, order: d[R.request.kind] === 2 ? d[R.request.order_index] : undefined,
+    sub: settle ? 0 : subOf(k, wallet, o => requestAddress(vault, o), hint),
+    closeOnly: d[RQ.reduce_only ?? 116] === 1,
+  };
+};
 
 /** Every request waiting in a vault's queue (one read of the router's request accounts). */
 export async function pendingRequests(conn: Connection, vault: PublicKey): Promise<RouterRequest[]> {
@@ -1052,6 +1093,8 @@ export const MAX_ORDERS: number = R.max_orders;
 export const orderAddress = (vault: PublicKey, wallet: PublicKey, index: number) => rpda(Buffer.from("order"), vault.toBuffer(), wallet.toBuffer(), Buffer.from([index]));
 export type StandingOrder = {
   key: PublicKey; vault: PublicKey; wallet: PublicKey; index: number; kind: number; reduceOnly: boolean;
+  /** Which of the wallet's trading accounts it belongs to (0 main, else isolated). */
+  sub: number;
   /** Stop, take-profit, trail: the side of the position it protects (1 long, -1 short). */
   side: number;
   /** Limit, TWAP: what is left to trade (+ = buy). Stop, take-profit, trail: how much to close (0 = all). */
@@ -1066,27 +1109,28 @@ export const decodeOrder = (k: PublicKey, d: Uint8Array): StandingOrder => {
   const o = R.order;
   return {
     key: k, vault: key(d, o.vault), wallet: key(d, o.wallet), index: d[o.index], kind: d[o.kind], reduceOnly: d[o.reduce_only] === 1,
+    sub: subOf(k, key(d, o.wallet), w => orderAddress(key(d, o.vault), w, d[o.index])),
     side: d[o.side] === 1 ? 1 : d[o.side] === 255 ? -1 : 0, size: i128(d, o.size), trigger: u64(d, o.trigger), peak: u64(d, o.peak), slice: u64(d, o.slice),
     interval: Number(i64(d, o.interval)), nextTime: Number(i64(d, o.next_time)), expiry: Number(i64(d, o.expiry)), queued: u64(d, o.queued_id) !== 0n,
   };
 };
 export type OrderParams = { index: number; kind: number; reduceOnly?: boolean; size: bigint; trigger: bigint; interval?: number; slices?: number; expiry?: number };
-export const placeOrder = (wallet: PublicKey, vault: PublicKey, o: OrderParams) => new TransactionInstruction({
+export const placeOrder = (wallet: PublicKey, vault: PublicKey, o: OrderParams, sub = 0) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [rw(wallet, true), ro(traderAddress(wallet)), ro(vault), ro(bookAddress(vault)), rw(orderAddress(vault, wallet, o.index)), ro(MARKET), ro(routerPortfolio(wallet)), ro(SystemProgram.programId)],
+  keys: [rw(wallet, true), ro(traderAddress(wallet, sub)), ro(vault), ro(bookAddress(vault)), rw(orderAddress(vault, accountOwner(wallet, sub), o.index)), ro(MARKET), ro(routerPortfolio(wallet, sub)), ro(SystemProgram.programId)],
   data: KEEPER_REWARDS
     ? new W().u8(12).u8(o.index).u8(o.kind).u8(o.reduceOnly ? 1 : 0).i128(o.size).u64(o.trigger).i64(BigInt(o.interval ?? 0)).u32(o.slices ?? 0).i64(BigInt(o.expiry ?? 0)).u64(BigInt(keeperBudget(o.kind, o.slices))).done()
     : new W().u8(12).u8(o.index).u8(o.kind).u8(o.reduceOnly ? 1 : 0).i128(o.size).u64(o.trigger).i64(BigInt(o.interval ?? 0)).u32(o.slices ?? 0).i64(BigInt(o.expiry ?? 0)).done(),
 });
-export const cancelOrder = (wallet: PublicKey, vault: PublicKey, index: number) => new TransactionInstruction({
+export const cancelOrder = (wallet: PublicKey, vault: PublicKey, index: number, sub = 0) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [rw(wallet, true), rw(orderAddress(vault, wallet, index))],
+  keys: [rw(wallet, true), rw(orderAddress(vault, accountOwner(wallet, sub), index))],
   data: new W().u8(13).done(),
 });
 /** Carries a standing order out (anyone may). */
 export const triggerOrder = (payer: PublicKey, o: StandingOrder) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [rw(payer, true), rw(o.key), rw(traderAddress(o.wallet)), rw(o.wallet), ro(o.vault), rw(bookAddress(o.vault)), rw(requestAddress(o.vault, o.wallet)), ro(MARKET), ro(routerPortfolio(o.wallet)), ro(SystemProgram.programId), ro(tiersAddress())],
+  keys: [rw(payer, true), rw(o.key), rw(traderAddress(o.wallet, o.sub)), rw(o.wallet), ro(o.vault), rw(bookAddress(o.vault)), rw(requestAddress(o.vault, accountOwner(o.wallet, o.sub))), ro(MARKET), ro(routerPortfolio(o.wallet, o.sub)), ro(SystemProgram.programId), ro(tiersAddress())],
   data: new W().u8(14).done(),
 });
 /** What an order would do at mark price `mark` with the wallet's position `held`, as the router
@@ -1110,10 +1154,11 @@ export function orderAction(o: StandingOrder, mark: bigint, held: bigint, now: n
   if (o.kind === ORDER.LIMIT) return (o.size > 0n ? mark <= o.trigger : mark >= o.trigger) ? "fire" : "wait";
   return now >= o.nextTime ? "fire" : "wait";
 }
-export type Trader = { wallet: PublicKey; portfolio: PublicKey; collateral: PublicKey; hasPending: boolean; hasStats: boolean; hasLedger: boolean; pendingVault: PublicKey; pendingId: bigint };
+/** `sub`: 0 for the wallet's main account, 1..255 for an isolated one. */
+export type Trader = { wallet: PublicKey; portfolio: PublicKey; collateral: PublicKey; hasPending: boolean; hasStats: boolean; hasLedger: boolean; sub: number; pendingVault: PublicKey; pendingId: bigint };
 export const decodeTrader = (d: Uint8Array): Trader => ({
   wallet: key(d, R.trader.wallet), portfolio: key(d, R.trader.portfolio), collateral: key(d, R.trader.collateral),
-  hasPending: d[R.trader.has_pending] === 1, hasStats: d[R.trader.has_pending + 1] === 1, hasLedger: d[R.trader.has_pending + 2] === 1,
+  hasPending: d[R.trader.has_pending] === 1, hasStats: d[R.trader.has_pending + 1] === 1, hasLedger: d[R.trader.has_pending + 2] === 1, sub: d[R.trader.has_pending + 3],
   pendingVault: key(d, R.trader.pending_vault), pendingId: u64(d, R.trader.pending_id),
 });
 
@@ -1130,7 +1175,7 @@ export const CARRY = {
   ledgerLen: Number(RC.ledger_len ?? 1_072), carryLen: Number(RC.carry_len ?? 88), slots: Number(RC.ledger_slots ?? 32),
 };
 export const carryAddress = (vault: PublicKey) => rpda(Buffer.from("carry"), vault.toBuffer());
-export const ledgerAddress = (wallet: PublicKey) => rpda(Buffer.from("ledger"), traderAddress(wallet).toBuffer());
+export const ledgerAddress = (wallet: PublicKey, sub = 0) => cached(`l${wallet.toBase58()}:${sub}`, () => rpda(Buffer.from("ledger"), traderAddress(wallet, sub).toBuffer()));
 /** Starts a vault's holding-fee meter (anyone may, and pays its rent). */
 export const openCarry = (payer: PublicKey, vault: PublicKey) => new TransactionInstruction({
   programId: ROUTER,
@@ -1139,16 +1184,16 @@ export const openCarry = (payer: PublicKey, vault: PublicKey) => new Transaction
 });
 /** Starts a trading account's fee ledger (anyone may, and pays its rent). Without one an account
  *  can only reduce its positions. */
-export const openLedger = (payer: PublicKey, wallet: PublicKey) => new TransactionInstruction({
+export const openLedger = (payer: PublicKey, wallet: PublicKey, sub = 0) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [rw(payer, true), rw(traderAddress(wallet)), rw(ledgerAddress(wallet)), ro(SystemProgram.programId)],
+  keys: [rw(payer, true), rw(traderAddress(wallet, sub)), rw(ledgerAddress(wallet, sub)), ro(SystemProgram.programId)],
   data: new W().u8(33).done(),
 });
 /** Pays what `wallet` owes vault `v` out of its capital into the vault (anyone may; the account
  *  must hold no position). */
-export const payFees = (v: Vault, wallet: PublicKey) => new TransactionInstruction({
+export const payFees = (v: Vault, wallet: PublicKey, sub = 0) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [ro(traderAddress(wallet)), rw(ledgerAddress(wallet)), rw(MARKET), rw(routerPortfolio(wallet)), rw(routerCollateral(wallet)), rw(PERC_VAULT), ro(PERC_VAULT_AUTH), ro(v.key), rw(v.buffer), ro(TOKEN_PROGRAM_ID), ro(PERCOLATOR)],
+  keys: [ro(traderAddress(wallet, sub)), rw(ledgerAddress(wallet, sub)), rw(MARKET), rw(routerPortfolio(wallet, sub)), rw(routerCollateral(wallet, sub)), rw(PERC_VAULT), ro(PERC_VAULT_AUTH), ro(v.key), rw(v.buffer), ro(TOKEN_PROGRAM_ID), ro(PERCOLATOR)],
   data: new W().u8(34).done(),
 });
 export type Owed = { asset: number; owed: bigint };
@@ -1176,31 +1221,32 @@ export function controlSequences(market: Uint8Array, asset: number) {
   return { nextObservation: u64(market, base + L.market.oracle_observation) + 1n, authorityEpoch: u64(market, base + L.market.authority_epoch) };
 }
 
-export const openTradingAccount = (wallet: PublicKey) => new TransactionInstruction({
+/** Opens the wallet's main trading account (`sub` 0) or one of its isolated ones. */
+export const openTradingAccount = (wallet: PublicKey, sub = 0) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [rw(wallet, true), rw(traderAddress(wallet)), rw(routerPortfolio(wallet)), rw(routerCollateral(wallet)), rw(MARKET), ro(MINT), ro(PERCOLATOR), ro(SystemProgram.programId), ro(TOKEN_PROGRAM_ID)],
-  data: new W().u8(0).done(),
+  keys: [rw(wallet, true), rw(traderAddress(wallet, sub)), rw(routerPortfolio(wallet, sub)), rw(routerCollateral(wallet, sub)), rw(MARKET), ro(MINT), ro(PERCOLATOR), ro(SystemProgram.programId), ro(TOKEN_PROGRAM_ID)],
+  data: sub ? new W().u8(0).u8(sub).done() : new W().u8(0).done(),
 });
-export const routerDeposit = (wallet: PublicKey, amount: bigint) => new TransactionInstruction({
+export const routerDeposit = (wallet: PublicKey, amount: bigint, sub = 0) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [ro(wallet, true), ro(traderAddress(wallet)), rw(ata(wallet, MINT)), rw(routerCollateral(wallet)), rw(routerPortfolio(wallet)), rw(MARKET), rw(PERC_VAULT), ro(TOKEN_PROGRAM_ID), ro(PERCOLATOR), rw(statsAddress(wallet))],
+  keys: [ro(wallet, true), ro(traderAddress(wallet, sub)), rw(ata(wallet, MINT)), rw(routerCollateral(wallet, sub)), rw(routerPortfolio(wallet, sub)), rw(MARKET), rw(PERC_VAULT), ro(TOKEN_PROGRAM_ID), ro(PERCOLATOR), rw(statsAddress(wallet))],
   data: new W().u8(1).u64(amount).done(),
 });
-export const routerWithdraw = (wallet: PublicKey, amount: bigint) => new TransactionInstruction({
+export const routerWithdraw = (wallet: PublicKey, amount: bigint, sub = 0) => new TransactionInstruction({
   programId: ROUTER,
   // Last: the fee ledger (what is owed to the vaults must be paid before a withdrawal). The
   // wallet and trader account writable: a withdrawal with no position left returns the keeper
   // deposit (see `KEEPER_DEPOSIT`).
-  keys: [rw(wallet, true), rw(traderAddress(wallet)), rw(routerPortfolio(wallet)), rw(MARKET), rw(routerCollateral(wallet)), rw(ata(wallet, MINT)), rw(PERC_VAULT), ro(PERC_VAULT_AUTH), ro(TOKEN_PROGRAM_ID), ro(PERCOLATOR), rw(statsAddress(wallet)), ro(ledgerAddress(wallet)),
+  keys: [rw(wallet, true), rw(traderAddress(wallet, sub)), rw(routerPortfolio(wallet, sub)), rw(MARKET), rw(routerCollateral(wallet, sub)), rw(ata(wallet, MINT)), rw(PERC_VAULT), ro(PERC_VAULT_AUTH), ro(TOKEN_PROGRAM_ID), ro(PERCOLATOR), rw(statsAddress(wallet)), ro(ledgerAddress(wallet, sub)),
     // The copy address: only while it is empty (no copy running) does a flat withdrawal return the keeper deposit.
     ro(rpda(Buffer.from("copy"), MARKET.toBuffer(), wallet.toBuffer()))],
   data: new W().u8(2).u64(amount).done(),
 });
 /** Turns a trading account's released profit into capital (what a withdrawal pays out). Anyone
  *  may send it; it fails when there is nothing to convert. */
-export const routerConvertPnl = (wallet: PublicKey) => new TransactionInstruction({
+export const routerConvertPnl = (wallet: PublicKey, sub = 0) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [ro(traderAddress(wallet)), rw(MARKET), rw(routerPortfolio(wallet)), ro(PERCOLATOR)],
+  keys: [ro(traderAddress(wallet, sub)), rw(MARKET), rw(routerPortfolio(wallet, sub)), ro(PERCOLATOR)],
   data: new W().u8(22).done(),
 });
 export const openBook = (payer: PublicKey, vault: PublicKey) => new TransactionInstruction({
@@ -1208,12 +1254,17 @@ export const openBook = (payer: PublicKey, vault: PublicKey) => new TransactionI
   keys: [rw(payer, true), ro(vault), rw(bookAddress(vault)), ro(SystemProgram.programId)],
   data: new W().u8(3).done(),
 });
-/** Queues a trade; `id` is the book's next id. It cannot be cancelled. */
-export const requestTrade = (wallet: PublicKey, vault: PublicKey, size: bigint) => new TransactionInstruction({
-  programId: ROUTER,
-  keys: [rw(wallet, true), rw(traderAddress(wallet)), ro(vault), rw(bookAddress(vault)), rw(requestAddress(vault, wallet)), ro(MARKET), ro(routerPortfolio(wallet)), ro(SystemProgram.programId), ro(tiersAddress())],
-  data: new W().u8(4).i128(size).done(),
-});
+/** Queues a trade; `id` is the book's next id. It cannot be cancelled. `closeOnly`: the router
+ *  lets it only shrink the position held when it lands and again when it fills (a close never
+ *  opens the other side, whatever the page showed). `sub`: which of the wallet's accounts. */
+export const requestTrade = (wallet: PublicKey, vault: PublicKey, size: bigint, opts: { sub?: number; closeOnly?: boolean } = {}) => {
+  const sub = opts.sub ?? 0;
+  return new TransactionInstruction({
+    programId: ROUTER,
+    keys: [rw(wallet, true), rw(traderAddress(wallet, sub)), ro(vault), rw(bookAddress(vault)), rw(requestAddress(vault, accountOwner(wallet, sub))), ro(MARKET), ro(routerPortfolio(wallet, sub)), ro(SystemProgram.programId), ro(tiersAddress())],
+    data: opts.closeOnly ? new W().u8(4).i128(size).u8(1).done() : new W().u8(4).i128(size).done(),
+  });
+};
 /** The router's price account for a feed, written only by the reporter key (`PostPrice`). A
  *  reported price is not verifiable on chain. On Solana the router accepts it only for a queued
  *  request that Pyth has not served for `REPORT_FALLBACK_SECS`; in an X1 build it is the source. */
@@ -1309,10 +1360,10 @@ export const syncInventory = (v: Vault) => new TransactionInstruction({
 });
 /** Queues the forced close of `wallet`'s position on a vault's market (`payer` may be anyone):
  *  a close-out on a close-only market, or a liquidation of an account below the router's level. */
-export const requestClose = (payer: PublicKey, wallet: PublicKey, vault: PublicKey) => new TransactionInstruction({
+export const requestClose = (payer: PublicKey, wallet: PublicKey, vault: PublicKey, sub = 0) => new TransactionInstruction({
   programId: ROUTER,
   // (The fee ledger: what the account owes the vaults counts toward its liquidation.)
-  keys: [rw(payer, true), rw(traderAddress(wallet)), ro(wallet), ro(vault), rw(bookAddress(vault)), rw(requestAddress(vault, wallet)), ro(MARKET), ro(SystemProgram.programId), ro(routerPortfolio(wallet)), ro(tiersAddress()), ro(ledgerAddress(wallet))],
+  keys: [rw(payer, true), rw(traderAddress(wallet, sub)), ro(wallet), ro(vault), rw(bookAddress(vault)), rw(requestAddress(vault, accountOwner(wallet, sub))), ro(MARKET), ro(SystemProgram.programId), ro(routerPortfolio(wallet, sub)), ro(tiersAddress()), ro(ledgerAddress(wallet, sub))],
   data: new W().u8(8).done(),
 });
 /** Moves a vault's mark to a verified Pyth update (a PriceUpdateV2 account). */
@@ -1351,13 +1402,14 @@ export const refreshFunding = (v: Vault) => new TransactionInstruction({
 export const fillRequest = (executor: PublicKey, v: Vault, r: RouterRequest) => new TransactionInstruction({
   programId: ROUTER,
   keys: [
-    rw(executor, true), rw(r.key), rw(traderAddress(r.wallet)), rw(r.wallet), rw(bookAddress(v.key)), rw(v.key), rw(MARKET),
-    rw(routerPortfolio(r.wallet)), rw(v.lpPortfolio), ro(v.delegate), ro(routerAuthority()), ro(VAULT_PROGRAM), ro(PERCOLATOR),
+    rw(executor, true), rw(r.key), rw(traderAddress(r.wallet, r.sub)), rw(r.wallet), rw(bookAddress(v.key)), rw(v.key), rw(MARKET),
+    rw(routerPortfolio(r.wallet, r.sub)), rw(v.lpPortfolio), ro(v.delegate), ro(routerAuthority()), ro(VAULT_PROGRAM), ro(PERCOLATOR),
     // A request queued by a standing order comes with that order.
-    ...(r.order !== undefined ? [rw(orderAddress(r.vault, r.wallet, r.order))] : []),
+    ...(r.order !== undefined ? [rw(orderAddress(r.vault, accountOwner(r.wallet, r.sub), r.order))] : []),
     // The vault's holding-fee meter and the trader's fee ledger (router `carry`), the market's
-    // leverage-tier record, then last the trader's track record (ignored when the trader has none).
-    rw(carryAddress(v.key)), rw(ledgerAddress(r.wallet)),
+    // leverage-tier record, then last the trader's track record (ignored when the trader has none,
+    // as an isolated account always does).
+    rw(carryAddress(v.key)), rw(ledgerAddress(r.wallet, r.sub)),
     ro(tiersAddress()),
     rw(statsAddress(r.wallet)),
   ],
@@ -1395,6 +1447,6 @@ export const expireRequest = (caller: PublicKey, r: RouterRequest) => new Transa
   // (A settlement names its vault: it can then go as soon as its epoch has rolled. A trader's own
   // request names its vault and the market: if the market was behind, its deposit goes back.)
   // (The caller writable: the router pays whoever expires a request a quarter of its bond.)
-  keys: [rw(caller, true), rw(r.key), rw(traderAddress(r.wallet)), rw(r.wallet), rw(bookAddress(r.vault)), ...(r.order !== undefined ? [rw(orderAddress(r.vault, r.wallet, r.order))] : r.settle ? [ro(r.vault)] : [ro(r.vault), ro(MARKET)])],
+  keys: [rw(caller, true), rw(r.key), rw(traderAddress(r.wallet, r.sub)), rw(r.wallet), rw(bookAddress(r.vault)), ...(r.order !== undefined ? [rw(orderAddress(r.vault, accountOwner(r.wallet, r.sub), r.order))] : r.settle ? [ro(r.vault)] : [ro(r.vault), ro(MARKET)])],
   data: new W().u8(7).done(),
 });

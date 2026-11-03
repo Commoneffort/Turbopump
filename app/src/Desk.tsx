@@ -34,15 +34,15 @@ export type Held = { asset: number; sym: string; q: bigint; size: number; mark: 
 /** The wallet's position on an asset as the chain has it now (not as last drawn). A close is
  *  sized from this: a position the page shows can be seconds old, and a stop or take-profit that
  *  filled meanwhile would turn a close of the old size into a new position the other way. */
-async function heldNow(conn: Connection, wallet: PublicKey, asset: number): Promise<bigint> {
-  const [pf, m] = await conn.getMultipleAccountsInfo([C.routerPortfolio(wallet), C.MARKET], "confirmed");
+async function heldNow(conn: Connection, wallet: PublicKey, asset: number, sub = 0): Promise<bigint> {
+  const [pf, m] = await conn.getMultipleAccountsInfo([C.routerPortfolio(wallet, sub), C.MARKET], "confirmed");
   if (!pf || !m) return 0n;
   return C.decodePortfolio(new Uint8Array(pf.data), asset, new Uint8Array(m.data)).position;
 }
 /** The trade that closes `share`% of a position, never more than is held now (0n: nothing to close). */
-async function closeSize(conn: Connection, wallet: PublicKey, asset: number, share: number): Promise<bigint> {
+async function closeSize(conn: Connection, wallet: PublicKey, asset: number, share: number, sub = 0): Promise<bigint> {
   readDirect();
-  const now = await heldNow(conn, wallet, asset);
+  const now = await heldNow(conn, wallet, asset, sub);
   if (now === 0n) return 0n;
   return -(share >= 100 ? now : now * BigInt(Math.round(share)) / 100n);
 }
@@ -64,6 +64,45 @@ const e6 = (x: number) => BigInt(Math.round(x * 1e6));
 const ORDER_NAME = ["Stop loss", "Take profit", "Trailing stop", "Limit", "TWAP"];
 /** The first of the wallet's order slots on this market that is free (or as many as asked). */
 const freeSlots = (state: C.State, n = 1) => Array.from({ length: C.MAX_ORDERS }, (_, i) => i).filter(i => !state.orders.some(o => o.index === i)).slice(0, n);
+
+/** Cross or isolated margin, chosen per market and kept in this browser. Cross: the wallet's main
+ *  account, whose money stands behind every position it holds. Isolated: a separate account for
+ *  this market alone (router `OpenAccount` with a number), holding only the margin put into it. */
+export type MarginMode = "cross" | "isolated";
+const MARGIN_KEY = (vault: PublicKey) => `pv:margin:${C.NETWORK}:${vault.toBase58()}`;
+export function savedMargin(vault: PublicKey): MarginMode { try { return localStorage.getItem(MARGIN_KEY(vault)) === "isolated" ? "isolated" : "cross"; } catch { return "cross"; } }
+export function saveMargin(vault: PublicKey, m: MarginMode) { try { localStorage.setItem(MARGIN_KEY(vault), m); } catch { /* storage unavailable */ } }
+
+/** One position in one of the wallet's accounts: its main one (`sub` 0) or an isolated one. */
+type AcctPos = { sub: number; asset: number; size: bigint; equity: bigint };
+/** The wallet's positions in every one of its accounts on the market: the main account and the
+ *  isolated account of each listed asset (one read). */
+function useAllAccounts(markets: Card[], tick: number) {
+  const { connection } = useConnection();
+  const { publicKey } = useWallet();
+  const [rows, setRows] = useState<AcctPos[]>([]);
+  const assets = [...new Set(markets.map(c => c.v.assetIndex))].sort((a, b) => a - b).join(",");
+  useEffect(() => {
+    if (!publicKey) { setRows([]); return; }
+    let on = true;
+    const subs = [0, ...assets.split(",").filter(Boolean).map(a => C.isolatedSub(Number(a)))];
+    const keys = [C.MARKET, ...subs.map(n => C.routerPortfolio(publicKey, n))];
+    connection.getMultipleAccountsInfo(keys, "confirmed").then(accs => {
+      if (!on || !accs[0]) return;
+      const m = new Uint8Array(accs[0].data);
+      const out: AcctPos[] = [];
+      subs.forEach((n, i) => {
+        const a = accs[i + 1];
+        if (!a) return;
+        const h = C.accountHealth(m, new Uint8Array(a.data));
+        for (const x of h.positions) out.push({ sub: n, asset: x.asset, size: x.size, equity: h.equity });
+      });
+      setRows(out);
+    }).catch(() => { /* kept as last read */ });
+    return () => { on = false; };
+  }, [connection, publicKey?.toBase58(), assets, Math.floor(tick / 2)]);
+  return rows;
+}
 
 export default function Desk({ route, send, busy, tick, go }: { route: string[]; send: Send; busy?: string; tick: number; go: (to: string) => void }) {
   const { cards, err } = useCards(tick);
@@ -93,17 +132,23 @@ export default function Desk({ route, send, busy, tick, go }: { route: string[];
 
 function DeskInner({ vaultKey, markets, day, send, busy, tick, go }: { vaultKey: PublicKey; markets: Card[]; day: Record<string, DayStats>; send: Send; busy?: string; tick: number; go: (to: string) => void }) {
   const { publicKey } = useWallet();
-  const { state, err, reload } = useVault(vaultKey, tick);
+  const [margin, setMarginState] = useState<MarginMode>(() => savedMargin(vaultKey));
+  const setMargin = (m: MarginMode) => { setMarginState(m); saveMargin(vaultKey, m); };
+  const assetHere = markets.find(c => c.v.key.equals(vaultKey))?.v.assetIndex;
+  const sub = margin === "isolated" && assetHere !== undefined ? C.isolatedSub(assetHere) : 0;
+  const { state, err, reload } = useVault(vaultKey, tick, sub);
+  const accounts = useAllAccounts(markets, tick);
   const [panel, setPanel] = useState<"trade" | "earn">("trade");
   const [wgHidden, setWgHidden] = useState(() => { try { return localStorage.getItem("pv:widgets-hidden") !== "0"; } catch { return true; } });
   const wrapped: Send = async (l, ixs) => { const r = await send(l, ixs); reload(); return r; };
-  const recentFills = useWalletFills(publicKey, state?.portfolio?.position ?? 0n);
+  const recentFills = useWalletFills(publicKey, state?.portfolio?.position ?? 0n, sub);
   // Each position held, by vault, so its whole history back to the opening fill can be read.
   const need = useMemo(() => (state?.health?.positions ?? []).map(x => {
     const c = markets.find(m => m.v.assetIndex === x.asset && (m.v.canonical || m.v.key.equals(state!.vault.key)));
     return c ? `${c.v.key.toBase58()}:${x.size}` : "";
   }).filter(Boolean).sort().join(","), [state, markets]);
-  const allFills = useDeepFills(publicKey, need, recentFills);
+  // (The server's full history is read for the main account only.)
+  const allFills = useDeepFills(sub ? null : publicKey, need, recentFills);
   const fills = useMemo(() => allFills.filter(f => f.vault === vaultKey.toBase58()), [allFills, vaultKey.toBase58()]);
   // The traders this wallet follows or copies: their fills on this market are marked on the chart.
   const { board } = useBoard(tick, Object.values(PULSE).some(Boolean) ? PULSE_BOARD_MS : undefined);
@@ -168,13 +213,13 @@ function DeskInner({ vaultKey, markets, day, send, busy, tick, go }: { vaultKey:
           <button className={panel === "trade" ? "on" : ""} onClick={() => setPanel("trade")}>Trade</button>
           <button className={panel === "earn" ? "on" : ""} onClick={() => setPanel("earn")}>Earn</button>
         </div>
-        {panel === "trade" ? <Ticket state={state} send={wrapped} busy={busy} copying={me.copy ? { leader: me.copy.leader.toBase58(), name: board?.profiles.get(me.copy.leader.toBase58())?.name ?? short(me.copy.leader.toBase58()) } : undefined} /> : <div className="earn"><LiquidityPanel state={state} send={wrapped} busy={busy} /></div>}
+        {panel === "trade" ? <Ticket state={state} send={wrapped} busy={busy} margin={margin} setMargin={setMargin} copying={me.copy && !state.sub ? { leader: me.copy.leader.toBase58(), name: board?.profiles.get(me.copy.leader.toBase58())?.name ?? short(me.copy.leader.toBase58()) } : undefined} /> : <div className="earn"><LiquidityPanel state={state} send={wrapped} busy={busy} /></div>}
         <button className="portfolio-btn" onClick={() => go("/portfolio")} title="Your positions, results and trading statistics across every market">
           <span>Portfolio</span><b aria-hidden>→</b>
         </button>
         <div className="ticket-acct"><Account state={state} send={wrapped} busy={busy} held={held} row={myRow} vaults={markets.map(c => c.v)} /></div>
       </section>
-      <section className="desk-bottom panel"><Bottom state={state} markets={markets} fills={allFills} held={held} liq={liq} send={wrapped} busy={busy} go={go} tick={tick} /></section>
+      <section className="desk-bottom panel"><Bottom state={state} markets={markets} fills={allFills} held={held} liq={liq} send={wrapped} busy={busy} go={go} tick={tick} accounts={accounts} setMargin={setMargin} /></section>
     </main>
   );
 }
@@ -423,7 +468,7 @@ function Stress({ state }: { state: C.State }) {
 
 // ---------------------------------------------------------------- order ticket
 
-function Ticket({ state, send, busy, copying }: { state: C.State & { readFor?: string }; send: Send; busy?: string; copying?: { leader: string; name: string } }) {
+function Ticket({ state, send, busy, copying, margin, setMargin }: { state: C.State & { readFor?: string }; send: Send; busy?: string; copying?: { leader: string; name: string }; margin: MarginMode; setMargin: (m: MarginMode) => void }) {
   const { publicKey } = useWallet();
   const { connection } = useConnection();
   // The wallet's coins: an order takes a bond and a deposit (0.1% of its value) in the chain's
@@ -446,8 +491,10 @@ function Ticket({ state, send, busy, copying }: { state: C.State & { readFor?: s
   const [unit, setUnit] = useState<"coin" | "usd">("coin");
   const [mode, setMode] = useState<"market" | "limit" | "protect" | "twap">("market");
   // Whether what is shown includes this wallet's own accounts yet (the market itself shows first).
-  const mine = !publicKey || state.readFor === undefined || state.readFor === publicKey.toBase58();
   const v = state.vault, p = state.portfolio, sym = v.feed?.symbol ?? "";
+  const sub = state.sub;
+  // (And that what is shown is the account the margin switch names.)
+  const mine = (!publicKey || state.readFor === undefined || state.readFor === publicKey.toBase58()) && (sub !== 0) === (margin === "isolated");
   const priceN = num(state.asset.price, 1e6);
   const dp = priceDp(priceN);
   const typed = Number(text || 0);
@@ -545,13 +592,14 @@ function Ticket({ state, send, busy, copying }: { state: C.State & { readFor?: s
   // The one thing that stops this order, if anything does.
   const blockerBase = !publicKey || !state.trader || !state.book || locked || state.closeOnly || noLiquidity || vaultMax === 0n;
   const blocker = !publicKey ? "Connect a wallet to trade"
-    : !state.trader ? "Create a trading account first"
+    : !state.trader ? (sub ? `Open your isolated ${sym} account first` : "Create a trading account first")
     : !state.book ? "This market's queue is not open yet"
     : locked ? (pendingHere ? "Your queued order has to fill or expire first" : "You have an order queued on another market")
     : state.closeOnly ? "This market is close-only until its remaining positions are closed"
     : noLiquidity ? "This market has no liquidity yet"
     : vaultMax === 0n ? (reduceOnly ? "The vault is settling an epoch: it only takes orders that reduce its position or close yours" : `The vault is at its limit for ${side > 0n ? "longs" : "shorts"}`)
     : want <= 0n ? "Enter a size"
+    : sub && (p?.capital ?? 0n) === 0n && held === 0n ? `Your isolated ${sym} account has no margin yet: deposit some below (Account)`
     : sent > marginMax(side) ? `Your margin covers at most ${units(marginMax(side))} ${sym} here: add margin or lower the size`
     : overLev ? `At ${lev}× this order needs ${money(orderMargin)} of margin and ${money(freeMargin)} is free: raise the leverage or lower the size`
     : coins !== undefined && coins < coinsNeeded ? `This order needs ${(coinsNeeded / 1e9).toFixed(3)} ${C.COIN} in your wallet for its deposit and bond (they come back when it fills); the wallet has ${(coins / 1e9).toFixed(3)}`
@@ -561,16 +609,17 @@ function Ticket({ state, send, busy, copying }: { state: C.State & { readFor?: s
     if (!publicKey || !state.book || blocker) return;
     // An account opened before the fee ledgers existed gets one with its first trade (it can only
     // reduce without one).
-    const ledger = state.trader && !state.trader.hasLedger ? [C.openLedger(publicKey, publicKey)] : [];
-    sendNoted(`${side > 0n ? "Long" : "Short"} ${units(sent)} ${sym}`, [...ledger, C.requestTrade(publicKey, v.key, sent * side)]);
+    const ledger = state.trader && !state.trader.hasLedger ? [C.openLedger(publicKey, publicKey, sub)] : [];
+    sendNoted(`${side > 0n ? "Long" : "Short"} ${units(sent)} ${sym}${sub ? " (isolated)" : ""}`, [...ledger, C.requestTrade(publicKey, v.key, sent * side, { sub })]);
   };
   // Close all of the position, or a share of it (a smaller trade the other way).
   const closeAll = (share = 100) => {
     if (!publicKey || !state.book || held === 0n) return;
     // A close-only market has no counterparty for a close: the position is closed out instead (whole only).
-    if (state.closeOnly) sendNoted("Close position", [C.requestClose(publicKey, publicKey, v.key)]);
-    else closeSize(connection, publicKey, v.assetIndex, share).then(q => {
-      if (q !== 0n) sendNoted(share >= 100 ? "Close position" : `Close ${share}% (${units(abs(q))} ${sym})`, [C.requestTrade(publicKey, v.key, q)]);
+    if (state.closeOnly) sendNoted("Close position", [C.requestClose(publicKey, publicKey, v.key, sub)]);
+    else closeSize(connection, publicKey, v.assetIndex, share, sub).then(q => {
+      // Close only: the router itself refuses to let it open or flip a position.
+      if (q !== 0n) sendNoted(share >= 100 ? "Close position" : `Close ${share}% (${units(abs(q))} ${sym})`, [C.requestTrade(publicKey, v.key, q, { sub, closeOnly: true })]);
     });
   };
   const [closePct, setClosePct] = useState(100);
@@ -578,16 +627,20 @@ function Ticket({ state, send, busy, copying }: { state: C.State & { readFor?: s
   // Close a slid size (coins), never more than is held.
   const closePart = (n: number) => {
     if (!publicKey || !state.book || held === 0n) return;
-    heldNow(connection, publicKey, v.assetIndex).then(now => {
+    heldNow(connection, publicKey, v.assetIndex, sub).then(now => {
       let part = BigInt(Math.round(n * 1e6));
       if (part >= abs(now)) part = abs(now);
       if (part <= 0n) return;
-      sendNoted(`Close ${units(part)} ${sym}`, [C.requestTrade(publicKey, v.key, now > 0n ? -part : part)]);
+      sendNoted(`Close ${units(part)} ${sym}`, [C.requestTrade(publicKey, v.key, now > 0n ? -part : part, { sub, closeOnly: true })]);
     });
   };
 
   return (
     <div className="ticket">
+      <div className="mmode" role="group" aria-label="Margin mode">
+        <button className={margin === "cross" ? "on" : ""} onClick={() => setMargin("cross")} title="Your main account: all of its money stands behind every position you hold in it, on every market. A loss on one market can use margin you put in for another.">Cross</button>
+        <button className={margin === "isolated" ? "on" : ""} onClick={() => setMargin("isolated")} title={`A separate account for ${sym} alone, with only the margin you put into it. If this position goes wrong it can lose that margin and nothing else; your other positions cannot be touched, and it cannot use their money either.`}>Isolated</button>
+      </div>
       <div className="otabs">
         {([["market", "Market"], ["limit", "Limit"], ["protect", "TP / SL"], ["twap", "TWAP"]] as const).map(([m, label]) => (
           <button key={m} className={mode === m ? "on" : ""} onClick={() => setMode(m)}>{label}</button>
@@ -662,7 +715,9 @@ function Ticket({ state, send, busy, copying }: { state: C.State & { readFor?: s
       <div className="ticket-go">
       {!publicKey ? <div className="connect"><WalletMultiButton /></div>
         : !mine ? <button className="submit neutral" disabled>Reading your account…</button>
-        : !state.trader ? <button className="submit neutral" disabled={!!busy} onClick={() => send("Create trading account", [C.openTradingAccount(publicKey), C.openLedger(publicKey, publicKey), S.openStats(publicKey, publicKey)])}>Create trading account</button>
+        : !state.trader ? (sub
+          ? <button className="submit neutral" disabled={!!busy} onClick={() => send(`Open isolated ${sym} account`, [C.openTradingAccount(publicKey, sub), C.openLedger(publicKey, publicKey, sub)])}>Open isolated {sym} account</button>
+          : <button className="submit neutral" disabled={!!busy} onClick={() => send("Create trading account", [C.openTradingAccount(publicKey), C.openLedger(publicKey, publicKey), S.openStats(publicKey, publicKey)])}>Create trading account</button>)
         : <button className={`submit ${side > 0n ? "up" : "down"}`} disabled={!!blocker || !!busy} onClick={submit}>{busy ? `${busy}…` : `${side > 0n ? "Long" : "Short"} ${want > 0n ? `${units(sent)} ` : ""}${sym}`}</button>}
       {state.trader && held !== 0n && (
         <div className="closeparts">
@@ -677,7 +732,9 @@ function Ticket({ state, send, busy, copying }: { state: C.State & { readFor?: s
       {blocker && publicKey && blocker !== "Enter a size" && <div className="why">{blocker}</div>}
       </div>
       {!blocker && want > vaultMax && <div className="why">The vault takes {units(vaultMax)} {sym} on this side right now, so the order is cut to that.</div>}
-      {!state.trader && publicKey && mine && <div className="why">One account covers every market. It belongs to a program address derived from your wallet: only the router can trade it, and withdrawals only go back to this wallet. About 0.07 test {C.COIN} of rent.</div>}
+      {!state.trader && publicKey && mine && (sub
+        ? <div className="why">A second account for {sym} alone: only the margin you deposit into it stands behind its position, so a loss here cannot reach your other money, and it holds one market at a time. Like your main account, only the router can trade it and withdrawals only go back to this wallet. About 0.07 test {C.COIN} of rent. Copy trading and the leaderboard count your main account only.</div>
+        : <div className="why">One account covers every market. It belongs to a program address derived from your wallet: only the router can trade it, and withdrawals only go back to this wallet. About 0.07 test {C.COIN} of rent.</div>)}
 
       </>}
       {pendingHere && <Pending r={pendingHere} sym={sym} send={send} busy={busy} />}
@@ -736,7 +793,7 @@ function StandingForm({ mode, side, state, send, busy }: { mode: "limit" | "prot
           <div><span>Carried out when the price is</span><b className="mono">{px ? `${side > 0n ? "≤" : "≥"} ${fmt(px, dp)}` : "—"}</b></div>
           <KeeperLine lamports={C.keeperBudget(C.ORDER.LIMIT)} />
         </div>
-        <button className={`submit ${side > 0n ? "up" : "down"}`} disabled={!!why || !!busy || !ready} onClick={() => publicKey && send(`Limit ${side > 0n ? "buy" : "sell"} ${size} ${sym} at ${limit}`, [C.placeOrder(publicKey, v.key, { index: free[0], kind: C.ORDER.LIMIT, reduceOnly: reduce, size: q, trigger: e6(px) })])}>
+        <button className={`submit ${side > 0n ? "up" : "down"}`} disabled={!!why || !!busy || !ready} onClick={() => publicKey && send(`Limit ${side > 0n ? "buy" : "sell"} ${size} ${sym} at ${limit}`, [C.placeOrder(publicKey, v.key, { index: free[0], kind: C.ORDER.LIMIT, reduceOnly: reduce, size: q, trigger: e6(px) }, state.sub)])}>
           {busy ? `${busy}…` : `Place limit ${side > 0n ? "buy" : "sell"}`}
         </button>
         {why && why !== "Enter a size" && <div className="why">{why}</div>}
@@ -755,9 +812,9 @@ function StandingForm({ mode, side, state, send, busy }: { mode: "limit" | "prot
       if (!publicKey) return;
       const ixs = [];
       let i = 0;
-      if (t) ixs.push(C.placeOrder(publicKey, v.key, { index: free[i++], kind: C.ORDER.TAKE, size: 0n, trigger: e6(t) }));
-      if (s) ixs.push(C.placeOrder(publicKey, v.key, { index: free[i++], kind: C.ORDER.STOP, size: 0n, trigger: e6(s) }));
-      if (tr) ixs.push(C.placeOrder(publicKey, v.key, { index: free[i++], kind: C.ORDER.TRAIL, size: 0n, trigger: BigInt(Math.round(tr * 100)) }));
+      if (t) ixs.push(C.placeOrder(publicKey, v.key, { index: free[i++], kind: C.ORDER.TAKE, size: 0n, trigger: e6(t) }, state.sub));
+      if (s) ixs.push(C.placeOrder(publicKey, v.key, { index: free[i++], kind: C.ORDER.STOP, size: 0n, trigger: e6(s) }, state.sub));
+      if (tr) ixs.push(C.placeOrder(publicKey, v.key, { index: free[i++], kind: C.ORDER.TRAIL, size: 0n, trigger: BigInt(Math.round(tr * 100)) }, state.sub));
       send("Set TP / SL", ixs);
     };
     const pnl = (x: number) => (x && held !== 0n ? signedMoney((x - priceN) * num(held, 1e6)) : "—");
@@ -792,7 +849,7 @@ function StandingForm({ mode, side, state, send, busy }: { mode: "limit" | "prot
         <div><span>Total value</span><b className="mono">{money(total * priceN)}</b></div>
         {k >= 2 && <KeeperLine lamports={C.keeperBudget(C.ORDER.TWAP, k)} />}
       </div>
-      <button className={`submit ${side > 0n ? "up" : "down"}`} disabled={!!why || !!busy || !ready} onClick={() => { if (!publicKey) return; const at = free[0], q = e6(total) * side; send(`TWAP ${side > 0n ? "buy" : "sell"} ${size} ${sym}`, [C.placeOrder(publicKey, v.key, { index: at, kind: C.ORDER.TWAP, reduceOnly: reduce, size: q, trigger: 0n, interval, slices: k })]).then(sig => sig && keepTwapPlan(C.orderAddress(v.key, publicKey, at), { total: q, slices: k, sig })); }}>
+      <button className={`submit ${side > 0n ? "up" : "down"}`} disabled={!!why || !!busy || !ready} onClick={() => { if (!publicKey) return; const at = free[0], q = e6(total) * side; send(`TWAP ${side > 0n ? "buy" : "sell"} ${size} ${sym}`, [C.placeOrder(publicKey, v.key, { index: at, kind: C.ORDER.TWAP, reduceOnly: reduce, size: q, trigger: 0n, interval, slices: k }, state.sub)]).then(sig => sig && keepTwapPlan(C.orderAddress(v.key, C.accountOwner(publicKey, state.sub), at), { total: q, slices: k, sig })); }}>
         {busy ? `${busy}…` : `Start TWAP ${side > 0n ? "buy" : "sell"}`}
       </button>
       {why && why !== "Enter a size" && <div className="why">{why}</div>}
@@ -845,10 +902,11 @@ function Account({ state, send, busy, held, row, vaults }: { state: C.State; sen
   // transaction as a withdrawal (the router refuses a withdrawal while any is owed).
   const owed = C.totalOwed(state.owed);
   const vaultOf = (asset: number) => vaults.find(x => x.assetIndex === asset && x.canonical) ?? vaults.find(x => x.assetIndex === asset);
-  const payAll = (u: PublicKey) => state.owed.flatMap(o => { const x = vaultOf(o.asset); return x ? [C.payFees(x, u)] : []; });
+  const sub = state.sub;
+  const payAll = (u: PublicKey) => state.owed.flatMap(o => { const x = vaultOf(o.asset); return x ? [C.payFees(x, u, sub)] : []; });
   return (
     <>
-      <div className="ph"><h3>Account{h && h.notional > 0n && <span className="lev mono">{fmt(num(h.notional, 1e6) / Math.max(num(h.equity, 1e6), 0.01), 1)}×</span>}</h3><Faucet compact /></div>
+      <div className="ph"><h3>{sub ? `Isolated ${state.vault.feed?.symbol ?? ""} account` : "Account"}{h && h.notional > 0n && <span className="lev mono">{fmt(num(h.notional, 1e6) / Math.max(num(h.equity, 1e6), 0.01), 1)}×</span>}</h3><Faucet compact /></div>
       {!publicKey ? <div className="quiet">Connect a wallet to see your account.</div> : (
         <div className="acct">
           <div className="acct-row"><span>Equity</span><b className="mono">{usd(equity)}</b></div>
@@ -878,11 +936,11 @@ function Account({ state, send, busy, held, row, vaults }: { state: C.State; sen
             <>
               <div className="move">
                 <label className="inp small"><span>USDC</span><input value={amount} onChange={e => setAmount(e.target.value.replace(/[^0-9.]/g, ""))} inputMode="decimal" /></label>
-                <button className="btn" disabled={!!busy || atoms <= 0n || atoms > state.userCollateral} onClick={() => send("Add margin", [ata(publicKey), C.routerDeposit(publicKey, atoms)])}>Deposit</button>
-                <button className="btn" disabled={!!busy || locked || state.openPositions > 0 || atoms <= 0n || atoms + owed > (p?.capital ?? 0n) + profit} onClick={() => send(owed > 0n ? "Pay fees and withdraw" : "Withdraw margin", [ata(publicKey), ...(profit > 0n ? [C.crank(publicKey, C.routerPortfolio(publicKey), [state.vault.assetIndex]), C.routerConvertPnl(publicKey)] : []), ...payAll(publicKey), C.routerWithdraw(publicKey, atoms)])}>Withdraw</button>
+                <button className="btn" disabled={!!busy || atoms <= 0n || atoms > state.userCollateral} onClick={() => send(sub ? `Add margin to isolated ${state.vault.feed?.symbol ?? ""}` : "Add margin", [ata(publicKey), C.routerDeposit(publicKey, atoms, sub)])}>Deposit</button>
+                <button className="btn" disabled={!!busy || locked || state.openPositions > 0 || atoms <= 0n || atoms + owed > (p?.capital ?? 0n) + profit} onClick={() => send(owed > 0n ? "Pay fees and withdraw" : "Withdraw margin", [ata(publicKey), ...(profit > 0n ? [C.crank(publicKey, C.routerPortfolio(publicKey, sub), [state.vault.assetIndex]), C.routerConvertPnl(publicKey, sub)] : []), ...payAll(publicKey), C.routerWithdraw(publicKey, atoms, sub)])}>Withdraw</button>
               </div>
               {locked ? <div className="fine">Withdrawals are paused while an order is queued.</div>
-                : state.openPositions > 0 && <div className="fine">Margin can be withdrawn once no position is open on any market. Deposits always work.</div>}
+                : state.openPositions > 0 && <div className="fine">{sub ? "Margin can be withdrawn once this position is closed." : "Margin can be withdrawn once no position is open on any market."} Deposits always work.</div>}
               {owed > 0n && state.openPositions === 0 && <div className="fine">A withdrawal first pays the {usd(owed)} owed to the vaults, out of your margin.</div>}
             </>
           )}
@@ -988,8 +1046,8 @@ function Protection({ orders, dp }: { orders: C.StandingOrder[]; dp: number }) {
   );
 }
 
-function Bottom({ state, markets, fills, held, liq, send, busy, go, tick }: {
-  state: C.State; markets: Card[]; fills: Fill[]; held: Held[]; liq?: number; send: Send; busy?: string; go: (to: string) => void; tick: number;
+function Bottom({ state, markets, fills, held, liq, send, busy, go, tick, accounts, setMargin }: {
+  state: C.State; markets: Card[]; fills: Fill[]; held: Held[]; liq?: number; send: Send; busy?: string; go: (to: string) => void; tick: number; accounts: AcctPos[]; setMargin: (m: MarginMode) => void;
 }) {
   const { publicKey } = useWallet();
   const { connection } = useConnection();
@@ -1007,10 +1065,29 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go, tick }: {
   // Close a share of a position on any market (a close-only market closes it out instead, whole).
   const closeShare = async (vault: PublicKey, asset: number, q: bigint, shut: boolean, s: string, pct: number) => {
     if (!publicKey || q === 0n) return;
-    if (shut) { send(`Close ${s} position`, [C.requestClose(publicKey, publicKey, vault)]); return; }
-    const part = await closeSize(connection, publicKey, asset, pct);
-    if (part !== 0n) send(pct >= 100 ? `Close ${s} position` : `Close ${pct}% of ${s} (${units(abs(part))})`, [C.requestTrade(publicKey, vault, part)]);
+    if (shut) { send(`Close ${s} position`, [C.requestClose(publicKey, publicKey, vault, state.sub)]); return; }
+    const part = await closeSize(connection, publicKey, asset, pct, state.sub);
+    if (part !== 0n) send(pct >= 100 ? `Close ${s} position` : `Close ${pct}% of ${s} (${units(abs(part))})`, [C.requestTrade(publicKey, vault, part, { sub: state.sub, closeOnly: true })]);
   };
+  // Positions in the wallet's other accounts (cross while an isolated one is shown, and every
+  // other market's isolated account): listed under the table, one click away.
+  const elsewhere = accounts.filter(a => a.sub !== state.sub);
+  const open = (a: AcctPos) => {
+    const c = byAsset.get(a.asset);
+    if (!c) return;
+    if (c.v.key.equals(state.vault.key)) { setMargin(a.sub ? "isolated" : "cross"); return; }
+    saveMargin(c.v.key, a.sub ? "isolated" : "cross");
+    go(c.v.canonical ? `/trade/${c.v.feed?.symbol}` : `/m/${c.v.key.toString()}`);
+  };
+  const otherList = elsewhere.length > 0 && (
+    <div className="elsewhere">
+      <span>{state.sub ? "Also open:" : "Also open in isolated accounts:"}</span>
+      {elsewhere.map(a => {
+        const c = byAsset.get(a.asset), s2 = c?.v.feed?.symbol ?? `asset ${a.asset}`;
+        return <button key={`${a.sub}:${a.asset}`} className={`link ${a.size > 0n ? "up" : "down"}`} onClick={() => open(a)} title={`Open ${s2} with its ${a.sub ? "isolated" : "cross"} account`}>{s2} {a.size > 0n ? "long" : "short"} {units(abs(a.size))} <i>{a.sub ? "isolated" : "cross"}</i></button>;
+      })}
+    </div>
+  );
   const nav = C.navOf(state);
   return (
     <>
@@ -1023,9 +1100,11 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go, tick }: {
         <button className={tab === "market" ? "on" : ""} onClick={() => setTab("market")}>Market details</button>
       </div>
       <div className="bottom-body">
-        {tab === "positions" && (!publicKey ? <div className="quiet">Connect a wallet to see your positions.</div> : positions.length === 0 ? <div className="quiet">No open positions.</div> : (
+        {tab === "positions" && (!publicKey ? <div className="quiet">Connect a wallet to see your positions.</div> : positions.length === 0 ? <div className="quiet">No open positions{state.sub ? ` in your isolated ${sym} account` : ""}.{otherList}</div> : (<>
           <table className="tbl lefts">
-            <thead><tr><th>Market</th><th>Size</th><th>Value</th><th title="Margin behind this position: its value divided by the leverage you chose for this market. One cross-margin account covers every market, so all of your equity stands behind every position.">Margin (cross)</th><th>Entry price</th><th>Mark price</th><th>PnL</th><th>Liq. price</th><th title="Take profit, stop loss and trailing stop set on this position">TP / SL</th><th>Close</th></tr></thead>
+            <thead><tr><th>Market</th><th>Size</th><th>Value</th>{state.sub
+              ? <th title="Everything in this isolated account stands behind this one position, and nothing else does.">Margin (isolated)</th>
+              : <th title="Margin behind this position: its value divided by the leverage you chose for this market. One cross-margin account covers every market, so all of your equity stands behind every position.">Margin (cross)</th>}<th>Entry price</th><th>Mark price</th><th>PnL</th><th>Liq. price</th><th title="Take profit, stop loss and trailing stop set on this position">TP / SL</th><th>Close</th></tr></thead>
             <tbody>
               {positions.map(x => {
                 const here = x.asset === v.assetIndex;
@@ -1041,7 +1120,7 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go, tick }: {
                     <td><button className={`link pos-name ${size > 0 ? "up" : "down"}`} title={`${size > 0 ? "Long" : "Short"} ${s} at ${lev}× (open this market)`} onClick={() => c && go(c.v.canonical ? `/trade/${s}` : `/m/${c.v.key.toString()}`)}>{s} <i>{lev}×</i></button></td>
                     <td className={`mono ${size > 0 ? "up" : "down"}`}>{fmt(Math.abs(size), 4).replace(/\.?0+$/, "")} {s}</td>
                     <td className="mono">{money(x.value)}</td>
-                    <td className="mono">{money(x.value / lev)}</td>
+                    <td className="mono">{money(state.sub ? num(state.health?.equity ?? 0n, 1e6) : x.value / lev)}</td>
                     <td className="mono">{e !== undefined ? fmt(e, dp) : "—"}</td>
                     <td className="mono">{fmt(mark, dp)}</td>
                     <td className={`mono pnl ${pnl === undefined ? "" : pnl >= 0 ? "up" : "down"}`} title={pnl === undefined ? "The entry price is not known: this wallet's earlier fills on this market are not on record" : "Against the average entry price, before fees; the percentage is the price move in your favour"}>{pnl === undefined ? "—" : <>{arrow(pnl)} {signedMoney(pnl)} <i>({pct(x.ret ?? 0)})</i></>}</td>
@@ -1062,7 +1141,8 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go, tick }: {
               })()}
             </tbody>
           </table>
-        ))}
+          {otherList}
+        </>))}
         {tab === "orders" && (!publicKey ? <div className="quiet">Connect a wallet to see your orders.</div> : standing.length === 0 ? <div className="quiet">No open orders on {sym}. Limit, TP / SL and trailing stop orders are placed from the order ticket; TWAP orders are in their own tab.</div> : (
           <table className="tbl">
             <thead><tr><th>Market</th><th>Type</th><th>Side</th><th className="r">Size</th><th className="r">Trigger</th><th className="r">Mark price</th><th>Status</th><th /></tr></thead>
@@ -1083,7 +1163,7 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go, tick }: {
                     <td className="r mono">{trig}</td>
                     <td className="r mono">{fmt(mark, dpp)}</td>
                     <td>{o.queued ? "queued: filling at the next price" : o.kind === C.ORDER.TWAP ? `next slice ${o.nextTime * 1000 <= Date.now() ? "due" : `in ${Math.max(1, Math.round((o.nextTime * 1000 - Date.now()) / 1000))} s`}` : "waiting"}</td>
-                    <td className="r"><button className="btn tiny" disabled={o.queued || !!busy} title={o.queued ? "Its queued request has to fill or expire first" : undefined} onClick={() => publicKey && send(`Cancel ${ORDER_NAME[o.kind].toLowerCase()}`, [C.cancelOrder(publicKey, v.key, o.index)])}>Cancel</button></td>
+                    <td className="r"><button className="btn tiny" disabled={o.queued || !!busy} title={o.queued ? "Its queued request has to fill or expire first" : undefined} onClick={() => publicKey && send(`Cancel ${ORDER_NAME[o.kind].toLowerCase()}`, [C.cancelOrder(publicKey, v.key, o.index, state.sub)])}>Cancel</button></td>
                   </tr>
                 );
               })}
@@ -1113,7 +1193,7 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go, tick }: {
                     <td><span className={`twap-bar ${buys ? "up" : "down"}`} title={share !== undefined ? `${fmt(share * 100, 1)}% filled` : "The full size is not known yet"}><span style={{ width: `${(share ?? 0) * 100}%` }} /></span></td>
                     <td className="r mono">{units(o.slice)} every {every}</td>
                     <td>{o.queued ? "filling at the next price" : due ? "due now" : `in ${Math.max(1, Math.round((o.nextTime * 1000 - Date.now()) / 1000))} s`}</td>
-                    <td className="r"><button className="btn tiny" disabled={o.queued || !!busy} title={o.queued ? "Its queued slice has to fill or expire first" : "Stops the TWAP; slices already filled stay filled"} onClick={() => publicKey && send("Cancel TWAP", [C.cancelOrder(publicKey, v.key, o.index)])}>Cancel</button></td>
+                    <td className="r"><button className="btn tiny" disabled={o.queued || !!busy} title={o.queued ? "Its queued slice has to fill or expire first" : "Stops the TWAP; slices already filled stay filled"} onClick={() => publicKey && send("Cancel TWAP", [C.cancelOrder(publicKey, v.key, o.index, state.sub)])}>Cancel</button></td>
                   </tr>
                 );
               })}

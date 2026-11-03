@@ -18,6 +18,7 @@ pub const MAX_ORDERS: u8 = 8;
 
 pub const SEED_AUTHORITY: &[u8] = b"authority";
 pub const SEED_TRADER: &[u8] = b"trader";
+pub const SEED_ISOLATED: &[u8] = b"isolated";
 pub const SEED_PORTFOLIO: &[u8] = b"portfolio";
 pub const SEED_COLLATERAL: &[u8] = b"collateral";
 pub const SEED_BOOK: &[u8] = b"book";
@@ -45,11 +46,42 @@ pub struct TraderState {
     /// 1 once the account has a fee ledger (`OpenLedger`): every fill and withdrawal must then
     /// name it (see `carry`).
     pub has_ledger: u8,
-    pub _pad: [u8; 4],
+    /// 0 for the wallet's main (cross-margin) account on the market; 1..=255 for one of its
+    /// isolated accounts (`OpenAccount` with a number): its own margin, one asset at a time.
+    pub sub: u8,
+    pub _pad: [u8; 3],
     pub pending_vault: Pubkey,
     pub pending_id: u64,
 }
 pub const TRADER_LEN: usize = core::mem::size_of::<TraderState>();
+
+impl TraderState {
+    /// The key a request's and a standing order's addresses are derived from: the wallet for its
+    /// main account, the trading account itself for an isolated one (so the two never share an
+    /// address).
+    pub fn owner(&self, trader_key: &Pubkey) -> Pubkey {
+        if self.sub == 0 { self.wallet } else { *trader_key }
+    }
+    /// The seeds the router signs for this account with.
+    pub fn signer(&self) -> TraderSigner {
+        TraderSigner { prefix: if self.sub == 0 { SEED_TRADER } else { SEED_ISOLATED }, market: self.market, wallet: self.wallet, tail: [if self.sub == 0 { self.bump } else { self.sub }, self.bump], tail_len: if self.sub == 0 { 1 } else { 2 } }
+    }
+}
+
+/// A trading account's signing seeds. (A program address is the hash of its seeds' bytes in a
+/// row, so an isolated account's number and bump can travel as one two-byte seed.)
+pub struct TraderSigner {
+    prefix: &'static [u8],
+    market: Pubkey,
+    wallet: Pubkey,
+    tail: [u8; 2],
+    tail_len: usize,
+}
+impl TraderSigner {
+    pub fn seeds(&self) -> [&[u8]; 4] {
+        [self.prefix, self.market.as_ref(), self.wallet.as_ref(), &self.tail[..self.tail_len]]
+    }
+}
 
 /// A vault's queue of pending requests and the Pyth update its mark currently holds.
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
@@ -121,7 +153,10 @@ pub struct Request {
     /// account's keeper deposit for a liquidation) rather than out of whoever queued it: the rent
     /// then goes back to the owner's side, and the caller was already paid back.
     pub funded: u8,
-    pub _pad: [u8; 4],
+    /// 1: the trade may only shrink the position (a close). It never opens, grows or flips one,
+    /// whatever the position is when it fills; it is cut to what is held then.
+    pub reduce_only: u8,
+    pub _pad: [u8; 3],
 }
 pub const KIND_TRADE: u8 = 0;
 pub const KIND_SETTLE: u8 = 1;
@@ -416,6 +451,17 @@ pub fn authority_address(program_id: &Pubkey) -> (Pubkey, u8) {
 }
 pub fn trader_address(program_id: &Pubkey, market: &Pubkey, wallet: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[SEED_TRADER, market.as_ref(), wallet.as_ref()], program_id)
+}
+/// An isolated trading account of `wallet` on `market` (`sub` 1..=255), and its portfolio and
+/// collateral accounts (derived from it).
+pub fn isolated_address(program_id: &Pubkey, market: &Pubkey, wallet: &Pubkey, sub: u8) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[SEED_ISOLATED, market.as_ref(), wallet.as_ref(), &[sub]], program_id)
+}
+pub fn isolated_portfolio_address(program_id: &Pubkey, trader: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[SEED_PORTFOLIO, trader.as_ref()], program_id)
+}
+pub fn isolated_collateral_address(program_id: &Pubkey, trader: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[SEED_COLLATERAL, trader.as_ref()], program_id)
 }
 pub fn portfolio_address(program_id: &Pubkey, market: &Pubkey, wallet: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[SEED_PORTFOLIO, market.as_ref(), wallet.as_ref()], program_id)

@@ -404,19 +404,21 @@ async function requestsOf(v: C.Vault, b: C.Book) {
       traderKeys = (await conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: C.TRADER_LEN }], dataSlice: { offset: 0, length: 0 } })).map(a => a.pubkey);
       traderKeysAt = Date.now();
     }
-    const owners: PublicKey[] = [];
+    // (A main account's requests live at its wallet's address, an isolated account's at its own.)
+    const owners: { at: PublicKey; sub: number }[] = [];
     for (let i = 0; i < traderKeys.length; i += 100) {
-      for (const a of await conn.getMultipleAccountsInfo(traderKeys.slice(i, i + 100))) {
+      const chunk = traderKeys.slice(i, i + 100);
+      for (const [j, a] of (await conn.getMultipleAccountsInfo(chunk)).entries()) {
         if (!a) continue;
         const t = C.decodeTrader(new Uint8Array(a.data));
-        if (t.hasPending && t.pendingVault.equals(v.key) && !found.some(r => r.id === t.pendingId)) owners.push(t.wallet);
+        if (t.hasPending && t.pendingVault.equals(v.key) && !found.some(r => r.id === t.pendingId)) owners.push({ at: t.sub ? chunk[j] : t.wallet, sub: t.sub });
       }
     }
     // (A settlement has no trader behind it: ours is at our own address.)
-    const keys = [...owners.map(w => C.requestAddress(v.key, w)), C.requestAddress(v.key, payer.publicKey, true)];
+    const keys = [...owners.map(o => C.requestAddress(v.key, o.at)), C.requestAddress(v.key, payer.publicKey, true)];
     for (const [i, a] of (await conn.getMultipleAccountsInfo(keys)).entries()) {
       if (!a || a.data.length !== C.REQUEST_LEN) continue;
-      const r = C.decodeRequest(keys[i], new Uint8Array(a.data));
+      const r = C.decodeRequest(keys[i], new Uint8Array(a.data), owners[i]?.sub);
       if (listed(r) && !found.some(x => x.id === r.id)) found.push(r);
     }
   }
@@ -501,7 +503,7 @@ async function fillTogether(v: C.Vault, b: C.Book, rs: C.RouterRequest[]): Promi
   const ready: C.RouterRequest[] = [];
   let lagCrank: TransactionInstruction | undefined, lag = 0;
   for (const r of rs) {
-    const plan = C.crankPlan(snap, payer.publicKey, v.lpPortfolio, v.assetIndex, r.wallet);
+    const plan = C.crankPlan(snap, payer.publicKey, v.lpPortfolio, v.assetIndex, r.wallet, [], r.sub);
     if (plan.settle.length || plan.resets.length) continue;
     lagCrank ??= plan.lagCrank;
     lag = Math.max(lag, plan.lag);
@@ -698,7 +700,7 @@ async function watch(vaults: C.Vault[], market: Uint8Array, full: boolean, maint
   const owners = new Map(traders.map(t => { const d = C.decodeTrader(new Uint8Array(t.account.data)); return [d.portfolio.toBase58(), d] as const; }));
   // What each trading account owes the vaults (router `carry`): it counts against its equity.
   const owedBy = new Map(ledgers.map(l => [new PublicKey(l.account.data.subarray(8, 40)).toBase58(), C.totalOwed(C.decodeLedger(new Uint8Array(l.account.data)))] as const));
-  const debt = (portfolio: PublicKey) => { const o = owners.get(portfolio.toBase58()); return o ? owedBy.get(C.traderAddress(o.wallet).toBase58()) ?? 0n : 0n; };
+  const debt = (portfolio: PublicKey) => { const o = owners.get(portfolio.toBase58()); return o ? owedBy.get(C.traderAddress(o.wallet, o.sub).toBase58()) ?? 0n : 0n; };
   for (const [i, v] of vaults.entries()) {
     if (!maintOn) break;
     const lp = snap.portfolios.find(p => p.pubkey.equals(v.lpPortfolio));
@@ -739,8 +741,8 @@ async function watch(vaults: C.Vault[], market: Uint8Array, full: boolean, maint
       if (!ok) await send(`record the leverage tier of ${v.feed?.symbol}`, [C.setTier(payer.publicKey, v.key)]);
     }
   }
-  const queue = (v: C.Vault, wallet: PublicKey, why: string) =>
-    send(`queue ${why} ${v.feed?.symbol} for ${wallet.toBase58().slice(0, 6)}`, [C.requestClose(payer.publicKey, wallet, v.key)], true);
+  const queue = (v: C.Vault, wallet: PublicKey, why: string, sub = 0) =>
+    send(`queue ${why} ${v.feed?.symbol} for ${wallet.toBase58().slice(0, 6)}${sub ? ` (isolated ${sub})` : ""}`, [C.requestClose(payer.publicKey, wallet, v.key, sub)], true);
   // Everything below is liquidation work (an executor without that role stops here).
   if (!can("liquidation")) return sent;
   const busy = new Set<string>();
@@ -749,8 +751,8 @@ async function watch(vaults: C.Vault[], market: Uint8Array, full: boolean, maint
     if (!holder) continue;
     const t = owners.get(holder.pubkey.toBase58())!;
     busy.add(holder.pubkey.toBase58());
-    if (!overdue(`close-out ${t.wallet.toBase58()}`)) continue;
-    sent = (await queue(v, t.wallet, "close-out")) || sent;
+    if (!overdue(`close-out ${holder.pubkey.toBase58()}`)) continue;
+    sent = (await queue(v, t.wallet, "close-out", t.sub)) || sent;
   }
   // Every account below its level, by market. They are queued together, several to a transaction
   // and all transactions at once, so a market's liquidations get the same target time, fill at one
@@ -761,14 +763,14 @@ async function watch(vaults: C.Vault[], market: Uint8Array, full: boolean, maint
     const o = owners.get(p.pubkey.toBase58());
     if (!o || o.hasPending || busy.has(p.pubkey.toBase58())) continue;
     const h = C.accountHealth(snap.market, p.data, debt(p.pubkey));
-    if (!h.liquidatable || !overdue(`liquidate ${o.wallet.toBase58()}`)) continue;
+    if (!h.liquidatable || !overdue(`liquidate ${p.pubkey.toBase58()}`)) continue;
     // Close the largest position first; the next pass looks again.
     const worst = h.positions.reduce((a, b) => (b.notional > a.notional ? b : a));
     const v = vaults.find(x => x.assetIndex === worst.asset);
     if (!v || C.closeOnly(snap.market, v.assetIndex)) continue;
     const d = due.get(v.key.toBase58()) ?? due.set(v.key.toBase58(), { v, ixs: [], why: [] }).get(v.key.toBase58())!;
-    d.ixs.push(C.requestClose(payer.publicKey, o.wallet, v.key));
-    d.why.push(`(equity ${(Number(h.equity) / 1e6).toFixed(2)} on ${(Number(h.notional) / 1e6).toFixed(2)} notional) ${v.feed?.symbol} for ${o.wallet.toBase58().slice(0, 6)}`);
+    d.ixs.push(C.requestClose(payer.publicKey, o.wallet, v.key, o.sub));
+    d.why.push(`(equity ${(Number(h.equity) / 1e6).toFixed(2)} on ${(Number(h.notional) / 1e6).toFixed(2)} notional) ${v.feed?.symbol} for ${o.wallet.toBase58().slice(0, 6)}${o.sub ? ` (isolated ${o.sub})` : ""}`);
   }
   const sends: Promise<boolean>[] = [];
   for (const { ixs, why } of due.values()) {
@@ -926,7 +928,7 @@ async function markPhase(v: C.Vault, now: number, snap: Snapshot, withCatchUp: b
   //    the chain (once per request), so the fill itself has only a few seconds to catch up.
   for (const r of live.filter(r => r.target > b.markPublish && now < r.target && !prepared.has(`${v.key}:${r.id}`))) {
     prepared.add(`${v.key}:${r.id}`);
-    const plan = C.crankPlan(await snapshot(), payer.publicKey, v.lpPortfolio, v.assetIndex, r.settle ? undefined : r.wallet);
+    const plan = C.crankPlan(await snapshot(), payer.publicKey, v.lpPortfolio, v.assetIndex, r.settle ? undefined : r.wallet, [], r.sub);
     if (plan.lag <= 15) continue;
     await catchUp(`get ready for ${v.feed?.symbol} #${r.id}`, plan.lagCrank, plan.lag, false);
   }
@@ -981,22 +983,25 @@ const carryTried = new Set<string>();
 const ledgered = new Set<string>();
 /** Opens a fee ledger for each of `wallets` that has none (the executor pays the rent, about
  *  0.008 of the chain's coin each). Returns the wallets still without one. */
-async function ensureLedgers(wallets: PublicKey[]): Promise<Set<string>> {
-  const todo = [...new Map(wallets.filter(w => !ledgered.has(w.toBase58())).map(w => [w.toBase58(), w])).values()];
+/** Accounts are named by their trader address (`acctKey`): a wallet's main and isolated
+ *  accounts each have their own ledger. */
+const acctKey = (r: { wallet: PublicKey; sub: number }) => C.traderAddress(r.wallet, r.sub).toBase58();
+async function ensureLedgers(accts: { wallet: PublicKey; sub: number }[]): Promise<Set<string>> {
+  const todo = [...new Map(accts.filter(a => !ledgered.has(acctKey(a))).map(a => [acctKey(a), a])).values()];
   if (!todo.length) return new Set();
-  const accs = await conn.getMultipleAccountsInfo(todo.map(w => C.traderAddress(w)), "confirmed").catch(() => null);
-  if (!accs) return new Set(todo.map(w => w.toBase58()));
-  const open: PublicKey[] = [];
-  todo.forEach((w, i) => {
+  const accs = await conn.getMultipleAccountsInfo(todo.map(a => C.traderAddress(a.wallet, a.sub)), "confirmed").catch(() => null);
+  if (!accs) return new Set(todo.map(acctKey));
+  const open: { wallet: PublicKey; sub: number }[] = [];
+  todo.forEach((a, i) => {
     const t = accs[i] ? C.decodeTrader(new Uint8Array(accs[i]!.data)) : null;
-    if (t?.hasLedger) ledgered.add(w.toBase58());
-    else if (t) open.push(w);
+    if (t?.hasLedger) ledgered.add(acctKey(a));
+    else if (t) open.push(a);
   });
   for (let i = 0; i < open.length; i += 6) {
     const part = open.slice(i, i + 6);
-    if (await send(`open fee ledger for ${part.map(w => w.toBase58().slice(0, 6)).join(", ")}`, part.map(w => C.openLedger(payer.publicKey, w)))) part.forEach(w => ledgered.add(w.toBase58()));
+    if (await send(`open fee ledger for ${part.map(a => a.wallet.toBase58().slice(0, 6) + (a.sub ? `/${a.sub}` : "")).join(", ")}`, part.map(a => C.openLedger(payer.publicKey, a.wallet, a.sub)))) part.forEach(a => ledgered.add(acctKey(a)));
   }
-  return new Set(todo.filter(w => !ledgered.has(w.toBase58())).map(w => w.toBase58()));
+  return new Set(todo.filter(a => !ledgered.has(acctKey(a))).map(acctKey));
 }
 
 async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boolean, round: Round | null, tradeOn = true, maintOn = true): Promise<boolean> {
@@ -1014,7 +1019,7 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
   const live = reqs.filter(r => now <= r.target + C.ROUTER_GRACE_SECS);
   // An account without a fee ledger can only reduce: one is opened (paid here) for every trader
   // whose request waits, before its fill. A request whose ledger is not open yet waits a pass.
-  const unledgered = tradeOn ? await ensureLedgers(live.filter(r => !r.settle).map(r => r.wallet)) : new Set<string>();
+  const unledgered = tradeOn ? await ensureLedgers(live.filter(r => !r.settle)) : new Set<string>();
 
   // 2. Fill requests the mark is at. The cranks in front bring every asset involved to the
   //    current slot (which also walks Percolator's price to the mark) and settle the positions
@@ -1028,7 +1033,7 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
   // `fillTogether` and go one by one below.)
   let filledOne = true;
   let notConverged = false;
-  for (const r of live.filter(r => tradeOn && b.markPrev < r.target && r.target <= b.markPublish && !unledgered.has(r.wallet.toBase58()))) {
+  for (const r of live.filter(r => tradeOn && b.markPrev < r.target && r.target <= b.markPublish && !unledgered.has(acctKey(r)))) {
     if (notConverged) break;
     const what = `${v.feed?.symbol} #${r.id}`;
     if (r.settle) { await settleEpoch(v, r, what); tried.add(r.id); continue; }
@@ -1038,7 +1043,7 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
     // many liquidations at once, and one at a time each waited for all those before it).
     // (Not the ones this pass has already filled or tried one by one.)
     if (filledOne) {
-      const rest = live.filter(x => !x.settle && !unledgered.has(x.wallet.toBase58()) && !grouped.has(x.id) && !handled.has(x.id) && x.id !== r.id && b.markPrev < x.target && x.target <= b.markPublish);
+      const rest = live.filter(x => !x.settle && !unledgered.has(acctKey(x)) && !grouped.has(x.id) && !handled.has(x.id) && x.id !== r.id && b.markPrev < x.target && x.target <= b.markPublish);
       for (const ids of await fillTogether(v, b, [r, ...rest])) grouped.add(ids);
       if (grouped.has(r.id)) continue;
     }
@@ -1047,7 +1052,7 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
     // Getting ready (catching up, settling the market's accounts) and the fill follow each other
     // here without going back through the whole pass in between, which cost seconds each time.
     for (let attempt = 0; attempt < 4; attempt++) {
-    const plan = C.crankPlan(await snapshot(), payer.publicKey, v.lpPortfolio, v.assetIndex, r.wallet);
+    const plan = C.crankPlan(await snapshot(), payer.publicKey, v.lpPortfolio, v.assetIndex, r.wallet, [], r.sub);
     const k = Math.max(1, Math.ceil((plan.lag + LAND_SLOTS) / 10));
     if (k > 6) {
       // Too far behind to catch up inside the fill: advance first, wait, then fill.
@@ -1171,8 +1176,8 @@ async function serviceOrders(vaults: C.Vault[], books: Map<string, C.Book>, mark
   }
   const due = orderCache.filter(o => !o.queued && (orderRetry.get(o.key.toBase58()) ?? 0) <= Date.now() && vaults.some(v => v.key.equals(o.vault)) && books.has(o.vault.toBase58()));
   if (!due.length) return;
-  const accs = await conn.getMultipleAccountsInfo(due.flatMap(o => [C.routerPortfolio(o.wallet), C.traderAddress(o.wallet)]));
-  const queuedNow = new Set<string>(); // a wallet has one request at a time: its other orders wait for the next pass
+  const accs = await conn.getMultipleAccountsInfo(due.flatMap(o => [C.routerPortfolio(o.wallet, o.sub), C.traderAddress(o.wallet, o.sub)]));
+  const queuedNow = new Set<string>(); // an account has one request at a time: its other orders wait for the next pass
   for (const [i, o] of due.entries()) {
     const v = vaults.find(x => x.key.equals(o.vault))!, b = books.get(o.vault.toBase58())!;
     const pf = accs[2 * i], tr = accs[2 * i + 1];
@@ -1182,7 +1187,7 @@ async function serviceOrders(vaults: C.Vault[], books: Map<string, C.Book>, mark
     if (what === "wait" || !overdue(`${what} order ${o.key.toBase58()}`)) continue;
     // A trail's record is only worth a transaction once the mark is clearly better.
     if (what === "record" && (o.peak === 0n || (b.markPrice > o.peak ? b.markPrice - o.peak : o.peak - b.markPrice) * 1000n < o.peak)) continue;
-    if (what === "fire" && (queuedNow.has(o.wallet.toBase58()) || C.decodeTrader(new Uint8Array(tr.data)).hasPending || b.pending.length >= 30 || C.closeOnly(market, v.assetIndex))) continue;
+    if (what === "fire" && (queuedNow.has(acctKey(o)) || C.decodeTrader(new Uint8Array(tr.data)).hasPending || b.pending.length >= 30 || C.closeOnly(market, v.assetIndex))) continue;
     // A vault closing its position to pay withdrawals takes only trades that shrink it, and
     // trades that only reduce the trader's own position (every stop, take-profit and trailing
     // stop is one). Any other order would be queued, filled with nothing and due again at
@@ -1195,7 +1200,7 @@ async function serviceOrders(vaults: C.Vault[], books: Map<string, C.Book>, mark
     const name = ["stop", "take-profit", "trailing stop", "limit", "TWAP"][o.kind] ?? "order";
     const ok = await send(`${what === "fire" ? "carry out" : what === "record" ? "record a better mark for" : "remove"} ${name} of ${o.wallet.toBase58().slice(0, 6)} on ${v.feed?.symbol} (mark ${Number(b.markPrice) / 1e6})`, [C.triggerOrder(payer.publicKey, o)], true);
     // Refused (not enough margin, the mark moved back): leave it a while. Done: read the orders again.
-    if (ok) { ordersAt = 0; if (what === "fire") queuedNow.add(o.wallet.toBase58()); } else orderRetry.set(o.key.toBase58(), Date.now() + 30_000);
+    if (ok) { ordersAt = 0; if (what === "fire") queuedNow.add(acctKey(o)); } else orderRetry.set(o.key.toBase58(), Date.now() + 30_000);
   }
 }
 
@@ -1277,7 +1282,7 @@ async function convertProfits(vaults: C.Vault[], market: Uint8Array) {
   if (Date.now() - convertAt < 45_000 || !vaults.length) return;
   convertAt = Date.now();
   const accs = await conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: C.TRADER_LEN }, { memcmp: { offset: 8, bytes: C.MARKET.toBase58() } }] });
-  const traders = accs.map(a => C.decodeTrader(new Uint8Array(a.account.data))).filter(t => !t.hasPending && (convertRetry.get(t.wallet.toBase58()) ?? 0) <= Date.now());
+  const traders = accs.map(a => C.decodeTrader(new Uint8Array(a.account.data))).filter(t => !t.hasPending && (convertRetry.get(t.portfolio.toBase58()) ?? 0) <= Date.now());
   let sent = 0;
   for (let i = 0; i < traders.length && sent < 4; i += 100) {
     const chunk = traders.slice(i, i + 100);
@@ -1291,9 +1296,9 @@ async function convertProfits(vaults: C.Vault[], market: Uint8Array) {
       // Only for an account with no position: that is when it can withdraw, and Percolator
       // releases little of a gain while the position that made it is still open.
       if (C.openPositions(d) !== 0) { sent--; continue; }
-      const ixs = [C.crank(payer.publicKey, t.portfolio, [vaults[0].assetIndex]), C.routerConvertPnl(t.wallet)];
+      const ixs = [C.crank(payer.publicKey, t.portfolio, [vaults[0].assetIndex]), C.routerConvertPnl(t.wallet, t.sub)];
       // Refused (nothing released yet, or the account moved meanwhile): leave it for ten minutes.
-      if (!(await send(`turn the profit of ${t.wallet.toBase58().slice(0, 6)} into capital`, ixs, true))) convertRetry.set(t.wallet.toBase58(), Date.now() + 600_000);
+      if (!(await send(`turn the profit of ${t.wallet.toBase58().slice(0, 6)} into capital`, ixs, true))) convertRetry.set(t.portfolio.toBase58(), Date.now() + 600_000);
     }
   }
 }
@@ -1306,7 +1311,7 @@ async function openTrackRecords() {
   if (Date.now() - statsAt < 60_000) return;
   statsAt = Date.now();
   const accs = await conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: C.TRADER_LEN }, { memcmp: { offset: 8, bytes: C.MARKET.toBase58() } }] });
-  const without = accs.map(a => C.decodeTrader(new Uint8Array(a.account.data))).filter(t => !t.hasStats);
+  const without = accs.map(a => C.decodeTrader(new Uint8Array(a.account.data))).filter(t => !t.hasStats && t.sub === 0); // (isolated accounts have none)
   for (const t of without.slice(0, 4)) {
     // Refused (a router that does not have track records yet): leave it for ten minutes.
     if (!(await send(`open the track record of ${t.wallet.toBase58().slice(0, 6)}`, [S.openStats(payer.publicKey, t.wallet)], true))) { statsAt = Date.now() + 540_000; return; }

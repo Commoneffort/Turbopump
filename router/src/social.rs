@@ -66,6 +66,10 @@ pub(crate) fn open_stats(program_id: &Pubkey, accounts: &[AccountInfo]) -> Progr
     }
     key_is(system, &system_program::ID)?;
     let mut t = load_trader(program_id, trader_ai, wallet.key)?;
+    // A track record belongs to the wallet's main account, not to an isolated one.
+    if t.sub != 0 {
+        return Err(RouterError::Isolated.into());
+    }
     key_is(market, &t.market)?;
     key_is(portfolio, &t.portfolio)?;
     let (sk, bump) = stats_address(program_id, &t.market, wallet.key);
@@ -337,6 +341,10 @@ pub(crate) fn set_copy(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
     if lt.market != t.market {
         return Err(RouterError::BadAccount.into());
     }
+    // Copying is between main accounts (isolated ones have no track record to follow).
+    if t.sub != 0 || lt.sub != 0 {
+        return Err(RouterError::Isolated.into());
+    }
     let (ck, bump) = copy_address(program_id, &t.market, wallet.key);
     key_is(copy_ai, &ck)?;
     // A copy opens positions for the account without the wallet: its keeper deposit (what a
@@ -457,6 +465,9 @@ pub(crate) fn trigger_copy(program_id: &Pubkey, accounts: &[AccountInfo], data: 
     key_is(wallet, &c.follower)?;
     let mut t = load_trader(program_id, trader_ai, wallet.key)?;
     let lt = load_trader(program_id, leader_trader, &c.leader)?;
+    if t.sub != 0 || lt.sub != 0 {
+        return Err(RouterError::Isolated.into());
+    }
     let v = load_vault(vault_ai)?;
     let mut b: Book = load(book_ai, program_id, BOOK_MAGIC)?;
     key_is(market, &v.market)?;

@@ -168,9 +168,11 @@ export default {
     "program": "DkK9TSMpVXLq26HeqxTXLysXyRKDYHTKU94SLFDWgjw3",
     "request": {
       "created_slot": 104,
+      "funded": 115,
       "id": 72,
       "kind": 113,
       "order_index": 114,
+      "reduce_only": 116,
       "size": 80,
       "target_time": 96,
       "vault": 8,
@@ -236,6 +238,7 @@ export default {
       "pending_id": 176,
       "pending_vault": 144,
       "portfolio": 72,
+      "sub": 140,
       "wallet": 40
     },
     "trader_len": 184

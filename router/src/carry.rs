@@ -393,13 +393,13 @@ pub fn pay_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult 
         invoke_signed(
             &perc::withdraw(trader_ai.key, market.key, portfolio.key, collateral.key, perc_vault.key, perc_vault_auth.key, view.portfolio_id, view.sequence, amount),
             &[trader_ai.clone(), market.clone(), portfolio.clone(), collateral.clone(), perc_vault.clone(), perc_vault_auth.clone(), token.clone(), percolator.clone()],
-            &[&[SEED_TRADER, t.market.as_ref(), t.wallet.as_ref(), &[t.bump]]],
+            &[&t.signer().seeds()[..]],
         )?;
         paid = token_amount(collateral)?.checked_sub(before).ok_or(RouterError::Overflow)?;
         invoke_signed(
             &spl_token::instruction::transfer(&spl_token::ID, collateral.key, buffer.key, trader_ai.key, &[], paid)?,
             &[collateral.clone(), buffer.clone(), trader_ai.clone(), token.clone()],
-            &[&[SEED_TRADER, t.market.as_ref(), t.wallet.as_ref(), &[t.bump]]],
+            &[&t.signer().seeds()[..]],
         )?;
     } else if !perc::positions(&market.try_borrow_data()?, &portfolio.try_borrow_data()?)?.is_empty() {
         // Nothing can leave an account with a position: not the time to settle (or forgive).

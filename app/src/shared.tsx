@@ -118,11 +118,13 @@ export function useCards(tick: number) {
 /** A market as read, and the wallet whose own accounts were read with it ("" for none). */
 export type VaultState = C.State & { readFor: string };
 const statesNow = new Map<string, { s: VaultState; at: number }>();
-export function useVault(vaultKey: PublicKey, tick: number) {
+/** `sub`: which of the wallet's trading accounts to show (0 its main, cross-margin one; else the
+ *  isolated one: see `C.traderAddress`). */
+export function useVault(vaultKey: PublicKey, tick: number, sub = 0) {
   const { connection } = useConnection();
   const { publicKey } = useWallet();
   // A market seen a moment ago in this tab shows as it was while it is read again.
-  const stateKey = `${vaultKey.toBase58()}:${publicKey?.toBase58() ?? ""}`;
+  const stateKey = `${vaultKey.toBase58()}:${publicKey?.toBase58() ?? ""}:${sub}`;
   const [state, setState] = useState<VaultState | undefined>(() => { const had = statesNow.get(stateKey); return had && Date.now() - had.at < 60_000 ? had.s : undefined; });
   const [err, setErr] = useState<string>();
   const [history, setHistory] = useState<{ t: number; p: number }[]>([]);
@@ -132,15 +134,23 @@ export function useVault(vaultKey: PublicKey, tick: number) {
       // With one, the market shows from the copy at once, and the wallet's part follows from the
       // RPC (`readFor` says whose is there: nothing is offered to sign before the wallet's own is).
       if (publicKey && !statesNow.has(stateKey)) C.fetchVault(view, vaultKey).then(s => setState(now => now ?? { ...s, readFor: "" })).catch(() => undefined);
-      const s = { ...(await C.fetchVault(publicKey ? connection : view, vaultKey, publicKey ?? undefined)), readFor: publicKey?.toBase58() ?? "" };
+      const s = { ...(await C.fetchVault(publicKey ? connection : view, vaultKey, publicKey ?? undefined, sub)), readFor: publicKey?.toBase58() ?? "" };
       statesNow.set(stateKey, { s, at: Date.now() });
       setState(s);
       setErr(undefined);
       const p = num(s.asset.price, 1e6);
       setHistory(h => (h.length && h[h.length - 1].p === p && Date.now() - h[h.length - 1].t < 30_000 ? h : [...h.slice(-240), { t: Date.now(), p }]));
     } catch (e: any) { setErr(e.message); }
-  }, [connection, vaultKey.toString(), publicKey?.toString()]);
+  }, [connection, vaultKey.toString(), publicKey?.toString(), sub]);
   useEffect(() => { setHistory([]); }, [vaultKey.toString()]);
+  // Another account chosen (cross or isolated): what shows is that account's, never the last one's.
+  const firstKey = useRef(stateKey);
+  useEffect(() => {
+    if (firstKey.current === stateKey) return;
+    firstKey.current = stateKey;
+    const had = statesNow.get(stateKey);
+    setState(had && Date.now() - had.at < 60_000 ? had.s : undefined);
+  }, [stateKey]);
   // Poll faster while a trade of this wallet is queued, so its fill shows up promptly.
   const waiting = !!state?.trader?.hasPending;
   useEffect(() => { load(); const id = setInterval(() => document.hidden || load(), waiting ? 2000 : 6000); return () => clearInterval(id); }, [load, tick, waiting]);
@@ -260,10 +270,11 @@ export function useFills(wallet: PublicKey | null, vault: PublicKey, tick: bigin
   return useMemo(() => fills.filter(f => f.vault === vault.toBase58()), [fills, vault.toBase58()]);
 }
 
-/** This wallet's fills on every market (see `useFills`). */
-export function useWalletFills(wallet: PublicKey | null, tick: bigint): Fill[] {
+/** This wallet's fills on every market (see `useFills`), in its main account or (`sub`) one of
+ *  its isolated ones. */
+export function useWalletFills(wallet: PublicKey | null, tick: bigint, sub = 0): Fill[] {
   const { connection } = useConnection();
-  const key = wallet ? `pv:fills2:${C.ROUTER.toBase58().slice(0, 8)}:${wallet.toBase58()}` : "";
+  const key = wallet ? `pv:fills2:${C.ROUTER.toBase58().slice(0, 8)}:${wallet.toBase58()}${sub ? `:${sub}` : ""}` : "";
   const [fills, setFills] = useState<Fill[]>([]);
   useEffect(() => {
     if (!wallet) { setFills([]); return; }
@@ -273,7 +284,7 @@ export function useWalletFills(wallet: PublicKey | null, tick: bigint): Fill[] {
       try { cache = JSON.parse(localStorage.getItem(key) ?? "") ?? cache; } catch { /* first visit */ }
       setFills(cache.fills);
       try {
-        const sigs = await connection.getSignaturesForAddress(C.traderAddress(wallet), { limit: 40 }, "confirmed");
+        const sigs = await connection.getSignaturesForAddress(C.traderAddress(wallet, sub), { limit: 40 }, "confirmed");
         // (X1's RPC is not rate-limited: a first visit there reads the whole recent history at once.)
         const fresh = sigs.filter(x => !x.err && !cache.seen.includes(x.signature)).reverse().slice(0, C.X1 ? 20 : 5);
         for (const x of fresh) {
@@ -285,7 +296,7 @@ export function useWalletFills(wallet: PublicKey | null, tick: bigint): Fill[] {
           const lines = (tx.meta?.logMessages ?? []).filter(l => /^Program log: fill \d+ -?\d+ \d+$/.test(l));
           if (!lines.length) continue;
           const keys = [...tx.transaction.message.staticAccountKeys, ...(tx.meta?.loadedAddresses?.writable ?? []), ...(tx.meta?.loadedAddresses?.readonly ?? [])].map(k => k.toString());
-          const trader = C.traderAddress(wallet).toString(), router = C.ROUTER.toString();
+          const trader = C.traderAddress(wallet, sub).toString(), router = C.ROUTER.toString();
           let n = 0;
           for (const ix of tx.transaction.message.compiledInstructions) {
             if (keys[ix.programIdIndex] !== router || ix.data[0] !== 6) continue;

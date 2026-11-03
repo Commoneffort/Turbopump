@@ -340,6 +340,22 @@ impl World {
         t
     }
 
+    /// An isolated trading account (number `sub`) of the same wallet as taker `main`, funded with
+    /// `amount`, registered as harness taker `taker`.
+    pub fn isolated(&mut self, main: usize, taker: usize, sub: u8, amount: u64) -> TraderKeys {
+        self.trader(main);
+        let (u, _) = &self.traders[&main];
+        let u = User { kp: u.kp.insecure_clone(), collateral: u.collateral, shares: u.shares };
+        let t = TraderKeys::isolated(self.env.market, u.kp.pubkey(), sub);
+        let mint = self.env.mint;
+        let open = rclient::open_account(&t, &mint);
+        let dep = rclient::deposit(&t, &u.collateral, &self.env.vault, amount);
+        let kp = u.kp.insecure_clone();
+        self.send(vec![open, rclient::open_ledger(&t.wallet, &t), dep], &[&kp]).expect("open and fund isolated account");
+        self.traders.insert(taker, (u, t));
+        t
+    }
+
     pub fn trader_kp(&self, taker: usize) -> Keypair {
         self.traders[&taker].0.kp.insecure_clone()
     }
@@ -359,7 +375,7 @@ impl World {
     /// among the harness's traders and its payer.
     pub fn request_account(&self, id: u64) -> (Pubkey, percolator_router::state::Request) {
         let router = percolator_router::id();
-        let mut keys: Vec<Pubkey> = self.traders.values().map(|(_, t)| percolator_router::state::request_address(&router, &self.vault, &t.wallet, false).0).collect();
+        let mut keys: Vec<Pubkey> = self.traders.values().map(|(_, t)| percolator_router::state::request_address(&router, &self.vault, &t.owner, false).0).collect();
         keys.push(percolator_router::state::request_address(&router, &self.vault, &self.payer.pubkey(), true).0);
         for k in keys {
             if let Some(a) = self.env.svm.get_account(&k) {
