@@ -751,3 +751,19 @@ pub fn pay_fees(k: &VaultKeys, t: &TraderKeys) -> Instruction {
         data: vec![TAG_PAY_FEES],
     }
 }
+
+/// Brings `t`'s track record up to its value now (anyone may).
+pub fn refresh_record(t: &TraderKeys) -> Instruction {
+    Instruction {
+        program_id: id(),
+        accounts: vec![
+            ro(t.trader),
+            ro(t.portfolio),
+            ro(t.market),
+            w(equities_address(&id(), &t.market, &t.wallet).0),
+            w(stats_address(&id(), &t.market, &t.wallet).0),
+            ro(ledger_address(&id(), &t.trader).0),
+        ],
+        data: vec![TAG_REFRESH_RECORD],
+    }
+}

@@ -15,3 +15,17 @@ deploy/indexer/
 demo/pitch/build/
 .vercel
 .env*
+# Secrets and anything that can hold one (never commit; see keys/ and ~/.config/percolator/)
+*.pem
+*.key
+*-keypair.json
+*keypair*.json
+*.secret
+secrets/
+**/hermes-key*
+**/devnet-rpc*
+**/alerts.env
+upgrade-buffer-*.json
+# Local snapshots of live chain state and scratch output
+issues/
+*.log

@@ -279,6 +279,7 @@ pub const TAG_REFRESH_FUNDING: u8 = 31;
 pub const TAG_OPEN_CARRY: u8 = 32;
 pub const TAG_OPEN_LEDGER: u8 = 33;
 pub const TAG_PAY_FEES: u8 = 34;
+pub const TAG_REFRESH_RECORD: u8 = 35;
 /// Widest trail, in basis points.
 pub const MAX_TRAIL_BPS: u64 = 5_000;
 /// Shortest time between two slices of a TWAP order, and the most slices one can have.
@@ -477,6 +478,7 @@ pub fn process_instruction(program_id: &Pubkey, accounts: &[AccountInfo], data: 
         TAG_OPEN_CARRY => carry::open_carry(program_id, accounts),
         TAG_OPEN_LEDGER => carry::open_ledger(program_id, accounts),
         TAG_PAY_FEES => carry::pay_fees(program_id, accounts),
+        TAG_REFRESH_RECORD => social::refresh_record(program_id, accounts),
         _ => Err(RouterError::InvalidInstruction.into()),
     }
 }

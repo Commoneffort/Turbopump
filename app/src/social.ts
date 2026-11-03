@@ -80,6 +80,14 @@ export const openStats = (payer: PublicKey, wallet: PublicKey) => new Transactio
   keys: [rw(payer, true), rw(C.traderAddress(wallet)), ro(wallet), rw(statsAddress(wallet)), ro(C.MARKET), ro(C.routerPortfolio(wallet)), ro(SystemProgram.programId), rw(C.equitiesAddress(wallet))],
   data: Buffer.from([15]),
 });
+/** Brings a trading account's track record up to its value now, without a trade (router
+ *  `RefreshRecord`, anyone may): a position losing money in an account that is not traded again
+ *  shows its loss in the record's days too. `trader`: the account's address (main or isolated). */
+export const refreshRecord = (t: C.Trader & { key: PublicKey }) => new TransactionInstruction({
+  programId: C.ROUTER,
+  keys: [ro(t.key), ro(t.portfolio), ro(C.MARKET), rw(C.equitiesAddress(t.wallet)), rw(statsAddress(t.wallet)), ro(C.ledgerAddress(t.wallet, t.sub))],
+  data: Buffer.from([35]),
+});
 /** Sets the wallet's name and badge; `oldName` is the name it holds now, if any. Taking a name,
  *  or changing it to another, costs `NAME_FEE` (paid to the treasury); badge and colour do not. */
 export const setProfile = (wallet: PublicKey, name: string, oldName: string | undefined, badge: number, color: number) => {

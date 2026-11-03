@@ -1319,6 +1319,29 @@ async function openTrackRecords() {
   if (without.length > 4) statsAt = 0;
 }
 
+let refreshAt = 0;
+/** Every 5 minutes, the track record of each account with an open position is brought up to its
+ *  value now (router `RefreshRecord`), so a losing position that is not traded again (an isolated
+ *  account, or any account left alone) still shows its loss in the days the contest counts. */
+async function refreshRecords() {
+  enter("refreshRecords");
+  if (Date.now() - refreshAt < 300_000) return;
+  refreshAt = Date.now();
+  const [accs, stats] = await Promise.all([
+    conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: C.TRADER_LEN }, { memcmp: { offset: 8, bytes: C.MARKET.toBase58() } }] }),
+    conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: S.STATS_LEN }, { memcmp: { offset: 40, bytes: C.MARKET.toBase58() } }], dataSlice: { offset: 8, length: 32 } }),
+  ]);
+  const recorded = new Set(stats.map(a => new PublicKey(a.account.data).toBase58()));
+  const traders = accs.map(a => ({ ...C.decodeTrader(new Uint8Array(a.account.data)), key: a.pubkey })).filter(t => recorded.has(t.wallet.toBase58()) && (t.sub !== 0 || t.hasStats));
+  const due: TransactionInstruction[] = [];
+  for (let i = 0; i < traders.length; i += 100) {
+    const chunk = traders.slice(i, i + 100);
+    const pfs = await conn.getMultipleAccountsInfo(chunk.map(t => t.portfolio));
+    chunk.forEach((t, j) => { if (pfs[j] && C.openPositions(new Uint8Array(pfs[j]!.data)) > 0) due.push(S.refreshRecord(t)); });
+  }
+  for (let i = 0; i < due.length; i += 5) await send(`refresh ${due.slice(i, i + 5).length} track record(s)`, due.slice(i, i + 5), true);
+}
+
 let vaultList: C.Vault[] = [];
 let servicedAssets: number[] = []; // the asset of every market being serviced
 let idleNames = "?";
@@ -1517,6 +1540,7 @@ setInterval(() => {
       if (maintOn && Date.now() - slowAt >= SLOW_JOBS_MS) {
         slowAt = Date.now();
         if (!queued) await openTrackRecords().catch(e => log("error", "track records", String(e?.message ?? e).slice(0, 140)));
+        if (!queued) await refreshRecords().catch(e => log("error", "refresh records", String(e?.message ?? e).slice(0, 140)));
         await convertProfits(vaults, market).catch(e => log("error", "profits", String(e?.message ?? e).slice(0, 140)));
       }
       // Low priority, in the background, and only while no trade is waiting.

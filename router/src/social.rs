@@ -103,6 +103,49 @@ pub(crate) fn book_flow_of(program_id: &Pubkey, t: &TraderState, accounts: &[Acc
     Ok(())
 }
 
+/// Brings a trading account's track record up to its value now, without a trade: its value in the
+/// wallet's record of values, and the record's profit and day (as a fill would, trading nothing).
+/// Anyone may call it: it only writes what the chain shows. Without it, a record moves only at
+/// fills, so a position losing money in an account that is not traded again (an isolated one, or
+/// any account its trader leaves alone) would never show its loss in the days a contest counts.
+///
+/// Accounts: 0 trader, 1 its portfolio, 2 market, 3 the wallet's record of values [w] (whether or
+/// not it exists), 4 the wallet's track record [w], then the account's fee ledger (required when
+/// it has one: what it owes counts against it).
+#[inline(never)]
+pub(crate) fn refresh_record(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let trader_ai = acc(accounts, 0)?;
+    let portfolio = acc(accounts, 1)?;
+    let market = acc(accounts, 2)?;
+    let eq_ai = acc(accounts, 3)?;
+    let stats_ai = acc(accounts, 4)?;
+    let t: TraderState = load(trader_ai, program_id, TRADER_MAGIC)?;
+    key_is(portfolio, &t.portfolio)?;
+    key_is(market, &t.market)?;
+    key_is(eq_ai, &equities_address(program_id, &t.market, &t.wallet).0)?;
+    key_is(stats_ai, &stats_address(program_id, &t.market, &t.wallet).0)?;
+    writable(stats_ai)?;
+    if stats_ai.owner != program_id {
+        return Err(RouterError::BadAccount.into());
+    }
+    let owed = match crate::carry::ledger_in(program_id, accounts, trader_ai.key) {
+        Some(l) => crate::carry::total_owed(l),
+        None if t.has_ledger != 0 => return Err(RouterError::BadAccount.into()),
+        None => 0,
+    };
+    let here = equity(portfolio)?.saturating_sub(owed as i128);
+    let others = if eq_ai.owner == program_id {
+        writable(eq_ai)?;
+        set_equity(program_id, eq_ai, t.sub, Some(here), 0)?
+    } else if t.sub == 0 && t.has_equities == 0 {
+        0
+    } else {
+        return Err(RouterError::BadAccount.into());
+    };
+    record_fill(program_id, stats_ai, &t, portfolio, 0, 0, 0, owed, others);
+    Ok(())
+}
+
 fn equity(portfolio: &AccountInfo) -> Result<i128, ProgramError> {
     let (capital, pnl, _) = perc::portfolio_exposure(&portfolio.try_borrow_data()?)?;
     Ok((capital as i128).checked_add(pnl).ok_or(RouterError::Overflow)?)

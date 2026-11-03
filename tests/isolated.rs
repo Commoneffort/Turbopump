@@ -278,3 +278,32 @@ fn leaving_out_the_record_of_values_is_refused() {
 fn payer_key(w: &World) -> solana_sdk::pubkey::Pubkey {
     w.payer.pubkey()
 }
+
+#[test]
+fn a_refresh_books_a_loss_in_an_account_that_is_not_traded_again() {
+    let mut w = live();
+    w.trader(0);
+    let main = w.traders[&0].1;
+    let payer = w.payer.insecure_clone();
+    w.send(vec![rclient::open_stats(&payer.pubkey(), &main)], &[]).unwrap();
+    let iso = w.isolated(0, 10, 1, 5_000_000);
+    w.taker_trade(10, 20 * U).unwrap();
+    let before = stats_of(&w, &main.wallet).last_pnl;
+    // The price falls 5%: the isolated long loses about 1 USDC, and nothing trades it.
+    w.move_price(20, 950_000);
+    // A trade in the main account alone would book the old, higher value of the isolated one.
+    w.taker_trade(0, U).unwrap();
+    let hidden = stats_of(&w, &main.wallet).last_pnl;
+    assert!(hidden > before - 200_000, "the loss is not seen yet: {before} -> {hidden}");
+    // A refresh (anyone may send it) books what the chain shows: the loss is in the record.
+    w.converge();
+    w.send(vec![rclient::refresh_record(&iso)], &[]).unwrap();
+    let seen = stats_of(&w, &main.wallet).last_pnl;
+    assert!(seen < hidden - 700_000, "the loss is booked: {hidden} -> {seen}");
+    // It also works for a main account, and for one that has no record of values.
+    w.send(vec![rclient::refresh_record(&main)], &[]).unwrap();
+    w.trader(1);
+    let other = w.traders[&1].1;
+    w.send(vec![rclient::open_stats(&payer.pubkey(), &other)], &[]).unwrap();
+    w.send(vec![rclient::refresh_record(&other)], &[]).unwrap();
+}
