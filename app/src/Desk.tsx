@@ -1173,7 +1173,7 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go, tick, accoun
                 return (
                   <Fragment key={rk(x)}>
                   <tr className={here ? "here" : ""}>
-                    <td><button className={`link pos-name ${size > 0 ? "up" : "down"}`} title={`${size > 0 ? "Long" : "Short"} ${s} at ${lev}×, ${x.sub ? "isolated" : "cross"} margin (open this market)`} onClick={() => { if (!c) return; if (c.v.key.equals(state.vault.key)) { setMargin(x.sub ? "isolated" : "cross"); return; } saveMargin(c.v.key, x.sub ? "isolated" : "cross"); go(c.v.canonical ? `/trade/${s}` : `/m/${c.v.key.toString()}`); }}>{s} <i>{lev}×</i><em className={`mtag${x.sub ? " iso" : ""}`}>{x.sub ? "Isolated" : "Cross"}</em></button></td>
+                    <td><button className={`link pos-name ${size > 0 ? "up" : "down"}`} title={`${size > 0 ? "Long" : "Short"} ${s} at ${lev}×, ${x.sub ? "isolated" : "cross"} margin (open this market)`} onClick={() => { if (!c) return; if (c.v.key.equals(state.vault.key)) { setMargin(x.sub ? "isolated" : "cross"); return; } saveMargin(c.v.key, x.sub ? "isolated" : "cross"); go(c.v.canonical ? `/trade/${s}` : `/m/${c.v.key.toString()}`); }}>{s} <i>{lev}×</i><em className="mtag">{x.sub ? "Isolated" : "Cross"}</em></button></td>
                     <td className={`mono ${size > 0 ? "up" : "down"}`}>{fmt(Math.abs(size), 4).replace(/\.?0+$/, "")} {s}</td>
                     <td className="mono">{money(x.value)}</td>
                     <td className="mono">{money(x.sub ? acctEq : x.value / lev)}</td>
