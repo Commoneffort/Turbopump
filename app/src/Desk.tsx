@@ -653,7 +653,7 @@ function Ticket({ state, send, busy, copying, margin, setMargin }: { state: C.St
         </div>
       )}
       {mode !== "market" ? <StandingForm mode={mode} side={side} state={state} send={send} busy={busy} /> : <>
-      <div className="otype"><span>Market order</span><span className="hint" title="It fills at the first oracle price published a few seconds after it lands, with no spread and no price impact.">fills at the oracle price</span></div>
+      <CurrentPosition held={held} sym={sym} />
 
       <label className="inp">
         <span>Size</span>
@@ -739,9 +739,19 @@ function Ticket({ state, send, busy, copying, margin, setMargin }: { state: C.St
       </>}
       {pendingHere && <Pending r={pendingHere} sym={sym} send={send} busy={busy} />}
       {!pendingHere && outcome && <div className="outcome" onClick={() => setOutcome(undefined)}>{outcome}</div>}
-      {want > 0n && <p className="fine">
-        A deposit of {(Number(C.expiryDeposit(sent, state.asset.price)) / 1e9).toFixed(4)} {C.COIN} ({C.EXPIRY_DEPOSIT_BPS / 100}% of the order, at most {Number(C.EXPIRY_DEPOSIT_CAP) / 1e9} {C.COIN}) goes with it and comes back when it fills; it is kept only if the order's price arrived and the order still expired while the market was current.
+      {mode === "market" && want > 0n && <p className="fine" title={`${C.EXPIRY_DEPOSIT_BPS / 100}% of the order, at most ${Number(C.EXPIRY_DEPOSIT_CAP) / 1e9} ${C.COIN}. It is kept only if the order's price arrived and the order still expired while the market was current.`}>
+        Deposit {(Number(C.expiryDeposit(sent, state.asset.price)) / 1e9).toFixed(4)} {C.COIN}, returned when it fills.
       </p>}
+    </div>
+  );
+}
+
+/** The position held on this market now, above the order form. */
+function CurrentPosition({ held, sym }: { held: bigint; sym: string }) {
+  return (
+    <div className="otype" title="Your position on this market in the account shown (cross or isolated)">
+      <span>Current position</span>
+      <b className={`mono ${held > 0n ? "up" : held < 0n ? "down" : ""}`}>{held === 0n ? `0 ${sym}` : `${held > 0n ? "+" : "−"}${units(abs(held))} ${sym}`}</b>
     </div>
   );
 }
@@ -785,6 +795,7 @@ function StandingForm({ mode, side, state, send, busy }: { mode: "limit" | "prot
     const why = need ?? (!free.length ? "All 8 order slots on this market are in use: cancel one first" : !n(size) ? "Enter a size" : !px ? "Enter a limit price" : undefined);
     return (
       <div className="sform">
+        <CurrentPosition held={held} sym={sym} />
         <label className="inp"><span>Limit price</span><input value={limit} onChange={digits(setLimit)} placeholder={fmt(priceN, dp)} inputMode="decimal" /><button className="unit" onClick={() => setLimit(String(+priceN.toFixed(dp)))}>Mark</button></label>
         <label className="inp"><span>Size</span><input value={size} onChange={digits(setSize)} placeholder="0.00" inputMode="decimal" /><em>{sym}</em></label>
         <label className="check" title={REDUCE_ONLY_HELP}><input type="checkbox" checked={reduce} onChange={e => setReduce(e.target.checked)} />Reduce only (never opens or flips a position)</label>
@@ -936,7 +947,7 @@ function Account({ state, send, busy, held, row, vaults }: { state: C.State; sen
             <>
               <div className="move">
                 <label className="inp small"><span>USDC</span><input value={amount} onChange={e => setAmount(e.target.value.replace(/[^0-9.]/g, ""))} inputMode="decimal" /></label>
-                <button className="btn" disabled={!!busy || atoms <= 0n || atoms > state.userCollateral} onClick={() => send(sub ? `Add margin to isolated ${state.vault.feed?.symbol ?? ""}` : "Add margin", [ata(publicKey), C.routerDeposit(publicKey, atoms, sub)])}>Deposit</button>
+                <button className="btn white" disabled={!!busy || atoms <= 0n || atoms > state.userCollateral} onClick={() => send(sub ? `Add margin to isolated ${state.vault.feed?.symbol ?? ""}` : "Add margin", [ata(publicKey), C.routerDeposit(publicKey, atoms, sub)])}>Deposit</button>
                 <button className="btn" disabled={!!busy || locked || state.openPositions > 0 || atoms <= 0n || atoms + owed > (p?.capital ?? 0n) + profit} onClick={() => send(owed > 0n ? "Pay fees and withdraw" : "Withdraw margin", [ata(publicKey), ...(profit > 0n ? [C.crank(publicKey, C.routerPortfolio(publicKey, sub), [state.vault.assetIndex]), C.routerConvertPnl(publicKey, sub)] : []), ...payAll(publicKey), C.routerWithdraw(publicKey, atoms, sub)])}>Withdraw</button>
               </div>
               {locked ? <div className="fine">Withdrawals are paused while an order is queued.</div>
@@ -1144,7 +1155,7 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go, tick, accoun
           {otherList}
         </>))}
         {tab === "orders" && (!publicKey ? <div className="quiet">Connect a wallet to see your orders.</div> : standing.length === 0 ? <div className="quiet">No open orders on {sym}. Limit, TP / SL and trailing stop orders are placed from the order ticket; TWAP orders are in their own tab.</div> : (
-          <table className="tbl">
+          <table className="tbl lefts">
             <thead><tr><th>Market</th><th>Type</th><th>Side</th><th className="r">Size</th><th className="r">Trigger</th><th className="r">Mark price</th><th>Status</th><th /></tr></thead>
             <tbody>
               {standing.map(o => {
@@ -1171,7 +1182,7 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go, tick, accoun
           </table>
         ))}
         {tab === "twap" && (!publicKey ? <div className="quiet">Connect a wallet to see your TWAP orders.</div> : twaps.length === 0 ? <div className="quiet">No running TWAP on {sym}. Start one from the TWAP tab of the order ticket; it shows here until its last slice has filled.</div> : (
-          <table className="tbl">
+          <table className="tbl lefts">
             <thead><tr><th>Market</th><th>Side</th><th className="r">Total</th><th className="r" title="Slices that have filled, and the size they traded">Filled</th><th className="r" title="Slices still to come, and the size left">Waiting</th><th>Progress</th><th className="r">Slice</th><th>Next slice</th><th /></tr></thead>
             <tbody>
               {twaps.map(o => {
@@ -1214,7 +1225,7 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go, tick, accoun
                 <span>fees</span><b className="mono">{money(fees)}</b>
                 <span>after fees</span><b className={`mono pnl ${booked - fees >= 0 ? "up" : "down"}`}>{signedMoney(booked - fees)}</b>
               </div>
-              <table className="tbl">
+              <table className="tbl lefts">
                 <thead><tr><th>Time</th><th>Market</th><th>Side</th><th className="r">Size</th><th className="r" title="For a trade that opened or added: its fill price. For a trade that reduced or closed: the position's average entry before it">Entry price</th><th className="r" title="The fill price of a trade that reduced or closed a position">Close price</th><th className="r">Value</th><th className="r">Fee</th><th className="r" title="What the trade booked when it reduced or closed a position: (price - average entry) x size closed, before fees">Closed PnL</th><th className="r">Transaction</th></tr></thead>
                 <tbody>
                   {[...rows].reverse().map(f => (

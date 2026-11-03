@@ -51,6 +51,14 @@ function loadIds(): string[] {
 export function WidgetPanel(ctx: Ctx) {
   const [ids, setIds] = useState<string[]>(loadIds);
   const [menu, setMenu] = useState(false);
+  // The menu hangs from the bar, which stays at the top of the column: it gets the room left
+  // between there and the column's bottom (or the window's) and scrolls inside it.
+  const fitMenu = (el: HTMLDivElement | null) => {
+    if (!el) return;
+    const col = el.closest(".desk-book") as HTMLElement | null;
+    const bottom = Math.min(col ? col.getBoundingClientRect().bottom : window.innerHeight, window.innerHeight);
+    el.style.maxHeight = `${Math.max(160, bottom - el.getBoundingClientRect().top - 8)}px`;
+  };
   const [open, setOpen] = useState<string>();
   const box = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -78,7 +86,7 @@ export function WidgetPanel(ctx: Ctx) {
           Add
         </button>
         {menu && (
-          <div className="wg-menu" role="menu">
+          <div className="wg-menu" role="menu" ref={fitMenu}>
             {WIDGETS.map(w => (
               <button key={w.id} role="menuitemcheckbox" aria-checked={ids.includes(w.id)} className={ids.includes(w.id) ? "on" : ""} onClick={() => toggle(w.id)}>
                 <i aria-hidden>{ids.includes(w.id)
