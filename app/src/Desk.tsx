@@ -638,8 +638,8 @@ function Ticket({ state, send, busy, copying, margin, setMargin }: { state: C.St
   return (
     <div className="ticket">
       <div className="mmode" role="group" aria-label="Margin mode">
-        <button className={margin === "cross" ? "on" : ""} onClick={() => setMargin("cross")} title="Your main account: all of its money stands behind every position you hold in it, on every market. A loss on one market can use margin you put in for another.">Cross</button>
-        <button className={margin === "isolated" ? "on" : ""} onClick={() => setMargin("isolated")} title={`A separate account for ${sym} alone, with only the margin you put into it. If this position goes wrong it can lose that margin and nothing else; your other positions cannot be touched, and it cannot use their money either.`}>Isolated</button>
+        <button className={margin === "cross" ? "on" : ""} onClick={() => setMargin("cross")} title={`Cross margin: your main account. All of its money stands behind every position you hold in it, on every market, so a gain on one market supports another, and a loss on one can use margin you put in for another. One account for every market; it is the one copy trading and the leaderboard count. It belongs to a program address derived from your wallet: only the router can trade it, and withdrawals only go back to this wallet. Opening it costs about 0.07 test ${C.COIN} of rent.`}>Cross</button>
+        <button className={margin === "isolated" ? "on" : ""} onClick={() => setMargin("isolated")} title={`Isolated margin: a separate account for ${sym} alone, holding only the margin you deposit into it. If this position goes wrong it can lose that margin and nothing else; your other positions cannot be touched, and it cannot use their money either. It holds one market at a time and has its own orders and queue place. Like your main account, only the router can trade it and withdrawals only go back to this wallet. Opening it costs about 0.07 test ${C.COIN} of rent. Copy trading and the leaderboard count your main account only.`}>Isolated</button>
       </div>
       <div className="otabs">
         {([["market", "Market"], ["limit", "Limit"], ["protect", "TP / SL"], ["twap", "TWAP"]] as const).map(([m, label]) => (
@@ -729,12 +729,9 @@ function Ticket({ state, send, busy, copying, margin, setMargin }: { state: C.St
       {state.trader && held !== 0n && !state.closeOnly && (
         <CloseSlider pct={closePct} onChange={setClosePct} disabled={locked || !!busy} />
       )}
-      {blocker && publicKey && blocker !== "Enter a size" && <div className="why">{blocker}</div>}
+      {blocker && publicKey && state.trader && blocker !== "Enter a size" && <div className="why">{blocker}</div>}
       </div>
       {!blocker && want > vaultMax && <div className="why">The vault takes {units(vaultMax)} {sym} on this side right now, so the order is cut to that.</div>}
-      {!state.trader && publicKey && mine && (sub
-        ? <div className="why">A second account for {sym} alone: only the margin you deposit into it stands behind its position, so a loss here cannot reach your other money, and it holds one market at a time. Like your main account, only the router can trade it and withdrawals only go back to this wallet. About 0.07 test {C.COIN} of rent. Copy trading and the leaderboard count your main account only.</div>
-        : <div className="why">One account covers every market. It belongs to a program address derived from your wallet: only the router can trade it, and withdrawals only go back to this wallet. About 0.07 test {C.COIN} of rent.</div>)}
 
       </>}
       {pendingHere && <Pending r={pendingHere} sym={sym} send={send} busy={busy} />}
