@@ -583,7 +583,9 @@ function Ticket({ state, send, busy, copying, margin, setMargin, vaults }: { sta
   // behind it times the leverage. Percolator itself only asks for the market's opening margin
   // (5% on BTC and ETH: 20×), so a lower leverage just means using less of what the account could
   // open. One margin account covers every market: the liquidation price shown is the account's.
-  const openRate = Number(state.levels.open) / 10_000, maxLev = Math.max(1, Math.floor(1 / openRate));
+  // While the router's risk dial is up, opening needs that many times the margin (see `C.riskDial`).
+  const dial = state.risk.dial;
+  const openRate = Math.min(1, Number(state.levels.open) * dial / 10_000), maxLev = Math.max(1, Math.floor(1 / openRate));
   const savedLev = () => { let x = 0; try { x = Number(localStorage.getItem(`pv:lev:${sym}`)); } catch { /* storage unavailable */ } return x >= 1 ? x : Math.min(5, maxLev); };
   const [share, setShareState] = useState<number>(); // the last quick share chosen, re-applied when the leverage changes
   const [levPick, setLevPick] = useState<number>(savedLev);
@@ -710,7 +712,7 @@ function Ticket({ state, send, busy, copying, margin, setMargin, vaults }: { sta
         <div className="lev">
           <div className="lev-l">
             <span className="hint" title={`How many times the margin you put behind this order it is worth. ${maxLev}× is the most this market allows. A lower leverage uses less of your free margin for the same size: the quick buttons size the order from your free margin times this leverage.`}>Leverage</span>
-            <b className="mono">{lev}×<i>max {maxLev}×</i></b>
+            <b className="mono">{lev}×<i title={dial > 1 ? `Lowered for now: ${state.risk.why}. New positions get ${dial}x less leverage and the vault takes ${dial}x less new risk until it passes. Closing is never limited.` : undefined}>max {maxLev}×{dial > 1 ? " (lowered)" : ""}</i></b>
           </div>
           <div className="lev-track" style={{ "--fill": `${maxLev > 1 ? (lev - 1) / (maxLev - 1) * 100 : 100}%`, "--now": "0%" } as CSSProperties}>
             <input type="range" min={1} max={maxLev} step={1} value={lev} onChange={e => chooseLev(Number(e.target.value))} className={side > 0n ? "up" : "down"} aria-label="Leverage" />

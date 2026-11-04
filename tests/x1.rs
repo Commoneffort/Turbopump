@@ -284,6 +284,8 @@ fn a_reported_price_needs_the_witness() {
     w.pyth_time = t1;
     w.advance_to(report).unwrap();
     assert_eq!({ w.book().mark_price }, 1_020_000);
+    // ...but 1% apart is wide (the risk dial, `percolator_router::risk`): opening is held at 4x.
+    assert_eq!(w.book().price_dial, 4);
     // A reported price 3% away from the witness's: refused.
     let t2 = t1 + 4;
     at(&mut w, t2);
@@ -302,4 +304,5 @@ fn a_reported_price_needs_the_witness() {
     // With it, the same price is accepted.
     w.advance_to(report).unwrap();
     assert_eq!({ w.book().mark_price }, 1_010_000);
+    assert_eq!(w.book().price_dial, 1, "the sources agree again");
 }

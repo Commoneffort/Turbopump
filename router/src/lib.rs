@@ -27,6 +27,7 @@ pub mod carry;
 #[cfg(not(target_os = "solana"))]
 pub mod client;
 pub mod funding;
+pub mod risk;
 pub mod social;
 pub mod state;
 pub mod swap;
@@ -895,13 +896,15 @@ fn margin_covers(market: &[u8], portfolio: &[u8], v: &vstate::VaultState, size: 
 /// The same check with a price move of `stress_bps` (0: at the current price, which is what the
 /// fill asks for).
 fn margin_covers_at(market: &[u8], portfolio: &[u8], v: &vstate::VaultState, size: i128, stress_bps: u128, tiers: Option<&state::Tiers>) -> Result<bool, ProgramError> {
-    margin_covers_owing(market, portfolio, v, size, stress_bps, tiers, 0)
+    margin_covers_owing(market, portfolio, v, size, stress_bps, tiers, 0, 1)
 }
 
 /// The same check for an account that owes the vaults `debt` (see `carry`): it counts against
 /// the account's equity.
 #[allow(clippy::too_many_arguments)]
-fn margin_covers_owing(market: &[u8], portfolio: &[u8], v: &vstate::VaultState, size: i128, stress_bps: u128, tiers: Option<&state::Tiers>, debt: u64) -> Result<bool, ProgramError> {
+/// `dial` (see `risk`) multiplies the margin to open the traded asset's position.
+#[allow(clippy::too_many_arguments)]
+fn margin_covers_owing(market: &[u8], portfolio: &[u8], v: &vstate::VaultState, size: i128, stress_bps: u128, tiers: Option<&state::Tiers>, debt: u64, dial: u8) -> Result<bool, ProgramError> {
     let asset = v.asset_index;
     let (_, min_im, fee_bps) = perc::margin_params(market)?;
     let (capital, pnl, _) = perc::portfolio_exposure(portfolio)?;
@@ -928,6 +931,7 @@ fn margin_covers_owing(market: &[u8], portfolio: &[u8], v: &vstate::VaultState, 
     let mut need = min_im;
     for (a, n) in each {
         let (open, _, _) = levels(market, tiers, a)?;
+        let open = if a == asset { open.saturating_mul(dial.max(1) as u64).min(10_000) } else { open };
         let stressed = n * (10_000 + stress_bps) / 10_000;
         need = need + stressed * open as u128 / 10_000 + stressed * fee_bps as u128 / 10_000;
         total += n;
@@ -1684,12 +1688,16 @@ fn advance(program_id: &Pubkey, accounts: &[AccountInfo], observation_sequence: 
     // that Pyth has not served for `FALLBACK_SECS` after its target, and only as that request's
     // price. In an X1 build it is the price source and follows the same rules as a Pyth update.
     // In an X1 build the witness must confirm it (account 7): recent, and within its band.
+    // How far the price's sources disagree (see `risk`): Pyth's own confidence interval, and on
+    // X1 the gap to the witness.
+    let mut disagreement = u.conf_bps();
     if reported && cfg!(feature = "x1") {
         let w = accounts.get(7).ok_or(RouterError::WitnessDisagrees)?;
         let wu = reporter::read_witness(w, &v.oracle_feeds[0]).map_err(|_| RouterError::WitnessDisagrees)?;
         if !reporter::witness_agrees(&u, &wu) {
             return Err(RouterError::WitnessDisagrees.into());
         }
+        disagreement = disagreement.max(reporter::witness_gap_bps(&u, &wu));
     }
     if reported && !cfg!(feature = "x1") {
         let now = Clock::get()?.unix_timestamp;
@@ -1727,6 +1735,7 @@ fn advance(program_id: &Pubkey, accounts: &[AccountInfo], observation_sequence: 
     b.mark_publish_time = u.publish_time;
     b.mark_prev_publish_time = u.prev_publish_time;
     b.mark_price = price;
+    b.price_dial = risk::price_dial(disagreement);
     b.mark_set_time = Clock::get()?.unix_timestamp.clamp(1, u32::MAX as i64) as u32;
     store(book_ai, &b)
 }
@@ -1853,6 +1862,7 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         let close_only = perc::asset_close_only(&market.try_borrow_data()?, v.asset_index)?;
         let reduces = before != 0 && (before > 0) != (size > 0) && size.unsigned_abs() <= before.unsigned_abs();
         let tiers = tiers_in(program_id, accounts, market.key);
+        let dial = risk::dial(b.price_dial, tier_of_feed(&v.oracle_feeds[0]), Clock::get()?.unix_timestamp);
         if !close_only && liquidatable(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, tiers.as_ref(), debt)? {
             // Below the liquidation level at this price: the one thing a fill does for such an
             // account is close its position here, whatever was asked. A trader has one place in
@@ -1865,7 +1875,7 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         } else if !reduces && holds_other_asset(&t, &market.try_borrow_data()?, &portfolio.try_borrow_data()?, v.asset_index)? {
             // An isolated account holds one asset at a time.
             size = 0;
-        } else if (close_only && !reduces) || !margin_covers_owing(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, &v, size, 0, tiers.as_ref(), debt)? {
+        } else if (close_only && !reduces) || !margin_covers_owing(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, &v, size, 0, tiers.as_ref(), debt, dial)? {
             size = 0;
         } else if !reduces && !fees.can_book(v.asset_index, market_id)? {
             // Without a fee ledger (`OpenLedger`), or with all its slots in use, an account can
@@ -1889,7 +1899,8 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         // A fill that only reduces the trader's own position is marked for the vault, which
         // takes it even while it accepts nothing else that grows its position.
         let closing = before != 0 && (before > 0) != (size > 0) && size.unsigned_abs() <= before.unsigned_abs();
-        trade_against_vault(accounts, &t, &v, abump, market_id, size, closing, fee_bps)?;
+        let dial = risk::dial(b.price_dial, tier_of_feed(&v.oracle_feeds[0]), Clock::get()?.unix_timestamp);
+        trade_against_vault(accounts, &t, &v, abump, market_id, size, closing, fee_bps, dial)?;
         // The vault's position just changed: one step of its funding rate toward the new target
         // (the asset is accrued to this slot, which Percolator requires to take a rate).
         funding::refresh(acc(accounts, 5)?, acc(accounts, 6)?, acc(accounts, 10)?, acc(accounts, 11)?, acc(accounts, 12)?, abump)?;
@@ -1983,12 +1994,14 @@ fn reduce_unilaterally<'a>(trader_ai: &AccountInfo<'a>, market: &AccountInfo<'a>
 /// `accounts` are `fill`'s, already checked there.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn trade_against_vault(accounts: &[AccountInfo], t: &TraderState, v: &vstate::VaultState, abump: u8, market_id: u64, size: i128, closing: bool, fee_bps: u64) -> ProgramResult {
+#[allow(clippy::too_many_arguments)]
+fn trade_against_vault(accounts: &[AccountInfo], t: &TraderState, v: &vstate::VaultState, abump: u8, market_id: u64, size: i128, closing: bool, fee_bps: u64, dial: u8) -> ProgramResult {
     let (trader_ai, vault_ai, market, portfolio) = (acc(accounts, 2)?, acc(accounts, 5)?, acc(accounts, 6)?, acc(accounts, 7)?);
     let (lp_portfolio, delegate, authority, vault_program, percolator) = (acc(accounts, 8)?, acc(accounts, 9)?, acc(accounts, 10)?, acc(accounts, 11)?, acc(accounts, 12)?);
     let mut arm = vec![TAG_ARM_FILL];
     arm.extend_from_slice(&size.to_le_bytes());
     arm.push(closing as u8);
+    arm.push(dial);
     invoke_signed(
         &Instruction {
             program_id: percolator_vault::id(),

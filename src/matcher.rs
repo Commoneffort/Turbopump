@@ -86,6 +86,8 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         return Err(VaultError::NotArmed.into());
     }
     let taker_closes = v.armed_closing != 0;
+    let dial = v.armed_dial;
+    v.armed_dial = 0;
     v.armed_size = 0;
     v.armed_slot = 0;
     v.armed_closing = 0;
@@ -104,8 +106,12 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     if v.position_nav_bps != 0 {
         let nav = if v.armed_nav != 0 { v.last_nav.min(v.armed_nav) } else { v.last_nav };
         let tier = crate::feeds::cap_tier(&v.oracle_feeds[0]);
-        let pos_bps = v.position_nav_bps.min(crate::feeds::position_nav_bps(tier));
-        let fill_bps = v.fill_nav_bps.min(crate::feeds::fill_nav_bps(tier));
+        // While the router's risk dial is up (price sources disagree, or a stock market is about
+        // to close: see `math::MAX_DIAL`), a fill that adds exposure gets that many times less room.
+        // Closes keep the full limit.
+        let d = if taker_closes { 1 } else { dial };
+        let pos_bps = math::dialed(v.position_nav_bps.min(crate::feeds::position_nav_bps(tier)), d);
+        let fill_bps = math::dialed(v.fill_nav_bps.min(crate::feeds::fill_nav_bps(tier)), d);
         let (f, i) = math::fill_caps(nav, pos_bps, fill_bps, req.oracle_price_e6, v.inventory, lp_sign, taker_closes);
         max_inventory = max_inventory.min(i);
         max_fill = max_fill.min(f);

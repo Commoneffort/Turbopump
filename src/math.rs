@@ -122,6 +122,16 @@ pub fn nav_cap(nav: u64, bps: u16, price_e6: u64) -> u128 {
     notional.saturating_mul(POS_SCALE) / price_e6 as u128
 }
 
+/// The highest risk dial the router may arm a fill with. The dial (1 = normal) divides the
+/// vault's room for new exposure and multiplies the margin a trader needs to open; the router
+/// raises it while its price sources disagree and in the last hours before a stock market closes.
+pub const MAX_DIAL: u8 = 4;
+
+/// `bps` with the risk dial applied (0 and 1 leave it as is).
+pub fn dialed(bps: u16, dial: u8) -> u16 {
+    if dial <= 1 { bps } else { bps / dial.min(MAX_DIAL) as u16 }
+}
+
 /// Percolator's position scale: one whole unit of the asset.
 pub const POS_SCALE: u128 = 1_000_000;
 
@@ -129,6 +139,15 @@ pub const POS_SCALE: u128 = 1_000_000;
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn dial_divides_room() {
+        assert_eq!(dialed(30_000, 0), 30_000);
+        assert_eq!(dialed(30_000, 1), 30_000);
+        assert_eq!(dialed(30_000, 2), 15_000);
+        assert_eq!(dialed(30_000, 4), 7_500);
+        assert_eq!(dialed(30_000, 9), 7_500);
+    }
 
     #[test]
     fn first_deposit_and_exit_round_trip() {

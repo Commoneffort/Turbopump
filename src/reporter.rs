@@ -60,6 +60,16 @@ pub fn witness_agrees(u: &PriceUpdate, w: &PriceUpdate) -> bool {
     a.abs_diff(b) * 10_000 <= a * WITNESS_BPS as u128
 }
 
+/// How far the witness's price is from the reported one, in bps of the reported one (10,000 when
+/// either is not positive).
+pub fn witness_gap_bps(u: &PriceUpdate, w: &PriceUpdate) -> u64 {
+    if u.price <= 0 || w.price <= 0 {
+        return 10_000;
+    }
+    let (a, b) = (u.price as u128, w.price as u128);
+    (a.abs_diff(b) * 10_000 / a).min(10_000) as u64
+}
+
 /// How long a queued request's target must have passed without a Pyth price before a reported
 /// price may serve it (Solana builds).
 pub const FALLBACK_SECS: i64 = 20;
@@ -112,4 +122,21 @@ pub fn read(ai: &AccountInfo, feed: &[u8; 32]) -> Result<PriceUpdate, VaultError
 /// True when `ai` is a reported-price account rather than a Pyth update.
 pub fn is_report(ai: &AccountInfo) -> bool {
     *ai.owner == ROUTER_PROGRAM_ID
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(price: i64) -> PriceUpdate {
+        PriceUpdate { feed_id: [0; 32], price, conf: 0, exponent: -6, publish_time: 100, prev_publish_time: 99 }
+    }
+
+    #[test]
+    fn witness_gap() {
+        assert_eq!(witness_gap_bps(&at(1_000_000), &at(1_000_000)), 0);
+        assert_eq!(witness_gap_bps(&at(1_000_000), &at(1_003_000)), 30);
+        assert_eq!(witness_gap_bps(&at(1_000_000), &at(997_000)), 30);
+        assert_eq!(witness_gap_bps(&at(0), &at(1)), 10_000);
+    }
 }

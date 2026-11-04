@@ -824,6 +824,8 @@ export async function fetchVault(conn: Connection, vaultKey: PublicKey, user?: P
     closeOnly: closeOnly(data(0)!, v.assetIndex),
     /** This asset's margins (bps): to open, below which it is liquidated, Percolator's own; and its tier. */
     levels: levels(data(0)!, v.assetIndex),
+    /** The router's risk dial now (see `riskDial`): opening needs this many times the margin. */
+    risk: riskDial(book?.priceDial ?? 1, tierOfFeed(v.feedHex), Math.floor(Date.now() / 1000)),
     /** The market account as read (every asset's margins and prices: see `levels`). */
     marketData: data(0)!,
     /** The market's funding: its cap, and the rate the router last set for this asset. */
@@ -1066,12 +1068,30 @@ export const requestAddress = (vault: PublicKey, owner: PublicKey, settlement = 
   rpda(Buffer.from("request"), vault.toBuffer(), owner.toBuffer(), Buffer.from([settlement ? 1 : 0]));
 
 /** `markSet`: chain time at which the mark was last moved (0 if not recorded). */
-export type Book = { vault: PublicKey; len: number; hasCarry: boolean; markSet: number; markPublish: number; markPrev: number; markPrice: bigint; nextId: bigint; pending: { id: bigint; target: number }[] };
+export type Book = { vault: PublicKey; len: number; hasCarry: boolean; markSet: number; markPublish: number; markPrev: number; markPrice: bigint; nextId: bigint; pending: { id: bigint; target: number }[]; priceDial: number };
 export function decodeBook(d: Uint8Array): Book {
   const b = R.book;
   const len = d[b.len];
   const pending = Array.from({ length: len }, (_, i) => ({ id: u64(d, b.pending_id + 8 * i), target: Number(i64(d, b.pending_target + 8 * i)) }));
-  return { vault: key(d, b.vault), len, hasCarry: d[(b as any).has_carry ?? 78] === 1, markSet: u32(d, b.mark_set_time), markPublish: Number(i64(d, b.mark_publish_time)), markPrev: Number(i64(d, b.mark_prev_publish_time)), markPrice: u64(d, b.mark_price), nextId: u64(d, b.next_id), pending };
+  return { vault: key(d, b.vault), len, hasCarry: d[(b as any).has_carry ?? 78] === 1, markSet: u32(d, b.mark_set_time), markPublish: Number(i64(d, b.mark_publish_time)), markPrev: Number(i64(d, b.mark_prev_publish_time)), markPrice: u64(d, b.mark_price), nextId: u64(d, b.next_id), pending, priceDial: d[(b as any).price_dial ?? 79] };
+}
+
+/** The router's risk dial (`router/src/risk.rs`), 1 = normal: a trade that opens or grows a
+ *  position needs `dial` times the usual margin, and the vault gives it `dial` times less room.
+ *  The higher of: how far the price sources disagreed on the mark's price (`priceDial`), and, on
+ *  stocks, 2 outside US regular hours (13:30-19:00 UTC) and 3 from Friday 19:00 to Monday 13:30 UTC. */
+export function riskDial(priceDial: number, tier: number, nowSec: number): { dial: number; why: string } {
+  let hours = 1;
+  if (tier === TIER_STOCK) {
+    const secs = ((nowSec % 86_400) + 86_400) % 86_400, weekday = (Math.floor(nowSec / 86_400) + 3) % 7;
+    const open = 13 * 3600 + 1800, calm = 19 * 3600;
+    const weekend = weekday === 4 ? secs >= calm : weekday === 5 || weekday === 6 ? true : weekday === 0 ? secs < open : false;
+    hours = weekend ? 3 : secs >= open && secs < calm ? 1 : 2;
+  }
+  const p = Math.max(1, priceDial || 1);
+  const dial = Math.min(4, Math.max(p, hours));
+  const why = dial <= 1 ? "" : hours >= p ? (hours === 3 ? "the stock market is closed for the weekend" : "the stock market is closing or closed") : "price sources disagree right now";
+  return { dial, why };
 }
 /** `settle`: an epoch settlement of the vault (then `wallet` is whoever queued it), not a trade.
  *  `order`: the index of the standing order that queued it, if one did. */

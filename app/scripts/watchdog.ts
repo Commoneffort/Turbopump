@@ -9,7 +9,11 @@
 //   - prices: a market with open positions whose mark is more than 5 minutes old;
 //   - the price services the X1 executor reads (jack0, and our own copy on 127.0.0.1:8091);
 //   - the services and bots are running, and the executor's log is still being written;
-//   - new kinds of failed checks in the bots' log (each kind once every 6 hours, with an example).
+//   - new kinds of failed checks in the bots' log (each kind once every 6 hours, with an example);
+//   - the money (`money`): Percolator holds the tokens its books say and at least what it owes
+//     accounts; each vault's cash covers what it owes now (paid withdrawals, opener fees, queued
+//     deposits); no vault's share price fell more than 5% in an hour; no vault holds more than
+//     its limit; and a 30% move against a vault's position would not cost it more than it is worth.
 // An alert is sent when a problem starts, again every 3 hours while it lasts, and once more when
 // it is over. A summary goes out every day at 08:00 UTC.
 //
@@ -51,10 +55,12 @@ function config() {
   try { for (const l of fs.readFileSync(ENV_FILE, "utf8").split("\n")) { const m = l.match(/^\s*([A-Z_]+)\s*=\s*(.*?)\s*$/); if (m) out[m[1]] = m[2].replace(/^["']|["']$/g, ""); } } catch { /* not set up yet */ }
   return out;
 }
+// `money`: runs the money checks once, printing what it finds instead of sending it.
+const DRY = process.argv[2] === "money";
 async function send(text: string) {
   say("ALERT", text.replace(/\n/g, " | "));
   const c = config();
-  if (!c.TELEGRAM_BOT_TOKEN || !c.TELEGRAM_CHAT_ID) return;
+  if (DRY || !c.TELEGRAM_BOT_TOKEN || !c.TELEGRAM_CHAT_ID) return;
   if (/^@.*bot$/i.test(c.TELEGRAM_CHAT_ID)) { say(`TELEGRAM_CHAT_ID is a bot's name (${c.TELEGRAM_CHAT_ID}); it has to be your chat: run "watchdog.ts chat-id"`); return; }
   try {
     const r = await fetch(`https://api.telegram.org/bot${c.TELEGRAM_BOT_TOKEN}/sendMessage`, {
@@ -195,6 +201,55 @@ async function botChecks() {
   }
 }
 
+// ---- the money ----
+// Share prices of the last hour, per vault (a share price ignores deposits and withdrawals: only
+// gains and losses move it).
+const shareHist = new Map<string, { at: number; price: number }[]>();
+const usdc = (x: bigint) => `$${(Number(x) / 1e6).toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
+async function money() {
+  const m = await C.fetchMarket(conn);
+  const dv = new DataView(m.data.buffer, m.data.byteOffset);
+  const u128 = (o: number) => dv.getBigUint64(o, true) + (dv.getBigUint64(o + 8, true) << 64n);
+  // Percolator's header totals (as the Health page reads them): held, insurance, capital, profit.
+  const [held, insurance, capital, profit] = [0, 1, 2, 3].map(i => u128(749 + 16 * i));
+  const tok = await conn.getAccountInfo(C.PERC_VAULT);
+  const tokens = tok ? new DataView(tok.data.buffer, tok.data.byteOffset).getBigUint64(64, true) : 0n;
+  await problem("percolator tokens missing", tokens < held, `🚨 Percolator's token account holds ${usdc(tokens)} but its books say ${usdc(held)}: ${usdc(held - tokens)} is missing.`);
+  const owed = capital + insurance + profit;
+  await problem("percolator short", held < owed, `🚨 Percolator owes accounts ${usdc(owed)} (capital ${usdc(capital)} + insurance ${usdc(insurance)} + booked profit ${usdc(profit)}) but holds ${usdc(held)}: short by ${usdc(owed - held)}.`);
+
+  const vaults = (await C.listVaults(conn)).filter(v => v.canonical && v.status === 1 && v.lastNav > 0n);
+  const cashShort: string[] = [], fell: string[] = [], over: string[] = [], fragile: string[] = [];
+  const now = Date.now();
+  for (const v of vaults) {
+    const s = await C.fetchVault(conn, v.key);
+    const name = v.feed?.symbol ?? v.key.toBase58().slice(0, 6);
+    const owes = s.vault.reserved + s.vault.pendingDeposit;
+    if (s.buffer < owes) cashShort.push(`${name} (cash ${usdc(s.buffer)}, owes ${usdc(owes)})`);
+    const value = s.buffer - owes + s.lp.capital + s.lp.pnl;
+    if (s.shareSupply > 0n && value > 0n) {
+      const price = Number(value) / Number(s.shareSupply);
+      const h = (shareHist.get(name) ?? []).filter(x => now - x.at <= 3_600_000);
+      h.push({ at: now, price });
+      shareHist.set(name, h);
+      const top = Math.max(...h.map(x => x.price));
+      if (price < top * 0.95) fell.push(`${name} ${((1 - price / top) * 100).toFixed(1)}%`);
+    }
+    if (s.asset.price > 0n && s.lp.position !== 0n) {
+      const units = Math.abs(Number(s.lp.position)) / 1e6;
+      const limit = Number(C.liveNav(s)) * C.tierPositionBps(C.tierOfFeed(v.feedHex)) / 10_000 / Number(s.asset.price);
+      if (limit > 0 && units > limit * 1.01) over.push(`${name} (${units.toFixed(2)} units, limit ${limit.toFixed(2)})`);
+      const loss = Math.abs(C.stress(s, 0.3));
+      if (value > 0n && loss >= Number(value) / 1e6) fragile.push(`${name} (a 30% move costs $${loss.toFixed(0)} of ${usdc(value)})`);
+    }
+  }
+  await problem("vault cash short", cashShort.length > 0, `🚨 vault cash does not cover what it owes now: ${cashShort.join(", ")}.`);
+  await problem("vault share price fell", fell.length > 0, `a vault's share price fell more than 5% within the hour: ${fell.join(", ")}. Check its position and the price.`);
+  await problem("vault over its limit", over.length > 0, `a vault holds more than its position limit: ${over.join(", ")} (Percolator can move it outside a fill: send SyncInventory and check the executor).`);
+  await problem("vault fragile", fragile.length > 0, `a 30% move against the vault's position would wipe it out: ${fragile.join(", ")}.`);
+  return `${vaults.length} vaults; Percolator holds ${usdc(held)} (tokens ${usdc(tokens)}), owes ${usdc(owed)}`;
+}
+
 let summaryDay = "";
 async function summary(have: number) {
   const now = new Date(), day = now.toISOString().slice(0, 10);
@@ -227,6 +282,11 @@ if (process.argv[2] === "chat-id") {
   console.log(`TELEGRAM_CHAT_ID=${id} written to ${ENV_FILE}`);
   process.exit(0);
 }
+if (DRY) {
+  say(await money());
+  say(`money checks done: ${open.size ? [...open.keys()].join(", ") : "all fine"}`);
+  process.exit(0);
+}
 if (process.argv[2] === "test") {
   const c = config();
   if (!c.TELEGRAM_BOT_TOKEN || !c.TELEGRAM_CHAT_ID) { console.log(`no TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in ${ENV_FILE}`); process.exit(1); }
@@ -241,6 +301,7 @@ for (;;) {
     await priceServices();
     await services();
     await botChecks();
+    await money();
     await summary(have);
   } catch (e: any) { say("check failed:", String(e?.message ?? e).slice(0, 160)); }
   await new Promise(r => setTimeout(r, 60_000));

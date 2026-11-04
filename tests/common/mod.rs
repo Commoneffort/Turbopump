@@ -65,6 +65,8 @@ pub struct World {
     /// Router trading accounts of the harness takers, by taker index.
     /// X1 builds: the witness confirms every reported price the harness posts (on by default).
     pub auto_witness: bool,
+    /// Confidence interval of the Pyth updates the harness publishes, in bps of the price.
+    pub pyth_conf_bps: u64,
     pub traders: HashMap<usize, (User, TraderKeys)>,
 }
 
@@ -197,6 +199,7 @@ impl World {
         d[40] = 1;
         d[41..73].copy_from_slice(&FEED);
         d[73..81].copy_from_slice(&(price_e6 as i64).to_le_bytes());
+        d[81..89].copy_from_slice(&(price_e6 * self.pyth_conf_bps / 10_000).to_le_bytes());
         d[89..93].copy_from_slice(&(-6i32).to_le_bytes());
         d[93..101].copy_from_slice(&publish_time.to_le_bytes());
         d[101..109].copy_from_slice(&prev_publish_time.to_le_bytes());
@@ -689,6 +692,7 @@ impl World {
             price: INITIAL_PRICE,
             traders: HashMap::new(),
             auto_witness: true,
+            pyth_conf_bps: 0,
         }
     }
 

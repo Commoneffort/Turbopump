@@ -575,10 +575,10 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
             push_mark(program_id, accounts, r(0), r(8), r(16))
         }
         TAG_ARM_FILL => {
-            if (rest.len() != 16 && rest.len() != 17) || rest.get(16).is_some_and(|c| *c > 1) {
+            if !(16..=18).contains(&rest.len()) || rest.get(16).is_some_and(|c| *c > 1) || rest.get(17).is_some_and(|d| *d > crate::math::MAX_DIAL) {
                 return Err(VaultError::InvalidInstruction.into());
             }
-            arm_fill(program_id, accounts, i128::from_le_bytes(rest[..16].try_into().unwrap()), rest.get(16) == Some(&1))
+            arm_fill(program_id, accounts, i128::from_le_bytes(rest[..16].try_into().unwrap()), rest.get(16) == Some(&1), rest.get(17).copied().unwrap_or(0))
         }
         TAG_REQUIRE_FLAT => {
             no_args(rest)?;
@@ -853,7 +853,7 @@ fn init_vault(program_id: &Pubkey, accounts: &[AccountInfo], p: InitParams) -> P
         position_nav_bps: p.position_nav_bps,
         fill_nav_bps: p.fill_nav_bps,
         armed_closing: 0,
-        _pad0: [0; 1],
+        armed_dial: 0,
         max_fill_abs: p.max_fill_abs,
         max_inventory_abs: p.max_inventory_abs,
         epoch_len_slots: p.epoch_len_slots,
@@ -1985,7 +1985,7 @@ fn set_funding_cap(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResu
 /// lower than at the last roll (see `live_nav`). Data: taker size (i128, + = taker buys), then
 /// optionally one byte, 1 when the fill only reduces the taker's own position (the router reads
 /// that from the taker's portfolio); the matcher takes such a fill even when reduce-only.
-fn arm_fill(program_id: &Pubkey, accounts: &[AccountInfo], size: i128, closing: bool) -> ProgramResult {
+fn arm_fill(program_id: &Pubkey, accounts: &[AccountInfo], size: i128, closing: bool, dial: u8) -> ProgramResult {
     let router = acc(accounts, 0)?;
     let vault_ai = acc(accounts, 1)?;
     router_signed(router)?;
@@ -1999,6 +1999,7 @@ fn arm_fill(program_id: &Pubkey, accounts: &[AccountInfo], size: i128, closing: 
     }
     v.armed_size = size;
     v.armed_closing = closing as u8;
+    v.armed_dial = dial;
     v.armed_slot = Clock::get()?.slot;
     v.armed_nav = match (accounts.get(2), accounts.get(3)) {
         (Some(market), Some(portfolio)) => {

@@ -100,7 +100,9 @@ pub struct Book {
     pub mark_set_time: u32,
     /// 1 once the vault has a holding-fee meter (`OpenCarry`): every fill must then name it.
     pub has_carry: u8,
-    pub _pad: [u8; 1],
+    /// The risk dial from the price the mark holds (`risk::price_dial`): how far its sources
+    /// disagreed. 0 in a book last written before the dial existed (counts as 1).
+    pub price_dial: u8,
     /// Publish time, previous publish time and price (e6) of the Pyth update the mark holds.
     pub mark_publish_time: i64,
     pub mark_prev_publish_time: i64,

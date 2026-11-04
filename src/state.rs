@@ -65,7 +65,9 @@ pub struct VaultState {
     /// Set with the armed fill when it only reduces the taker's own position (no flip). Such a
     /// fill is taken even while the vault is reduce-only: a trader can always close.
     pub armed_closing: u8,
-    pub _pad0: [u8; 1],
+    /// The risk dial the router armed this fill with (`risk::dial`, 0 or 1 = normal): a fill that
+    /// grows the vault's position gets this many times less room. Cleared with the arm.
+    pub armed_dial: u8,
     pub max_fill_abs: u128,
     pub max_inventory_abs: u128,
     pub epoch_len_slots: u64,

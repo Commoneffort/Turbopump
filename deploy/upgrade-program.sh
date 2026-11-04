@@ -31,6 +31,13 @@ case "$1" in
   engine) ID=8o3uV87X2CvPYfPwM1sxeaYYE7sGWsTUiEy7SskEMM3P; PKEY=keys/percolator-devnet-keypair.json; SO=${PERCOLATOR_SO:-../percolator-prog/target/deploy/percolator_prog.so} ;;
   *) echo "usage: $0 router|vault|engine x1|devnet"; exit 1 ;;
 esac
+# The release gate (deploy/release-check.sh): our own programs go up only as a build whose hash
+# was recorded for the commit checked out, after the suite passed on it.
+if [ "$1" != engine ] && [ -z "$NO_RELEASE_CHECK" ]; then
+  h=$(sha256sum "$SO" | cut -d' ' -f1)
+  grep -q " $(git rev-parse HEAD) $2 $(basename "$SO" .so) $h\$" deploy/releases.log 2>/dev/null || {
+    echo "refused: $SO ($h) is not a checked release of $(git rev-parse --short HEAD) for $2. Run deploy/release-check.sh first."; exit 1; }
+fi
 # Already live (a rerun after a step that failed further on): nothing to upload.
 live=$(mktemp)
 if solana program dump -k "$KEY" -u "$RPC" $ID "$live" >/dev/null 2>&1 && [ "$(head -c "$(stat -c %s "$SO")" "$live" | sha256sum | cut -d' ' -f1)" = "$(sha256sum "$SO" | cut -d' ' -f1)" ]; then

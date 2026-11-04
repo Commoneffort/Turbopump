@@ -93,6 +93,14 @@ impl PriceUpdate {
     pub fn confident(&self) -> bool {
         self.price > 0 && (self.conf as u128) * 10_000 <= (self.price as u128) * MAX_CONF_BPS
     }
+
+    /// The confidence interval in bps of the price (10,000 when the price is not positive).
+    pub fn conf_bps(&self) -> u64 {
+        if self.price <= 0 {
+            return 10_000;
+        }
+        ((self.conf as u128) * 10_000 / self.price as u128).min(10_000) as u64
+    }
 }
 
 #[cfg(test)]

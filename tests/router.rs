@@ -691,6 +691,53 @@ fn leverage_follows_the_assets_tier() {
     assert_eq!((a.a_long, a.a_short), (percolator::ADL_ONE, percolator::ADL_ONE), "before Percolator's own liquidation");
 }
 
+/// The risk dial (`percolator_router::risk`): while Pyth's confidence interval is wide, a trader
+/// needs twice the margin to open and the vault gives a growing fill half the room. Closing is
+/// never held back.
+#[test]
+fn a_wide_confidence_interval_halves_leverage_and_the_vaults_room() {
+    let trader = |w: &mut World, i: usize, usdc: u64| {
+        let u = w.new_user(100_000_000);
+        let t = rclient::TraderKeys::new(w.env.market, u.kp.pubkey());
+        let mint = w.env.mint;
+        w.send(vec![rclient::open_account(&t, &mint), rclient::open_ledger(&t.wallet, &t), rclient::deposit(&t, &u.collateral, &w.env.vault, usdc)], &[&u.kp]).unwrap();
+        w.traders.insert(i, (u, t));
+    };
+    let mut w = live_at(MarketConfig { maintenance_margin_bps: 250, initial_margin_bps: 500, max_price_move_bps_per_slot: 24, ..devnet_like_config() });
+    let set = rclient::set_tier(&w.payer.pubkey(), &w.vault, &w.env.market);
+    w.send(vec![set], &[]).unwrap();
+    // 0.5 USDC on the default tier (10x): 4 units at 1.00 is 8x.
+    trader(&mut w, 7, 500_000);
+    w.pyth_conf_bps = 30; // dial 2: at most 5x
+    w.taker_trade(7, 4 * UNIT as i128).unwrap();
+    assert_eq!(w.book().price_dial, 2);
+    assert_eq!(position(&w, 7), 0, "8x is refused while the sources disagree");
+    w.taker_trade(7, 2 * UNIT as i128).unwrap();
+    assert_eq!(position(&w, 7), 2 * UNIT as i128, "4x still trades");
+    w.pyth_conf_bps = 0;
+    w.taker_trade(7, 2 * UNIT as i128).unwrap();
+    assert_eq!(w.book().price_dial, 1);
+    assert_eq!(position(&w, 7), 4 * UNIT as i128, "back to normal once they agree");
+
+    // The vault's room: the same large order fills about half as much at dial 2.
+    let big = |conf: u64| {
+        let mut w = live_at(MarketConfig { maintenance_margin_bps: 250, initial_margin_bps: 500, max_price_move_bps_per_slot: 24, ..devnet_like_config() });
+        trader(&mut w, 9, 50_000_000);
+        w.pyth_conf_bps = conf;
+        w.taker_trade(9, 40 * UNIT as i128).unwrap();
+        position(&w, 9)
+    };
+    let (calm, wide) = (big(0), big(30));
+    assert!(calm > 0 && wide > 0, "{calm} {wide}");
+    assert!((wide - calm / 2).abs() <= 1, "half the room: {calm} -> {wide}");
+
+    // Closing is not dialled: a 4-dial price still closes the whole position.
+    w.pyth_conf_bps = 90;
+    w.taker_trade(7, -4 * UNIT as i128).unwrap();
+    assert_eq!(w.book().price_dial, 4);
+    assert_eq!(position(&w, 7), 0);
+}
+
 /// The mark's circuit breaker: a price further from the mark than a market moves in the time
 /// between the two is refused, a real move that large is accepted once that time has passed.
 #[test]
@@ -702,7 +749,7 @@ fn a_price_too_far_from_the_mark_for_the_time_passed_is_refused() {
     assert!(within_band(1_000_000, 975_000, 1) && !within_band(1_000_000, 974_999, 1));
     assert!(!within_band(1_000_000, 500_000, 95) && within_band(1_000_000, 500_000, 96));
 
-    let mut w = live();
+    let mut w = live_at(MarketConfig { maintenance_margin_bps: 250, initial_margin_bps: 500, max_price_move_bps_per_slot: 24, ..devnet_like_config() });
     w.taker_trade(0, UNIT as i128).unwrap();
     let b = w.book();
     let (t0, p0) = (b.mark_publish_time, b.mark_price);
