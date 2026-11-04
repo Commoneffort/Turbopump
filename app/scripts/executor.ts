@@ -771,6 +771,8 @@ async function watch(vaults: C.Vault[], market: Uint8Array, full: boolean, maint
     const o = owners.get(p.pubkey.toBase58());
     if (!o || o.hasPending || busy.has(p.pubkey.toBase58())) continue;
     const h = C.accountHealth(snap.market, p.data, debt(p.pubkey));
+    // Back above its level (or closed): its next liquidation, if any, starts a new wait.
+    if (!h.liquidatable && h.settled) liquidationQueuedAt.delete(p.pubkey.toBase58());
     if (!h.liquidatable || !overdue(`liquidate ${p.pubkey.toBase58()}`)) continue;
     // Close the largest position first; the next pass looks again.
     const worst = h.positions.reduce((a, b) => (b.notional > a.notional ? b : a));
@@ -778,7 +780,9 @@ async function watch(vaults: C.Vault[], market: Uint8Array, full: boolean, maint
     if (!v || C.closeOnly(snap.market, v.assetIndex)) continue;
     const d = due.get(v.key.toBase58()) ?? due.set(v.key.toBase58(), { v, ixs: [], why: [] }).get(v.key.toBase58())!;
     d.ixs.push(C.requestClose(payer.publicKey, o.wallet, v.key, o.sub));
-    liquidationQueuedAt.set(p.pubkey.toBase58(), Date.now());
+    // The first time only: a router liquidation that keeps filling nothing (the vault has no room
+    // on that side) is queued again on every scan, and must not hold the backstop off for ever.
+    if (!liquidationQueuedAt.has(p.pubkey.toBase58())) liquidationQueuedAt.set(p.pubkey.toBase58(), Date.now());
     d.why.push(`(equity ${(Number(h.equity) / 1e6).toFixed(2)} on ${(Number(h.notional) / 1e6).toFixed(2)} notional) ${v.feed?.symbol} for ${o.wallet.toBase58().slice(0, 6)}${o.sub ? ` (isolated ${o.sub})` : ""}`);
   }
   // Accounts whose booked value still looks fine but whose positions have lost since they were
