@@ -131,9 +131,9 @@ fn foreign_lp_cannot_route_fills_through_the_vault() {
 
 #[test]
 fn inventory_cap_limits_fills() {
-    // 10 USDC of NAV at 1.00, on the test feed (a major in test builds): a fill adds up to 7.5
-    // units (0.75x NAV) when the vault is flat, less the fuller it is; ordinary trades stop at 24
-    // units (80% of the 3x position limit), the rest is kept for trades that close a position.
+    // 10 USDC of NAV at 1.00, on the test feed (a major in test builds): a fill adds up to 5
+    // units (0.5x NAV) when the vault is flat, less the fuller it is; ordinary trades stop at 16
+    // units (80% of the 2x position limit), the rest is kept for trades that close a position.
     // 10% margin, so the vault's own caps bind before Percolator's margin check.
     let mut w = World::with_config(devnet_like_config());
     w.env.warp_to_slot(5);
@@ -142,7 +142,7 @@ fn inventory_cap_limits_fills() {
     w.deposit(&alice, 10_000_000).unwrap();
     w.advance(EPOCH_LEN, INITIAL_PRICE);
     w.roll().unwrap();
-    let (full, room, per_fill) = (30 * UNIT as i128, 24 * UNIT as i128, 7_500_000i128);
+    let (full, room, per_fill) = (20 * UNIT as i128, 16 * UNIT as i128, 5_000_000i128);
     w.taker_trade(0, 10 * UNIT as i128).unwrap();
     assert_eq!({ w.vault_state().inventory }, -per_fill, "per-fill cap, flat vault");
     // Each further buy gets the per-fill cap times the share of the limit still free.

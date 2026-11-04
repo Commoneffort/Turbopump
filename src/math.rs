@@ -225,8 +225,8 @@ mod tests {
         assert_eq!(d(9_900_000, 1, false).0, 250_000);
         // A fill that shrinks the vault's position is not scaled.
         assert_eq!(d(5_000_000, -1, false).0, 2_500_000);
-        // Majors keep 3x and 0.75x; stocks get the default's.
-        assert_eq!(fill_caps(nav, position_nav_bps(TIER_MAJOR), fill_nav_bps(TIER_MAJOR), price, 0, 1, true), (7_500_000, 30_000_000));
+        // Majors keep 2x and 0.5x; stocks get the default's.
+        assert_eq!(fill_caps(nav, position_nav_bps(TIER_MAJOR), fill_nav_bps(TIER_MAJOR), price, 0, 1, true), (5_000_000, 20_000_000));
         assert_eq!(position_nav_bps(TIER_STOCK), position_nav_bps(TIER_DEFAULT));
     }
 

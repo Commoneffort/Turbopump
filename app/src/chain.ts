@@ -864,7 +864,7 @@ export function accountHealth(market: Uint8Array, portfolio: Uint8Array, debt = 
   const P = L.portfolio;
   const at = (a: number) => L.market.slots + a * L.market.slot_len + L.market.engine;
   const positions: { asset: number; size: bigint; price: bigint; notional: bigint }[] = [];
-  let settled = true, notional = 0n;
+  let settled = true, notional = 0n, unbooked = 0n;
   for (let i = 0; i < 16; i++) {
     const leg = P.legs + i * P.leg_len;
     if (portfolio[leg + L.leg.active] !== 1) continue;
@@ -874,6 +874,17 @@ export function accountHealth(market: Uint8Array, portfolio: Uint8Array, debt = 
     const n = (size < 0n ? -size : size) * price / UNIT;
     const long = portfolio[leg + L.leg.side] === 0;
     if (u64(portfolio, leg + L.leg.kf_epoch_snap) < u64(market, at(asset) + (long ? L.market.kf_epoch_long : L.market.kf_epoch_short))) settled = false;
+    // The profit or loss the price has made since the account was last re-valued, which its
+    // capital and PnL do not show yet: |basis| x (K now - K then) / (A at the basis x POS_SCALE),
+    // as Percolator books it when the account is next touched (funding is off, so F is left out).
+    const sameEpoch = u64(portfolio, leg + L.leg.epoch_snap) === u64(market, at(asset) + (long ? L.market.epoch_long : L.market.epoch_short));
+    const aBasis = u128(portfolio, leg + L.leg.a_basis);
+    if (sameEpoch && aBasis > 0n) {
+      const q = i128(portfolio, leg + L.leg.basis_pos_q);
+      const kNow = i128(market, at(asset) + (long ? L.market.k_long : L.market.k_short));
+      const dk = kNow - i128(portfolio, leg + L.leg.k_snap);
+      unbooked += ((q < 0n ? -q : q) * dk) / (aBasis * UNIT);
+    }
     notional += n;
     if (size !== 0n) positions.push({ asset, size, price, notional: n });
   }
@@ -881,7 +892,12 @@ export function accountHealth(market: Uint8Array, portfolio: Uint8Array, debt = 
   const equity = u128(portfolio, P.capital) + i128(portfolio, P.pnl) - debt;
   // Below the sum of each position's notional times its tier's liquidation level (router `liquidatable`).
   const floor = positions.reduce((t, p) => t + p.notional * levels(market, p.asset).liq, 0n);
-  return { equity, notional, settled, positions, floor: floor / 10_000n, liquidatable: settled && notional > 0n && (equity <= 0n || equity * 10_000n < floor) };
+  // `estimate`: the equity at today's price, booked or not. `near`: re-valued now, it would be
+  // below its liquidation level, or within 25% of it, so it should be re-valued before the next
+  // move rather than whenever its turn comes.
+  const estimate = equity + unbooked;
+  const near = notional > 0n && (estimate <= 0n || estimate * 10_000n * 4n < floor * 5n);
+  return { equity, estimate, near, notional, settled, positions, floor: floor / 10_000n, liquidatable: settled && notional > 0n && (equity <= 0n || equity * 10_000n < floor) };
 }
 
 // ---- tiers (the vault's `feeds` and the router's `levels`): majors open at 20x, stocks at 5x,
@@ -893,8 +909,8 @@ export const tierOfFeed = (hex: string) => (MAJOR_FEEDS.includes(hex) ? TIER_MAJ
 export const TIER_NAME = ["standard", "major", "stock"];
 const tierRow = (key: string, tier: number, fallback: number) => Number(((L.router as any)[key] as number[] | undefined)?.[tier] ?? fallback);
 export const tierInsuranceBps = (tier: number) => tierRow("insurance_nav_bps", tier, tier === TIER_MAJOR ? 300 : 800);
-export const tierPositionBps = (tier: number) => tierRow("tier_position_nav_bps", tier, tier === TIER_MAJOR ? 30_000 : 10_000);
-export const tierFillBps = (tier: number) => tierRow("tier_fill_nav_bps", tier, tier === TIER_MAJOR ? 7_500 : 2_500);
+export const tierPositionBps = (tier: number) => tierRow("tier_position_nav_bps", tier, tier === TIER_MAJOR ? 20_000 : 10_000);
+export const tierFillBps = (tier: number) => tierRow("tier_fill_nav_bps", tier, tier === TIER_MAJOR ? 5_000 : 2_500);
 export const tiersAddress = () => rpda(Buffer.from("tiers"), MARKET.toBuffer());
 /** The market's tier record as last read with the market (fetchVault, marketSnapshot, fetchTiers). */
 let TIERS: Uint8Array | null = null;

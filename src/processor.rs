@@ -59,7 +59,7 @@ pub const INSURANCE_NAV_BPS: u64 = 0;
 /// that ordinary withdrawals can be paid without closing the vault's position first. Percolator
 /// only pays capital out of a flat account, so this cash is all a withdrawal can use while the
 /// vault holds a position; at 10% the test networks' vaults went reduce-only about once an hour.
-/// The 70% left in Percolator still margins a position of 3x the vault's value many times over
+/// The 70% left in Percolator still margins a position of 2x the vault's value many times over
 /// (initial margin 5%), and `TopUpMargin` moves the reserve in if the vault's margin runs thin.
 /// The test build keeps 10%, which its numbers are written for.
 #[cfg(feature = "devnet")]
@@ -77,8 +77,10 @@ pub const TOPUP_TO_BPS: u64 = 6_000;
 /// market's base fee only (the caller's fee is ignored there). What providers earn is that base
 /// fee, through the asset's insurance.
 pub const CANON_SPREAD_BPS: u16 = 10;
-pub const CANON_POSITION_NAV_BPS: u16 = 30_000; // position up to 3x the vault's NAV
-pub const CANON_FILL_NAV_BPS: u16 = 7_500; // each fill up to 0.75x the vault's NAV
+// The widest a canonical vault can be (majors: see `feeds`); vaults created before 2026-11-04 store
+// 3x and 0.75x, and the matcher holds them to their feed's tier anyway.
+pub const CANON_POSITION_NAV_BPS: u16 = 20_000; // position up to 2x the vault's NAV
+pub const CANON_FILL_NAV_BPS: u16 = 5_000; // each fill up to 0.5x the vault's NAV
 #[cfg(feature = "devnet")]
 pub const CANON_MATCHER_TTL_SLOTS: u64 = 216_000;
 #[cfg(not(feature = "devnet"))]

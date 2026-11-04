@@ -362,8 +362,8 @@ function LaunchPage({ send, busy, go, initial, focus }: { send: Send; busy?: str
       </section>
       <section className="card">
         <h3>The rules every market gets</h3>
-        <div className="row"><span>Vault position limit</span><b>3× its NAV</b></div>
-        <div className="row"><span>Most new exposure per order</span><b>0.75× its NAV (closing is not limited)</b></div>
+        <div className="row"><span>Vault position limit</span><b>2× its NAV on BTC and ETH, 1× elsewhere</b></div>
+        <div className="row"><span>Most new exposure per order</span><b>0.5× its NAV on BTC and ETH, 0.25× elsewhere (closing is not limited)</b></div>
         <div className="row"><span>Cash kept for withdrawals</span><b>10% of its NAV</b></div>
         <div className="row"><span>Epoch</span><b>about {Math.round(C.CANON_EPOCH_LEN_SLOTS * C.slotSeconds() / 60)} minutes</b></div>
         <div className="row"><span>Insurance kept for traders</span><b>$100</b></div>

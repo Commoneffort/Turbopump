@@ -198,7 +198,7 @@ export default {
     "stress_bps": 0,
     "tier_fill_nav_bps": [
       2500,
-      7500,
+      5000,
       2500
     ],
     "tier_levels": [
@@ -217,7 +217,7 @@ export default {
     ],
     "tier_position_nav_bps": [
       10000,
-      30000,
+      20000,
       10000
     ],
     "tier_slots": 64,

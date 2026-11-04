@@ -115,13 +115,14 @@ pub fn cap_tier(feed: &[u8; 32]) -> u8 {
     tier_of_feed(feed)
 }
 
-/// The most the vault may hold on a feed, as basis points of its value in notional.
+/// The most the vault may hold on a feed, as basis points of its value in notional. Majors 2x
+/// (3x until 2026-11-04: a 30% move against a full vault then cost 90% of it; at 2x, 60%).
 pub fn position_nav_bps(tier: u8) -> u16 {
-    if tier == TIER_MAJOR { 30_000 } else { 10_000 }
+    if tier == TIER_MAJOR { 20_000 } else { 10_000 }
 }
 /// The most one fill may add to the vault's position, as basis points of its value in notional.
 pub fn fill_nav_bps(tier: u8) -> u16 {
-    if tier == TIER_MAJOR { 7_500 } else { 2_500 }
+    if tier == TIER_MAJOR { 5_000 } else { 2_500 }
 }
 /// The share of the vault's value its asset's insurance keeps (deployed builds; the test build
 /// keeps only the floor, see `processor::INSURANCE_NAV_BPS`).

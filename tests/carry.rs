@@ -25,8 +25,10 @@ fn live() -> World {
     let mut w = World::with_config(devnet_like_config());
     w.env.set_clock(5, 1_000);
     w.operate();
+    // 75 USDC: with the major tier's 2x limit, the vault holds up to 150 units at 1.00 and one
+    // fill adds up to 37.5 (0.5x), the numbers the tests below are written for.
     let alice = w.new_user(100_000_000);
-    w.deposit(&alice, 50_000_000).unwrap();
+    w.deposit(&alice, 75_000_000).unwrap();
     w.advance(EPOCH_LEN, INITIAL_PRICE);
     w.roll().unwrap();
     w.claim(&alice, 0).unwrap();
@@ -61,7 +63,7 @@ fn capital(w: &World, taker: usize) -> u128 {
     let d = w.env.svm.get_account(&w.taker_portfolio(taker)).unwrap().data;
     perc::portfolio_exposure(&d).unwrap().0
 }
-/// Trades `size` in steps of 30 units (one fill may add at most 0.75x the vault's value, 37.5
+/// Trades `size` in steps of 30 units (one fill may add at most 0.5x the vault's value, 37.5
 /// units here).
 fn trade(w: &mut World, taker: usize, size: i128) {
     let mut left = size;

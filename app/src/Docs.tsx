@@ -292,8 +292,8 @@ export default function Docs() {
         <p>Every market opened here runs on the same fixed template, so nobody can open a market set up to fail. The program ignores whatever parameters the opener sends.</p>
         <table className="doc-table">
           <tbody>
-            <tr><td>Vault position limit</td><td>By the feed's tier: 3× the vault's value in notional on BTC and ETH, 1× on everything else. Ordinary trades may use 80% of it; the last 20% is kept for trades that close a trader's position, liquidations among them, so a liquidation is never refused because the vault is full.</td></tr>
-            <tr><td>Most new exposure per fill</td><td>0.75× the vault's value on BTC and ETH, 0.25× on the rest, when the vault is flat; less the fuller it is on that side (half full: half as much; never under a tenth). The part of a fill that shrinks the vault's position is not limited.</td></tr>
+            <tr><td>Vault position limit</td><td>By the feed's tier: 2× the vault's value in notional on BTC and ETH, 1× on everything else. Ordinary trades may use 80% of it; the last 20% is kept for trades that close a trader's position, liquidations among them, so a liquidation is never refused because the vault is full.</td></tr>
+            <tr><td>Most new exposure per fill</td><td>0.5× the vault's value on BTC and ETH, 0.25× on the rest, when the vault is flat; less the fuller it is on that side (half full: half as much; never under a tenth). The part of a fill that shrinks the vault's position is not limited.</td></tr>
             <tr><td>Value the limits use</td><td>The lower of the vault's value at its last roll and its value now (its equity in Percolator, read when each fill is armed): a vault that has lost since its last roll takes trades for what it is worth now.</td></tr>
             <tr><td>Epoch</td><td>{CANON_EPOCH_LEN_SLOTS.toLocaleString()} slots (about {Math.round(CANON_EPOCH_LEN_SLOTS * slotSeconds() / 60)} minutes at the current slot time) on devnet</td></tr>
             <tr><td>Insurance kept</td><td>100 USDC or a share of the vault's value, whichever is more: 3% on BTC and ETH, 8% on everything else, which moves more. Kept in insurance for traders; only fees above it are harvested.</td></tr>
@@ -341,7 +341,7 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           <p>
             <b>Why that is fine for now.</b> On other exchanges funding mainly keeps the perp's price close to the index. Here a
             trade always fills at the oracle price itself, so there is no gap to close: funding would only pay the vault for
-            carrying a one-sided market. Until it is back, the vault's own limits do that job: a cap on its position (3× its value
+            carrying a one-sided market. Until it is back, the vault's own limits do that job: a cap on its position (2× its value
             on BTC and ETH, 1× elsewhere), smaller fills the fuller it is on one side, and 20% of its limit kept for closes and
             liquidations (see Market rules). <b>What brings it back:</b> a change in Percolator so that a funding payment alone
             no longer blocks new trades (each position would take its funding when it is next settled, instead of every position
@@ -445,7 +445,7 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
 
         <h2 id="risks">Risks</h2>
         <ul>
-          <li><b>Directional.</b> If traders win overall, depositors lose. Caps bound the vault's exposure to 3× its value on BTC and ETH and 1× elsewhere: on BTC a 33% move against a full vault would cost it all of its value; on the rest that takes a move of 100%.</li>
+          <li><b>Directional.</b> If traders win overall, depositors lose. Caps bound the vault's exposure to 2× its value on BTC and ETH and 1× elsewhere: on BTC a 33% move against a full vault would cost it all of its value; on the rest that takes a move of 100%.</li>
           <li><b>Chain clock.</b> A request's target comes from the chain clock (or the mark time, if later). The {ROUTER_DELAY_SECS}-second delay assumes the clock does not run more than a few seconds behind real time; Solana's clock normally tracks it within a second or two.</li>
           <li><b>A request that cannot fill.</b> If a request cannot fill (for example because the price moved during the wait and the account can no longer afford it), the mark waits at its price until it expires, at most {ROUTER_GRACE_SECS} seconds, before moving on. The requester loses the bond; liquidations on that market wait that long.</li>
           <li><b>Executors.</b> Filling needs someone to fetch each target-time Pyth update from Hermes (which needs a Pyth API key; the free plan covers every market listed here) and send the transactions. Keeping marks fresh between trades uses Pyth's free sponsored feed accounts. Anyone with a key can run an executor; if nobody does, requests expire and nothing trades.</li>

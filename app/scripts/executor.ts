@@ -483,6 +483,14 @@ async function tune(lagCrank: TransactionInstruction, k: number, settle: Transac
   return `simulation kept changing: ${seen.join("; ")}`;
 }
 
+/** When a router liquidation was last queued for an account (`watch`): its backstop waits for it. */
+const liquidationQueuedAt = new Map<string, number>();
+/** When an account close to its liquidation level was last re-valued ahead of its turn (`watch`). */
+const revaluedAt = new Map<string, number>();
+/** How long the backstop leaves an account whose router liquidation is queued, while it still has
+ *  money left: the router closes it against the vault at the next price (4 to 6 s), and Percolator's
+ *  own liquidation would put the whole market on closing only. */
+const BACKSTOP_WAIT_MS = 15_000;
 /** When the backstop crank (`watch`) was last sent for an account. */
 const backstopAt = new Map<string, number>(), backstopTries = new Map<string, number>();
 /** How many liquidations are queued in one transaction (`watch`). */
@@ -770,7 +778,28 @@ async function watch(vaults: C.Vault[], market: Uint8Array, full: boolean, maint
     if (!v || C.closeOnly(snap.market, v.assetIndex)) continue;
     const d = due.get(v.key.toBase58()) ?? due.set(v.key.toBase58(), { v, ixs: [], why: [] }).get(v.key.toBase58())!;
     d.ixs.push(C.requestClose(payer.publicKey, o.wallet, v.key, o.sub));
+    liquidationQueuedAt.set(p.pubkey.toBase58(), Date.now());
     d.why.push(`(equity ${(Number(h.equity) / 1e6).toFixed(2)} on ${(Number(h.notional) / 1e6).toFixed(2)} notional) ${v.feed?.symbol} for ${o.wallet.toBase58().slice(0, 6)}${o.sub ? ` (isolated ${o.sub})` : ""}`);
+  }
+  // Accounts whose booked value still looks fine but whose positions have lost since they were
+  // last re-valued (`accountHealth.estimate`), to below their level or close to it. The router
+  // only liquidates on booked values, and the routine re-valuing reaches every account only every
+  // 30 s or so: these are re-valued now (a crank of the account books its profit and loss), so the
+  // next scan, 6 s later, can queue their liquidation before they fall to Percolator's own level.
+  const ahead: { pubkey: PublicKey; assets: number[]; why: string }[] = [];
+  for (const p of snap.portfolios) {
+    const o = owners.get(p.pubkey.toBase58());
+    if (!o || o.hasPending || busy.has(p.pubkey.toBase58())) continue;
+    const h = C.accountHealth(snap.market, p.data, debt(p.pubkey));
+    if (h.liquidatable || !h.near || !h.settled) continue;
+    const k = p.pubkey.toBase58();
+    if (Date.now() - (revaluedAt.get(k) ?? 0) < 10_000) continue;
+    revaluedAt.set(k, Date.now());
+    ahead.push({ pubkey: p.pubkey, assets: h.positions.map(q => q.asset), why: `${o.wallet.toBase58().slice(0, 6)} (${(Number(h.estimate) / 1e6).toFixed(2)} at today's price against a level of ${(Number(h.floor) / 1e6).toFixed(2)})` });
+  }
+  for (let i = 0; i < ahead.length; i += LIQ_PER_TX) {
+    const part = ahead.slice(i, i + LIQ_PER_TX);
+    await send(`re-value ${part.length} account(s) close to liquidation: ${part.map(a => a.why).join("; ")}`, part.map(a => C.crank(payer.publicKey, a.pubkey, a.assets)), false);
   }
   const sends: Promise<boolean>[] = [];
   for (const { ixs, why } of due.values()) {
@@ -796,6 +825,10 @@ async function watch(vaults: C.Vault[], market: Uint8Array, full: boolean, maint
     for (const q of h.positions) need += q.notional * C.levels(snap.market, q.asset).mm;
     if (h.equity * 10_000n >= need) continue;
     const k = p.pubkey.toBase58();
+    // A router liquidation of it is queued and it still has money left: that closes it against
+    // the vault in a few seconds and keeps the market open; Percolator's own would not. Only
+    // once it is past zero, or the close has not happened in BACKSTOP_WAIT_MS, does the backstop go.
+    if (h.equity > 0n && Date.now() - (liquidationQueuedAt.get(k) ?? 0) < BACKSTOP_WAIT_MS) continue;
     if (Date.now() - (backstopAt.get(k) ?? 0) < 30_000 || !overdue(`backstop ${k}`)) continue;
     // An account already past zero is not closed by a crank (only one with something left is);
     // it is tried a few times, then left to the router's close-out and logged once.

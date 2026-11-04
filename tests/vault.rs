@@ -802,7 +802,7 @@ fn pyth_push_feed_address_derivation() {
 
 #[test]
 fn canonical_vaults_are_unique_per_feed_and_scale_with_nav() {
-    // 10% margin, so the vault's own 3x-NAV cap binds before Percolator's margin check.
+    // 10% margin, so the vault's own 2x-NAV cap binds before Percolator's margin check.
     let mut w = World::with_config(devnet_like_config());
     w.env.set_clock(5, 1_000);
     w.env.update_market_init_fee_policy(LISTING_FEE as u128).unwrap();
@@ -839,18 +839,18 @@ fn canonical_vaults_are_unique_per_feed_and_scale_with_nav() {
     w.taker_trade_asset(0, asset, 5 * UNIT as i128).unwrap();
     assert_eq!({ w.vault_state().inventory }, 0, "no NAV, no fills");
 
-    // 20 USDC of NAV at $1 (the test feed has a major's limits): fills up to 15 units (0.75x) when
-    // flat and less the fuller the vault is; ordinary trades stop at 48 units (80% of 3x).
+    // 20 USDC of NAV at $1 (the test feed has a major's limits): fills up to 10 units (0.5x) when
+    // flat and less the fuller the vault is; ordinary trades stop at 32 units (80% of 2x).
     w.deposit(&alice, 20_000_000).unwrap();
     w.advance_oracle(pyth, EPOCH_LEN, &mut ts, 100_000_000);
     w.roll().unwrap();
     w.taker_trade_asset(0, asset, 40 * UNIT as i128).unwrap();
-    assert_eq!({ w.vault_state().inventory }, -15 * UNIT as i128, "per-fill cap is 0.75x NAV");
+    assert_eq!({ w.vault_state().inventory }, -10 * UNIT as i128, "per-fill cap is 0.5x NAV");
     for _ in 0..40 {
         w.advance_oracle(pyth, 1, &mut ts, 100_000_000);
         w.taker_trade_asset(0, asset, 40 * UNIT as i128).unwrap();
     }
-    assert_eq!({ w.vault_state().inventory }, -48 * UNIT as i128, "ordinary trades use 80% of the 3x limit");
+    assert_eq!({ w.vault_state().inventory }, -32 * UNIT as i128, "ordinary trades use 80% of the 2x limit");
 }
 
 // ---------------------------------------------------------------- retiring idle markets
