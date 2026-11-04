@@ -468,7 +468,7 @@ function VaultCapacity({ state }: { state: C.State }) {
       <div className="skew">
         <div className="skew-l"><span>Vault position</span><b className="mono">{v.inventory === 0n ? "flat" : `${v.inventory > 0n ? "long" : "short"} ${units(abs(v.inventory))} ${sym}`}</b></div>
         <div className="skew-track"><i style={{ left: `${at}%` }} /><em /></div>
-        <div className="skew-ends mono"><span>−{units(limit)}</span><span title={`Its limit is ${v.positionNavBps ? fmt(Number(v.positionNavBps) / 10_000, 2).replace(/\.?0+$/, "") : "3"}× the vault's liquidity (3× for BTC and ETH, 1× for the rest). Near 100% used, it only takes trades that bring it back.`}>{PULSE.crowd && limit > 0n ? `${fmt(Math.min(100, Number(abs(v.inventory) * 1000n / limit) / 10), 1)}% of limit used` : `limit ${v.positionNavBps ? fmt(Number(v.positionNavBps) / 10_000, 2).replace(/\.?0+$/, "") : "3"}× liquidity`}</span><span>+{units(limit)}</span></div>
+        <div className="skew-ends mono"><span>−{units(limit)}</span><span title={`Its limit is ${fmt(Math.min(Number(v.positionNavBps || 20_000), C.tierPositionBps(C.tierOfFeed(v.feedHex))) / 10_000, 2).replace(/\.?0+$/, "")}× the vault's liquidity (2× for BTC and ETH, 1× for the rest). Near 100% used, it only takes trades that bring it back.`}>{PULSE.crowd && limit > 0n ? `${fmt(Math.min(100, Number(abs(v.inventory) * 1000n / limit) / 10), 1)}% of limit used` : `limit ${v.positionNavBps ? fmt(Number(v.positionNavBps) / 10_000, 2).replace(/\.?0+$/, "") : "3"}× liquidity`}</span><span>+{units(limit)}</span></div>
       </div>
       <Stress state={state} />
       </div>
