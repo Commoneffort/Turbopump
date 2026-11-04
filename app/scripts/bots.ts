@@ -130,6 +130,13 @@ async function send(label: string, kp: Keypair, ixs: TransactionInstruction[], e
 }
 /** Runs a transaction without sending it, and returns its program error code (or "ok"). */
 async function wouldFail(kp: Keypair, ixs: TransactionInstruction[]): Promise<string> {
+  return (await simulate(kp, ixs)).code;
+}
+
+/** `wouldFail`, also returning the accounts in `read` as the simulation saw them (after it ran):
+ *  the clock there is the one the program checked, which a separate read on a public RPC is not
+ *  (its servers are at different blocks). */
+async function simulate(kp: Keypair, ixs: TransactionInstruction[], read: PublicKey[] = []): Promise<{ code: string; seen: (Uint8Array | null)[] }> {
   const tx = new Transaction().add(...ixs);
   tx.feePayer = kp.publicKey;
   tx.recentBlockhash = (await conn.getLatestBlockhash()).blockhash;
@@ -137,11 +144,12 @@ async function wouldFail(kp: Keypair, ixs: TransactionInstruction[]): Promise<st
   // not all at the same block, and one that has not seen the blockhash yet says so) is asked again,
   // and reported as "rpc" if it stays: nothing was learned about the program, so nothing is judged.
   for (let i = 0; ; i++) {
-    const r = await conn.simulateTransaction(tx, [kp]).catch(() => null);
-    if (r && !r.value.err) return "ok";
+    const r = await conn.simulateTransaction(tx, [kp], read.length ? read : undefined).catch(() => null);
+    const seen = (r?.value.accounts ?? []).map(a => (a ? new Uint8Array(Buffer.from(a.data[0], "base64")) : null));
+    if (r && !r.value.err) return { code: "ok", seen };
     const code = r && ((r.value.logs ?? []).map(l => l.match(/custom program error: (0x[0-9a-f]+)/)?.[1]).filter(Boolean).pop() ?? JSON.stringify(r.value.err));
-    if (code && !/BlockhashNotFound|AccountNotFound/.test(code)) return code;
-    if (i === 2) return "rpc";
+    if (code && !/BlockhashNotFound|AccountNotFound/.test(code)) return { code, seen };
+    if (i === 2) return { code: "rpc", seen: [] };
     await new Promise(res => setTimeout(res, 1500));
     tx.recentBlockhash = (await conn.getLatestBlockhash()).blockhash;
   }
@@ -187,9 +195,11 @@ function depositFloat(pk: PublicKey) {
   if (!floats.size) for (const b of BOTS) floats.set(wallet(b.name).publicKey.toBase58(), NO_FLOAT.includes(b.kind) ? 0 : Number(C.expiryDeposit(BigInt(b.usdc * 5) * C.UNIT, 1_000_000n)));
   return floats.get(pk.toBase58()) ?? Number(C.expiryDeposit(2_000n * C.UNIT, 1_000_000n));
 }
-// Below this the paying wallet is reported on every pass (PAYER_WARN to change it): about a day
-// of what the services were measured to spend (X1 ~270 XNT a day with 19 markets, devnet ~1 SOL).
-const PAYER_WARN = Number(process.env.PAYER_WARN ?? (C.X1 ? 300 : 1.5));
+// Below this the paying wallet is reported on every pass (PAYER_WARN to change it). The watchdog
+// keeps that wallet topped up from the treasury between 80 and 150 XNT on X1 (2 and 4 SOL on
+// devnet) and warns below 60 XNT (1.5 SOL): the same warning level here. (It was 300 XNT, a day of
+// fees with 19 markets: with the watchdog's top-up that failed on every pass by design.)
+const PAYER_WARN = Number(process.env.PAYER_WARN ?? (C.X1 ? 60 : 1.5));
 async function gas(kp: Keypair, extra = 0) {
   const float = depositFloat(kp.publicKey) + extra;
   const have = await conn.getBalance(kp.publicKey);
@@ -456,9 +466,12 @@ function accounting(bot: string, symbol: string, before: C.State, after: C.State
   const span = all.reduce((m, p) => (p > m ? p : m), 0n) - all.reduce((m, p) => (p < m ? p : m), pA);
   const fee = abs(got) * pA / 1_000_000n * feeBps / 10_000n;
   const moved = held * (pA - pB) / 1_000_000n;
-  const unexplained = after.health.equity - before.health.equity + fee - moved;
+  // The fees the fill booked in the account's ledger (router `carry`: the crowded-side fee on what
+  // it grew the vault's position by, the holding fee since the last fill): equity counts them.
+  const booked = C.totalOwed(after.owed) - C.totalOwed(before.owed);
+  const unexplained = after.health.equity - before.health.equity + fee + booked - moved;
   const allowed = (abs(got) + abs(held)) * span / 1_000_000n + fee / 20n + 20_000n;
-  check(abs(unexplained) <= allowed, "a fill changes the account's value by its fee and the price move only", { bot, symbol, got, heldBefore: held, equityBefore: before.health.equity, equityAfter: after.health.equity, fee, priceMove: moved, unexplained, allowed });
+  check(abs(unexplained) <= allowed, "a fill changes the account's value by its fee and the price move only", { bot, symbol, got, heldBefore: held, equityBefore: before.health.equity, equityAfter: after.health.equity, fee, booked, priceMove: moved, unexplained, allowed });
 }
 
 async function act(bot: Bot, m: Market, feeBps: bigint) {
@@ -842,9 +855,19 @@ async function crossRoutine(bot: Bot, feeBps: bigint) {
     // system program's "insufficient funds", which says nothing about the margin rule.)
     const coinsOk = (await conn.getBalance(me)) >= Number(C.expiryDeposit(most * 97n / 100n, s.asset.price)) + C.ROUTER_BOND_LAMPORTS + 1_000_000;
     if (coinsOk && most > stepOf(s.asset.price) * 100n && most * 14n / 10n < (side > 0n ? room.long : room.short)) {
-      const under = await wouldFail(kp, [C.requestTrade(me, m.vault, side * most * 97n / 100n)]);
+      const sim = await simulate(kp, [C.requestTrade(me, m.vault, side * most * 97n / 100n)], [C.MARKET, s.portfolioKey!]);
+      const under = sim.code;
       const over = await wouldFail(kp, [C.requestTrade(me, m.vault, side * (most * 13n / 10n + 1_000_000n))]);
-      if (under !== "rpc" && over !== "rpc") check(under === "ok" && over === "0x5706", "with positions on several markets, the largest order shown is what the program accepts", { symbol: m.symbol, positions: s.openPositions, most, under, over });
+      // Refused: wrong only if the account could afford it as the simulation saw it. Between the
+      // reads and the simulation the executor may re-value it at a newer price (a loss booked, or
+      // another market's price moved): the room is worked out again from the simulation's accounts.
+      const [ms, ps] = sim.seen;
+      const roomThen = ms && ps ? C.marginRoom(ms, ps, s.vault.assetIndex) : cap;
+      const moved = under === "0x5706" && most * 97n / 100n > (roomThen > abs(held) ? roomThen - abs(held) : 0n);
+      // (An X1 RPC answering UnsupportedProgramId is about the server, not the program.)
+      const rpcNoise = (c: string) => c === "rpc" || /UnsupportedProgramId/.test(c);
+      if (moved) note({ type: "unchecked", bot: bot.name, what: "with positions on several markets, the largest order shown is what the program accepts" });
+      else if (!rpcNoise(under) && !rpcNoise(over)) check(under === "ok" && over === "0x5706", "with positions on several markets, the largest order shown is what the program accepts", { symbol: m.symbol, positions: s.openPositions, most, under, over });
     }
     const step = stepOf(s.asset.price);
     const want = closing ? -held : held !== 0n ? 0n : (Math.random() < 0.5 ? 1n : -1n) * ((cap / 4n) / step * step);
@@ -909,13 +932,13 @@ async function adversaryRoutine(bot: Bot) {
       const atMark2 = book2.markPrev < r.target && r.target <= book2.markPublish;
       const stalled = atMark2 && book2.markSet > 0 && now2 > book2.markSet + C.ROUTER_STALL_SECS - 8;
       if (now2 < r.target + C.ROUTER_GRACE_SECS - 10 && !stalled) {
-        const code = await wouldFail(kp, [C.expireRequest(me, r)]);
+        const { code, seen } = await simulate(kp, [C.expireRequest(me, r)], [SYSVAR_CLOCK_PUBKEY, C.bookAddress(v.key)]);
         // Accepted: wrong only if the request still had time when the simulation ran. On a
         // throttled RPC (public devnet) the simulation can run many seconds after the clock was
-        // read, past the request's grace or after its price had been the mark for the stall time:
-        // the clock and the queue are read once more, and such a case is not counted.
+        // read, or on a server further ahead: the clock and the queue are taken from the
+        // simulation itself, and a case where the request had run out of time there is not counted.
         if (code === "ok") {
-          const [c3, b3] = await conn.getMultipleAccountsInfo([SYSVAR_CLOCK_PUBKEY, C.bookAddress(v.key)]).catch(() => [null, null]);
+          const [c3, b3] = seen.length === 2 ? seen.map(d => (d ? { data: d } : null)) : await conn.getMultipleAccountsInfo([SYSVAR_CLOCK_PUBKEY, C.bookAddress(v.key)]).catch(() => [null, null]);
           const now3 = c3 ? Number(new DataView(c3.data.buffer, c3.data.byteOffset).getBigInt64(32, true)) : Infinity;
           const book3 = b3 ? C.decodeBook(new Uint8Array(b3.data)) : null;
           const atMark3 = !!book3 && book3.markPrev < r.target && r.target <= book3.markPublish;
@@ -1260,7 +1283,13 @@ else if (process.argv[2] === "run") {
     await sleep(15_000);
     for (let n = 0; ; n++) {
       const m = traded[n % traded.length];
-      await ordersRoutine(ob, m, feeBps).catch(e => { check(false, "the orders routine runs to its end", { symbol: m.symbol, error: String(e?.message ?? e).slice(0, 200) }); });
+      // A routine cut short by the RPC refusing requests (429: the public devnet RPC) says nothing
+      // about the programs: it is noted as unchecked, not as a failed check.
+      await ordersRoutine(ob, m, feeBps).catch(e => {
+        const error = String(e?.message ?? e).slice(0, 200);
+        if (/429|Too Many Requests|rate limit/i.test(error)) note({ type: "unchecked", bot: ob.name, what: "the orders routine runs to its end", error });
+        else check(false, "the orders routine runs to its end", { symbol: m.symbol, error });
+      });
       await sleep(PACE * 1000);
     }
   })();

@@ -1194,6 +1194,11 @@ async function serviceCovers(vaults: C.Vault[]) {
 
 // ---- standing orders ----
 const orderRetry = new Map<string, number>(); // order address -> not before (ms)
+/** Refusals in a row per order: an order the account cannot afford (it is refused for margin
+ *  every time its condition holds) is tried again later each time, 30 s doubling to 15 min, so
+ *  it does not cost a transaction simulation every pass for as long as it stands. */
+const orderFails = new Map<string, number>();
+const orderBackoff = (k: string) => { const n = (orderFails.get(k) ?? 0) + 1; orderFails.set(k, n); return Math.min(30_000 * 2 ** (n - 1), 900_000); };
 let ordersAt = 0;
 let orderCache: C.StandingOrder[] = [];
 /** Carries out the standing orders whose condition holds at their vault's mark (stop,
@@ -1233,7 +1238,7 @@ async function serviceOrders(vaults: C.Vault[], books: Map<string, C.Book>, mark
     const name = ["stop", "take-profit", "trailing stop", "limit", "TWAP"][o.kind] ?? "order";
     const ok = await send(`${what === "fire" ? "carry out" : what === "record" ? "record a better mark for" : "remove"} ${name} of ${o.wallet.toBase58().slice(0, 6)} on ${v.feed?.symbol} (mark ${Number(b.markPrice) / 1e6})`, [C.triggerOrder(payer.publicKey, o)], true);
     // Refused (not enough margin, the mark moved back): leave it a while. Done: read the orders again.
-    if (ok) { ordersAt = 0; if (what === "fire") queuedNow.add(acctKey(o)); } else orderRetry.set(o.key.toBase58(), Date.now() + 30_000);
+    if (ok) { ordersAt = 0; orderFails.delete(o.key.toBase58()); if (what === "fire") queuedNow.add(acctKey(o)); } else orderRetry.set(o.key.toBase58(), Date.now() + orderBackoff(o.key.toBase58()));
   }
 }
 
