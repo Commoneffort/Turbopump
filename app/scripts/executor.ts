@@ -420,7 +420,17 @@ async function requestsOf(v: C.Vault, b: C.Book) {
   enter("requestsOf");
   if (!b.pending.length) return [];
   const listed = (r: C.RouterRequest) => b.pending.some(p => p.id === r.id);
-  const found = (await C.pendingRequests(conn, v.key)).filter(listed);
+  // The book names its requests (since 2026-11-05): read exactly those. Only requests it does not
+  // name (queued before the book was grown) need the search through the router's accounts.
+  const named = b.pending.filter(p => p.key);
+  const found: C.RouterRequest[] = [];
+  for (let i = 0; i < named.length; i += 100) {
+    const part = named.slice(i, i + 100);
+    for (const [j, a] of (await conn.getMultipleAccountsInfo(part.map(p => p.key!))).entries()) {
+      if (a && a.data.length === C.REQUEST_LEN) { const r = C.decodeRequest(part[j].key!, new Uint8Array(a.data)); if (listed(r)) found.push(r); }
+    }
+  }
+  if (named.length < b.pending.length) found.push(...(await C.pendingRequests(conn, v.key)).filter(r => listed(r) && !found.some(x => x.id === r.id)));
   if (found.length < b.pending.length) {
     if (Date.now() - traderKeysAt > 20_000) {
       traderKeys = (await conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: C.TRADER_LEN }], dataSlice: { offset: 0, length: 0 } })).map(a => a.pubkey);
@@ -1082,7 +1092,9 @@ async function priceAndFill(v: C.Vault, b: C.Book, j: { price: bigint; publish: 
     C.postPrice(reporter.publicKey, v.feed!.id, j.price, publish, Math.min(j.prev, publish - 1)),
     C.advanceMark(v, C.reportAddress(v.feed!.id), market),
     C.crank(payer.publicKey, v.lpPortfolio, [v.assetIndex]),
-    ...(holds && moves ? [C.crank(payer.publicKey, C.routerPortfolio(r.wallet, r.sub), [v.assetIndex])] : []),
+    // (Named with every asset the trader holds: an account is re-valued as a whole, and only with
+    // all of them at the current slot in the same transaction.)
+    ...(holds && moves ? [C.crank(payer.publicKey, C.routerPortfolio(r.wallet, r.sub), [...C.portfolioAssets(new Uint8Array(pf!.data)).filter(a => a !== v.assetIndex), v.assetIndex])] : []),
     C.fillRequest(payer.publicKey, v, r, true),
   ];
   const tx = new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: 900_000 }), ...ixs);

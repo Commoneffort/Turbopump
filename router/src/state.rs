@@ -122,6 +122,47 @@ pub const BOOK_LEN: usize = core::mem::size_of::<Book>();
 /// The fields before the two request arrays, and the size of a book made before 2026-11-05.
 pub const BOOK_HEADER_LEN: usize = BOOK_LEN - 16 * MAX_PENDING;
 pub const OLD_BOOK_LEN: usize = BOOK_HEADER_LEN + 16 * OLD_MAX_PENDING;
+/// The book account (since 2026-11-05): the `Book`, then the address of each pending request in
+/// the same order as `pending_id`, so that an executor reads exactly the requests queued instead of
+/// searching all of the router's accounts. (Kept outside the struct: the program's stack is 4 KB.)
+/// An address is all zeros for a request queued before the book was grown.
+pub const BOOK_KEYS_OFF: usize = BOOK_LEN;
+pub const BOOK_ACCOUNT_LEN: usize = BOOK_KEYS_OFF + 32 * MAX_PENDING;
+
+pub fn load_book(ai: &AccountInfo, program_id: &Pubkey) -> Result<Book, ProgramError> {
+    if ai.owner != program_id || ai.data_len() != BOOK_ACCOUNT_LEN {
+        return Err(RouterError::BadAccount.into());
+    }
+    let d = ai.try_borrow_data()?;
+    if d[..8] != BOOK_MAGIC.to_le_bytes() {
+        return Err(RouterError::BadAccount.into());
+    }
+    Ok(bytemuck::pod_read_unaligned(&d[..BOOK_LEN]))
+}
+
+pub fn store_book(ai: &AccountInfo, b: &Book) -> Result<(), ProgramError> {
+    ai.try_borrow_mut_data()?[..BOOK_LEN].copy_from_slice(bytemuck::bytes_of(b));
+    Ok(())
+}
+
+/// Writes the address of the request at place `i`.
+pub fn set_book_key(ai: &AccountInfo, i: usize, key: &Pubkey) -> Result<(), ProgramError> {
+    let o = BOOK_KEYS_OFF + 32 * i;
+    ai.try_borrow_mut_data()?[o..o + 32].copy_from_slice(key.as_ref());
+    Ok(())
+}
+
+/// After `Book::remove` moved the last request (place `last`) into place `i`: its address too.
+pub fn move_book_key(ai: &AccountInfo, i: usize, last: usize) -> Result<(), ProgramError> {
+    let mut d = ai.try_borrow_mut_data()?;
+    let (from, to) = (BOOK_KEYS_OFF + 32 * last, BOOK_KEYS_OFF + 32 * i);
+    if from != to {
+        let k: [u8; 32] = d[from..from + 32].try_into().unwrap();
+        d[to..to + 32].copy_from_slice(&k);
+    }
+    d[from..from + 32].fill(0);
+    Ok(())
+}
 
 impl Book {
     pub fn earliest_target(&self) -> Option<i64> {
@@ -129,7 +170,9 @@ impl Book {
         targets[..self.len as usize].iter().copied().min()
     }
 
-    pub fn remove(&mut self, id: u64) -> Result<(), RouterError> {
+    /// Removes request `id`; returns its place and the place of the last request, which moved
+    /// into it (see `move_book_key`).
+    pub fn remove(&mut self, id: u64) -> Result<(usize, usize), RouterError> {
         let n = self.len as usize;
         let (mut ids, mut targets) = (self.pending_id, self.pending_target);
         let i = ids[..n].iter().position(|x| *x == id).ok_or(RouterError::BadAccount)?;
@@ -140,7 +183,7 @@ impl Book {
         self.pending_id = ids;
         self.pending_target = targets;
         self.len -= 1;
-        Ok(())
+        Ok((i, n - 1))
     }
 }
 

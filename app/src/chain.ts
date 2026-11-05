@@ -1119,15 +1119,18 @@ export const requestAddress = (vault: PublicKey, owner: PublicKey, settlement = 
 /** `slotTime`: the router writing this book counts in slots (an X1 router since 2026-11-05: its
  *  pending targets or its mark are slots). Detected from the values, so services keep working
  *  with the router before and after its upgrade. */
-export type Book = { vault: PublicKey; len: number; hasCarry: boolean; markSet: number; markPublish: number; markPrev: number; markPrice: bigint; nextId: bigint; pending: { id: bigint; target: number }[]; priceDial: number; slotTime: boolean };
+export type Book = { vault: PublicKey; len: number; hasCarry: boolean; markSet: number; markPublish: number; markPrev: number; markPrice: bigint; nextId: bigint; pending: { id: bigint; target: number; key?: PublicKey }[]; priceDial: number; slotTime: boolean };
 export function decodeBook(d: Uint8Array): Book {
   const b = R.book;
   const len = d[b.len];
-  // (The two request arrays fill the rest of the account: 128 places since 2026-11-05, 32 in a
-  // book not grown yet, see `growBook`.)
-  const places = Math.floor((d.length - b.pending_id) / 16);
+  // (128 places since 2026-11-05, then each request's address; 32 places and no addresses in a
+  // book not grown yet, see `growBook`. An address is zeros for a request queued before.)
+  const RA = R as any;
+  const grown = d.length === RA.book_account_len;
+  const places = grown ? R.max_pending : RA.max_pending_old ?? 32;
   const targets = b.pending_id + 8 * places;
-  const pending = Array.from({ length: len }, (_, i) => ({ id: u64(d, b.pending_id + 8 * i), target: Number(i64(d, targets + 8 * i)) }));
+  const keyAt = (i: number) => { if (!grown) return undefined; const k = new PublicKey(d.slice(RA.book_keys_off + 32 * i, RA.book_keys_off + 32 * i + 32)); return k.equals(PublicKey.default) ? undefined : k; };
+  const pending = Array.from({ length: len }, (_, i) => ({ id: u64(d, b.pending_id + 8 * i), target: Number(i64(d, targets + 8 * i)), key: keyAt(i) }));
   let markPublish = Number(i64(d, b.mark_publish_time)), markPrev = Number(i64(d, b.mark_prev_publish_time));
   const isSlot = (t: number) => t > 0 && t <= LEGACY_TIME;
   const slotTime = X1 && (isSlot(markPublish) || pending.some(p => isSlot(p.target)));
@@ -1277,7 +1280,7 @@ export const LAZY_FILLS = X1 && (typeof process === "undefined" || process.env?.
 export const rangeAddress = (vault: PublicKey) => rpda(Buffer.from("range"), vault.toBuffer());
 export const RANGE_LEN = 8 + 32 + 8 + 8 + 8 + 64 + 1 + 1 + 6;
 /** A vault's book made when books held 32 requests is grown to 128 (router tag 37; anyone may). */
-export const BOOK_LEN: number = (L.router as any).book_len;
+export const BOOK_LEN: number = (L.router as any).book_account_len;
 export const growBook = (payer: PublicKey, vault: PublicKey) => new TransactionInstruction({
   programId: ROUTER,
   keys: [rw(payer, true), rw(bookAddress(vault)), ro(SystemProgram.programId)],
@@ -1293,6 +1296,15 @@ export const decodeRange = (d: Uint8Array): PriceRange => ({
   low: u64(d, 40), high: u64(d, 48), markAt: Number(i64(d, 56)),
   indices: [0, 1, 2, 3].map(i => u128(d, 64 + 16 * i)), valid: d[128] === 1,
 });
+/** The assets a portfolio has a position (an active leg) on. */
+export function portfolioAssets(d: Uint8Array): number[] {
+  const out: number[] = [];
+  for (let i = 0; i < 16; i++) {
+    const base = L.portfolio.legs + i * L.portfolio.leg_len;
+    if (d[base + L.leg.active] === 1) out.push(u32(d, base + L.leg.asset_index));
+  }
+  return [...new Set(out)];
+}
 /** How many positions are open on an asset (both sides). */
 export function assetPositionCount(market: Uint8Array, asset: number): number {
   const e = L.market.slots + asset * L.market.slot_len + L.market.engine;

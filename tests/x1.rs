@@ -544,13 +544,13 @@ fn a_book_and_a_request_from_before_slot_time_keep_working() {
     acct.data.copy_from_slice(bytemuck::bytes_of(&r));
     w.env.svm.set_account(rk, acct).unwrap();
     let mut acct = w.env.svm.get_account(&bk).unwrap();
-    let mut b: percolator_router::state::Book = bytemuck::pod_read_unaligned(&acct.data);
+    let mut b: percolator_router::state::Book = bytemuck::pod_read_unaligned(&acct.data[..percolator_router::state::BOOK_LEN]);
     let mut targets = b.pending_target;
     targets[0] = unix_target;
     b.pending_target = targets;
     b.mark_publish_time = unix_target - 10;
     b.mark_prev_publish_time = unix_target - 11;
-    acct.data.copy_from_slice(bytemuck::bytes_of(&b));
+    acct.data[..percolator_router::state::BOOK_LEN].copy_from_slice(bytemuck::bytes_of(&b));
     w.env.svm.set_account(bk, acct).unwrap();
     assert_eq!(w.request_target(id), unix_target);
 
@@ -582,7 +582,7 @@ fn a_book_and_a_request_from_before_slot_time_keep_working() {
 
 #[test]
 fn a_book_made_for_32_requests_grows_in_place_and_keeps_its_queue() {
-    use percolator_router::state::{BOOK_HEADER_LEN, BOOK_LEN, MAX_PENDING, OLD_BOOK_LEN, OLD_MAX_PENDING};
+    use percolator_router::state::{BOOK_ACCOUNT_LEN, BOOK_HEADER_LEN, BOOK_KEYS_OFF, MAX_PENDING, OLD_BOOK_LEN, OLD_MAX_PENDING};
     let mut w = live();
     w.trader(0);
     let id = w.request(0, UNIT as i128).unwrap();
@@ -604,13 +604,40 @@ fn a_book_made_for_32_requests_grows_in_place_and_keeps_its_queue() {
     assert!(w.send(vec![rclient::fill(&w.payer.pubkey(), &k, &t0)], &[]).is_err());
     let payer = w.payer.pubkey();
     w.send(vec![rclient::grow_book(&payer, &w.vault)], &[]).unwrap();
-    assert_eq!(w.env.svm.get_account(&bk).unwrap().data.len(), BOOK_LEN);
+    assert_eq!(w.env.svm.get_account(&bk).unwrap().data.len(), BOOK_ACCOUNT_LEN);
+    // The same book, except that the queued request's address is not known (zeros).
     let grown = w.env.svm.get_account(&bk).unwrap().data;
-    let diff: Vec<usize> = (0..BOOK_LEN).filter(|i| grown[*i] != new[*i]).collect();
+    let diff: Vec<usize> = (0..BOOK_KEYS_OFF).filter(|i| grown[*i] != new[*i]).collect();
     assert!(diff.is_empty(), "grown back to exactly the same book; differs at {:?}", &diff[..diff.len().min(8)]);
+    assert!(grown[BOOK_KEYS_OFF..].iter().all(|x| *x == 0));
+    let rk = percolator_router::state::request_address(&percolator_router::id(), &w.vault, &w.traders[&0].1.owner, false).0;
+    assert_eq!(&new[BOOK_KEYS_OFF..BOOK_KEYS_OFF + 32], rk.as_ref(), "a new book names its requests");
     // Again: nothing to do.
     w.send(vec![rclient::grow_book(&payer, &w.vault)], &[]).unwrap();
     assert_eq!(w.request_target(id), target);
     w.execute(0, id).unwrap();
     assert_eq!(position(&w, 0), UNIT as i128);
+}
+
+#[test]
+fn the_book_names_each_queued_request_in_order() {
+    use percolator_router::state::{book_address, request_address, BOOK_KEYS_OFF};
+    let mut w = live();
+    for i in 0..3 { w.trader(i); }
+    let ids: Vec<u64> = (0..3).map(|i| w.request(i, UNIT as i128).unwrap()).collect();
+    let key_of = |w: &World, i: usize| request_address(&percolator_router::id(), &w.vault, &w.traders[&i].1.owner, false).0;
+    let keys = |w: &World| {
+        let d = w.env.svm.get_account(&book_address(&percolator_router::id(), &w.vault).0).unwrap().data;
+        let b = w.book();
+        (0..b.len as usize).map(|p| (b.pending_id[p], Pubkey::new_from_array(d[BOOK_KEYS_OFF + 32 * p..BOOK_KEYS_OFF + 32 * p + 32].try_into().unwrap()))).collect::<Vec<_>>()
+    };
+    assert_eq!(keys(&w), vec![(ids[0], key_of(&w, 0)), (ids[1], key_of(&w, 1)), (ids[2], key_of(&w, 2))]);
+    // The first fills: the last request takes its place, with its address.
+    w.execute(0, ids[0]).unwrap();
+    let k = keys(&w);
+    assert_eq!(k.len(), 2);
+    for (id, key) in k {
+        let i = ids.iter().position(|x| *x == id).unwrap();
+        assert_eq!(key, key_of(&w, i));
+    }
 }

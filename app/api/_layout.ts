@@ -91,6 +91,8 @@ export default {
       "pending_target": 1144,
       "vault": 8
     },
+    "book_account_len": 6264,
+    "book_keys_off": 2168,
     "book_len": 2168,
     "carry": {
       "index_long": 40,
@@ -147,6 +149,7 @@ export default {
     ],
     "max_orders": 8,
     "max_pending": 128,
+    "max_pending_old": 32,
     "min_fill_bps": 1000,
     "min_im_off": 518,
     "mm_bps_off": 550,

@@ -280,7 +280,7 @@ pub fn open_carry(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResul
     writable(book_ai)?;
     key_is(system, &system_program::ID)?;
     load_vault(vault_ai)?;
-    let mut b: Book = load(book_ai, program_id, BOOK_MAGIC)?;
+    let mut b: Book = load_book(book_ai, program_id)?;
     if b.vault != *vault_ai.key {
         return Err(RouterError::BadAccount.into());
     }
@@ -297,7 +297,7 @@ pub fn open_carry(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResul
     c.updated = Clock::get()?.unix_timestamp;
     store(carry_ai, &c)?;
     b.has_carry = 1;
-    store(book_ai, &b)
+    store_book(book_ai, &b)
 }
 
 /// `OpenLedger` (tag 33, anyone, the payer pays the rent): starts a trading account's fee

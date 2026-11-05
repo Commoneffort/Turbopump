@@ -552,7 +552,7 @@ fn sweep(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     writable(book_ai)?;
     writable(treasury)?;
     key_is(treasury, &percolator_vault::processor::TREASURY)?;
-    let _: Book = load(book_ai, program_id, BOOK_MAGIC)?;
+    let _: Book = load_book(book_ai, program_id)?;
     let keep = Rent::get()?.minimum_balance(book_ai.data_len());
     let spare = book_ai.lamports().saturating_sub(keep);
     if spare == 0 {
@@ -934,13 +934,13 @@ fn open_book(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let v = load_vault(vault_ai)?;
     let (bk, bump) = book_address(program_id, vault_ai.key);
     key_is(book_ai, &bk)?;
-    create_pda(payer, book_ai, system, program_id, BOOK_LEN, 0, &[SEED_BOOK, vault_ai.key.as_ref(), &[bump]])?;
+    create_pda(payer, book_ai, system, program_id, BOOK_ACCOUNT_LEN, 0, &[SEED_BOOK, vault_ai.key.as_ref(), &[bump]])?;
     let mut b = Book::zeroed();
     b.magic = BOOK_MAGIC;
     b.vault = *vault_ai.key;
     b.market = v.market;
     b.bump = bump;
-    store(book_ai, &b)
+    store_book(book_ai, &b)
 }
 
 /// `GrowBook` (anyone; the payer pays the extra rent): grows a book made when books held
@@ -957,18 +957,18 @@ fn grow_book(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if book_ai.owner != program_id {
         return Err(RouterError::BadAccount.into());
     }
-    if book_ai.data_len() == BOOK_LEN {
+    if book_ai.data_len() == BOOK_ACCOUNT_LEN {
         return Ok(());
     }
     if book_ai.data_len() != OLD_BOOK_LEN || book_ai.try_borrow_data()?[..8] != BOOK_MAGIC.to_le_bytes() {
         return Err(RouterError::BadAccount.into());
     }
     let old = book_ai.try_borrow_data()?.to_vec();
-    let need = Rent::get()?.minimum_balance(BOOK_LEN).saturating_sub(book_ai.lamports());
+    let need = Rent::get()?.minimum_balance(BOOK_ACCOUNT_LEN).saturating_sub(book_ai.lamports());
     if need > 0 {
         invoke(&system_instruction::transfer(payer.key, book_ai.key, need), &[payer.clone(), book_ai.clone(), system.clone()])?;
     }
-    book_ai.realloc(BOOK_LEN, true)?;
+    book_ai.realloc(BOOK_ACCOUNT_LEN, true)?;
     let mut d = book_ai.try_borrow_mut_data()?;
     let (h, n) = (BOOK_HEADER_LEN, OLD_MAX_PENDING);
     d[..h].copy_from_slice(&old[..h]);
@@ -1168,7 +1168,7 @@ fn request(program_id: &Pubkey, accounts: &[AccountInfo], mut size: i128, reduce
     key_is(system, &system_program::ID)?;
     let mut t = load_trader(program_id, trader_ai, wallet.key)?;
     let v = load_vault(vault_ai)?;
-    let mut b: Book = load(book_ai, program_id, BOOK_MAGIC)?;
+    let mut b: Book = load_book(book_ai, program_id)?;
     key_is(market, &v.market)?;
     key_is(market, &t.market)?;
     key_is(portfolio, &t.portfolio)?;
@@ -1293,10 +1293,11 @@ fn enqueue_after<'a>(
     let (mut ids, mut targets) = (b.pending_id, b.pending_target);
     ids[b.len as usize] = id;
     targets[b.len as usize] = target;
+    set_book_key(book_ai, b.len as usize, request_ai.key)?;
     b.pending_id = ids;
     b.pending_target = targets;
     b.len += 1;
-    store(book_ai, &*b)?;
+    store_book(book_ai, &*b)?;
     if let Some((trader_ai, t)) = trader {
         t.has_pending = 1;
         t.pending_vault = *vault_ai.key;
@@ -1338,7 +1339,7 @@ fn request_close(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
     key_is(system, &system_program::ID)?;
     let mut t = load_trader(program_id, trader_ai, wallet.key)?;
     let v = load_vault(vault_ai)?;
-    let mut b: Book = load(book_ai, program_id, BOOK_MAGIC)?;
+    let mut b: Book = load_book(book_ai, program_id)?;
     key_is(market, &v.market)?;
     key_is(market, &t.market)?;
     if b.vault != *vault_ai.key {
@@ -1434,7 +1435,7 @@ fn place_order(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
 
     let t = load_trader(program_id, trader_ai, wallet.key)?;
     let v = load_vault(vault_ai)?;
-    let b: Book = load(book_ai, program_id, BOOK_MAGIC)?;
+    let b: Book = load_book(book_ai, program_id)?;
     key_is(market, &v.market)?;
     key_is(market, &t.market)?;
     key_is(portfolio, &t.portfolio)?;
@@ -1558,7 +1559,7 @@ fn trigger_order(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
     // The order belongs to this trading account (a wallet may have isolated ones too).
     key_is(order_ai, &order_address(program_id, vault_ai.key, &t.owner(trader_ai.key), o.index).0)?;
     let v = load_vault(vault_ai)?;
-    let mut b: Book = load(book_ai, program_id, BOOK_MAGIC)?;
+    let mut b: Book = load_book(book_ai, program_id)?;
     key_is(market, &v.market)?;
     key_is(market, &t.market)?;
     key_is(portfolio, &t.portfolio)?;
@@ -1788,7 +1789,7 @@ fn advance(program_id: &Pubkey, accounts: &[AccountInfo], observation_sequence: 
     let (ak, abump) = authority_address(program_id);
     key_is(authority, &ak)?;
     let v = load_vault(vault_ai)?;
-    let mut b: Book = load(book_ai, program_id, BOOK_MAGIC)?;
+    let mut b: Book = load_book(book_ai, program_id)?;
     if b.vault != *vault_ai.key {
         return Err(RouterError::BadAccount.into());
     }
@@ -1897,7 +1898,7 @@ fn advance(program_id: &Pubkey, accounts: &[AccountInfo], observation_sequence: 
     b.mark_price = price;
     b.price_dial = risk::price_dial(disagreement);
     b.mark_set_time = Clock::get()?.unix_timestamp.clamp(1, u32::MAX as i64) as u32;
-    store(book_ai, &b)
+    store_book(book_ai, &b)
 }
 
 /// Fills a request at the mark, once the mark is the first Pyth price at or after the request's
@@ -1955,7 +1956,7 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         None
     };
     let order_ai = order.as_ref().map(|(a, _)| *a);
-    let mut b: Book = load(book_ai, program_id, BOOK_MAGIC)?;
+    let mut b: Book = load_book(book_ai, program_id)?;
     let v = load_vault(vault_ai)?;
     if r.vault != *vault_ai.key || b.vault != *vault_ai.key || t.pending_vault != *vault_ai.key || t.pending_id != r.id {
         return Err(RouterError::BadAccount.into());
@@ -2093,8 +2094,9 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         social::record_fill(program_id, stats_ai, &t, portfolio, v.asset_index, traded, effective, owed, others);
     }
 
-    b.remove(r.id)?;
-    store(book_ai, &b)?;
+    let (place, last) = b.remove(r.id)?;
+    move_book_key(book_ai, place, last)?;
+    store_book(book_ai, &b)?;
     t.has_pending = 0;
     store(trader_ai, &t)?;
     if let Some((order_ai, o)) = order {
@@ -2242,7 +2244,7 @@ fn request_settle(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResul
     let (ak, abump) = authority_address(program_id);
     key_is(authority, &ak)?;
     let v = load_vault(vault_ai)?;
-    let mut b: Book = load(book_ai, program_id, BOOK_MAGIC)?;
+    let mut b: Book = load_book(book_ai, program_id)?;
     if b.vault != *vault_ai.key {
         return Err(RouterError::BadAccount.into());
     }
@@ -2306,7 +2308,7 @@ fn settle(program_id: &Pubkey, accounts: &[AccountInfo], frontier: u64) -> Progr
     key_is(authority, &ak)?;
     let r: Request = load(request_ai, program_id, REQUEST_MAGIC)?;
     key_is(wallet, &r.wallet)?;
-    let mut b: Book = load(book_ai, program_id, BOOK_MAGIC)?;
+    let mut b: Book = load_book(book_ai, program_id)?;
     let v = load_vault(vault_ai)?;
     if r.kind != KIND_SETTLE || r.vault != *vault_ai.key || b.vault != *vault_ai.key {
         return Err(RouterError::BadAccount.into());
@@ -2334,8 +2336,9 @@ fn settle(program_id: &Pubkey, accounts: &[AccountInfo], frontier: u64) -> Progr
     data.extend_from_slice(&frontier.to_le_bytes());
     invoke_signed(&Instruction { program_id: percolator_vault::id(), accounts: metas, data }, &infos, &[&[SEED_AUTHORITY, &[abump]]])?;
 
-    b.remove(r.id)?;
-    store(book_ai, &b)?;
+    let (place, last) = b.remove(r.id)?;
+    move_book_key(book_ai, place, last)?;
+    store_book(book_ai, &b)?;
     close(request_ai, BOND_LAMPORTS, executor, wallet)
 }
 
@@ -2379,7 +2382,7 @@ fn expire(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     }
     let r: Request = load(request_ai, program_id, REQUEST_MAGIC)?;
     key_is(wallet, &r.wallet)?;
-    let mut b: Book = load(book_ai, program_id, BOOK_MAGIC)?;
+    let mut b: Book = load_book(book_ai, program_id)?;
     if b.vault != r.vault {
         return Err(RouterError::BadAccount.into());
     }
@@ -2425,9 +2428,10 @@ fn expire(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         pay(request_ai, caller, share)?;
         msg!("reward expire {}", share);
     }
-    b.remove(r.id)?;
+    let (place, last) = b.remove(r.id)?;
+    move_book_key(book_ai, place, last)?;
     b.forfeited_bonds = b.forfeited_bonds.saturating_add(bond);
-    store(book_ai, &b)?;
+    store_book(book_ai, &b)?;
     if r.kind == KIND_ORDER {
         let order_ai = acc(accounts, 5)?;
         writable(order_ai)?;
@@ -2449,9 +2453,9 @@ fn expire(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if r.kind == KIND_TRADE && at_mark && !market_was_behind(accounts, &r)? {
         let rent = Rent::get()?.minimum_balance(REQUEST_LEN);
         let kept = request_ai.lamports().saturating_sub(rent).max(bond);
-        let mut b: Book = load(book_ai, program_id, BOOK_MAGIC)?;
+        let mut b: Book = load_book(book_ai, program_id)?;
         b.forfeited_bonds = b.forfeited_bonds.saturating_add(kept - bond);
-        store(book_ai, &b)?;
+        store_book(book_ai, &b)?;
         return close(request_ai, kept, book_ai, rent_to);
     }
     close(request_ai, bond, book_ai, rent_to)

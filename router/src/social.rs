@@ -593,7 +593,7 @@ pub(crate) fn trigger_copy(program_id: &Pubkey, accounts: &[AccountInfo], data: 
         return Err(RouterError::Isolated.into());
     }
     let v = load_vault(vault_ai)?;
-    let mut b: Book = load(book_ai, program_id, BOOK_MAGIC)?;
+    let mut b: Book = load_book(book_ai, program_id)?;
     key_is(market, &v.market)?;
     key_is(market, &t.market)?;
     key_is(market, &lt.market)?;

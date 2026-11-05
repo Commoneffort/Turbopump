@@ -236,7 +236,7 @@ impl World {
 
     pub fn book(&self) -> percolator_router::state::Book {
         let k = percolator_router::state::book_address(&percolator_router::id(), &self.vault).0;
-        bytemuck::pod_read_unaligned(&self.env.svm.get_account(&k).unwrap().data)
+        bytemuck::pod_read_unaligned(&self.env.svm.get_account(&k).unwrap().data[..percolator_router::state::BOOK_LEN])
     }
 
     /// Router `Advance` to a Pyth update.

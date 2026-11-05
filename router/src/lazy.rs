@@ -97,7 +97,7 @@ pub fn open_range(program_id: &Pubkey, accounts: &[AccountInfo]) -> solana_progr
     crate::writable(range_ai)?;
     crate::key_is(system, &solana_program::system_program::ID)?;
     crate::load_vault(vault_ai)?;
-    let b: Book = load(book_ai, program_id, BOOK_MAGIC)?;
+    let b: Book = load_book(book_ai, program_id)?;
     if b.vault != *vault_ai.key {
         return Err(RouterError::BadAccount.into());
     }
