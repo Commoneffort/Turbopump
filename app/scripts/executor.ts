@@ -1089,12 +1089,16 @@ async function markPhase(v: C.Vault, now: number, snap: Snapshot, withCatchUp: b
     // allowed (the price range is narrow and has seen the current mark).
     const first = live.find(r => r.target === earliest && !r.settle);
     const atTarget = live.filter(r => r.target === earliest).length;
-    if (j && ONE_TX && C.LAZY_FILLS && first && (await lazyNow(v, b, atTarget))) moved = await priceAndFill(v, b, j, first, snap.market, slotNow);
+    const oneTx = !!j && ONE_TX && C.LAZY_FILLS && !!first && (await lazyNow(v, b, atTarget)) && (await priceAndFill(v, b, j, first, snap.market, slotNow));
+    moved = oneTx;
     if (j && !moved) moved = await advanceReported(v, j, `price for slot ${earliest}`, withCatchUp, true);
     if (moved) {
       const ba = await conn.getAccountInfo(C.bookAddress(v.key));
       if (ba) b = C.decodeBook(new Uint8Array(ba.data));
-      return { b, reqs, moved, lazy: await lazyNow(v, b, live.filter(r => b.markPrev < r.target && r.target <= b.markPublish).length) };
+      // (The request filled in the price's own transaction is done: not tried again this pass.)
+      const left = oneTx ? reqs.filter(r => r.id !== first!.id) : reqs;
+      const leftLive = oneTx ? live.filter(r => r.id !== first!.id) : live;
+      return { b, reqs: left, moved, lazy: await lazyNow(v, b, leftLive.filter(r => b.markPrev < r.target && r.target <= b.markPublish).length) };
     }
   } else if (!owed && earliest !== null && earliest > C.LEGACY_TIME && Math.max(now, Date.now() / 1000) >= earliest + (ORACLE === "jack" ? 0 : 0.6) && now < earliest + C.ROUTER_GRACE_SECS - 3) {
     const u = ORACLE === "pyth" ? await firstAtOrAfter(v.feed!.id, earliest).catch(() => null) : null;

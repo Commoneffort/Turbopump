@@ -23,17 +23,22 @@ case "$2" in
   devnet) RPC=${DEVNET_RPC:-$(cat ~/.config/percolator/devnet-rpc 2>/dev/null || echo https://api.devnet.solana.com)}; KEY=$HOME/.config/solana/percolator-test/deployer.json; FEATURES=devnet; OUT=target/deploy-devnet ;;
   *) echo "usage: $0 router|vault|engine x1|devnet"; exit 1 ;;
 esac
+# PROGRAM_SO=<file> uploads that binary of the router or vault instead of building one (a rollback
+# to a saved release, docs/SPEED-FORK.md): it must be a release checked before, on this network.
 case "$1" in
-  router) ID=DkK9TSMpVXLq26HeqxTXLysXyRKDYHTKU94SLFDWgjw3; PKEY=keys/router-keypair.json; SO=$OUT/percolator_router.so
-          (cd router && cargo build-sbf --tools-version v1.53 --features $FEATURES --sbf-out-dir ../$OUT >/dev/null 2>&1 || cargo build-sbf --tools-version v1.53 --features $FEATURES --sbf-out-dir ../$OUT) ;;
-  vault)  ID=BSync6F8gtJs3Wj4w8L6H3ZtS397w2XoCYGEAJGmeYX; PKEY=keys/percolator_vault-keypair.json; SO=$OUT/percolator_vault.so
-          cargo build-sbf --tools-version v1.53 --features $FEATURES --sbf-out-dir $OUT >/dev/null 2>&1 || cargo build-sbf --tools-version v1.53 --features $FEATURES --sbf-out-dir $OUT ;;
+  router) ID=DkK9TSMpVXLq26HeqxTXLysXyRKDYHTKU94SLFDWgjw3; PKEY=keys/router-keypair.json; SO=${PROGRAM_SO:-$OUT/percolator_router.so}
+          [ -n "$PROGRAM_SO" ] || (cd router && cargo build-sbf --tools-version v1.53 --features $FEATURES --sbf-out-dir ../$OUT >/dev/null 2>&1 || cargo build-sbf --tools-version v1.53 --features $FEATURES --sbf-out-dir ../$OUT) ;;
+  vault)  ID=BSync6F8gtJs3Wj4w8L6H3ZtS397w2XoCYGEAJGmeYX; PKEY=keys/percolator_vault-keypair.json; SO=${PROGRAM_SO:-$OUT/percolator_vault.so}
+          [ -n "$PROGRAM_SO" ] || cargo build-sbf --tools-version v1.53 --features $FEATURES --sbf-out-dir $OUT >/dev/null 2>&1 || cargo build-sbf --tools-version v1.53 --features $FEATURES --sbf-out-dir $OUT ;;
   engine) ID=8o3uV87X2CvPYfPwM1sxeaYYE7sGWsTUiEy7SskEMM3P; PKEY=keys/percolator-devnet-keypair.json; SO=${PERCOLATOR_SO:-../percolator-prog/target/deploy/percolator_prog.so} ;;
   *) echo "usage: $0 router|vault|engine x1|devnet"; exit 1 ;;
 esac
 # The release gate (deploy/release-check.sh): our own programs go up only as a build whose hash
 # was recorded for the commit checked out, after the suite passed on it.
-if [ "$1" != engine ] && [ -z "$NO_RELEASE_CHECK" ]; then
+if [ "$1" != engine ] && [ -z "$NO_RELEASE_CHECK" ] && [ -n "$PROGRAM_SO" ]; then
+  h=$(sha256sum "$SO" | cut -d' ' -f1)
+  grep -q " $2 percolator_$1 $h\$" deploy/releases.log 2>/dev/null || { echo "refused: $SO ($h) is not a release checked before for $2"; exit 1; }
+elif [ "$1" != engine ] && [ -z "$NO_RELEASE_CHECK" ]; then
   h=$(sha256sum "$SO" | cut -d' ' -f1)
   grep -q " $(git rev-parse HEAD) $2 $(basename "$SO" .so) $h\$" deploy/releases.log 2>/dev/null || {
     echo "refused: $SO ($h) is not a checked release of $(git rev-parse --short HEAD) for $2. Run deploy/release-check.sh first."; exit 1; }
