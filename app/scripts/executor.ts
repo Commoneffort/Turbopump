@@ -1065,6 +1065,8 @@ type Round = { b: C.Book; reqs: C.RouterRequest[]; moved: boolean; lazy?: boolea
  *  second against 3.2 s; the old way 3.2-3.8 s against lazy 5-5.5 s at 6 to 12 a second.) */
 const LAZY_BUSY = Number(process.env.LAZY_BUSY ?? 3);
 const LAZY_HOLDERS = Number(process.env.LAZY_HOLDERS ?? 200);
+/** Lazy fills sent side by side on one market (each re-values only its own trader). */
+const LAZY_PARALLEL = Number(process.env.LAZY_PARALLEL ?? 6);
 const lazyWhy = new Map<string, string>();
 async function lazyNow(v: C.Vault, b: C.Book, waiting = 1): Promise<boolean> {
   if (!C.LAZY_FILLS) return false;
@@ -1308,21 +1310,21 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
       }));
     }
   }
-  for (const r of live.filter(r => tradeOn && b.markPrev < r.target && r.target <= b.markPublish && !unledgered.has(acctKey(r)))) {
-    if (notConverged) break;
+  const fillOne = async (r: C.RouterRequest, mayGroup: boolean) => {
+    if (notConverged) return;
     const what = `${v.feed?.symbol} #${r.id}`;
-    if (r.settle) { await settleEpoch(v, r, what); tried.add(r.id); continue; }
-    if (grouped.has(r.id)) continue;
+    if (r.settle) { await settleEpoch(v, r, what); tried.add(r.id); return; }
+    if (grouped.has(r.id) || handled.has(r.id)) return;
     // After the first fill at this price, the accounts on the market are settled to it: the
     // other requests at the same price go out together, a few to a transaction (a crash brings
     // many liquidations at once, and one at a time each waited for all those before it).
     // (Not the ones this pass has already filled or tried one by one.)
     // Lazy: each fill re-values only its own trader and the vault (see `fillTogether`).
     const lazy = lazyVault;
-    if (filledOne) {
+    if (filledOne && mayGroup) {
       const rest = live.filter(x => !x.settle && !unledgered.has(acctKey(x)) && !grouped.has(x.id) && !handled.has(x.id) && x.id !== r.id && b.markPrev < x.target && x.target <= b.markPublish);
       for (const ids of await fillTogether(v, b, [r, ...rest], lazy)) grouped.add(ids);
-      if (grouped.has(r.id)) continue;
+      if (grouped.has(r.id)) return;
     }
     filledOne = true;
     handled.add(r.id);
@@ -1376,6 +1378,17 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
     else log(`  ${what}: ${Math.round(Date.now() / 1000 - (r.target - C.ROUTER_DELAY_SECS))} s from request to result (${(Date.now() / 1000 - r.target).toFixed(1)} s after its price time)`);
     break;
     }
+  };
+  // Lazy: the requests whose traders are up to date go in groups; the others each re-value only
+  // their own trader (and the vault), so they do not wait on one another: LAZY_PARALLEL at once.
+  if (lazyVault && atMarkReqs.length > 1) {
+    for (const ids of await fillTogether(v, b, atMarkReqs, true)) grouped.add(ids);
+    const rest = atMarkReqs.filter(r => !grouped.has(r.id));
+    for (let i = 0; i < rest.length && !notConverged; i += LAZY_PARALLEL) await Promise.all(rest.slice(i, i + LAZY_PARALLEL).map(r => fillOne(r, false)));
+  }
+  for (const r of live.filter(r => tradeOn && b.markPrev < r.target && r.target <= b.markPublish && !unledgered.has(acctKey(r)))) {
+    if (notConverged) break;
+    await fillOne(r, true);
   }
 
   // 3. Expire requests past their grace period, and a request this pass could not fill once
