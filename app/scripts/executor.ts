@@ -992,6 +992,51 @@ async function lazyNow(v: C.Vault, b: C.Book): Promise<boolean> {
 }
 const rangeTried = new Set<string>();
 
+/** Slot time with lazy settlement: the target price, the mark move, the vault's (and, when the
+ *  price moved, the trader's) re-valuation and the first fill at that price, all in one
+ *  transaction, so the trade fills in the slot its price is posted in. Tried once per target
+ *  (ONE_TX=0 turns it off); if it does not land, the usual way follows (price, then fills). */
+const ONE_TX = process.env.ONE_TX !== "0";
+const oneTxTried = new Set<string>();
+async function priceAndFill(v: C.Vault, b: C.Book, j: { price: bigint; publish: number; prev: number }, r: C.RouterRequest, market: Uint8Array, slot: number): Promise<boolean> {
+  enter("priceAndFill");
+  const key = `${v.key.toBase58()}:${r.target}`;
+  if (!reporter || oneTxTried.has(key)) return false;
+  oneTxTried.add(key);
+  const a = C.decodeAsset(market, v.assetIndex);
+  // (One crank accrues an asset by at most 10 slots: further behind goes the usual way.)
+  if (slot - Number(a.slotLast) > 8) return false;
+  const [posted, pf, ta] = await conn.getMultipleAccountsInfo([C.reportAddress(v.feed!.id), C.routerPortfolio(r.wallet, r.sub), C.traderAddress(r.wallet, r.sub)]);
+  // Without a fee ledger the router lets the account only reduce, and the fill would trade
+  // nothing: such a request goes the usual way, which opens the ledger first.
+  if (!ta || !C.decodeTrader(new Uint8Array(ta.data)).hasLedger) return false;
+  const have = posted ? C.decodeReport(new Uint8Array(posted.data)).publish : 0;
+  const publish = Math.max(j.publish, have);
+  // The trader is re-valued only if it holds the asset and the price moves (otherwise its crank
+  // would have nothing to do, which fails the whole transaction).
+  const holds = !!pf && C.decodePortfolio(new Uint8Array(pf.data), v.assetIndex, market).position !== 0n;
+  const moves = j.price !== b.markPrice;
+  const ixs = [
+    C.postPrice(reporter.publicKey, v.feed!.id, j.price, publish, Math.min(j.prev, publish - 1)),
+    C.advanceMark(v, C.reportAddress(v.feed!.id), market),
+    C.crank(payer.publicKey, v.lpPortfolio, [v.assetIndex]),
+    ...(holds && moves ? [C.crank(payer.publicKey, C.routerPortfolio(r.wallet, r.sub), [v.assetIndex])] : []),
+    C.fillRequest(payer.publicKey, v, r, true),
+  ];
+  const tx = new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: 900_000 }), ...ixs);
+  try {
+    const sig = await conn.sendTransaction(tx, [payer, reporter], { skipPreflight: true });
+    await confirmed(sig);
+    const st = (await conn.getSignatureStatuses([sig]).catch(() => null))?.value?.[0];
+    if (st?.err) throw new Error(JSON.stringify(st.err));
+    log("ok", `price and fill ${v.feed?.symbol} #${r.id} in one transaction at ${Number(j.price) / 1e6} (slot ${r.target})`);
+    return true;
+  } catch (e: any) {
+    log("fail", `price and fill ${v.feed?.symbol} #${r.id} in one transaction`, String(e?.message ?? e).split("\n")[0].slice(0, 160));
+    return false;
+  }
+}
+
 /** Steps 0 and 1 of servicing a market (below): gets ready for queued requests and, once the
  *  earliest target has passed, moves the mark to the price at that target. Every market does
  *  this side by side at the start of a round, so the accounts are then re-valued once for all of
@@ -1030,7 +1075,11 @@ async function markPhase(v: C.Vault, now: number, snap: Snapshot, withCatchUp: b
     // Slot time: the price as it is now, posted so that it lands in the target slot. The router
     // stamps the post with its slot: nobody picks which price is the first at or after it.
     const j = jackLatest(v.feed!.symbol);
-    if (j) moved = await advanceReported(v, j, `price for slot ${earliest}`, withCatchUp, true);
+    // The first trade at the target in the same transaction as its price, while lazy fills are
+    // allowed (the price range is narrow and has seen the current mark).
+    const first = live.find(r => r.target === earliest && !r.settle);
+    if (j && ONE_TX && C.LAZY_FILLS && first && (await lazyNow(v, b))) moved = await priceAndFill(v, b, j, first, snap.market, slotNow);
+    if (j && !moved) moved = await advanceReported(v, j, `price for slot ${earliest}`, withCatchUp, true);
     if (moved) {
       const ba = await conn.getAccountInfo(C.bookAddress(v.key));
       if (ba) b = C.decodeBook(new Uint8Array(ba.data));
@@ -1141,13 +1190,15 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
   if (lazyVault && atMarkReqs.length > 1) {
     const want = new Set([v.lpPortfolio.toBase58(), ...atMarkReqs.map(r => C.routerPortfolio(r.wallet, r.sub).toBase58())]);
     const p = C.crankPlan(await snapshot(), payer.publicKey, v.lpPortfolio, v.assetIndex);
-    const theirs = p.settle.filter(ix => want.has(ix.keys[2]?.pubkey.toBase58() ?? ""));
+    // (Each crank names every asset its account holds: an account is re-valued as a whole, and
+    // only with all of them brought to the current slot in the same transaction.)
+    const theirs = p.settleAlone.filter(ix => want.has(ix.keys[2]?.pubkey.toBase58() ?? ""));
     if (theirs.length > 1) {
-      // Six to a transaction, each simulated first and cleared of accounts that turn out to have
+      // Four to a transaction, each simulated first and cleared of accounts that turn out to have
       // nothing to re-value (one such crank fails its whole transaction); sent together, and the
       // fills wait for them.
       const k0 = Math.max(0, Math.ceil(p.lag / 10));
-      const chunks = Array.from({ length: Math.ceil(theirs.length / 6) }, (_, i) => theirs.slice(6 * i, 6 * i + 6));
+      const chunks = Array.from({ length: Math.ceil(theirs.length / 4) }, (_, i) => theirs.slice(4 * i, 4 * i + 4));
       await Promise.all(chunks.map(async (chunk, i) => {
         const t = await tune(p.lagCrank, i === 0 ? k0 : 0, chunk, []);
         if (typeof t === "string" || !t.settle.length) return;
