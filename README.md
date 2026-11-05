@@ -6,6 +6,8 @@ A vault pools deposits, lists its own perpetual market on Percolator, acts as th
 
 **Status:** live on Solana devnet and X1 testnet, unaudited. Do not use with real funds.
 
+> **Speed work in progress (branch `speed/2026-11`).** It forks our Percolator engine away from upstream's settlement rules. The last version before it is tagged `pre-speed-fork-2026-11-05`; see [docs/SPEED-FORK.md](docs/SPEED-FORK.md) for what changes and how to roll back.
+
 ## Percolator and Turbopump
 
 Two different things, by two different authors. **Percolator** is the risk engine underneath: one Solana program by Anatoly Yakovenko that keeps margin, profit and loss, insurance and its own liquidation. We did not write it. **Turbopump** is what this repository adds on top:
