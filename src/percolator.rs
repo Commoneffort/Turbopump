@@ -144,7 +144,13 @@ pub const ASSET_EFFECTIVE_PRICE: usize = 25;
 pub const ASSET_SLOT_LAST: usize = 41;
 pub const ASSET_A_LONG: usize = 49;
 pub const ASSET_A_SHORT: usize = 65;
+pub const ASSET_F_LONG: usize = 113;
+pub const ASSET_F_SHORT: usize = 129;
 pub const ASSET_KF_EPOCH_LONG: usize = 145;
+pub const ASSET_B_LONG: usize = 225;
+pub const ASSET_B_SHORT: usize = 241;
+pub const ASSET_STALE_LONG: usize = 337;
+pub const ASSET_STALE_SHORT: usize = 345;
 pub const ASSET_KF_EPOCH_SHORT: usize = 153;
 pub const ASSET_EPOCH_LONG: usize = 497;
 pub const ASSET_EPOCH_SHORT: usize = 505;
@@ -186,6 +192,15 @@ pub fn max_trading_fee_bps(d: &[u8]) -> Result<u64, ProgramError> {
 pub fn asset_price(d: &[u8], asset_index: u16) -> Result<(u64, u64, u64), ProgramError> {
     let e = MARKET_SLOTS_OFF + asset_index as usize * MARKET_ASSET_SLOT_LEN + SLOT_ENGINE;
     Ok((rd_u64(d, e)?, rd_u64(d, e + ASSET_EFFECTIVE_PRICE)?, rd_u64(d, e + ASSET_SLOT_LAST)?))
+}
+
+/// How many accounts on an asset are not yet re-valued at its latest price move (both sides),
+/// and its funding (F) and social-loss (B) indices of each side: the router's lazy settlement
+/// (`router/src/lazy.rs`) only lets a fill skip re-valuing the others while those have not moved.
+pub fn asset_cohort(d: &[u8], asset_index: u16) -> Result<(u64, [u128; 4]), ProgramError> {
+    let e = MARKET_SLOTS_OFF + asset_index as usize * MARKET_ASSET_SLOT_LEN + SLOT_ENGINE;
+    let stale = rd_u64(d, e + ASSET_STALE_LONG)?.saturating_add(rd_u64(d, e + ASSET_STALE_SHORT)?);
+    Ok((stale, [rd_u128(d, e + ASSET_F_LONG)?, rd_u128(d, e + ASSET_F_SHORT)?, rd_u128(d, e + ASSET_B_LONG)?, rd_u128(d, e + ASSET_B_SHORT)?]))
 }
 
 /// True while an asset is close-only: a position on it was reduced unilaterally (the vault's

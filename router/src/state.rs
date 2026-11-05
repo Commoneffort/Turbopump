@@ -26,6 +26,8 @@ pub const SEED_REQUEST: &[u8] = b"request";
 pub const SEED_ORDER: &[u8] = b"order";
 pub const SEED_TIERS: &[u8] = b"tiers";
 pub const SEED_CARRY: &[u8] = b"carry";
+pub const SEED_RANGE: &[u8] = b"range";
+pub const RANGE_MAGIC: u64 = u64::from_le_bytes(*b"PRRANGE1");
 pub const SEED_LEDGER: &[u8] = b"ledger";
 
 /// A trader's router account. Its address owns the trader's Percolator portfolio and collateral
@@ -574,6 +576,30 @@ pub const LEDGER_LEN: usize = core::mem::size_of::<Ledger>();
 pub fn ledger_address(program_id: &Pubkey, trader: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[SEED_LEDGER, trader.as_ref()], program_id)
 }
+
+pub fn range_address(program_id: &Pubkey, vault: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[SEED_RANGE, vault.as_ref()], program_id)
+}
+
+/// A vault's price range since every account on its asset was last up to date (`lazy`).
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+#[repr(C, packed)]
+pub struct PriceRange {
+    pub magic: u64,
+    pub vault: Pubkey,
+    /// Lowest and highest price (e6) since the restart.
+    pub low: u64,
+    pub high: u64,
+    /// The router time of the mark it last took in.
+    pub mark_at: i64,
+    /// The asset's funding (F) and social-loss (B) indices of each side at the restart.
+    pub indices: [u128; 4],
+    /// 1 while usable; 0 when it missed a mark move (until the next restart).
+    pub valid: u8,
+    pub bump: u8,
+    pub _pad: [u8; 6],
+}
+pub const RANGE_LEN: usize = core::mem::size_of::<PriceRange>();
 
 pub fn book_address(program_id: &Pubkey, vault: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[SEED_BOOK, vault.as_ref()], program_id)

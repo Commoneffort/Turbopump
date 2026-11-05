@@ -1261,6 +1261,35 @@ export const CARRY = {
   ledgerLen: Number(RC.ledger_len ?? 1_072), carryLen: Number(RC.carry_len ?? 88), slots: Number(RC.ledger_slots ?? 32),
 };
 export const carryAddress = (vault: PublicKey) => rpda(Buffer.from("carry"), vault.toBuffer());
+/** Lazy settlement (router `lazy`, engine fork; docs/SPEED-FORK.md): a vault's price range since
+ *  every account on its asset was last up to date. While it is narrow, a fill re-values only the
+ *  trader and the vault, not every holder. On where the deployed Percolator has the fork. */
+export const LAZY_FILLS = X1 && (typeof process === "undefined" || process.env?.LAZY !== "0");
+export const rangeAddress = (vault: PublicKey) => rpda(Buffer.from("range"), vault.toBuffer());
+export const RANGE_LEN = 8 + 32 + 8 + 8 + 8 + 64 + 1 + 1 + 6;
+export const openRange = (payer: PublicKey, vault: PublicKey) => new TransactionInstruction({
+  programId: ROUTER,
+  keys: [rw(payer, true), ro(vault), ro(bookAddress(vault)), rw(rangeAddress(vault)), ro(SystemProgram.programId)],
+  data: new W().u8(36).done(),
+});
+export type PriceRange = { low: bigint; high: bigint; markAt: number; indices: bigint[]; valid: boolean };
+export const decodeRange = (d: Uint8Array): PriceRange => ({
+  low: u64(d, 40), high: u64(d, 48), markAt: Number(i64(d, 56)),
+  indices: [0, 1, 2, 3].map(i => u128(d, 64 + 16 * i)), valid: d[128] === 1,
+});
+/** The router's `lazy::tolerant`: whether a fill now skips re-valuing the asset's other accounts
+ *  (true only while some are out of date and the range allows it). */
+export function lazyReady(market: Uint8Array, asset: number, b: Book, r: PriceRange | null, requireStale = true): boolean {
+  if (!r || !r.valid || r.low === 0n) return false;
+  const e = L.market.slots + asset * L.market.slot_len + L.market.engine;
+  const stale = u64(market, e + 337) + u64(market, e + 345);
+  const indices = [113, 129, 225, 241].map(o => u128(market, e + o));
+  // (Without `requireStale`: before the fill's own crank has accrued the asset to the new mark,
+  // nobody is out of date yet.)
+  if ((requireStale && stale === 0n) || r.markAt !== b.markPublish || indices.some((x, i) => x !== r.indices[i])) return false;
+  const mm = u64(market, (L.router as any).mm_bps_off ?? 550);
+  return (r.high - r.low) * 10_000n <= r.low * (mm / 4n);
+}
 export const ledgerAddress = (wallet: PublicKey, sub = 0) => cached(`l${wallet.toBase58()}:${sub}`, () => rpda(Buffer.from("ledger"), traderAddress(wallet, sub).toBuffer()));
 /** Starts a vault's holding-fee meter (anyone may, and pays its rent). */
 export const openCarry = (payer: PublicKey, vault: PublicKey) => new TransactionInstruction({
@@ -1462,7 +1491,9 @@ export const advanceMark = (v: Vault, pyth: PublicKey, market: Uint8Array) => {
     programId: ROUTER,
     keys: [ro(routerAuthority()), ro(v.key), rw(bookAddress(v.key)), rw(MARKET), ro(pyth), ro(VAULT_PROGRAM), ro(PERCOLATOR),
       // X1: a reported price is only taken with the witness's price for the feed (router WitnessDisagrees otherwise).
-      ...(X1 && v.feed && pyth.equals(reportAddress(v.feed.id)) ? [ro(witnessAddress(v.feed.id))] : [])],
+      ...(X1 && v.feed && pyth.equals(reportAddress(v.feed.id)) ? [ro(witnessAddress(v.feed.id))] : []),
+      // The vault's price range takes the new mark in (lazy settlement; ignored if not open).
+      ...(LAZY_FILLS ? [rw(rangeAddress(v.key))] : [])],
     data: new W().u8(5).u64(s.nextObservation).u64(s.authorityEpoch).done(),
   });
 };
@@ -1488,7 +1519,7 @@ export const refreshFunding = (v: Vault) => new TransactionInstruction({
   data: Buffer.from([31]),
 });
 /** Fills a request whose target the mark is at. Anyone can; the executor earns the bond. */
-export const fillRequest = (executor: PublicKey, v: Vault, r: RouterRequest) => new TransactionInstruction({
+export const fillRequest = (executor: PublicKey, v: Vault, r: RouterRequest, lazy = false) => new TransactionInstruction({
   programId: ROUTER,
   keys: [
     rw(executor, true), rw(r.key), rw(traderAddress(r.wallet, r.sub)), rw(r.wallet), rw(bookAddress(v.key)), rw(v.key), rw(MARKET),
@@ -1501,6 +1532,8 @@ export const fillRequest = (executor: PublicKey, v: Vault, r: RouterRequest) => 
     rw(carryAddress(v.key)), rw(ledgerAddress(r.wallet, r.sub)),
     ro(tiersAddress()),
     rw(equitiesAddress(r.wallet)),
+    // With the vault's price range the fill may skip re-valuing the other holders (lazy).
+    ...(lazy ? [rw(rangeAddress(v.key))] : []),
     rw(statsAddress(r.wallet)),
   ],
   data: new W().u8(6).done(),

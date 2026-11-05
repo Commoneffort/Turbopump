@@ -367,3 +367,158 @@ fn a_reported_price_needs_the_witness() {
     assert_eq!({ w.book().mark_price }, 1_010_000);
     assert_eq!(w.book().price_dial, 1, "the sources agree again");
 }
+
+// ---- Lazy settlement (router `lazy`, engine fork `execute_trade_with_fee_cohort_tolerant_not_atomic`) ----
+
+fn crank_one(w: &mut World, portfolio: Pubkey) -> Result<u64, String> {
+    let slot = w.env.current_slot();
+    let asset = w.asset();
+    let payer = w.payer.pubkey();
+    let ix = solana_sdk::instruction::Instruction {
+        program_id: perc::PERCOLATOR_PROGRAM_ID,
+        accounts: vec![
+            solana_sdk::instruction::AccountMeta::new(payer, true),
+            solana_sdk::instruction::AccountMeta::new(w.env.market, false),
+            solana_sdk::instruction::AccountMeta::new(portfolio, false),
+        ],
+        data: percolator_prog::ix::Instruction::PermissionlessCrank {
+            now_slot: slot,
+            observations: vec![percolator_prog::ix::CrankObservationHint { asset_index: asset, oracle_accounts: 0 }],
+        }
+        .encode(),
+    };
+    w.send(vec![ix], &[])
+}
+
+fn stale_accounts(w: &World) -> u64 {
+    let m = w.env.svm.get_account(&w.env.market).unwrap().data;
+    perc::asset_cohort(&m, w.asset()).unwrap().0
+}
+
+/// Posts `price` (reporter and witness) in the next slot and moves the mark to it with the
+/// vault's price range, then accrues the asset until Percolator's price is there, re-valuing
+/// nobody.
+fn lazy_move(w: &mut World, price: u64) {
+    let (reporter_kp, witness) = (w.reporter(), w.witness());
+    let slot = w.env.current_slot() + 1;
+    w.goto_slot(slot);
+    let n = now(w);
+    w.post_report(&witness, price, n, n - 1).unwrap();
+    let report = w.post_report(&reporter_kp, price, n, n - 1).unwrap();
+    let ix = rclient::with_range(w.advance_ix(&report), &w.vault);
+    w.send(vec![ix], &[]).expect("advance with the range");
+    w.price = price;
+    w.pyth_time = n;
+    let asset = w.asset();
+    for _ in 0..20 {
+        let eff = w.env.primary_market_state().1.assets[asset as usize].effective_price;
+        if eff == price {
+            return;
+        }
+        let s = w.env.current_slot() + 1;
+        w.goto_slot(s);
+        w.catch_up(asset, s, &[]);
+    }
+    panic!("the price did not converge");
+}
+
+/// A request of `taker` brought to its price lazily: the price at its target with the range,
+/// the asset accrued, and only the taker and the vault re-valued.
+fn lazy_target(w: &mut World, taker: usize, id: u64) {
+    let target = w.request_target(id) as u64;
+    let mark_slot = { w.book().mark_publish_time } as u64;
+    // (lazy_move posts in the next slot: the one before the target at the latest.)
+    w.goto_slot(target.max(mark_slot + 1) - 1);
+    let p = w.price;
+    lazy_move(w, p);
+    let pf = w.traders[&taker].1.portfolio;
+    let _ = crank_one(w, pf);
+    let lp = w.portfolio;
+    let _ = crank_one(w, lp);
+}
+
+#[test]
+fn a_fill_skips_revaluing_the_other_holders_while_the_price_range_is_narrow() {
+    let mut w = live();
+    w.trader(0);
+    w.trader(1);
+    w.taker_trade(1, 5 * UNIT as i128).unwrap();
+    w.taker_trade(0, 5 * UNIT as i128).unwrap();
+    let payer = w.payer.pubkey();
+    w.send(vec![rclient::open_range(&payer, &w.vault)], &[]).unwrap();
+    // Everyone is up to date (the trades above re-valued all): the range restarts at the next
+    // mark move, which leaves both traders out of date.
+    lazy_move(&mut w, 1_003_000);
+    assert!(stale_accounts(&w) >= 2, "the move left accounts to re-value: {}", stale_accounts(&w));
+    let id = w.request(0, 2 * UNIT as i128).unwrap();
+    lazy_target(&mut w, 0, id);
+    assert!(stale_accounts(&w) >= 1, "trader 1 is still out of date");
+    // The ordinary fill: Percolator refuses to add risk while anyone is out of date.
+    let k = w.keys.clone().unwrap();
+    let t0 = w.traders[&0].1;
+    assert!(w.send(vec![rclient::fill(&payer, &k, &t0)], &[]).is_err());
+    // With the range: it fills.
+    w.send(vec![rclient::fill_lazy(&payer, &k, &t0)], &[]).expect("lazy fill");
+    assert_eq!(position(&w, 0), 7 * UNIT as i128);
+    // Trader 1 is re-valued later, at the same prices: the cohort empties and it can trade.
+    let t1 = w.traders[&1].1.portfolio;
+    crank_one(&mut w, t1).unwrap();
+    assert_eq!(stale_accounts(&w), 0);
+    w.taker_trade(1, -(5 * UNIT as i128)).unwrap();
+    assert_eq!(position(&w, 1), 0);
+}
+
+#[test]
+fn a_wide_price_range_or_a_missed_mark_means_everyone_is_revalued_first() {
+    let mut w = live();
+    w.trader(0);
+    w.trader(1);
+    w.taker_trade(1, 5 * UNIT as i128).unwrap();
+    w.taker_trade(0, 5 * UNIT as i128).unwrap();
+    let payer = w.payer.pubkey();
+    w.send(vec![rclient::open_range(&payer, &w.vault)], &[]).unwrap();
+    let k = w.keys.clone().unwrap();
+    let t0 = w.traders[&0].1;
+    // A move of a quarter of the maintenance margin or more, while someone is out of date.
+    let mm = perc::maintenance_margin_bps(&w.env.svm.get_account(&w.env.market).unwrap().data).unwrap();
+    let wide = 1_000_000 + 1_000_000 * (mm / lazy_div() + 10) / 10_000;
+    // (In steps the price band takes.)
+    let mut p = 1_000_000u64;
+    while p < wide {
+        p = (p + 15_000).min(wide);
+        lazy_move(&mut w, p);
+        w.goto_slot(w.env.current_slot() + 8);
+    }
+    let id = w.request(0, UNIT as i128).unwrap();
+    lazy_target(&mut w, 0, id);
+    assert!(stale_accounts(&w) >= 1);
+    assert!(w.send(vec![rclient::fill_lazy(&payer, &k, &t0)], &[]).is_err(), "the range is too wide");
+    // Everyone re-valued: the range restarts and the fill goes through.
+    let t1 = w.traders[&1].1.portfolio;
+    crank_one(&mut w, t1).unwrap();
+    w.send(vec![rclient::fill_lazy(&payer, &k, &t0)], &[]).expect("fill once everyone is current");
+
+    // A mark move made without the range spoils it until everyone is current again.
+    let (reporter_kp, witness) = (w.reporter(), w.witness());
+    let s = w.env.current_slot() + 1;
+    w.goto_slot(s);
+    let n = now(&w);
+    w.post_report(&witness, p + 1_000, n, n - 1).unwrap();
+    let report = w.post_report(&reporter_kp, p + 1_000, n, n - 1).unwrap();
+    w.advance_to(report).unwrap();
+    w.price = p + 1_000;
+    w.pyth_time = n;
+    let s = w.env.current_slot() + 1;
+    w.goto_slot(s);
+    let asset = w.asset();
+    w.catch_up(asset, s, &[]);
+    let id = w.request(0, UNIT as i128).unwrap();
+    lazy_target(&mut w, 0, id);
+    if stale_accounts(&w) > 0 {
+        assert!(w.send(vec![rclient::fill_lazy(&payer, &k, &t0)], &[]).is_err(), "the range missed a mark move");
+    }
+}
+
+fn lazy_div() -> u64 {
+    percolator_router::lazy::RANGE_SHARE_DIV
+}

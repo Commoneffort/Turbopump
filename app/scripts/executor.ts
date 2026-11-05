@@ -968,7 +968,19 @@ async function settleEpoch(v: C.Vault, r: C.RouterRequest, what: string) {
 
 /** A market's book and queued requests as read at the start of a round, and whether the round
  *  moved its mark. */
-type Round = { b: C.Book; reqs: C.RouterRequest[]; moved: boolean };
+/** `lazy`: the market's fills at this price may re-value only the trader and the vault (router
+ *  `lazy`: the price range since everyone was last up to date is narrow), so the round does not
+ *  re-value every holder first. */
+type Round = { b: C.Book; reqs: C.RouterRequest[]; moved: boolean; lazy?: boolean };
+
+/** Whether fills on `v` at the mark `b` holds may go lazily (see `Round.lazy`). */
+async function lazyNow(v: C.Vault, b: C.Book): Promise<boolean> {
+  if (!C.LAZY_FILLS) return false;
+  const [m, ra] = await conn.getMultipleAccountsInfo([C.MARKET, C.rangeAddress(v.key)]).catch(() => [null, null]);
+  if (!m || !ra || ra.data.length !== C.RANGE_LEN) return false;
+  return C.lazyReady(new Uint8Array(m.data), v.assetIndex, b, C.decodeRange(new Uint8Array(ra.data)), false);
+}
+const rangeTried = new Set<string>();
 
 /** Steps 0 and 1 of servicing a market (below): gets ready for queued requests and, once the
  *  earliest target has passed, moves the mark to the price at that target. Every market does
@@ -1012,6 +1024,7 @@ async function markPhase(v: C.Vault, now: number, snap: Snapshot, withCatchUp: b
     if (moved) {
       const ba = await conn.getAccountInfo(C.bookAddress(v.key));
       if (ba) b = C.decodeBook(new Uint8Array(ba.data));
+      return { b, reqs, moved, lazy: await lazyNow(v, b) };
     }
   } else if (!C.SLOT_TIME && !owed && earliest !== null && Math.max(now, Date.now() / 1000) >= earliest + (ORACLE === "jack" ? 0 : 0.6) && now < earliest + C.ROUTER_GRACE_SECS - 3) {
     const u = ORACLE === "pyth" ? await firstAtOrAfter(v.feed!.id, earliest).catch(() => null) : null;
@@ -1087,6 +1100,11 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
     carryTried.add(v.key.toBase58());
     await send(`start the holding-fee meter of ${v.feed?.symbol}`, [C.openCarry(payer.publicKey, v.key)]);
   }
+  // The vault's price range (lazy settlement): opened once, by whoever gets there first.
+  if (C.LAZY_FILLS && maintOn && !rangeTried.has(v.key.toBase58())) {
+    rangeTried.add(v.key.toBase58());
+    if (!(await conn.getAccountInfo(C.rangeAddress(v.key)))) await send(`open the price range of ${v.feed?.symbol}`, [C.openRange(payer.publicKey, v.key)]);
+  }
   const { b, reqs } = round;
   const rnow = C.routerNow(snap.slot, now);
   const live = reqs.filter(r => !graceOver(r.target, rnow, now));
@@ -1115,7 +1133,9 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
     // other requests at the same price go out together, a few to a transaction (a crash brings
     // many liquidations at once, and one at a time each waited for all those before it).
     // (Not the ones this pass has already filled or tried one by one.)
-    if (filledOne) {
+    // Lazy: each fill re-values its own trader (and the vault), so fills do not go in groups.
+    const lazy = !!round.lazy || (C.LAZY_FILLS && (await lazyNow(v, b)));
+    if (filledOne && !lazy) {
       const rest = live.filter(x => !x.settle && !unledgered.has(acctKey(x)) && !grouped.has(x.id) && !handled.has(x.id) && x.id !== r.id && b.markPrev < x.target && x.target <= b.markPublish);
       for (const ids of await fillTogether(v, b, [r, ...rest])) grouped.add(ids);
       if (grouped.has(r.id)) continue;
@@ -1125,7 +1145,10 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
     // Getting ready (catching up, settling the market's accounts) and the fill follow each other
     // here without going back through the whole pass in between, which cost seconds each time.
     for (let attempt = 0; attempt < 4; attempt++) {
-    const plan = C.crankPlan(await snapshot(), payer.publicKey, v.lpPortfolio, v.assetIndex, r.wallet, [], r.sub);
+    const full = C.crankPlan(await snapshot(), payer.publicKey, v.lpPortfolio, v.assetIndex, r.wallet, [], r.sub);
+    // Lazy: of the accounts out of date, only the trader's and the vault's are re-valued.
+    const mineOrVault = (ix: TransactionInstruction) => ix.keys[2]?.pubkey.equals(C.routerPortfolio(r.wallet, r.sub)) || ix.keys[2]?.pubkey.equals(v.lpPortfolio);
+    const plan = lazy ? { ...full, settle: full.settle.filter(mineOrVault), settleAlone: full.settleAlone.filter(mineOrVault) } : full;
     const k = Math.max(1, Math.ceil((plan.lag + LAND_SLOTS) / 10));
     if (k > 6) {
       // Too far behind to catch up inside the fill: advance first, wait, then fill.
@@ -1142,7 +1165,7 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
       if ((await settleAll(`for ${what}`, plan.settleAlone)) === 0) break;
       continue;
     }
-    const tail = [...plan.resets, C.fillRequest(payer.publicKey, v, r)];
+    const tail = [...plan.resets, C.fillRequest(payer.publicKey, v, r, lazy)];
     let t = await tune(plan.lagCrank, k, plan.settle, plan.settle.length > 3 ? [] : tail);
     if (typeof t !== "string" && plan.settle.length > 3 && t.settle.length <= 3) t = await tune(plan.lagCrank, t.k, t.settle, tail);
     if (typeof t === "string" ? t.includes("ProgramFailedToComplete") : t.settle.length > 3) {
@@ -1164,7 +1187,7 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
     // 10-slot boundary on. Whichever matches the landing slot fills; the other fails harmlessly.
     const version = (n: number) => [...Array(n).fill(plan.lagCrank), ...tuned.settle, ...tail];
     // (A version without lag cranks too, for landing just behind another market's fill.)
-    await race(`${r.size === 0n ? "forced close" : "fill"} ${what} size ${Number(r.size) / 1e6} at ${Number(b.markPrice) / 1e6} (${tuned.k} lag + ${tuned.settle.length} settle cranks)`, tuned.k > 0 && !tuned.settle.length && C.X1 ? [version(tuned.k), version(tuned.k + 1), version(0)] : C.X1 ? [version(tuned.k), version(tuned.k + 1)] : [version(tuned.k), version(tuned.k + 1), version(tuned.k + 2)]);
+    await race(`${lazy ? "lazy " : ""}${r.size === 0n ? "forced close" : "fill"} ${what} size ${Number(r.size) / 1e6} at ${Number(b.markPrice) / 1e6} (${tuned.k} lag + ${tuned.settle.length} settle cranks)`, tuned.k > 0 && !tuned.settle.length && C.X1 ? [version(tuned.k), version(tuned.k + 1), version(0)] : C.X1 ? [version(tuned.k), version(tuned.k + 1)] : [version(tuned.k), version(tuned.k + 1), version(tuned.k + 2)]);
     if (C.SLOT_TIME) log(`  ${what}: done ${(Date.now() / 1000 - C.routerUnix(r.target)).toFixed(1)} s after its price slot ${r.target}`);
     else log(`  ${what}: ${Math.round(Date.now() / 1000 - (r.target - C.ROUTER_DELAY_SECS))} s from request to result (${(Date.now() / 1000 - r.target).toFixed(1)} s after its price time)`);
     break;
@@ -1591,7 +1614,8 @@ setInterval(() => {
         [i, await markPhase(vaults[i], now, snaps[i], n === 0).catch(e => { log("error", vaults[i].feed?.symbol, String(e?.message ?? e).slice(0, 140)); return null; })] as const;
       // (Side by side where the RPC allows it; one after the other on a throttled one.)
       const rounds = new Map<number, Round | null>(C.X1 ? await Promise.all(pending.map(mark)) : await pending.reduce(async (acc, i, n) => [...(await acc), await mark(i, n)], Promise.resolve([] as (readonly [number, Round | null])[])));
-      if ([...rounds.values()].some(r => r?.moved)) await settleRound(vaults).catch(e => log("error", "settle round", String(e?.message ?? e).slice(0, 140)));
+      // (Markets whose fills go lazily skip it: their fills re-value only the trader and the vault.)
+      if ([...rounds.values()].some(r => r?.moved && !r.lazy)) await settleRound(vaults).catch(e => log("error", "settle round", String(e?.message ?? e).slice(0, 140)));
       const service = (i: number) => {
         const v = vaults[i];
         // (A market with nothing queued gets an empty round: only its routine price refresh.)

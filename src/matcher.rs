@@ -23,6 +23,10 @@ const REQUEST_LEN: usize = 67;
 const ABI_VERSION: u32 = 3;
 const FLAG_VALID: u32 = 1;
 const FLAG_PARTIAL_OK: u32 = 2;
+/// Percolator fork flag (percolator-prog `matcher_abi::FLAG_COHORT_TOLERANT`, 2026-11-05): the
+/// trade may go through while other accounts' re-valuations on the asset are pending. Set only
+/// when the router armed the fill so (`state::ARMED_COHORT_TOLERANT`).
+pub const FLAG_COHORT_TOLERANT: u32 = 1 << 22;
 const FLAG_BACKING_FEE_CAP_SHIFT: u32 = 8;
 
 pub struct Request {
@@ -86,7 +90,8 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         return Err(VaultError::NotArmed.into());
     }
     let taker_closes = v.armed_closing != 0;
-    let dial = v.armed_dial;
+    let dial = v.armed_dial & !state::ARMED_COHORT_TOLERANT;
+    let tolerant = v.armed_dial & state::ARMED_COHORT_TOLERANT != 0;
     v.armed_dial = 0;
     v.armed_size = 0;
     v.armed_slot = 0;
@@ -147,7 +152,8 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
 
     let flags = FLAG_VALID
         | FLAG_PARTIAL_OK
-        | ((v.backing_fee_cap_bps as u32) << FLAG_BACKING_FEE_CAP_SHIFT);
+        | ((v.backing_fee_cap_bps as u32) << FLAG_BACKING_FEE_CAP_SHIFT)
+        | if tolerant { FLAG_COHORT_TOLERANT } else { 0 };
     let mut ret = [0u8; state::MATCHER_RETURN_LEN];
     ret[0..4].copy_from_slice(&ABI_VERSION.to_le_bytes());
     ret[4..8].copy_from_slice(&flags.to_le_bytes());

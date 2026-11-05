@@ -27,6 +27,9 @@ pub const KIND_CANONICAL: u8 = 1;
 /// account is also the matcher context Percolator passes to the vault's matcher entrypoint.
 pub const MATCHER_RETURN_LEN: usize = 64;
 pub const VAULT_STATE_OFF: usize = MATCHER_RETURN_LEN;
+/// `VaultState::armed_dial` bit: the router lets the armed fill go through while other accounts on
+/// the asset are not re-valued yet (`matcher::FLAG_COHORT_TOLERANT`).
+pub const ARMED_COHORT_TOLERANT: u8 = 0x80;
 
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 #[repr(C, packed)]
@@ -67,6 +70,7 @@ pub struct VaultState {
     pub armed_closing: u8,
     /// The risk dial the router armed this fill with (`risk::dial`, 0 or 1 = normal): a fill that
     /// grows the vault's position gets this many times less room. Cleared with the arm.
+    /// The risk dial of the armed fill (low bits), and `ARMED_COHORT_TOLERANT`.
     pub armed_dial: u8,
     pub max_fill_abs: u128,
     pub max_inventory_abs: u128,

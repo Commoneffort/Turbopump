@@ -27,6 +27,7 @@ pub mod carry;
 #[cfg(not(target_os = "solana"))]
 pub mod client;
 pub mod funding;
+pub mod lazy;
 pub mod risk;
 pub mod social;
 pub mod state;
@@ -330,6 +331,7 @@ pub const TAG_OPEN_CARRY: u8 = 32;
 pub const TAG_OPEN_LEDGER: u8 = 33;
 pub const TAG_PAY_FEES: u8 = 34;
 pub const TAG_REFRESH_RECORD: u8 = 35;
+pub const TAG_OPEN_RANGE: u8 = 36;
 /// Widest trail, in basis points.
 pub const MAX_TRAIL_BPS: u64 = 5_000;
 /// Shortest time between two slices of a TWAP order, and the most slices one can have.
@@ -526,6 +528,7 @@ pub fn process_instruction(program_id: &Pubkey, accounts: &[AccountInfo], data: 
         TAG_SWAP => swap::swap(accounts, rest),
         TAG_REFRESH_FUNDING => funding::refresh_funding(program_id, accounts),
         TAG_OPEN_CARRY => carry::open_carry(program_id, accounts),
+        TAG_OPEN_RANGE => lazy::open_range(program_id, accounts),
         TAG_OPEN_LEDGER => carry::open_ledger(program_id, accounts),
         TAG_PAY_FEES => carry::pay_fees(program_id, accounts),
         TAG_REFRESH_RECORD => social::refresh_record(program_id, accounts),
@@ -1816,6 +1819,17 @@ fn advance(program_id: &Pubkey, accounts: &[AccountInfo], observation_sequence: 
     if SLOT_TIME && mark_at != 0 && b.mark_price != 0 {
         disagreement = disagreement.max(risk::speed_bps(b.mark_price, price, at.saturating_sub(mark_at)));
     }
+    // Lazy settlement (`lazy`): the vault's price range, when passed, restarts if every account
+    // is up to date now, and takes this mark in below.
+    let range_ai = lazy::find(program_id, accounts, vault_ai.key);
+    let mut range = match range_ai {
+        Some(ai) => {
+            let mut r: PriceRange = load(ai, program_id, RANGE_MAGIC)?;
+            lazy::restart_if_current(&mut r, &market.try_borrow_data()?, v.asset_index, &b)?;
+            Some(r)
+        }
+        None => None,
+    };
     let mut data = vec![TAG_PUSH_MARK];
     data.extend_from_slice(&price.to_le_bytes());
     data.extend_from_slice(&observation_sequence.to_le_bytes());
@@ -1834,6 +1848,10 @@ fn advance(program_id: &Pubkey, accounts: &[AccountInfo], observation_sequence: 
         &[authority.clone(), vault_ai.clone(), market.clone(), percolator.clone(), vault_program.clone()],
         &[&[SEED_AUTHORITY, &[abump]]],
     )?;
+    if let (Some(ai), Some(r)) = (range_ai, range.as_mut()) {
+        lazy::take_mark(r, mark_at, at, price);
+        store(ai, r)?;
+    }
     b.mark_publish_time = at;
     b.mark_prev_publish_time = at_prev;
     b.mark_price = price;
@@ -2002,7 +2020,18 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         // takes it even while it accepts nothing else that grows its position.
         let closing = before != 0 && (before > 0) != (size > 0) && size.unsigned_abs() <= before.unsigned_abs();
         let dial = risk::dial(b.price_dial, tier_of_feed(&v.oracle_feeds[0]), Clock::get()?.unix_timestamp);
-        trade_against_vault(accounts, &t, &v, abump, market_id, size, closing, fee_bps, dial)?;
+        // Lazy settlement (`lazy`): with the vault's price range passed and narrow enough, the
+        // fill goes through without the asset's other accounts re-valued first.
+        let tolerant = match lazy::find(program_id, accounts, vault_ai.key) {
+            Some(ai) => {
+                let mut r: PriceRange = load(ai, program_id, RANGE_MAGIC)?;
+                lazy::restart_if_current(&mut r, &market.try_borrow_data()?, v.asset_index, &b)?;
+                store(ai, &r)?;
+                lazy::tolerant(&r, &market.try_borrow_data()?, v.asset_index, &b)?
+            }
+            None => false,
+        };
+        trade_against_vault(accounts, &t, &v, abump, market_id, size, closing, fee_bps, dial, tolerant)?;
         // The vault's position just changed: one step of its funding rate toward the new target
         // (the asset is accrued to this slot, which Percolator requires to take a rate).
         funding::refresh(acc(accounts, 5)?, acc(accounts, 6)?, acc(accounts, 10)?, acc(accounts, 11)?, acc(accounts, 12)?, abump)?;
@@ -2097,13 +2126,16 @@ fn reduce_unilaterally<'a>(trader_ai: &AccountInfo<'a>, market: &AccountInfo<'a>
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
-fn trade_against_vault(accounts: &[AccountInfo], t: &TraderState, v: &vstate::VaultState, abump: u8, market_id: u64, size: i128, closing: bool, fee_bps: u64, dial: u8) -> ProgramResult {
+fn trade_against_vault(accounts: &[AccountInfo], t: &TraderState, v: &vstate::VaultState, abump: u8, market_id: u64, size: i128, closing: bool, fee_bps: u64, dial: u8, tolerant: bool) -> ProgramResult {
     let (trader_ai, vault_ai, market, portfolio) = (acc(accounts, 2)?, acc(accounts, 5)?, acc(accounts, 6)?, acc(accounts, 7)?);
     let (lp_portfolio, delegate, authority, vault_program, percolator) = (acc(accounts, 8)?, acc(accounts, 9)?, acc(accounts, 10)?, acc(accounts, 11)?, acc(accounts, 12)?);
     let mut arm = vec![TAG_ARM_FILL];
     arm.extend_from_slice(&size.to_le_bytes());
     arm.push(closing as u8);
     arm.push(dial);
+    if tolerant {
+        arm.push(1);
+    }
     invoke_signed(
         &Instruction {
             program_id: percolator_vault::id(),

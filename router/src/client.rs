@@ -314,6 +314,30 @@ pub fn fill(executor: &Pubkey, k: &VaultKeys, t: &TraderKeys) -> Instruction {
     }
 }
 
+/// `fill` with the vault's price range (`lazy`): the fill may then go through without the
+/// asset's other accounts re-valued first, while the range allows it.
+pub fn fill_lazy(executor: &Pubkey, k: &VaultKeys, t: &TraderKeys) -> Instruction {
+    let mut ix = fill(executor, k, t);
+    let at = ix.accounts.len() - 1;
+    ix.accounts.insert(at, w(range_address(&id(), &k.vault).0));
+    ix
+}
+
+/// `advance` with the vault's price range (`lazy`), so that it takes the new mark in.
+pub fn with_range(mut ix: Instruction, vault: &Pubkey) -> Instruction {
+    ix.accounts.push(w(range_address(&id(), vault).0));
+    ix
+}
+
+/// Starts a vault's price range account (`lazy`; anyone may, and pays for it).
+pub fn open_range(payer: &Pubkey, vault: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: id(),
+        accounts: vec![AccountMeta::new(*payer, true), ro(*vault), ro(book_address(&id(), vault).0), w(range_address(&id(), vault).0), ro(system_program::ID)],
+        data: vec![TAG_OPEN_RANGE],
+    }
+}
+
 pub fn expire(caller: &Pubkey, vault: &Pubkey, t: &TraderKeys) -> Instruction {
     Instruction {
         program_id: id(),

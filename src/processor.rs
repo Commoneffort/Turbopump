@@ -577,10 +577,13 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
             push_mark(program_id, accounts, r(0), r(8), r(16))
         }
         TAG_ARM_FILL => {
-            if !(16..=18).contains(&rest.len()) || rest.get(16).is_some_and(|c| *c > 1) || rest.get(17).is_some_and(|d| *d > crate::math::MAX_DIAL) {
+            if !(16..=19).contains(&rest.len()) || rest.get(16).is_some_and(|c| *c > 1) || rest.get(17).is_some_and(|d| *d > crate::math::MAX_DIAL) || rest.get(18).is_some_and(|c| *c > 1) {
                 return Err(VaultError::InvalidInstruction.into());
             }
-            arm_fill(program_id, accounts, i128::from_le_bytes(rest[..16].try_into().unwrap()), rest.get(16) == Some(&1), rest.get(17).copied().unwrap_or(0))
+            // (Byte 18, since 2026-11-05: 1 when the router lets this fill go through while other
+            // accounts on the asset are not re-valued yet: see `matcher::FLAG_COHORT_TOLERANT`.)
+            let dial = rest.get(17).copied().unwrap_or(0) | if rest.get(18) == Some(&1) { state::ARMED_COHORT_TOLERANT } else { 0 };
+            arm_fill(program_id, accounts, i128::from_le_bytes(rest[..16].try_into().unwrap()), rest.get(16) == Some(&1), dial)
         }
         TAG_REQUIRE_FLAT => {
             no_args(rest)?;

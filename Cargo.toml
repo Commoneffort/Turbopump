@@ -45,3 +45,8 @@ unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(target_os, values("solana"))',
     'cfg(feature, values("custom-heap", "custom-panic"))',
 ] }
+
+# Speed work (docs/SPEED-FORK.md): the engine fork's branch, from the local worktree until its
+# commit is pinned (here and in percolator-prog).
+[patch."https://github.com/Commoneffort/percolator"]
+percolator = { path = "../_wt_speed" }
