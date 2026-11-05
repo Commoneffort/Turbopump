@@ -1282,6 +1282,11 @@ export const decodeRange = (d: Uint8Array): PriceRange => ({
   low: u64(d, 40), high: u64(d, 48), markAt: Number(i64(d, 56)),
   indices: [0, 1, 2, 3].map(i => u128(d, 64 + 16 * i)), valid: d[128] === 1,
 });
+/** How many positions are open on an asset (both sides). */
+export function assetPositionCount(market: Uint8Array, asset: number): number {
+  const e = L.market.slots + asset * L.market.slot_len + L.market.engine;
+  return Number(u64(market, e + 321) + u64(market, e + 329));
+}
 /** The router's `lazy::tolerant`: whether a fill now skips re-valuing the asset's other accounts
  *  (true only while some are out of date and the range allows it). */
 export function lazyReady(market: Uint8Array, asset: number, b: Book, r: PriceRange | null, requireStale = true): boolean {

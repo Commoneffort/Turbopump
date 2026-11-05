@@ -983,12 +983,22 @@ async function settleEpoch(v: C.Vault, r: C.RouterRequest, what: string) {
  *  re-value every holder first. */
 type Round = { b: C.Book; reqs: C.RouterRequest[]; moved: boolean; lazy?: boolean };
 
-/** Whether fills on `v` at the mark `b` holds may go lazily (see `Round.lazy`). */
-async function lazyNow(v: C.Vault, b: C.Book): Promise<boolean> {
+/** Whether fills on `v` at the mark `b` holds go lazily (see `Round.lazy`), for `waiting`
+ *  requests at that price. The router must allow it (the price range). And while few accounts
+ *  hold positions, a burst of trades at one price is faster the old way: everyone re-valued at
+ *  once in a few transactions side by side, then the fills in groups. So lazily when few trades
+ *  wait (`LAZY_BUSY`) or many accounts hold positions (`LAZY_HOLDERS`), where re-valuing them all
+ *  is what does not scale. (Load drill, 60 holders, November 2026: lazy 1.9 s at one trade a
+ *  second against 3.2 s; the old way 3.2-3.8 s against lazy 5-5.5 s at 6 to 12 a second.) */
+const LAZY_BUSY = Number(process.env.LAZY_BUSY ?? 3);
+const LAZY_HOLDERS = Number(process.env.LAZY_HOLDERS ?? 200);
+async function lazyNow(v: C.Vault, b: C.Book, waiting = 1): Promise<boolean> {
   if (!C.LAZY_FILLS) return false;
   const [m, ra] = await conn.getMultipleAccountsInfo([C.MARKET, C.rangeAddress(v.key)]).catch(() => [null, null]);
   if (!m || !ra || ra.data.length !== C.RANGE_LEN) return false;
-  return C.lazyReady(new Uint8Array(m.data), v.assetIndex, b, C.decodeRange(new Uint8Array(ra.data)), false);
+  const market = new Uint8Array(m.data);
+  if (waiting > LAZY_BUSY && C.assetPositionCount(market, v.assetIndex) <= LAZY_HOLDERS) return false;
+  return C.lazyReady(market, v.assetIndex, b, C.decodeRange(new Uint8Array(ra.data)), false);
 }
 const rangeTried = new Set<string>();
 
@@ -1078,12 +1088,13 @@ async function markPhase(v: C.Vault, now: number, snap: Snapshot, withCatchUp: b
     // The first trade at the target in the same transaction as its price, while lazy fills are
     // allowed (the price range is narrow and has seen the current mark).
     const first = live.find(r => r.target === earliest && !r.settle);
-    if (j && ONE_TX && C.LAZY_FILLS && first && (await lazyNow(v, b))) moved = await priceAndFill(v, b, j, first, snap.market, slotNow);
+    const atTarget = live.filter(r => r.target === earliest).length;
+    if (j && ONE_TX && C.LAZY_FILLS && first && (await lazyNow(v, b, atTarget))) moved = await priceAndFill(v, b, j, first, snap.market, slotNow);
     if (j && !moved) moved = await advanceReported(v, j, `price for slot ${earliest}`, withCatchUp, true);
     if (moved) {
       const ba = await conn.getAccountInfo(C.bookAddress(v.key));
       if (ba) b = C.decodeBook(new Uint8Array(ba.data));
-      return { b, reqs, moved, lazy: await lazyNow(v, b) };
+      return { b, reqs, moved, lazy: await lazyNow(v, b, live.filter(r => b.markPrev < r.target && r.target <= b.markPublish).length) };
     }
   } else if (!owed && earliest !== null && earliest > C.LEGACY_TIME && Math.max(now, Date.now() / 1000) >= earliest + (ORACLE === "jack" ? 0 : 0.6) && now < earliest + C.ROUTER_GRACE_SECS - 3) {
     const u = ORACLE === "pyth" ? await firstAtOrAfter(v.feed!.id, earliest).catch(() => null) : null;
@@ -1186,7 +1197,7 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
   // vault. Those are re-valued side by side first (a few to a transaction, like the round's
   // settle), so that the fills can then go several to a transaction.
   const atMarkReqs = live.filter(r => tradeOn && !r.settle && b.markPrev < r.target && r.target <= b.markPublish && !unledgered.has(acctKey(r)));
-  const lazyVault = atMarkReqs.length > 0 && (!!round.lazy || (C.LAZY_FILLS && (await lazyNow(v, b))));
+  const lazyVault = atMarkReqs.length > 0 && (round.moved ? !!round.lazy : C.LAZY_FILLS && (await lazyNow(v, b, atMarkReqs.length)));
   if (lazyVault && atMarkReqs.length > 1) {
     const want = new Set([v.lpPortfolio.toBase58(), ...atMarkReqs.map(r => C.routerPortfolio(r.wallet, r.sub).toBase58())]);
     const p = C.crankPlan(await snapshot(), payer.publicKey, v.lpPortfolio, v.assetIndex);
