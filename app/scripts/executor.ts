@@ -1065,8 +1065,11 @@ type Round = { b: C.Book; reqs: C.RouterRequest[]; moved: boolean; lazy?: boolea
  *  second against 3.2 s; the old way 3.2-3.8 s against lazy 5-5.5 s at 6 to 12 a second.) */
 const LAZY_BUSY = Number(process.env.LAZY_BUSY ?? 3);
 const LAZY_HOLDERS = Number(process.env.LAZY_HOLDERS ?? 200);
-/** Lazy fills sent side by side on one market (each re-values only its own trader). */
-const LAZY_PARALLEL = Number(process.env.LAZY_PARALLEL ?? 6);
+/** Lazy fills sent side by side on one market (each re-values only its own trader). Off (1) by
+ *  default: in the load drill (400 holders, November 2026) fills side by side kept failing on one
+ *  another's catch-up cranks (a crank with nothing to do fails its transaction), and one after the
+ *  other was faster (13.6 fills a second at 50 trades a second, against 5.8). */
+const LAZY_PARALLEL = Number(process.env.LAZY_PARALLEL ?? 1);
 const lazyWhy = new Map<string, string>();
 async function lazyNow(v: C.Vault, b: C.Book, waiting = 1): Promise<boolean> {
   if (!C.LAZY_FILLS) return false;
@@ -1384,7 +1387,7 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
   };
   // Lazy: the requests whose traders are up to date go in groups; the others each re-value only
   // their own trader (and the vault), so they do not wait on one another: LAZY_PARALLEL at once.
-  if (lazyVault && atMarkReqs.length > 1) {
+  if (lazyVault && atMarkReqs.length > 1 && LAZY_PARALLEL > 1) {
     for (const ids of await fillTogether(v, b, atMarkReqs, true)) grouped.add(ids);
     const rest = atMarkReqs.filter(r => !grouped.has(r.id));
     // The vault re-valued once first, if it is out of date: a fill that carried it would fail
