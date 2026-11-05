@@ -431,6 +431,8 @@ async function requestsOf(v: C.Vault, b: C.Book) {
     }
   }
   if (named.length < b.pending.length) found.push(...(await C.pendingRequests(conn, v.key)).filter(r => listed(r) && !found.some(x => x.id === r.id)));
+  // (Every request named: one that is not there any more has just been filled or expired.)
+  if (named.length === b.pending.length) return found;
   if (found.length < b.pending.length) {
     if (Date.now() - traderKeysAt > 20_000) {
       traderKeys = (await conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: C.TRADER_LEN }], dataSlice: { offset: 0, length: 0 } })).map(a => a.pubkey);
@@ -1063,13 +1065,18 @@ type Round = { b: C.Book; reqs: C.RouterRequest[]; moved: boolean; lazy?: boolea
  *  second against 3.2 s; the old way 3.2-3.8 s against lazy 5-5.5 s at 6 to 12 a second.) */
 const LAZY_BUSY = Number(process.env.LAZY_BUSY ?? 3);
 const LAZY_HOLDERS = Number(process.env.LAZY_HOLDERS ?? 200);
+const lazyWhy = new Map<string, string>();
 async function lazyNow(v: C.Vault, b: C.Book, waiting = 1): Promise<boolean> {
   if (!C.LAZY_FILLS) return false;
   const [m, ra] = await conn.getMultipleAccountsInfo([C.MARKET, C.rangeAddress(v.key)]).catch(() => [null, null]);
-  if (!m || !ra || ra.data.length !== C.RANGE_LEN) return false;
+  const why = (w: string) => { if (lazyWhy.get(v.key.toBase58()) !== w) { lazyWhy.set(v.key.toBase58(), w); log(`lazy ${v.feed?.symbol}: ${w}`); } return w === "yes"; };
+  if (!m || !ra || ra.data.length !== C.RANGE_LEN) return why("no price range account");
   const market = new Uint8Array(m.data);
-  if (waiting > LAZY_BUSY && C.assetPositionCount(market, v.assetIndex) <= LAZY_HOLDERS) return false;
-  return C.lazyReady(market, v.assetIndex, b, C.decodeRange(new Uint8Array(ra.data)), false);
+  const positions = C.assetPositionCount(market, v.assetIndex);
+  if (waiting > LAZY_BUSY && positions <= LAZY_HOLDERS) return why(`busy, few holders (${positions})`);
+  const r = C.decodeRange(new Uint8Array(ra.data));
+  if (C.lazyReady(market, v.assetIndex, b, r, false)) return why("yes");
+  return why(!r.valid ? "range spoilt" : r.markAt !== b.markPublish ? `range missed a mark (${r.markAt} vs ${b.markPublish})` : `range too wide or indices moved (${r.low}-${r.high})`);
 }
 const rangeTried = new Set<string>();
 const growTriedAt = new Map<string, number>();
