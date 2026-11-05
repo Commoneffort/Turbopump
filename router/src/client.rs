@@ -329,6 +329,15 @@ pub fn with_range(mut ix: Instruction, vault: &Pubkey) -> Instruction {
     ix
 }
 
+/// Grows a vault's book made before 2026-11-05 to `MAX_PENDING` requests (anyone may).
+pub fn grow_book(payer: &Pubkey, vault: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: id(),
+        accounts: vec![AccountMeta::new(*payer, true), w(book_address(&id(), vault).0), ro(system_program::ID)],
+        data: vec![TAG_GROW_BOOK],
+    }
+}
+
 /// Starts a vault's price range account (`lazy`; anyone may, and pays for it).
 pub fn open_range(payer: &Pubkey, vault: &Pubkey) -> Instruction {
     Instruction {

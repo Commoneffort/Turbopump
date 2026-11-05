@@ -88,10 +88,10 @@ export default {
       "mark_set_time": 74,
       "next_id": 104,
       "pending_id": 120,
-      "pending_target": 376,
+      "pending_target": 1144,
       "vault": 8
     },
-    "book_len": 632,
+    "book_len": 2168,
     "carry": {
       "index_long": 40,
       "index_short": 56,
@@ -146,7 +146,7 @@ export default {
       "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace"
     ],
     "max_orders": 8,
-    "max_pending": 32,
+    "max_pending": 128,
     "min_fill_bps": 1000,
     "min_im_off": 518,
     "mm_bps_off": 550,

@@ -1,6 +1,6 @@
 // Account decoding and instruction building for the vault program and Percolator. Offsets come
 // from layout.json, which a Rust test exports from the program and engine types.
-import {
+import { AddressLookupTableAccount,
   AccountMeta,
   Commitment,
   ComputeBudgetProgram,
@@ -657,11 +657,11 @@ export async function marketSnapshot(conn: Connection, commitment: Commitment = 
  *  can use several hundred thousand units, and the fee does not depend on the request. On X1 a
  *  transaction pays 10 lamports for every unit it asks for, used or not (0.014 XNT at the
  *  maximum), so it asks for what a simulation says it uses, plus `spare`. */
-export async function computeLimit(conn: Connection, payer: PublicKey, ixs: TransactionInstruction[], spare = 1.2): Promise<TransactionInstruction> {
+export async function computeLimit(conn: Connection, payer: PublicKey, ixs: TransactionInstruction[], spare = 1.2, alts: AddressLookupTableAccount[] = []): Promise<TransactionInstruction> {
   const max = ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 });
   if (!X1) return max;
   try {
-    const msg = new TransactionMessage({ payerKey: payer, recentBlockhash: PublicKey.default.toBase58(), instructions: [max, ...ixs] }).compileToV0Message();
+    const msg = new TransactionMessage({ payerKey: payer, recentBlockhash: PublicKey.default.toBase58(), instructions: [max, ...ixs] }).compileToV0Message(alts);
     const r = await conn.simulateTransaction(new VersionedTransaction(msg), { sigVerify: false, replaceRecentBlockhash: true });
     const used = r.value.unitsConsumed;
     if (used) return ComputeBudgetProgram.setComputeUnitLimit({ units: Math.min(1_400_000, Math.ceil(used * spare) + 10_000) });
@@ -1123,7 +1123,11 @@ export type Book = { vault: PublicKey; len: number; hasCarry: boolean; markSet: 
 export function decodeBook(d: Uint8Array): Book {
   const b = R.book;
   const len = d[b.len];
-  const pending = Array.from({ length: len }, (_, i) => ({ id: u64(d, b.pending_id + 8 * i), target: Number(i64(d, b.pending_target + 8 * i)) }));
+  // (The two request arrays fill the rest of the account: 128 places since 2026-11-05, 32 in a
+  // book not grown yet, see `growBook`.)
+  const places = Math.floor((d.length - b.pending_id) / 16);
+  const targets = b.pending_id + 8 * places;
+  const pending = Array.from({ length: len }, (_, i) => ({ id: u64(d, b.pending_id + 8 * i), target: Number(i64(d, targets + 8 * i)) }));
   let markPublish = Number(i64(d, b.mark_publish_time)), markPrev = Number(i64(d, b.mark_prev_publish_time));
   const isSlot = (t: number) => t > 0 && t <= LEGACY_TIME;
   const slotTime = X1 && (isSlot(markPublish) || pending.some(p => isSlot(p.target)));
@@ -1272,6 +1276,13 @@ export const carryAddress = (vault: PublicKey) => rpda(Buffer.from("carry"), vau
 export const LAZY_FILLS = X1 && (typeof process === "undefined" || process.env?.LAZY !== "0");
 export const rangeAddress = (vault: PublicKey) => rpda(Buffer.from("range"), vault.toBuffer());
 export const RANGE_LEN = 8 + 32 + 8 + 8 + 8 + 64 + 1 + 1 + 6;
+/** A vault's book made when books held 32 requests is grown to 128 (router tag 37; anyone may). */
+export const BOOK_LEN: number = (L.router as any).book_len;
+export const growBook = (payer: PublicKey, vault: PublicKey) => new TransactionInstruction({
+  programId: ROUTER,
+  keys: [rw(payer, true), rw(bookAddress(vault)), ro(SystemProgram.programId)],
+  data: new W().u8(37).done(),
+});
 export const openRange = (payer: PublicKey, vault: PublicKey) => new TransactionInstruction({
   programId: ROUTER,
   keys: [rw(payer, true), ro(vault), ro(bookAddress(vault)), rw(rangeAddress(vault)), ro(SystemProgram.programId)],

@@ -334,6 +334,7 @@ pub const TAG_OPEN_LEDGER: u8 = 33;
 pub const TAG_PAY_FEES: u8 = 34;
 pub const TAG_REFRESH_RECORD: u8 = 35;
 pub const TAG_OPEN_RANGE: u8 = 36;
+pub const TAG_GROW_BOOK: u8 = 37;
 /// Widest trail, in basis points.
 pub const MAX_TRAIL_BPS: u64 = 5_000;
 /// Shortest time between two slices of a TWAP order, and the most slices one can have.
@@ -531,6 +532,7 @@ pub fn process_instruction(program_id: &Pubkey, accounts: &[AccountInfo], data: 
         TAG_REFRESH_FUNDING => funding::refresh_funding(program_id, accounts),
         TAG_OPEN_CARRY => carry::open_carry(program_id, accounts),
         TAG_OPEN_RANGE => lazy::open_range(program_id, accounts),
+        TAG_GROW_BOOK => grow_book(program_id, accounts),
         TAG_OPEN_LEDGER => carry::open_ledger(program_id, accounts),
         TAG_PAY_FEES => carry::pay_fees(program_id, accounts),
         TAG_REFRESH_RECORD => social::refresh_record(program_id, accounts),
@@ -939,6 +941,42 @@ fn open_book(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     b.market = v.market;
     b.bump = bump;
     store(book_ai, &b)
+}
+
+/// `GrowBook` (anyone; the payer pays the extra rent): grows a book made when books held
+/// `OLD_MAX_PENDING` requests to `MAX_PENDING`, keeping every queued request. Until then the book
+/// cannot be used (every instruction checks its size). Does nothing to a book already grown.
+///
+/// Accounts: 0 payer [s, w], 1 book [w], 2 system program.
+#[inline(never)]
+fn grow_book(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let (payer, book_ai, system) = (acc(accounts, 0)?, acc(accounts, 1)?, acc(accounts, 2)?);
+    signer(payer)?;
+    writable(book_ai)?;
+    key_is(system, &system_program::ID)?;
+    if book_ai.owner != program_id {
+        return Err(RouterError::BadAccount.into());
+    }
+    if book_ai.data_len() == BOOK_LEN {
+        return Ok(());
+    }
+    if book_ai.data_len() != OLD_BOOK_LEN || book_ai.try_borrow_data()?[..8] != BOOK_MAGIC.to_le_bytes() {
+        return Err(RouterError::BadAccount.into());
+    }
+    let old = book_ai.try_borrow_data()?.to_vec();
+    let need = Rent::get()?.minimum_balance(BOOK_LEN).saturating_sub(book_ai.lamports());
+    if need > 0 {
+        invoke(&system_instruction::transfer(payer.key, book_ai.key, need), &[payer.clone(), book_ai.clone(), system.clone()])?;
+    }
+    book_ai.realloc(BOOK_LEN, true)?;
+    let mut d = book_ai.try_borrow_mut_data()?;
+    let (h, n) = (BOOK_HEADER_LEN, OLD_MAX_PENDING);
+    d[..h].copy_from_slice(&old[..h]);
+    // The ids, then the targets, each array now MAX_PENDING long.
+    d[h..h + 8 * n].copy_from_slice(&old[h..h + 8 * n]);
+    d[h + 8 * n..h + 8 * MAX_PENDING].fill(0);
+    d[h + 8 * MAX_PENDING..h + 8 * MAX_PENDING + 8 * n].copy_from_slice(&old[h + 8 * n..h + 16 * n]);
+    Ok(())
 }
 
 /// Margin check: after the trade, equity must cover every position's opening margin (its tier's,

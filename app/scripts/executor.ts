@@ -42,7 +42,7 @@
 // Run: RPC=... npx tsx scripts/executor.ts
 // On X1 testnet: NETWORK=x1-testnet npx tsx scripts/executor.ts (the price service is then the
 // source, the key is ~/.config/solana/percolator-x1/deployer.json, and no Hermes key is needed).
-import { ComputeBudgetProgram, Connection, Keypair, PublicKey, SYSVAR_CLOCK_PUBKEY, Transaction, TransactionInstruction, TransactionMessage, VersionedTransaction } from "@solana/web3.js";
+import { AddressLookupTableAccount, AddressLookupTableProgram, ComputeBudgetProgram, Connection, Keypair, PublicKey, SystemProgram, SYSVAR_CLOCK_PUBKEY, Transaction, TransactionInstruction, TransactionMessage, VersionedTransaction } from "@solana/web3.js";
 import * as fs from "fs";
 import { createRequire } from "module";
 import * as C from "../src/chain";
@@ -475,7 +475,7 @@ async function tune(lagCrank: TransactionInstruction, k: number, settle: Transac
   let shortAt = -1, overAt = -1;
   for (let round = 0; round < 10; round++) {
     // The simulation replaces the blockhash, so any well-formed one will do.
-    const msg = new TransactionMessage({ payerKey: payer.publicKey, recentBlockhash: PublicKey.default.toBase58(), instructions: [...budget(), ...Array(k).fill(lagCrank), ...settle, ...tail] }).compileToV0Message();
+    const msg = new TransactionMessage({ payerKey: payer.publicKey, recentBlockhash: PublicKey.default.toBase58(), instructions: [...budget(), ...Array(k).fill(lagCrank), ...settle, ...tail] }).compileToV0Message(ALTS);
     const r = await conn.simulateTransaction(new VersionedTransaction(msg), { sigVerify: false, replaceRecentBlockhash: true });
     const err: any = r.value.err;
     if (!err) return { k, settle };
@@ -520,7 +520,9 @@ const LIQ_PER_TX = Number(process.env.LIQ_PER_TX ?? 6);
 /** How many fills go in one transaction when several requests share a price. */
 // (Two since the fee accounts were added to a fill, 2026-10-29: three fills and three lag cranks
 // came to 1,234 bytes, over a transaction's 1,232.)
-const FILLS_PER_TX = Number(process.env.FILLS_PER_TX ?? 2);
+// (Four with the lookup table, `ensureAlt`: the shared accounts then take a byte each.)
+const FILLS_PER_TX_ENV = process.env.FILLS_PER_TX;
+let FILLS_PER_TX = Number(FILLS_PER_TX_ENV ?? 2);
 
 /** Fills requests that wait at the vault's current mark together, `FILLS_PER_TX` to a
  *  transaction, when none of them needs accounts settled first (true right after a fill at that
@@ -572,7 +574,7 @@ async function fillTogether(v: C.Vault, b: C.Book, rs: C.RouterRequest[], lazy =
     if (typeof t === "string" && t.includes(`"Custom":${0x570a}`)) continue;
     if (typeof t === "string") {
       // What the program said (the simulation's last lines), for a group that cannot go together.
-      const msg = new TransactionMessage({ payerKey: payer.publicKey, recentBlockhash: PublicKey.default.toBase58(), instructions: [...budget(), ...Array(k).fill(lagCrank), ...tail] }).compileToV0Message();
+      const msg = new TransactionMessage({ payerKey: payer.publicKey, recentBlockhash: PublicKey.default.toBase58(), instructions: [...budget(), ...Array(k).fill(lagCrank), ...tail] }).compileToV0Message(ALTS);
       const sim = await conn.simulateTransaction(new VersionedTransaction(msg), { sigVerify: false, replaceRecentBlockhash: true }).catch(() => null);
       log("fail", `fill ${group.length} together on ${v.feed?.symbol} (${group.map(r => `#${r.id}${r.size === 0n ? " close" : ""}`).join(" ")})`, `${t} | ${(sim?.value.logs ?? []).filter(l => /log:|failed/.test(l)).slice(-3).join(" | ")}`);
       continue;
@@ -601,6 +603,55 @@ const raceWins = new Map<string, number[]>();
 // nor fails in that time is usually just slow, and the others cannot both succeed with it).
 const FIRST_ALONE_MS = Number(process.env.RACE_FIRST_MS ?? 1_500);
 
+// ---- address lookup table (X1): the accounts every fill shares are named by a one-byte index
+// instead of 32 bytes, so a transaction holds four fills instead of two (a transaction is at most
+// 1,232 bytes). One table per executor key, kept in deploy/logs; ALT=0 turns it off.
+let ALTS: AddressLookupTableAccount[] = [];
+const ALT_ON = C.X1 && process.env.ALT !== "0";
+const altFile = () => `../deploy/logs/alt-${C.NETWORK}-${payer.publicKey.toBase58()}.json`;
+async function ensureAlt(vaults: C.Vault[]) {
+  if (!ALT_ON || !vaults.length) return;
+  const want = new Set<string>([C.MARKET, C.ROUTER, C.VAULT_PROGRAM, C.PERCOLATOR, C.routerAuthority(), C.tiersAddress(), SystemProgram.programId, ComputeBudgetProgram.programId, SYSVAR_CLOCK_PUBKEY,
+    ...(reporter ? [reporter.publicKey] : []),
+    ...vaults.flatMap(v => [v.key, C.bookAddress(v.key), v.lpPortfolio, v.delegate, C.carryAddress(v.key), C.rangeAddress(v.key), ...(v.feed ? [C.reportAddress(v.feed.id), C.witnessAddress(v.feed.id)] : [])]),
+  ].map(k => k.toBase58()));
+  // (Signers cannot be read from a table: the reporter signs its price posts, so it stays out.)
+  if (reporter) want.delete(reporter.publicKey.toBase58());
+  let addr: PublicKey | null = null;
+  try { addr = new PublicKey(JSON.parse(fs.readFileSync(altFile(), "utf8")).address); } catch { /* none yet */ }
+  let table = addr ? (await conn.getAddressLookupTable(addr).catch(() => null))?.value ?? null : null;
+  if (!table) {
+    const slot = await conn.getSlot("finalized");
+    const [create, created] = AddressLookupTableProgram.createLookupTable({ authority: payer.publicKey, payer: payer.publicKey, recentSlot: slot });
+    if (!(await send("create the executor's lookup table", [create], true))) return;
+    fs.writeFileSync(altFile(), JSON.stringify({ address: created.toBase58() }));
+    addr = created;
+  }
+  const have = new Set((table?.state.addresses ?? []).map(k => k.toBase58()));
+  const missing = [...want].filter(k => !have.has(k)).map(k => new PublicKey(k));
+  for (let i = 0; i < missing.length; i += 20) {
+    await send(`add ${Math.min(20, missing.length - i)} accounts to the lookup table`, [AddressLookupTableProgram.extendLookupTable({ lookupTable: addr!, authority: payer.publicKey, payer: payer.publicKey, addresses: missing.slice(i, i + 20) })], true);
+  }
+  // (A table's new entries can be used from the next slot on.)
+  if (missing.length) await new Promise(r => setTimeout(r, 1_500));
+  table = (await conn.getAddressLookupTable(addr!).catch(() => null))?.value ?? null;
+  ALTS = table ? [table] : [];
+  if (table) log(`lookup table ${addr!.toBase58()}: ${table.state.addresses.length} accounts`);
+}
+let blockhash = { hash: "", at: 0 };
+async function recentBlockhash() {
+  if (Date.now() - blockhash.at > 2_000) blockhash = { hash: (await conn.getLatestBlockhash("processed")).blockhash, at: Date.now() };
+  return blockhash.hash;
+}
+/** Sends `ixs` signed by the payer: through the lookup table when there is one. */
+async function sendIxs(ixs: TransactionInstruction[]) {
+  if (!ALTS.length) return conn.sendTransaction(new Transaction().add(...ixs), [payer], { skipPreflight: true });
+  const msg = new TransactionMessage({ payerKey: payer.publicKey, recentBlockhash: await recentBlockhash(), instructions: ixs }).compileToV0Message(ALTS);
+  const tx = new VersionedTransaction(msg);
+  tx.sign([payer]);
+  return conn.sendTransaction(tx, { skipPreflight: true });
+}
+
 /** Sends alternative versions of one action (no preflight) and waits until one lands. They differ
  *  only in their cranks and at most one can succeed. On X1 a failed transaction still pays for all
  *  the compute it asked for (about 0.011 XNT here), and sending every version at once paid for one
@@ -610,10 +661,10 @@ async function race(label: string, variants: TransactionInstruction[][]) {
   const sigs: (string | null)[] = variants.map(() => null);
   // Each asks for what the largest of them uses in simulation, with room for one more crank.
   let most = 0;
-  if (C.X1) most = Math.max(...(await Promise.all(variants.map(ixs => C.computeLimit(conn, payer.publicKey, ixs)))).map(ix => ix.data.readUInt32LE(1)));
+  if (C.X1) most = Math.max(...(await Promise.all(variants.map(ixs => C.computeLimit(conn, payer.publicKey, ixs, 1.2, ALTS)))).map(ix => ix.data.readUInt32LE(1)));
   const one = async (i: number) => {
     const head = C.X1 ? [ComputeBudgetProgram.setComputeUnitLimit({ units: Math.min(1_400_000, Math.ceil(most * 1.25) + 150_000) })] : budget();
-    sigs[i] = await conn.sendTransaction(new Transaction().add(...head, ...variants[i]), [payer], { skipPreflight: true }).catch(() => null);
+    sigs[i] = await sendIxs([...head, ...variants[i]]).catch(() => null);
   };
   const kind = `${label.split(" ")[0]}/${variants.length}`;
   const wins = raceWins.get(kind) ?? raceWins.set(kind, variants.map(() => 0)).get(kind)!;
@@ -1001,6 +1052,7 @@ async function lazyNow(v: C.Vault, b: C.Book, waiting = 1): Promise<boolean> {
   return C.lazyReady(market, v.assetIndex, b, C.decodeRange(new Uint8Array(ra.data)), false);
 }
 const rangeTried = new Set<string>();
+const growTriedAt = new Map<string, number>();
 
 /** Slot time with lazy settlement: the target price, the mark move, the vault's (and, when the
  *  price moved, the trader's) re-valuation and the first fill at that price, all in one
@@ -1173,6 +1225,12 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
   if (maintOn && !C.decodeBook(snap.book).hasCarry && !carryTried.has(v.key.toBase58())) {
     carryTried.add(v.key.toBase58());
     await send(`start the holding-fee meter of ${v.feed?.symbol}`, [C.openCarry(payer.publicKey, v.key)]);
+  }
+  // A book made when books held 32 requests: grown to 128 (a router from 2026-11-05 on refuses it
+  // until then; an older router does not know the instruction, so it is tried once a minute).
+  if (maintOn && snap.book.length < C.BOOK_LEN && Date.now() - (growTriedAt.get(v.key.toBase58()) ?? 0) > 60_000) {
+    growTriedAt.set(v.key.toBase58(), Date.now());
+    if (await send(`grow the queue of ${v.feed?.symbol} to 128 places`, [C.growBook(payer.publicKey, v.key)], true)) return false;
   }
   // The vault's price range (lazy settlement): opened once, by whoever gets there first.
   if (C.LAZY_FILLS && maintOn && C.decodeBook(snap.book).slotTime && !rangeTried.has(v.key.toBase58())) {
@@ -1652,6 +1710,8 @@ setInterval(() => {
           }
         }
         servicedAssets = vaults.map(v => v.assetIndex);
+        await ensureAlt(vaults).catch(e => log("error", "lookup table", String(e?.message ?? e).slice(0, 140)));
+        if (ALTS.length && !FILLS_PER_TX_ENV) FILLS_PER_TX = 4;
         vaultsAt = Date.now();
         // Runs in the background. Where the service is the source, every feed is recorded, so
         // a market that is not open yet has a price to be listed at.

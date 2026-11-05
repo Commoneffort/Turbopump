@@ -113,7 +113,7 @@ if [ -n "$LOAD" ]; then
     (cd app && $DRILL npx tsx scripts/crowd.ts open "$((n - have))" ${CROWD_USDC:-200} ${CROWD_LEV:-4} 2>&1 | grep -v -i deprecat | tail -2)
     have=$n
     for r in ${LOAD_RATES//,/ }; do
-      (cd app && $DRILL npx tsx scripts/crowd.ts load "$r" 30 25 2>&1 | grep -v -i deprecat)
+      (cd app && $DRILL npx tsx scripts/crowd.ts load "$r" ${LOAD_SECS:-30} 25 2>&1 | grep -v -i deprecat)
       sleep 20
     done
   done

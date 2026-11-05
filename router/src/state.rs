@@ -12,7 +12,10 @@ pub const ORDER_MAGIC: u64 = u64::from_le_bytes(*b"PRORDER1");
 pub const TIERS_MAGIC: u64 = u64::from_le_bytes(*b"PRTIERS1");
 pub const CARRY_MAGIC: u64 = u64::from_le_bytes(*b"PRCARRY1");
 pub const LEDGER_MAGIC: u64 = u64::from_le_bytes(*b"PRLEDGR1");
-pub const MAX_PENDING: usize = 32;
+/// Requests a book holds (128 since 2026-11-05; books made before held 32 and are grown in place
+/// by `GrowBook`, see `OLD_MAX_PENDING`).
+pub const MAX_PENDING: usize = 128;
+pub const OLD_MAX_PENDING: usize = 32;
 /// Standing orders one wallet can have on one vault's market.
 pub const MAX_ORDERS: u8 = 8;
 
@@ -116,6 +119,9 @@ pub struct Book {
     pub pending_target: [i64; MAX_PENDING],
 }
 pub const BOOK_LEN: usize = core::mem::size_of::<Book>();
+/// The fields before the two request arrays, and the size of a book made before 2026-11-05.
+pub const BOOK_HEADER_LEN: usize = BOOK_LEN - 16 * MAX_PENDING;
+pub const OLD_BOOK_LEN: usize = BOOK_HEADER_LEN + 16 * OLD_MAX_PENDING;
 
 impl Book {
     pub fn earliest_target(&self) -> Option<i64> {

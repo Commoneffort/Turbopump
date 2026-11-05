@@ -579,3 +579,38 @@ fn a_book_and_a_request_from_before_slot_time_keep_working() {
     w.send(vec![rclient::expire(&kp.pubkey(), &w.vault, &t)], &[&kp]).expect("expires by the clock");
     assert_eq!({ w.book().len }, 0);
 }
+
+#[test]
+fn a_book_made_for_32_requests_grows_in_place_and_keeps_its_queue() {
+    use percolator_router::state::{BOOK_HEADER_LEN, BOOK_LEN, MAX_PENDING, OLD_BOOK_LEN, OLD_MAX_PENDING};
+    let mut w = live();
+    w.trader(0);
+    let id = w.request(0, UNIT as i128).unwrap();
+    let target = w.request_target(id);
+    // The same book as a pre-2026-11-05 router wrote it: 32 places.
+    let bk = percolator_router::state::book_address(&percolator_router::id(), &w.vault).0;
+    let mut acct = w.env.svm.get_account(&bk).unwrap();
+    let new = acct.data.clone();
+    let (h, n) = (BOOK_HEADER_LEN, OLD_MAX_PENDING);
+    let mut old = new[..h].to_vec();
+    old.extend_from_slice(&new[h..h + 8 * n]);
+    old.extend_from_slice(&new[h + 8 * MAX_PENDING..h + 8 * MAX_PENDING + 8 * n]);
+    assert_eq!(old.len(), OLD_BOOK_LEN);
+    acct.data = old;
+    w.env.svm.set_account(bk, acct).unwrap();
+    // Unusable until grown (every instruction checks the book's size).
+    let k = w.keys.clone().unwrap();
+    let t0 = w.traders[&0].1;
+    assert!(w.send(vec![rclient::fill(&w.payer.pubkey(), &k, &t0)], &[]).is_err());
+    let payer = w.payer.pubkey();
+    w.send(vec![rclient::grow_book(&payer, &w.vault)], &[]).unwrap();
+    assert_eq!(w.env.svm.get_account(&bk).unwrap().data.len(), BOOK_LEN);
+    let grown = w.env.svm.get_account(&bk).unwrap().data;
+    let diff: Vec<usize> = (0..BOOK_LEN).filter(|i| grown[*i] != new[*i]).collect();
+    assert!(diff.is_empty(), "grown back to exactly the same book; differs at {:?}", &diff[..diff.len().min(8)]);
+    // Again: nothing to do.
+    w.send(vec![rclient::grow_book(&payer, &w.vault)], &[]).unwrap();
+    assert_eq!(w.request_target(id), target);
+    w.execute(0, id).unwrap();
+    assert_eq!(position(&w, 0), UNIT as i128);
+}
