@@ -361,9 +361,9 @@ async function confirmed(sig: string, processedIsEnough = FAST) {
 async function send(label: string, ixs: TransactionInstruction[], wait = false) {
   enter("send");
   const head = await budgetFor(ixs);
-  const tx = new Transaction().add(...head, ...ixs);
   try {
-    const sig = await conn.sendTransaction(tx, [payer]);
+    // (Through the lookup table when there is one: shorter, so more fits in a transaction.)
+    const sig = ALTS.length ? await sendIxs([...head, ...ixs], false) : await conn.sendTransaction(new Transaction().add(...head, ...ixs), [payer]);
     if (wait) await confirmed(sig);
     log(wait ? "ok" : "sent", label);
     return true;
@@ -468,7 +468,7 @@ const budget = () => [ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_00
  *  transaction that may land in a later state than the one simulated. */
 async function budgetFor(ixs: TransactionInstruction[], atLeast = 0): Promise<TransactionInstruction[]> {
   if (!C.X1) return budget();
-  const fit = await C.computeLimit(conn, payer.publicKey, ixs);
+  const fit = await C.computeLimit(conn, payer.publicKey, ixs, 1.2, ALTS);
   const units = Math.min(1_400_000, Math.max(fit.data.readUInt32LE(1), atLeast));
   return [ComputeBudgetProgram.setComputeUnitLimit({ units })];
 }
@@ -485,8 +485,18 @@ async function tune(lagCrank: TransactionInstruction, k: number, settle: Transac
   let shortAt = -1, overAt = -1;
   for (let round = 0; round < 10; round++) {
     // The simulation replaces the blockhash, so any well-formed one will do.
-    const msg = new TransactionMessage({ payerKey: payer.publicKey, recentBlockhash: PublicKey.default.toBase58(), instructions: [...budget(), ...Array(k).fill(lagCrank), ...settle, ...tail] }).compileToV0Message(ALTS);
-    const r = await conn.simulateTransaction(new VersionedTransaction(msg), { sigVerify: false, replaceRecentBlockhash: true });
+    // (A transaction over 1,232 bytes cannot even be encoded: "too large", and the caller sends less.)
+    let r;
+    try {
+      const msg = new TransactionMessage({ payerKey: payer.publicKey, recentBlockhash: PublicKey.default.toBase58(), instructions: [...budget(), ...Array(k).fill(lagCrank), ...settle, ...tail] }).compileToV0Message(ALTS);
+      r = await conn.simulateTransaction(new VersionedTransaction(msg), { sigVerify: false, replaceRecentBlockhash: true });
+    } catch (e: any) {
+      if (/overruns|too large|Transaction too large/i.test(String(e?.message ?? e))) {
+        if (settle.length > 1) { settle = settle.slice(0, Math.ceil(settle.length / 2)); continue; }
+        return "too large";
+      }
+      throw e;
+    }
     const err: any = r.value.err;
     if (!err) return { k, settle };
     const i = (err.InstructionError?.[0] ?? -1) - 2, code = err.InstructionError?.[1]?.Custom;
@@ -574,7 +584,7 @@ async function fillTogether(v: C.Vault, b: C.Book, rs: C.RouterRequest[], lazy =
     const t = await tune(lagCrank, k, vaultCrank ? [vaultCrank] : [], tail);
     // More than one transaction's compute (a fill that books a large gain or loss costs more):
     // the group goes as two smaller ones.
-    if (typeof t === "string" && /ProgramFailedToComplete|ComputationalBudgetExceeded/.test(t) && group.length > 2) {
+    if (typeof t === "string" && /ProgramFailedToComplete|ComputationalBudgetExceeded|too large/.test(t) && group.length >= 2) {
       const half = Math.ceil(group.length / 2);
       groups.push(group.slice(0, half), group.slice(half));
       continue;
@@ -654,12 +664,12 @@ async function recentBlockhash() {
   return blockhash.hash;
 }
 /** Sends `ixs` signed by the payer: through the lookup table when there is one. */
-async function sendIxs(ixs: TransactionInstruction[]) {
-  if (!ALTS.length) return conn.sendTransaction(new Transaction().add(...ixs), [payer], { skipPreflight: true });
+async function sendIxs(ixs: TransactionInstruction[], skipPreflight = true) {
+  if (!ALTS.length) return conn.sendTransaction(new Transaction().add(...ixs), [payer], { skipPreflight });
   const msg = new TransactionMessage({ payerKey: payer.publicKey, recentBlockhash: await recentBlockhash(), instructions: ixs }).compileToV0Message(ALTS);
   const tx = new VersionedTransaction(msg);
   tx.sign([payer]);
-  return conn.sendTransaction(tx, { skipPreflight: true });
+  return conn.sendTransaction(tx, { skipPreflight });
 }
 
 /** Sends alternative versions of one action (no preflight) and waits until one lands. They differ
@@ -725,8 +735,8 @@ async function settleAll(label: string, cranks: TransactionInstruction[]) {
   const one = async (ixs: TransactionInstruction[]): Promise<void> => {
     // (X1 charges for the compute asked for. Whichever of these lands first also does the
     // market's price move, which the simulation of the others did not include: more to spare.)
-    const head = C.X1 ? [await C.computeLimit(conn, payer.publicKey, ixs, 1.45)] : budget();
-    const sig = await conn.sendTransaction(new Transaction().add(...head, ...ixs), [payer]).catch(e => { refusedFirst ||= String(e?.message ?? e).split("\n")[0].slice(0, 100); return null; });
+    const head = C.X1 ? [await C.computeLimit(conn, payer.publicKey, ixs, 1.45, ALTS)] : budget();
+    const sig = await sendIxs([...head, ...ixs], false).catch(e => { refusedFirst ||= String(e?.message ?? e).split("\n")[0].slice(0, 100); return null; });
     if (sig) { sigs.push(sig); txs++; return; }
     // Refused as a whole: one account in it may be unable to settle before another has (the
     // engine answers EngineCounterUnderflow, see `tune`). Each account then goes alone, so the
@@ -768,7 +778,7 @@ async function catchUp(label: string, lagCrank: TransactionInstruction, lag: num
     const ixs = Array(n).fill(lagCrank);
     // The same cranks twice would be the same transaction: each gets a budget of its own.
     const head = C.X1
-      ? [ComputeBudgetProgram.setComputeUnitLimit({ units: Math.min(1_400_000, (await C.computeLimit(conn, payer.publicKey, ixs)).data.readUInt32LE(1) + i) })]
+      ? [ComputeBudgetProgram.setComputeUnitLimit({ units: Math.min(1_400_000, (await C.computeLimit(conn, payer.publicKey, ixs, 1.2, ALTS)).data.readUInt32LE(1) + i) })]
       : [ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }), ComputeBudgetProgram.setComputeUnitPrice({ microLamports: PRIORITY + i })];
     const sig = await conn.sendTransaction(new Transaction().add(...head, ...ixs), [payer]).catch(e => { if (i === 0) log("fail", label, String(e?.message ?? e).split("\n")[0].slice(0, 120)); return null; });
     if (sig) sigs.push(sig); else break;
