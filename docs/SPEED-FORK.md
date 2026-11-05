@@ -1,6 +1,7 @@
 # Speed work: where we leave upstream, and how to go back
 
-**Status: in progress since 2026-11-05 on branch `speed/2026-11`.**
+**Status: built on 2026-11-05 on branch `speed/2026-11` (all three repositories); see "Where it
+stands" at the end.**
 
 > **Flag.** This work moves Turbopump away from upstream Percolator. The router and executor
 > changes are ours alone, as before. The engine change (part 3) edits Percolator's own
@@ -58,3 +59,25 @@ fill touches two accounts whatever the number of holders. The other limit is the
 account itself: every fill writes it, and a chain caps the compute one account can use per
 block, so one market account tops out at a few hundred fills per second. Beyond that, an asset
 needs several markets (several vaults), which the executor already serves in parallel.
+
+## Where it stands
+
+| Part | State |
+|---|---|
+| 1. Slot time on X1 | built and tested (router X1 build: `SLOT_TIME`, `DELAY_SLOTS` 3, `BATCH_SLOTS` 2, `GRACE_SLOTS` 250; posted prices carry their post slot) |
+| 2. Price at the target slot | built (executor posts the latest price one slot before the target, `POST_LEAD_SLOTS`) |
+| 3. Lazy settlement | built and tested: engine `execute_trade_with_fee_cohort_tolerant_not_atomic`, program matcher flag `FLAG_COHORT_TOLERANT`, vault `ARMED_COHORT_TOLERANT`, router `lazy.rs` (`PriceRange`, tag 36), executor `LAZY_FILLS` |
+| 4. Delay follows the market | built: the delay doubles per risk-dial step, and price speed (`risk::speed_bps`) raises the dial |
+| 5. Instant lane | not built (needs makers to quote) |
+
+Not yet built either: price, mark move and fill in one transaction (measured ~580k compute
+units together, so it fits) and a ring of recent prices so that any executor can fill on X1.
+
+Upgrading: services detect slot time from the router's own values, so they run unchanged
+before and after the router upgrade. Upgrade order: engine, vault, router; restart the
+executors on the new code first. Old marks and requests (unix seconds) are recognised: an old
+mark counts as long ago, an old request expires by the clock (`tests/x1.rs`).
+
+Checks: Turbopump suite (both builds) passes; engine suite passes plus three new tests; the
+forked program replays a copy of live X1 (`issues/replay-2026-11-05`) identically to the
+deployed one.

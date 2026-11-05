@@ -2,7 +2,7 @@
 
 Turbopump is permissionless, adminless liquidity vaults for [Percolator](https://github.com/aeyakovenko/percolator), Anatoly Yakovenko's perpetual-futures risk engine on Solana, with trading that cannot be front-run.
 
-A vault pools deposits, lists its own perpetual market on Percolator, acts as the counterparty to every trade on it, and pays the market's trading fees to its depositors. Every trade goes through a router that fills it at the first Pyth price published four to five seconds after the trade was requested (on the next 2-second mark, so trades sent close together share a price), a price nobody could know when they traded. Nobody holds a key over any of it: every parameter is fixed when a vault is created, and every maintenance step can be run by anyone.
+A vault pools deposits, lists its own perpetual market on Percolator, acts as the counterparty to every trade on it, and pays the market's trading fees to its depositors. Every trade goes through a router that fills it at the first oracle price published after a short wait, a price nobody could know when they traded: on X1 three slots after the trade landed (about a second; counted in slots since November 2026, see docs/SPEED-FORK.md), on Solana four seconds (on the next 2-second mark, so trades sent close together share a price). Nobody holds a key over any of it: every parameter is fixed when a vault is created, and every maintenance step can be run by anyone.
 
 **Status:** live on Solana devnet and X1 testnet, unaudited. Do not use with real funds.
 
@@ -16,7 +16,7 @@ Two different things, by two different authors. **Percolator** is the risk engin
 |---|---|---|
 | Liquidity | None of its own: a trade needs a counterparty | One shared vault per asset, the counterparty to every trade |
 | Market keys | Whoever lists a market holds its admin, insurance and oracle keys | The vault's own address holds them; no instruction uses them |
-| Price a trade gets | The market's mark at that moment | The first oracle price published 4 to 5 seconds after the request (on the next 2-second mark) |
+| Price a trade gets | The market's mark at that moment | The first oracle price published after a short wait: on X1 3 slots (about a second), on Solana 4 to 5 seconds |
 | Order types | An immediate trade between two accounts | Market, limit, stop loss, take profit, trailing stop, TWAP |
 | Who earns the fees | The asset's insurance operator | Depositors 85%, the market's opener 5%, the platform 10% |
 
