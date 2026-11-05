@@ -140,8 +140,9 @@ fn a_trade_fills_at_the_first_reported_price_after_its_target_and_nothing_else()
     let landed = w.env.current_slot();
     let id = w.request(0, size).unwrap();
     let target = w.request_target(id);
-    // Three slots at dial 1, rounded up to the 4-slot grid.
-    assert!(target >= landed as i64 + 3 && target < landed as i64 + 3 + 4 && target % 4 == 0, "target slot {target} for a request in slot {landed}");
+    // Three slots at dial 1, rounded up to the batch grid.
+    let grid = percolator_router::BATCH_SLOTS;
+    assert!(target >= landed as i64 + 3 && target < landed as i64 + 3 + grid && target % grid == 0, "target slot {target} for a request in slot {landed}");
 
     // A price posted before the target can still move the mark, but cannot fill the request.
     w.goto_slot(target as u64 - 1);
@@ -211,7 +212,7 @@ fn the_delay_grows_with_the_risk_dial() {
     at(&mut w, t + 60);
     let calm = w.request(0, UNIT as i128).unwrap();
     let landed = w.env.current_slot() as i64;
-    assert!(w.request_target(calm) - landed < 3 + 4);
+    assert!(w.request_target(calm) - landed < 3 + percolator_router::BATCH_SLOTS);
     w.execute(0, calm).unwrap();
     // 1% in 3 slots (just inside the price band)...
     let mark_slot = { w.book().mark_publish_time } as u64;
@@ -228,7 +229,7 @@ fn the_delay_grows_with_the_risk_dial() {
     let landed = w.env.current_slot() as i64;
     let fast = w.request(0, -(UNIT as i128)).unwrap();
     let target = w.request_target(fast);
-    assert!(target >= landed + 24 && target < landed + 24 + 4, "target {target} from slot {landed}");
+    assert!(target >= landed + 24 && target < landed + 24 + percolator_router::BATCH_SLOTS, "target {target} from slot {landed}");
 }
 
 #[test]

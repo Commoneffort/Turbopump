@@ -75,7 +75,7 @@ export default {
   },
   "router": {
     "batch_secs": 2,
-    "batch_slots": 4,
+    "batch_slots": 2,
     "behind_refund_slots": 150,
     "bond_lamports": 2000000,
     "book": {

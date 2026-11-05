@@ -526,15 +526,22 @@ const FILLS_PER_TX = Number(process.env.FILLS_PER_TX ?? 2);
  *  transaction, when none of them needs accounts settled first (true right after a fill at that
  *  price). Returns the ids sent in a transaction that landed; the others are filled one by one
  *  as before (a group whose simulation fails is not sent). */
-async function fillTogether(v: C.Vault, b: C.Book, rs: C.RouterRequest[]): Promise<bigint[]> {
+/** `lazy` (router `lazy`): only the traders' own accounts must be up to date for a request to
+ *  join a group; the vault's account, if out of date, is re-valued once in front of the group. */
+async function fillTogether(v: C.Vault, b: C.Book, rs: C.RouterRequest[], lazy = false): Promise<bigint[]> {
   const done: bigint[] = [];
   if (FILLS_PER_TX < 2 || !rs.length) return done;
   const snap = await snapshot();
   const ready: C.RouterRequest[] = [];
   let lagCrank: TransactionInstruction | undefined, lag = 0;
+  let vaultCrank: TransactionInstruction | undefined;
   for (const r of rs) {
     const plan = C.crankPlan(snap, payer.publicKey, v.lpPortfolio, v.assetIndex, r.wallet, [], r.sub);
-    if (plan.settle.length || plan.resets.length) continue;
+    if (lazy) {
+      const mine = C.routerPortfolio(r.wallet, r.sub);
+      if (plan.resets.length || plan.settle.some(ix => ix.keys[2]?.pubkey.equals(mine))) continue;
+      vaultCrank ??= plan.settle.find(ix => ix.keys[2]?.pubkey.equals(v.lpPortfolio));
+    } else if (plan.settle.length || plan.resets.length) continue;
     lagCrank ??= plan.lagCrank;
     lag = Math.max(lag, plan.lag);
     ready.push(r);
@@ -551,8 +558,8 @@ async function fillTogether(v: C.Vault, b: C.Book, rs: C.RouterRequest[]): Promi
   for (let i = 0; i < groups.length; i++) {
     const group = groups[i];
     if (!group.length) continue;
-    const tail = group.map(r => C.fillRequest(payer.publicKey, v, r));
-    const t = await tune(lagCrank, k, [], tail);
+    const tail = group.map(r => C.fillRequest(payer.publicKey, v, r, lazy));
+    const t = await tune(lagCrank, k, vaultCrank ? [vaultCrank] : [], tail);
     // More than one transaction's compute (a fill that books a large gain or loss costs more):
     // the group goes as two smaller ones.
     if (typeof t === "string" && /ProgramFailedToComplete|ComputationalBudgetExceeded/.test(t) && group.length > 2) {
@@ -571,13 +578,16 @@ async function fillTogether(v: C.Vault, b: C.Book, rs: C.RouterRequest[]): Promi
       continue;
     }
     const crank = lagCrank;
-    const version = (n: number) => [...Array(n).fill(crank), ...tail];
+    const pre = t.settle;
+    const version = (n: number, withPre = true) => [...Array(n).fill(crank), ...(withPre ? pre : []), ...tail];
     // The groups go out side by side, and the first to land brings the assets to the current
     // slot: a later one landing in that same slot needs no lag crank at all. (The versions differ
     // only in their cranks, and at most one of them fits the slot it lands in.)
     // (Markets fill side by side as well, so even the first group may land behind another's.)
     // (On devnet a transaction can land a crank's worth of slots later than expected: one more there.)
-    const versions = [version(t.k), version(t.k + 1), ...(C.X1 ? [] : [version(t.k + 2)]), ...(t.k > 0 ? [version(0)] : [])];
+    // (Lazy: the vault's re-valuation in front is only right for the first group to land; a
+    // version without it for the others.)
+    const versions = [version(t.k), version(t.k + 1), ...(C.X1 ? [] : [version(t.k + 2)]), ...(t.k > 0 ? [version(0)] : []), ...(pre.length ? [version(t.k, false), version(0, false)] : [])];
     sends.push(race(`fill ${group.length > 1 ? `${group.length} together ` : ""}on ${v.feed?.symbol}: ${group.map(r => `#${r.id}`).join(" ")} at ${Number(b.markPrice) / 1e6}`, versions).then(ok => { if (ok) done.push(...group.map(r => r.id)); }));
   }
   await Promise.all(sends);
@@ -1123,6 +1133,17 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
   // `fillTogether` and go one by one below.)
   let filledOne = true;
   let notConverged = false;
+  // Lazy settlement (router `lazy`): the fills at this price re-value only their traders and the
+  // vault. Those are re-valued side by side first (a few to a transaction, like the round's
+  // settle), so that the fills can then go several to a transaction.
+  const atMarkReqs = live.filter(r => tradeOn && !r.settle && b.markPrev < r.target && r.target <= b.markPublish && !unledgered.has(acctKey(r)));
+  const lazyVault = atMarkReqs.length > 0 && (!!round.lazy || (C.LAZY_FILLS && (await lazyNow(v, b))));
+  if (lazyVault && atMarkReqs.length > 1) {
+    const want = new Set([v.lpPortfolio.toBase58(), ...atMarkReqs.map(r => C.routerPortfolio(r.wallet, r.sub).toBase58())]);
+    const p = C.crankPlan(await snapshot(), payer.publicKey, v.lpPortfolio, v.assetIndex);
+    const theirs = p.settle.filter(ix => want.has(ix.keys[2]?.pubkey.toBase58() ?? ""));
+    if (theirs.length > 1 && p.lag < 10) await settleAll(`for ${atMarkReqs.length} fills on ${v.feed?.symbol} (lazy)`, theirs);
+  }
   for (const r of live.filter(r => tradeOn && b.markPrev < r.target && r.target <= b.markPublish && !unledgered.has(acctKey(r)))) {
     if (notConverged) break;
     const what = `${v.feed?.symbol} #${r.id}`;
@@ -1132,11 +1153,11 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
     // other requests at the same price go out together, a few to a transaction (a crash brings
     // many liquidations at once, and one at a time each waited for all those before it).
     // (Not the ones this pass has already filled or tried one by one.)
-    // Lazy: each fill re-values its own trader (and the vault), so fills do not go in groups.
-    const lazy = !!round.lazy || (C.LAZY_FILLS && (await lazyNow(v, b)));
-    if (filledOne && !lazy) {
+    // Lazy: each fill re-values only its own trader and the vault (see `fillTogether`).
+    const lazy = lazyVault;
+    if (filledOne) {
       const rest = live.filter(x => !x.settle && !unledgered.has(acctKey(x)) && !grouped.has(x.id) && !handled.has(x.id) && x.id !== r.id && b.markPrev < x.target && x.target <= b.markPublish);
-      for (const ids of await fillTogether(v, b, [r, ...rest])) grouped.add(ids);
+      for (const ids of await fillTogether(v, b, [r, ...rest], lazy)) grouped.add(ids);
       if (grouped.has(r.id)) continue;
     }
     filledOne = true;

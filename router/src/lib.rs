@@ -82,8 +82,10 @@ pub const SLOT_TIME: bool = cfg!(feature = "x1");
 /// Our price reaches the chain within about a slot of the exchanges, so three slots after a
 /// request lands the price it fills at is still unknown to anyone.
 pub const DELAY_SLOTS: i64 = 3;
-/// Slot-time batch grid: targets are rounded up to a multiple of this many slots.
-pub const BATCH_SLOTS: i64 = 4;
+/// Slot-time batch grid: targets are rounded up to a multiple of this many slots. Small: with
+/// lazy settlement (`lazy`) a price move no longer means re-valuing every holder, so moving the
+/// mark more often costs little.
+pub const BATCH_SLOTS: i64 = 2;
 /// Slot-time `GRACE_SECS` (about 90 s of X1 slots).
 pub const GRACE_SLOTS: i64 = 250;
 /// In slot time, a router time above this was written in unix seconds by a build before slot

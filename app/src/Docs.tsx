@@ -1,5 +1,5 @@
 import { MANIFEST as M } from "./chain";
-import { CANON_EPOCH_LEN_SLOTS, CARRY, LAYOUT, holdPctHour, ROUTER, ROUTER_BATCH_SECS, ROUTER_BATCH_SLOTS, ROUTER_DELAY_SECS, ROUTER_DELAY_SLOTS, ROUTER_GRACE_SECS, ROUTER_WAIT_SECS, SLOT_TIME, TRADE_FEE_PCT, X1, slotSeconds } from "./chain";
+import { CANON_EPOCH_LEN_SLOTS, CARRY, LAYOUT, holdPctHour, ROUTER, ROUTER_BATCH_SECS, ROUTER_BATCH_SLOTS, ROUTER_DELAY_SECS, ROUTER_DELAY_SLOTS, ROUTER_GRACE_SECS, ROUTER_WAIT_SECS, SLOT_TIME, TRADE_FEE_BPS, TRADE_FEE_PCT, X1, slotSeconds } from "./chain";
 
 /** The wait before a trade's price, in words for this network: slots on X1 (slot time), seconds on Solana. */
 const WAIT = SLOT_TIME ? `${ROUTER_DELAY_SLOTS} slots (about a second)` : `${ROUTER_DELAY_SECS} seconds`;
@@ -203,15 +203,19 @@ export default function Docs() {
           <li><b>No backing out.</b> A request cannot be cancelled. If nobody fills it within {ROUTER_GRACE_SECS} seconds of its target it expires, nothing is traded, and its bond is forfeited. If its price had already become the mark by then, the deposit is kept too: letting an order lapse after seeing the price is not free.</li>
         </ol>
         <p>
-          <b>How long a fill takes.</b> Three parts add up. The {ROUTER_DELAY_SECS}-second wait, which is what stops
+          <b>How long a fill takes.</b> {SLOT_TIME ? <>On X1 three parts add up. The trade lands (about a slot). Then the
+          wait of {ROUTER_DELAY_SLOTS} slots, plus up to {ROUTER_BATCH_SLOTS - 1} of rounding to the {ROUTER_BATCH_SLOTS}-slot grid, which is what stops
+          front-running: the price it fills at is posted in a slot after that, so nobody knew it when the trade was sent. Then
+          the executor's work: the price goes up in the target slot and the fill in the next one or two. The wait is counted in
+          slots because the chain clock runs a second or more behind real time and moves in whole seconds; a slot is exact. It
+          is this short because the head start anyone could get is worth far less than the fee: measured over the exchanges our
+          price comes from (November 2026), knowing the price a second early is worth about 1 bps a trade, while a round trip
+          pays {2 * TRADE_FEE_BPS} bps in fees. In a fast market the risk dial doubles the wait with each step (up to {ROUTER_DELAY_SLOTS * 8} slots), so the
+          protection grows exactly when a head start is worth more. DRILL_X1</> : <>Three parts add up. The {ROUTER_DELAY_SECS}-second wait, which is what stops
           front-running, plus up to {ROUTER_BATCH_SECS - 1} more second{ROUTER_BATCH_SECS - 1 === 1 ? "" : "s"} of rounding to the batch grid. Then the price at the
-          target has to be posted (on X1, when the price has not moved, the executor posts the unchanged price 0.4 seconds after
-          the target instead of waiting for the next change), and the executor needs about a second to move the mark, settle the
-          accounts and send the fill. On X1 a typical trade fills about five seconds after it lands, and rarely more than six.
-          The wait is not shortened because the chain clock it is counted from runs a second or two behind real time, so a
-          shorter wait would leave too little time between the request and its price. A one-second grid was tried in a load
-          test (November 2026): it saved about a tenth of a second when trading was quiet, but under load trades filled later
-          and settling the accounts cost a third more, so the grid stays at {ROUTER_BATCH_SECS} seconds.
+          target has to be posted, and the executor needs about a second to move the mark, settle the accounts and send the
+          fill. The wait is not shortened on Solana because the chain clock it is counted from runs a second or two behind real
+          time.</>}
         </p>
         <p>The router has no admin: no pause, no allow or block list, and its upgrade authority is to be burned before mainnet.</p>
 
@@ -461,6 +465,7 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
         <ul>
           <li><b>Directional.</b> If traders win overall, depositors lose. Caps bound the vault's exposure to 2× its value on BTC and ETH and 1× elsewhere (3× on BTC and ETH until 4 November 2026): on BTC a 50% move against a full vault would cost it all of its value, a 30% move 60% of it; on the rest it takes a move of 100%. The risk dial lowers the room for new exposure while a jump is more likely.</li>
           <li><b>Chain clock.</b> {SLOT_TIME ? <>On X1 a request's target is counted in slots, which the chain itself numbers, so the clock (which runs a second or more behind real time there) plays no part. The {ROUTER_DELAY_SLOTS}-slot delay assumes our price reaches the chain within about a slot of the exchanges' (measured: at most 0.17 s from an exchange quote to our server).</> : <>A request's target comes from the chain clock (or the mark time, if later). The {ROUTER_DELAY_SECS}-second delay assumes the clock does not run more than a few seconds behind real time; Solana's clock normally tracks it within a second or two.</>}</li>
+          <li><b>Lazy settlement{X1 ? "" : " (X1)"}.</b> While a fill skips re-valuing the other accounts, one of them could already owe more than it holds, and its shortfall would then be shared among positions opened meanwhile. The router allows it only while the price has stayed within a quarter of Percolator's maintenance margin since every account was last up to date, which an account above maintenance cannot lose all its margin in; an account that was already below maintenance is covered only by the liquidation watch, as before. This is our fork's rule, not upstream Percolator's, and it has not been audited.</li>
           <li><b>A request that cannot fill.</b> If a request cannot fill (for example because the price moved during the wait and the account can no longer afford it), the mark waits at its price until it expires, at most {ROUTER_GRACE_SECS} seconds, before moving on. The requester loses the bond; liquidations on that market wait that long.</li>
           <li><b>Executors.</b> Filling needs someone to fetch each target-time Pyth update from Hermes (which needs a Pyth API key; since early November our free-plan key is refused for BTC, ETH and SOL, so devnet fills through the backup price source, about 20 seconds after the target) and send the transactions. Keeping marks fresh between trades uses Pyth's free sponsored feed accounts. Anyone with a key can run an executor; if nobody does, requests expire and nothing trades.</li>
           <li><b>Market authority.</b> On devnet, Percolator's market-level authority belongs to the vault program's governor address, which the program only uses to retire idle markets. Nobody can shut an asset down or resolve the market, and permissionless stale resolution is off. On another market, whoever holds that authority can shut assets down or resolve the market; the vault then winds down and pays out.</li>
@@ -649,6 +654,31 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           re-values every open account on a market whose price moved, so a round takes longer the more positions are open.
           Above about eight trades a second on three markets, each market's queue (28 places for trades) fills up and further
           trades are turned away at once, without cost, rather than kept waiting.
+        </p>
+        <p>
+          <b>Lazy settlement{X1 ? "" : " (X1)"}.</b> That limit is gone where our Percolator fork runs (X1 since November 2026). Percolator
+          normally refuses any trade that adds risk until every position on the market has been re-valued after a price move,
+          so each round's work grew with the number of open positions. Our fork lets a trade through while other accounts are
+          still waiting to be re-valued, re-valuing only the trader and the vault, and the router allows it only while that is
+          safe: it keeps, per vault, the lowest and highest price since the last moment every account on the market was up to
+          date, and lets a fill skip the others only while that range is within a quarter of Percolator's maintenance margin
+          (an account that was above maintenance then cannot have lost all its margin since) and no funding or shared loss
+          has been booked in between. Outside that range, or for an executor that does not track it, fills wait for everyone
+          as before. The others are still re-valued, by routine upkeep a few times a minute and by the liquidation watch for
+          any account near its level. DRILL_LAZY In the October version of the engine, re-valuing a winner before a loser could cost it part of
+          its gain if the price turned; on the engine we run now the outcome is the same in every order (tests/reversal.rs).
+        </p>
+        <p>
+          <b>Scale.</b> With lazy settlement a fill touches two accounts however many traders hold positions, so the number of
+          traders no longer slows fills. What remains is the market account: every fill writes it, and a chain caps how much
+          compute one account can use in a block, which puts one market at a few hundred fills a second. Beyond that, an asset
+          gets more than one market (more vaults), which executors already serve side by side.
+        </p>
+        <p>
+          <b>Forked engine.</b> Lazy settlement changes one of Percolator's own rules, so from November 2026 we run a fork of
+          the engine that upstream does not have (documented in docs/SPEED-FORK.md in the repository, with the tag of the last
+          version before it). The fork only acts when the vault's matcher asks for it; every other trade, and every other
+          market on the same program, behaves exactly as upstream's.
         </p>
 
         <h2 id="integrate">Integrating</h2>
