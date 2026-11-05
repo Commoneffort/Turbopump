@@ -96,6 +96,28 @@ their own were slower than the old way for a burst of trades on a market few acc
 executor picks per round: lazily while at most `LAZY_BUSY` (3) trades wait or more than
 `LAZY_HOLDERS` (200) accounts hold positions, the old way otherwise.
 
+Limits with 400 accounts holding positions (load drill, three markets, trades sent for 8 s;
+median wait, fills a second, trades turned away):
+
+| Trades a second | Before the queue and executor work | After |
+|---|---|---|
+| 6 | 3.8 s | 3.5 s |
+| 12 | 5.2 s, 8.1/s | 4.6 s, 7.3/s |
+| 25 | 5.1 s, 10.6/s, 63 of 200 turned away | 5.2 s, 15.7/s, none turned away |
+| 50 | 5.5 s, 12.6/s, 232 of 400 turned away | 7.1 s, 13.6/s, 25 of 400 turned away |
+
+What changed for it: a queue of 128 requests per market instead of 28 (`GrowBook`, router tag 37,
+grows a live book in place); the book names each queued request, so the executor reads exactly
+those instead of searching all the router's accounts (that search took 2.2 s with 400 traders);
+an address lookup table, so a transaction holds more fills; a transaction too large to encode is
+split instead of stopping the pass. Tried and left off: lazy fills side by side on one market
+(`LAZY_PARALLEL`), slower because each one's catch-up crank fails once another has caught the
+asset up. What limits it now: on one market the lazy fills of stale traders go one after the
+other (about 2 a second a market when every trader is out of date), so above about 15 fills a
+second the queues fill. Next: a fill that catches the asset up itself without failing when
+another already did (router or engine), which lets them go side by side; then more markets per
+asset.
+
 Checks: Percolator program suite on the fork: 272 failures, the same 272 as on the deployed build
 (upstream's stale tests), after registering the new engine call in the INV-088 roster;
 Turbopump suite (both builds) passes; engine suite passes plus three new tests; the
