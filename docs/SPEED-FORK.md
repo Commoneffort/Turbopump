@@ -70,14 +70,34 @@ needs several markets (several vaults), which the executor already serves in par
 | 4. Delay follows the market | built: the delay doubles per risk-dial step, and price speed (`risk::speed_bps`) raises the dial |
 | 5. Instant lane | not built (needs makers to quote) |
 
-Not yet built either: price, mark move and fill in one transaction (measured ~580k compute
-units together, so it fits) and a ring of recent prices so that any executor can fill on X1.
+Built too: price, mark move and the first fill in one transaction (~580k compute units) when few
+trades wait. Not built: a ring of recent prices so that any executor can fill on X1.
+
+Rollout: `deploy/speed-rollout.sh` (X1, in the order below). Rollback: `deploy/speed-rollback.sh`
+(router first, then the services' code back to the tag, then vault and engine, from the saved
+binaries; `PROGRAM_SO` in `deploy/upgrade-program.sh` uploads a saved release).
 
 Upgrading: services detect slot time from the router's own values, so they run unchanged
 before and after the router upgrade. Upgrade order: engine, vault, router; restart the
 executors on the new code first. Old marks and requests (unix seconds) are recognised: an old
 mark counts as long ago, an old request expires by the clock (`tests/x1.rs`).
 
-Checks: Turbopump suite (both builds) passes; engine suite passes plus three new tests; the
+Measured (load drill on a local chain, 60 accounts holding positions, the same trades each run;
+median seconds from sending a trade to its result, 90th percentile in brackets):
+
+| Trades a second | Before | Slot time only | Everything (adaptive) |
+|---|---|---|---|
+| 1 | 5.5 | 3.2 | 1.9 (2.3) |
+| 6 | 5.1 | 3.2 | 2.8 (4.0) |
+| 12 | 5.5 (5.6 fills/s) | 3.8 (7.8 fills/s) | 3.5 (4.3) (7.4 fills/s) |
+
+Accounts re-valued over the whole drill: 1,270 before, 247 with lazy settlement. Lazy fills on
+their own were slower than the old way for a burst of trades on a market few accounts hold, so the
+executor picks per round: lazily while at most `LAZY_BUSY` (3) trades wait or more than
+`LAZY_HOLDERS` (200) accounts hold positions, the old way otherwise.
+
+Checks: Percolator program suite on the fork: 272 failures, the same 272 as on the deployed build
+(upstream's stale tests), after registering the new engine call in the INV-088 roster;
+Turbopump suite (both builds) passes; engine suite passes plus three new tests; the
 forked program replays a copy of live X1 (`issues/replay-2026-11-05`) identically to the
 deployed one.

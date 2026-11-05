@@ -211,7 +211,10 @@ export default function Docs() {
           is this short because the head start anyone could get is worth far less than the fee: measured over the exchanges our
           price comes from (November 2026), knowing the price a second early is worth about 1 bps a trade, while a round trip
           pays {2 * TRADE_FEE_BPS} bps in fees. In a fast market the risk dial doubles the wait with each step (up to {ROUTER_DELAY_SLOTS * 8} slots), so the
-          protection grows exactly when a head start is worth more. DRILL_X1</> : <>Three parts add up. The {ROUTER_DELAY_SECS}-second wait, which is what stops
+          protection grows exactly when a head start is worth more. In a load test on a local copy of the
+          chain (November 2026, 60 accounts holding positions) a trade filled a median 1.9 seconds after it was sent at one
+          trade a second (2.3 s for 9 in 10), 2.8 s at six a second and 3.5 s at twelve, against 5.1 to 5.5 seconds before.
+          When few trades wait, the price and the first fill at it go in one transaction.</> : <>Three parts add up. The {ROUTER_DELAY_SECS}-second wait, which is what stops
           front-running, plus up to {ROUTER_BATCH_SECS - 1} more second{ROUTER_BATCH_SECS - 1 === 1 ? "" : "s"} of rounding to the batch grid. Then the price at the
           target has to be posted, and the executor needs about a second to move the mark, settle the accounts and send the
           fill. The wait is not shortened on Solana because the chain clock it is counted from runs a second or two behind real
@@ -665,7 +668,9 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           (an account that was above maintenance then cannot have lost all its margin since) and no funding or shared loss
           has been booked in between. Outside that range, or for an executor that does not track it, fills wait for everyone
           as before. The others are still re-valued, by routine upkeep a few times a minute and by the liquidation watch for
-          any account near its level. DRILL_LAZY In the October version of the engine, re-valuing a winner before a loser could cost it part of
+          any account near its level. In the November load test the executor re-valued 247 accounts for the same trades that
+          had needed 1,270, and the executor picks the old way (everyone at once) for a burst of trades on a market few
+          accounts hold, where that is still quicker. In the October version of the engine, re-valuing a winner before a loser could cost it part of
           its gain if the price turned; on the engine we run now the outcome is the same in every order (tests/reversal.rs).
         </p>
         <p>
