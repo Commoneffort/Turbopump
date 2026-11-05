@@ -18,7 +18,7 @@ D=$ROOT/deploy/logs/drill
 RPC=http://127.0.0.1:18899
 mkdir -p "$D"
 running() { [ -f "$D/$1.pid" ] && kill -0 -- "-$(cat "$D/$1.pid")" 2>/dev/null; }
-stop_all() { for s in bots witness keeper executor oracle validator driver; do if running $s; then kill -- "-$(cat "$D/$s.pid")" 2>/dev/null; echo "$s stopped"; fi; rm -f "$D/$s.pid"; done; }
+stop_all() { for s in maker bots witness keeper executor oracle validator driver; do if running $s; then kill -- "-$(cat "$D/$s.pid")" 2>/dev/null; echo "$s stopped"; fi; rm -f "$D/$s.pid"; done; }
 bg() { # <name> <dir> <command...>: runs in its own process group, pid file in $D
   local name=$1 dir=$2; shift 2
   (cd "$dir" && setsid sh -c "echo \$\$ > $D/$name.pid; exec $*" >> "$D/$name.log" 2>&1 < /dev/null &)
@@ -38,7 +38,7 @@ case "$1" in
     stop_all >/dev/null
     for i in $(seq 30); do ss -ltn | grep -qE ":(18899|19900|18001) " || break; sleep 1; done
     rm -rf "$D"/*; mkdir -p "$D"
-    bg driver "$ROOT" env LOAD=1 LOAD_CROWDS=${LOAD_CROWDS:-60,240} LOAD_RATES=${LOAD_RATES:-1,3,6,12} deploy/crash-drill.sh inner
+    bg driver "$ROOT" env LOAD=1 MAKER=$MAKER LOAD_CROWDS=${LOAD_CROWDS:-60,240} LOAD_RATES=${LOAD_RATES:-1,3,6,12} deploy/crash-drill.sh inner
     echo "load drill started; follow it with: tail -f $D/driver.log   (deploy/crash-drill.sh status | stop)"
     exit 0 ;;
   crowd) # a crowd of accounts instead of the bots and scenarios (see the crowd step below)
@@ -103,6 +103,15 @@ DRILL="env $COMMON BOT_LOG=$D/bots.jsonl EXEC_LOG=$D/executor.log ORACLE_CONTROL
 say "== markets and liquidity"
 (cd app && $DRILL FAUCET_KEY=$KEY npx tsx scripts/open-markets.ts SOL,BTC,ETH ${DRILL_SEED:-30000})
 (cd app && $DRILL npx tsx scripts/crash-drill.ts ready)
+
+# MAKER=1: our maker (app/scripts/maker.ts) with its own collateral quotes every load trade, which
+# takes the quote first and goes through the queue only without one.
+if [ -n "$MAKER" ]; then
+  say "== maker"
+  (cd app && $DRILL PERCOLATOR_FAUCET_KEY=$KEY MAKER_KEY=$D/maker.json npx tsx scripts/maker.ts setup ${MAKER_USDC:-200000} 2>&1 | grep -v -i deprecat | tail -3)
+  bg maker "$ROOT/app" env $COMMON PERCOLATOR_KEYPAIR=$KEY MAKER_KEY=$D/maker.json MAKER_PRICES=http://127.0.0.1:18090 npx tsx scripts/maker.ts serve 18300
+  export QUOTE_URL=http://127.0.0.1:18300
+fi
 
 if [ -n "$LOAD" ]; then
   # The load drill (deploy/crash-drill.sh load): for each crowd size in LOAD_CROWDS (accounts holding

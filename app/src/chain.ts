@@ -1,6 +1,6 @@
 // Account decoding and instruction building for the vault program and Percolator. Offsets come
 // from layout.json, which a Rust test exports from the program and engine types.
-import { AddressLookupTableAccount,
+import { Ed25519Program, AddressLookupTableAccount,
   AccountMeta,
   Commitment,
   ComputeBudgetProgram,
@@ -1606,3 +1606,52 @@ export const expireRequest = (caller: PublicKey, r: RouterRequest) => new Transa
   keys: [rw(caller, true), rw(r.key), rw(traderAddress(r.wallet, r.sub)), rw(r.wallet), rw(bookAddress(r.vault)), ...(r.order !== undefined ? [rw(orderAddress(r.vault, accountOwner(r.wallet, r.sub), r.order))] : r.settle ? [ro(r.vault)] : [ro(r.vault), ro(MARKET)])],
   data: new W().u8(7).done(),
 });
+
+// ---- maker quotes (router `quote`, vault program `maker`, 2026-11-06) ----
+// A maker signs a price for one trading account; the taker's transaction carries the signature
+// (an Ed25519 verification) and the router's TakeQuote fills it in the same slot at that price.
+// Without a quote (none offered, expired, too large) a trade goes through the queue as before.
+
+/** Makers are on where the deployed programs have them (X1 first; QUOTES=0 turns them off). */
+export const QUOTES_ON = X1 && (typeof process === "undefined" || process.env?.QUOTES !== "0");
+export const makerAddress = (wallet: PublicKey, market = MARKET) => PublicKey.findProgramAddressSync([Buffer.from("maker"), market.toBuffer(), wallet.toBuffer()], VAULT_PROGRAM)[0];
+export const QUOTE_MSG_LEN = 114;
+/** The bytes a maker signs (router `quote::quote_message`). */
+export function quoteMessage(maker: PublicKey, trader: PublicKey, asset: number, size: bigint, price: bigint, expiry: bigint, id: bigint): Uint8Array {
+  const m = new Uint8Array(QUOTE_MSG_LEN);
+  const dv = new DataView(m.buffer);
+  m.set(Buffer.from("TPQUOTE1"), 0);
+  m.set(maker.toBuffer(), 8);
+  m.set(trader.toBuffer(), 40);
+  dv.setUint16(72, asset, true);
+  const s = BigInt.asUintN(128, size);
+  dv.setBigUint64(74, s & ((1n << 64n) - 1n), true);
+  dv.setBigUint64(82, s >> 64n, true);
+  dv.setBigUint64(90, price, true);
+  dv.setBigUint64(98, expiry, true);
+  dv.setBigUint64(106, id, true);
+  return m;
+}
+/** A signed quote as a maker's service returns it (amounts as decimal strings). */
+export type Quote = { maker: string; wallet: string; portfolio: string; delegate: string; makerAssets: number[]; vault: string; trader: string; asset: number; size: string; price: string; expiry: string; id: string; signature: string };
+/** TakeQuote (router tag 38): the Ed25519 verification goes just before it. */
+export const takeQuote = (v: Vault, wallet: PublicKey, sub: number, q: Quote) => {
+  const w = new W().u8(38);
+  const size = BigInt.asUintN(128, BigInt(q.size));
+  w.u64(size & ((1n << 64n) - 1n)).u64(size >> 64n).u64(BigInt(q.price)).u64(BigInt(q.expiry)).u64(BigInt(q.id));
+  return new TransactionInstruction({
+    programId: ROUTER,
+    keys: [rw(wallet, true), rw(traderAddress(wallet, sub)), rw(routerPortfolio(wallet, sub)), ro(v.key), ro(bookAddress(v.key)), rw(MARKET),
+      rw(new PublicKey(q.maker)), rw(new PublicKey(q.portfolio)), ro(new PublicKey(q.delegate)), ro(routerAuthority()), ro(VAULT_PROGRAM), ro(PERCOLATOR),
+      ro(new PublicKey("Sysvar1nstructions1111111111111111111111111")),
+      rw(carryAddress(v.key)), rw(ledgerAddress(wallet, sub)), ro(tiersAddress()), rw(rangeAddress(v.key)), rw(equitiesAddress(wallet))],
+    data: w.done(),
+  });
+};
+/** The instructions that take quote `q`: its signature check, then TakeQuote. `cranks` (to bring
+ *  the maker's and the trader's accounts and the asset to the current slot) go in front. */
+export function takeQuoteIxs(v: Vault, wallet: PublicKey, sub: number, q: Quote, cranks: TransactionInstruction[] = []): TransactionInstruction[] {
+  const msg = quoteMessage(new PublicKey(q.maker), traderAddress(wallet, sub), q.asset, BigInt(q.size), BigInt(q.price), BigInt(q.expiry), BigInt(q.id));
+  const verify = Ed25519Program.createInstructionWithPublicKey({ publicKey: new PublicKey(q.wallet).toBytes(), message: msg, signature: Buffer.from(q.signature, "base64") });
+  return [...cranks, verify, takeQuote(v, wallet, sub, q)];
+}

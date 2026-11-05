@@ -13,7 +13,7 @@
 // The report: how many accounts went below their liquidation level, the most at once, how long
 // until none was left, how many liquidation fills it took (a partial liquidation leaves a smaller
 // position), and the accounts that ended owing money (bad debt) with the total.
-import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction, TransactionInstruction } from "@solana/web3.js";
+import { ComputeBudgetProgram, Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction, TransactionInstruction, TransactionMessage, VersionedTransaction } from "@solana/web3.js";
 import { createAssociatedTokenAccountIdempotentInstruction, createMintToInstruction } from "@solana/spl-token";
 import * as fs from "fs";
 import * as C from "../src/chain";
@@ -135,6 +135,34 @@ async function crash(pct: number, secs: number, watch: number) {
   say(`  accounts owing money (bad debt): ${after.negative}, total $${after.owed.toFixed(2)}`);
 }
 
+/** A maker's quote server (scripts/maker.ts serve), for the load: trades take its quotes first. */
+const QUOTE_URL = process.env.QUOTE_URL ?? "";
+/** Takes a maker's quote for `size` on `v` from `w`'s main account in one transaction; false when
+ *  there is none or it cannot be taken. The cranks in front (the maker's account and the trader's,
+ *  each with all its assets) are kept only as far as the simulation says they have work. */
+async function takeQuoteOrNot(w: Keypair, v: C.Vault, size: bigint): Promise<boolean> {
+  const trader = C.traderAddress(w.publicKey);
+  const r = await fetch(`${QUOTE_URL}/quote?vault=${v.key.toBase58()}&trader=${trader.toBase58()}&size=${size}`, { signal: AbortSignal.timeout(1_000) });
+  if (!r.ok) return false;
+  const q = (await r.json()) as C.Quote;
+  const pf = await conn.getAccountInfo(C.routerPortfolio(w.publicKey), "processed");
+  const mine = pf ? C.portfolioAssets(new Uint8Array(pf.data)) : [];
+  const last = (as: number[]) => [...as.filter(a => a !== v.assetIndex), v.assetIndex];
+  const makerCrank = C.crank(w.publicKey, new PublicKey(q.portfolio), last(q.makerAssets.length ? q.makerAssets : [v.assetIndex]));
+  const traderCrank = mine.length ? [C.crank(w.publicKey, C.routerPortfolio(w.publicKey), last(mine))] : [];
+  for (const cranks of [[makerCrank, ...traderCrank], [makerCrank], traderCrank, []]) {
+    const ixs = C.takeQuoteIxs(v, w.publicKey, 0, q, cranks);
+    const msg = new TransactionMessage({ payerKey: w.publicKey, recentBlockhash: PublicKey.default.toBase58(), instructions: [ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }), ...ixs] }).compileToV0Message();
+    const sim = await conn.simulateTransaction(new VersionedTransaction(msg), { sigVerify: false, replaceRecentBlockhash: true });
+    if (sim.value.err) continue;
+    const units = Math.min(1_400_000, Math.ceil((sim.value.unitsConsumed ?? 1_000_000) * 1.3) + 20_000);
+    const sig = await conn.sendTransaction(new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units }), ...ixs), [w], { skipPreflight: true });
+    const res = await conn.confirmTransaction(sig, "processed");
+    return !res.value.err;
+  }
+  return false;
+}
+
 /** Throughput: small trades (`usd` each) from the crowd's wallets at `rps` a second for `secs`
  *  seconds, each wallet at most once; then waits until every one has filled or expired and reports
  *  how many filled, how fast, and what was refused at the door (a full queue, for one). */
@@ -144,7 +172,7 @@ async function load(rps: number, secs: number, usd: number) {
   if (ws.length < rps * secs) say(`only ${ws.length} wallets: the run sends that many`);
   const snap = await C.marketSnapshot(conn);
   const holders = snap.portfolios.filter(p => C.accountHealth(snap.market, p.data).notional > 0n).length;
-  type Job = { w: Keypair; v: typeof vaults[number]; size: bigint; before: bigint; sent?: number; ok?: boolean; err?: string; done?: number };
+  type Job = { w: Keypair; v: typeof vaults[number]; size: bigint; before: bigint; sent?: number; ok?: boolean; err?: string; done?: number; quoted?: boolean };
   const jobs: Job[] = [];
   for (const [i, w] of ws.entries()) {
     const v = vaults[i % vaults.length];
@@ -170,6 +198,12 @@ async function load(rps: number, secs: number, usd: number) {
     if (at > Date.now()) await sleep(at - Date.now());
     j.sent = Date.now();
     sends.push((async () => {
+      // With a maker (QUOTE_URL, scripts/maker.ts serve): its quote taken in one transaction,
+      // which fills at once; without one, the queue.
+      if (QUOTE_URL) {
+        const q = await takeQuoteOrNot(j.w, j.v, j.size).catch(() => false);
+        if (q) { j.ok = true; j.done = Date.now(); j.quoted = true; return; }
+      }
       try {
         const ixs = [C.requestTrade(j.w.publicKey, j.v.key, j.size)];
         const sig = await conn.sendTransaction(new Transaction().add(await C.computeLimit(conn, j.w.publicKey, ixs), ...ixs), [j.w]);
@@ -194,7 +228,7 @@ async function load(rps: number, secs: number, usd: number) {
   const refused = new Map<string, number>(); for (const j of jobs.filter(j => j.ok === false)) refused.set(j.err!, (refused.get(j.err!) ?? 0) + 1);
   say(`==== load report: ${rps}/s for ${secs} s, ${holders} accounts holding`);
   say(`  sent ${jobs.length}, accepted ${jobs.filter(j => j.ok).length}, refused at the door ${jobs.filter(j => j.ok === false).length} ${JSON.stringify(Object.fromEntries(refused))}`);
-  say(`  filled ${filled}, expired ${expired}, not finished ${jobs.filter(j => j.ok && !j.done).length}`);
+  say(`  filled ${filled}, expired ${expired}, not finished ${jobs.filter(j => j.ok && !j.done).length}${QUOTE_URL ? `, ${jobs.filter(j => j.quoted).length} at a maker's quote` : ""}`);
   say(`  seconds from send to result: p50 ${q(0.5)}, p90 ${q(0.9)}, max ${q(1)}`);
   say(`  fills per second over the run: ${(filled / ((lastDone - t0) / 1000)).toFixed(2)} (sending took ${((sendEnd - t0) / 1000).toFixed(0)} s, last result at ${((lastDone - t0) / 1000).toFixed(0)} s)`);
 }
