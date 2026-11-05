@@ -248,6 +248,13 @@ function jackFirstAtOrAfter(symbol: string, t: number): { price: bigint; publish
  *  target: room for a tick from just before the target still on its way (jack0's reached this
  *  server at most 0.17 s after their quote time, median 0.06 s, measured 2026-11-05). */
 const HOLD_SECS = Number(process.env.HOLD_SECS ?? 0.4);
+/** True once a request with target `t` is past its grace period. In slot time (X1, see
+ *  C.SLOT_TIME) targets are slots; one queued before slot time is in unix seconds. */
+const graceOver = (t: number, rnow: number, now: number) => (C.SLOT_TIME && t > C.LEGACY_TIME ? now > t + C.ROUTER_GRACE_SECS : rnow > t + C.ROUTER_GRACE);
+/** Slot time: the price is posted this many slots before the target slot, so that it lands in
+ *  the target slot or just after (a transaction sent now lands in this slot or the next). One
+ *  that lands early only moves the mark; the next pass posts again. */
+const POST_LEAD_SLOTS = Number(process.env.POST_LEAD_SLOTS ?? 1);
 function jackLatest(symbol: string) {
   const list = jackSamples(symbol);
   return list.length >= 2 ? { price: BigInt(Math.round(list[list.length - 1].price * 1e6)), publish: list[list.length - 1].t, prev: list[list.length - 2].t } : null;
@@ -276,12 +283,16 @@ async function advanceReported(v: C.Vault, u: { price: bigint; publish: number; 
   // A price that is already posted (the service's timestamp has not moved since: a stock outside
   // its trading hours, say) is not posted again; the mark only moves to it.
   const have = posted ? C.decodeReport(new Uint8Array(posted.data)).publish : 0;
-  const ixs = [...lagCranks, ...(have >= u.publish ? [] : [C.postPrice(reporter.publicKey, v.feed!.id, u.price, u.publish, prev)]), C.advanceMark(v, C.reportAddress(v.feed!.id), market)];
+  // Slot time: the price's place is the slot its post lands in, so it is always posted (once a
+  // slot), with a publish time that never goes back.
+  const repost = C.SLOT_TIME || have < u.publish;
+  const publish = C.SLOT_TIME ? Math.max(u.publish, have) : u.publish;
+  const ixs = [...lagCranks, ...(repost ? [C.postPrice(reporter.publicKey, v.feed!.id, u.price, publish, Math.min(prev, publish - 1))] : []), C.advanceMark(v, C.reportAddress(v.feed!.id), market)];
   // Catch-up cranks do more work the later they land than the simulation saw: more room then.
   const head = C.X1 ? [await C.computeLimit(conn, payer.publicKey, ixs, lagCranks.length ? 1.5 : 1.2)] : budget();
   const tx = new Transaction().add(...head, ...ixs);
   try {
-    const sig = await conn.sendTransaction(tx, have >= u.publish ? [payer] : [payer, reporter]);
+    const sig = await conn.sendTransaction(tx, repost ? [payer, reporter] : [payer]);
     await confirmed(sig);
     log("ok", `mark ${v.feed!.symbol} -> reported ${Number(u.price) / 1e6} at ${u.publish} (${why})`);
     return true;
@@ -969,12 +980,13 @@ async function markPhase(v: C.Vault, now: number, snap: Snapshot, withCatchUp: b
   if (!snap.book) return null;
   let b = C.decodeBook(snap.book);
   const reqs = await requestsOf(v, b);
-  const live = reqs.filter(r => now <= r.target + C.ROUTER_GRACE_SECS);
+  const rnow = C.routerNow(snap.slot, now);
+  const live = reqs.filter(r => !graceOver(r.target, rnow, now));
   let moved = false;
 
   // 0. While a request waits for its target time, bring every asset its fill will touch up to
   //    the chain (once per request), so the fill itself has only a few seconds to catch up.
-  for (const r of live.filter(r => r.target > b.markPublish && now < r.target && !prepared.has(`${v.key}:${r.id}`))) {
+  for (const r of live.filter(r => r.target > b.markPublish && rnow < r.target && !prepared.has(`${v.key}:${r.id}`))) {
     prepared.add(`${v.key}:${r.id}`);
     const plan = C.crankPlan(await snapshot(), payer.publicKey, v.lpPortfolio, v.assetIndex, r.settle ? undefined : r.wallet, [], r.sub);
     if (plan.lag <= 15) continue;
@@ -992,7 +1004,16 @@ async function markPhase(v: C.Vault, now: number, snap: Snapshot, withCatchUp: b
   // (Hermes is asked 0.6 s after the target, for its update to be out. The price service's stream
   // is read as it comes: the first tick stamped at the target second goes at once, and a quiet
   // price HOLD_SECS after it.)
-  if (!owed && earliest !== null && Math.max(now, Date.now() / 1000) >= earliest + (ORACLE === "jack" ? 0 : 0.6) && now < earliest + C.ROUTER_GRACE_SECS - 3) {
+  if (C.SLOT_TIME && !owed && earliest !== null && earliest <= C.LEGACY_TIME && rnow >= earliest - POST_LEAD_SLOTS && rnow < earliest + C.ROUTER_GRACE - 8) {
+    // Slot time: the price as it is now, posted so that it lands in the target slot. The router
+    // stamps the post with its slot: nobody picks which price is the first at or after it.
+    const j = jackLatest(v.feed!.symbol);
+    if (j) moved = await advanceReported(v, j, `price for slot ${earliest}`, withCatchUp);
+    if (moved) {
+      const ba = await conn.getAccountInfo(C.bookAddress(v.key));
+      if (ba) b = C.decodeBook(new Uint8Array(ba.data));
+    }
+  } else if (!C.SLOT_TIME && !owed && earliest !== null && Math.max(now, Date.now() / 1000) >= earliest + (ORACLE === "jack" ? 0 : 0.6) && now < earliest + C.ROUTER_GRACE_SECS - 3) {
     const u = ORACLE === "pyth" ? await firstAtOrAfter(v.feed!.id, earliest).catch(() => null) : null;
     if (u && u.publish > b.markPublish) {
       await advancePosted(v, u);
@@ -1067,7 +1088,8 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
     await send(`start the holding-fee meter of ${v.feed?.symbol}`, [C.openCarry(payer.publicKey, v.key)]);
   }
   const { b, reqs } = round;
-  const live = reqs.filter(r => now <= r.target + C.ROUTER_GRACE_SECS);
+  const rnow = C.routerNow(snap.slot, now);
+  const live = reqs.filter(r => !graceOver(r.target, rnow, now));
   // An account without a fee ledger can only reduce: one is opened (paid here) for every trader
   // whose request waits, before its fill. A request whose ledger is not open yet waits a pass.
   const unledgered = tradeOn ? await ensureLedgers(live.filter(r => !r.settle)) : new Set<string>();
@@ -1143,7 +1165,8 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
     const version = (n: number) => [...Array(n).fill(plan.lagCrank), ...tuned.settle, ...tail];
     // (A version without lag cranks too, for landing just behind another market's fill.)
     await race(`${r.size === 0n ? "forced close" : "fill"} ${what} size ${Number(r.size) / 1e6} at ${Number(b.markPrice) / 1e6} (${tuned.k} lag + ${tuned.settle.length} settle cranks)`, tuned.k > 0 && !tuned.settle.length && C.X1 ? [version(tuned.k), version(tuned.k + 1), version(0)] : C.X1 ? [version(tuned.k), version(tuned.k + 1)] : [version(tuned.k), version(tuned.k + 1), version(tuned.k + 2)]);
-    log(`  ${what}: ${Math.round(Date.now() / 1000 - (r.target - C.ROUTER_DELAY_SECS))} s from request to result (${(Date.now() / 1000 - r.target).toFixed(1)} s after its price time)`);
+    if (C.SLOT_TIME) log(`  ${what}: done ${(Date.now() / 1000 - C.routerUnix(r.target)).toFixed(1)} s after its price slot ${r.target}`);
+    else log(`  ${what}: ${Math.round(Date.now() / 1000 - (r.target - C.ROUTER_DELAY_SECS))} s from request to result (${(Date.now() / 1000 - r.target).toFixed(1)} s after its price time)`);
     break;
     }
   }
@@ -1160,8 +1183,8 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
     const cur = va && C.decodeVault(v.key, new Uint8Array(va.data));
     dead = !!cur && (snap.slot < cur.epochStart + cur.epochLen || (cur.pendingDeposit === 0n && cur.pendingWithdraw === 0n));
   }
-  for (const r of reqs.filter(r => maintOn && (now > r.target + C.ROUTER_GRACE_SECS || (dead && r.settle && !tried.has(r.id)) || (stalled && refused.has(r.id) && b.markPrev < r.target && r.target <= b.markPublish)) && overdue(`expire ${r.id}`))) {
-    await send(`expire ${v.feed?.symbol} #${r.id}${now > r.target + C.ROUTER_GRACE_SECS ? "" : dead && r.settle ? " (its epoch has rolled)" : " (it cannot fill, and others are waiting behind it)"}`, [C.expireRequest(payer.publicKey, r)]);
+  for (const r of reqs.filter(r => maintOn && (graceOver(r.target, rnow, now) || (dead && r.settle && !tried.has(r.id)) || (stalled && refused.has(r.id) && b.markPrev < r.target && r.target <= b.markPublish)) && overdue(`expire ${r.id}`))) {
+    await send(`expire ${v.feed?.symbol} #${r.id}${graceOver(r.target, rnow, now) ? "" : dead && r.settle ? " (its epoch has rolled)" : " (it cannot fill, and others are waiting behind it)"}`, [C.expireRequest(payer.publicKey, r)]);
   }
 
   // 4. Free: move the mark to Pyth's sponsored feed account when it is newer, never past a
@@ -1185,8 +1208,10 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
     // With positions open: at once on a 0.3% move, after 30 s on a 0.1% move, and every 60 s
     // whatever the price did. Each update is followed by a re-valuation of every account on the
     // market, which is most of what the service costs; a price that has not moved needs neither.
-    const age = j ? j.publish - b.markPublish : 0;
-    if ((!queued || urgent) && j && j.publish > b.markPublish && (age >= every || moved >= move || (held && age >= 30 && moved >= HELD_MARK_MOVE))) await advanceReported(v, j, urgent && queued ? "refresh: the price moved 1% or more" : held ? "refresh" : "refresh, no positions");
+    // (Slot time: the mark's own times are slots; its age is counted from when it was set.)
+    const age = j ? (C.SLOT_TIME ? (b.markSet ? now - b.markSet : every) : j.publish - b.markPublish) : 0;
+    const newer = !!j && (C.SLOT_TIME || j.publish > b.markPublish);
+    if ((!queued || urgent) && j && newer && (age >= every || moved >= move || (held && age >= 30 && moved >= HELD_MARK_MOVE))) await advanceReported(v, j, urgent && queued ? "refresh: the price moved 1% or more" : held ? "refresh" : "refresh, no positions");
   } else if (snap.feed && live.length === 0 && reqs.length === 0) {
     const p = C.decodePyth(snap.feed);
     const a = C.decodeAsset(snap.market, v.assetIndex);
@@ -1499,7 +1524,9 @@ setInterval(() => {
           for (const [i, v] of idleVaults.entries()) {
             if (!books[i] || C.decodeBook(new Uint8Array(books[i]!.data)).len === 0) continue;
             const late = Date.now() / 1000 - C.ROUTER_GRACE_SECS - 5;
-            for (const r of (await C.pendingRequests(conn, v.key)).filter(r => r.target < late)) {
+            const slotNow = await conn.getSlot().catch(() => 0);
+            const past = (t: number) => (C.SLOT_TIME && t <= C.LEGACY_TIME ? slotNow > 0 && t < slotNow - C.ROUTER_GRACE_SLOTS - 14 : t < late);
+            for (const r of (await C.pendingRequests(conn, v.key)).filter(r => past(r.target))) {
               await send(`expire ${v.feed?.symbol} #${r.id} (queued on a market that is not serviced)`, [C.expireRequest(payer.publicKey, r)]);
             }
           }
@@ -1516,13 +1543,15 @@ setInterval(() => {
       const clock = new DataView(accs[0]!.data.buffer, accs[0]!.data.byteOffset);
       const now = Number(clock.getBigInt64(32, true));
       const slot = clock.getBigUint64(0, true);
+      C.noteSlot(slot);
       const market = new Uint8Array(accs[1]!.data);
       let busy = false;
       // A backup takes over for this pass when a fill, or a price on a market with positions, is
       // overdue by BACKUP_AFTER_SECS: the primary is not doing its work. (A primary always is.)
       const books0 = vaults.map((_, i) => (accs[2 + 2 * i] ? C.decodeBook(new Uint8Array(accs[2 + 2 * i]!.data)) : null));
-      const lateFill = books0.some(b => !!b && b.pending.some(p => p.target < now - BACKUP_SECS));
-      const lateMark = books0.some((b, i) => { const a = C.decodeAsset(market, vaults[i].assetIndex); return !!b && (a.oiLong !== 0n || a.oiShort !== 0n) && now - b.markPublish > markLateSecs() + BACKUP_SECS; });
+      // (Slot time: targets are slots, and the mark's age is counted from when it was set.)
+      const lateFill = books0.some(b => !!b && b.pending.some(p => (C.SLOT_TIME && p.target <= C.LEGACY_TIME ? (Number(slot) - p.target) * C.SLOT_SECS > BACKUP_SECS : p.target < now - BACKUP_SECS)));
+      const lateMark = books0.some((b, i) => { const a = C.decodeAsset(market, vaults[i].assetIndex); return !!b && (a.oiLong !== 0n || a.oiShort !== 0n) && now - (C.SLOT_TIME ? b.markSet : b.markPublish) > markLateSecs() + BACKUP_SECS; });
       const takeover = !BACKUP_SECS || lateFill || lateMark;
       if (BACKUP_SECS && takeover !== tookOver) { tookOver = takeover; log("failover", takeover ? `taking over (${lateFill ? "a fill" : "a price"} is ${BACKUP_SECS} s overdue)` : "standing by: the primary is keeping up"); }
       const tradeOn = can("trade") && takeover, maintOn = can("maintenance") && takeover;

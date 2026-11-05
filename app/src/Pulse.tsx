@@ -125,7 +125,7 @@ export function Queue({ state, fills, board, go, bare }: { state: C.State; fills
   const shown = [...rows.values()].map(q => {
     if (!q.gone || q.fill || q.r.settle) return q;
     const w = q.r.wallet.toBase58(), want = num(q.r.size, 1e6);
-    const fill = fills.find(f => f.wallet === w && Math.abs(f.time - q.r.target) <= C.ROUTER_GRACE_SECS + 5 && Math.sign(f.size) === Math.sign(want));
+    const fill = fills.find(f => f.wallet === w && Math.abs(f.time - C.routerUnix(q.r.target)) <= C.ROUTER_GRACE_SECS + 5 && Math.sign(f.size) === Math.sign(want));
     return fill ? { ...q, fill } : q;
   }).filter(q => !q.gone || q.fill || now - q.gone < 3).sort((a, b) => a.r.target - b.r.target);
   const waiting = shown.filter(q => !q.gone).length;
@@ -133,20 +133,20 @@ export function Queue({ state, fills, board, go, bare }: { state: C.State; fills
     <div className="queue">
       {!bare && <div className="ph queue-h">
         <h3>Queue{waiting > 0 && <em>{waiting}</em>}</h3>
-        <span className="hint" title={`Every trade waits ${C.ROUTER_DELAY_SECS} seconds and then fills at the first oracle price after that: a price nobody, the trader included, could know when it was sent.`}>{shown.length ? "fills at the next price" : "no trade waiting"}</span>
+        <span className="hint" title={`Every trade waits ${C.SLOT_TIME ? `about ${C.ROUTER_WAIT_SECS} seconds (${C.ROUTER_DELAY_SLOTS} slots or more, longer in a fast market)` : `${C.ROUTER_DELAY_SECS} seconds`} and then fills at the first oracle price after that: a price nobody, the trader included, could know when it was sent.`}>{shown.length ? "fills at the next price" : "no trade waiting"}</span>
       </div>}
       {bare && !shown.length && <div className="quiet">No trade waiting.</div>}
       {shown.slice(0, 4).map(q => {
         const n = num(q.r.size, 1e6), w = q.r.wallet.toBase58();
         const what = q.r.settle ? "Vault settlement" : `${q.r.order !== undefined ? `${KIND[q.r.order] ?? "Order"} · ` : ""}${n > 0 ? "Long" : "Short"} ${fmt(Math.abs(n), Math.abs(n) >= 100 ? 1 : 3)} ${sym}`;
-        const left = Math.ceil(q.r.target - now);
+        const left = Math.ceil((C.routerUnix(q.r.target) || now) - now);
         const status = q.fill ? `filled ${fmt(q.fill.price, q.fill.price >= 1000 ? 1 : 3)}` : q.gone ? "done" : left > 0 ? `in ${left}s` : "filling…";
         return (
           <div key={q.r.id.toString()} className={`queue-row${q.fill ? (n > 0 ? " done-up" : " done-down") : ""}${!q.gone && left <= 0 ? " busy" : ""}`}>
             {q.r.settle ? <span className="who muted">Vault</span> : <Who wallet={w} board={board} go={go} />}
             <span className={q.r.settle ? "" : n > 0 ? "up" : "down"} title={q.r.settle ? "" : money(Math.abs(n) * price)}>{what}</span>
             <span className="mono">{status}</span>
-            {!q.gone && left > 0 && <i style={{ width: `${Math.max(0, Math.min(100, (left / C.ROUTER_DELAY_SECS) * 100))}%` }} />}
+            {!q.gone && left > 0 && <i style={{ width: `${Math.max(0, Math.min(100, (left / Math.max(1, C.SLOT_TIME ? C.ROUTER_WAIT_SECS : C.ROUTER_DELAY_SECS)) * 100))}%` }} />}
           </div>
         );
       })}

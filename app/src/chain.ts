@@ -340,7 +340,9 @@ export function decodePyth(d: Uint8Array) {
 
 /** The same from the router's reported-price account (X1). */
 export function decodeReport(d: Uint8Array) {
-  return { e6: u64(d, 40), publish: Number(i64(d, 48)), prev: Number(i64(d, 56)) };
+  // (Since 2026-11-05 the account also holds the slot of the post and of the post before it.)
+  const slots = d.length >= 88 ? { slot: Number(u64(d, 72)), prevSlot: Number(u64(d, 80)) } : { slot: 0, prevSlot: 0 };
+  return { e6: u64(d, 40), publish: Number(i64(d, 48)), prev: Number(i64(d, 56)), ...slots };
 }
 /** Price and publish time from a feed's price account on this network (see `priceAccount`). */
 export const decodePrice = (d: Uint8Array) => (X1 ? decodeReport(d) : decodePyth(d));
@@ -803,6 +805,7 @@ export async function fetchVault(conn: Connection, vaultKey: PublicKey, user?: P
   if (user) keys.push(ledgerAddress(user, sub));
   keys.push(tiersAddress()); // last: the market's tier record (margins depend on it)
   const [accs, slot] = await Promise.all([conn.getMultipleAccountsInfo(keys, "confirmed"), conn.getSlot("confirmed")]);
+  noteSlot(slot);
   const data = (i: number) => (accs[i] ? new Uint8Array(accs[i]!.data) : undefined);
   setTiers(data(keys.length - 1));
   const tokenAmount = (d?: Uint8Array) => (d ? u64(d, 64) : 0n);
@@ -1007,6 +1010,35 @@ export const ROUTER = new PublicKey(R.program);
 export const ROUTER_DELAY_SECS = R.delay_secs;
 export const ROUTER_BATCH_SECS: number = (R as any).batch_secs ?? 1;
 export const ROUTER_GRACE_SECS = R.grace_secs;
+/** Slot time (the router's X1 build since 2026-11-05, docs/SPEED-FORK.md): a request's target
+ *  and the mark's price time (`Book.markPublish`/`markPrev`, `RouterRequest.target`) are slots,
+ *  not unix seconds. The delay is `ROUTER_DELAY_SLOTS` at risk dial 1, doubled per dial step,
+ *  rounded up to a multiple of `ROUTER_BATCH_SLOTS`. */
+export const SLOT_TIME = X1;
+export const ROUTER_DELAY_SLOTS: number = (R as any).delay_slots ?? 3;
+export const ROUTER_BATCH_SLOTS: number = (R as any).batch_slots ?? 4;
+export const ROUTER_GRACE_SLOTS: number = (R as any).grace_slots ?? 250;
+/** Router times above this, in slot time, were written in unix seconds before slot time. */
+export const LEGACY_TIME = 1_000_000_000;
+/** The grace period in router time (slots or seconds). */
+export const ROUTER_GRACE = SLOT_TIME ? ROUTER_GRACE_SLOTS : ROUTER_GRACE_SECS;
+/** Roughly how long an X1 slot takes (measured 2026-11: 0.35-0.36 s). For display only. */
+export const SLOT_SECS = 0.36;
+/** Typical seconds from a request landing to its price, at dial 1 (for display). */
+export const ROUTER_WAIT_SECS = SLOT_TIME ? Math.round((ROUTER_DELAY_SLOTS + ROUTER_BATCH_SLOTS / 2) * SLOT_SECS * 10) / 10 : ROUTER_DELAY_SECS + ROUTER_BATCH_SECS / 2;
+let slotRef = { slot: 0, unix: 0 };
+/** Tells `routerUnix` the chain's current slot (call it with each slot read). */
+export function noteSlot(slot: number | bigint, unixSec = Date.now() / 1000) {
+  if (Number(slot) >= slotRef.slot) slotRef = { slot: Number(slot), unix: unixSec };
+}
+/** A router time as unix seconds: as it is in second time (and for a value written before slot
+ *  time); in slot time estimated from the last slot seen (`noteSlot`), 0 when none was. */
+export function routerUnix(t: number): number {
+  if (!SLOT_TIME || t > LEGACY_TIME || t === 0) return t;
+  return slotRef.slot ? slotRef.unix + (t - slotRef.slot) * slotSecs : 0;
+}
+/** The current router time from a slot and the chain clock. */
+export const routerNow = (slot: number | bigint, unixSec: number) => (SLOT_TIME ? Number(slot) : unixSec);
 /** What a request posts and its executor earns. Larger on X1 (the router's X1 build), where a
  *  fill costs its sender about that much in fees. */
 export const ROUTER_BOND_LAMPORTS = X1 ? 20_000_000 : R.bond_lamports;
@@ -1089,7 +1121,10 @@ export function decodeBook(d: Uint8Array): Book {
   const b = R.book;
   const len = d[b.len];
   const pending = Array.from({ length: len }, (_, i) => ({ id: u64(d, b.pending_id + 8 * i), target: Number(i64(d, b.pending_target + 8 * i)) }));
-  return { vault: key(d, b.vault), len, hasCarry: d[(b as any).has_carry ?? 78] === 1, markSet: u32(d, b.mark_set_time), markPublish: Number(i64(d, b.mark_publish_time)), markPrev: Number(i64(d, b.mark_prev_publish_time)), markPrice: u64(d, b.mark_price), nextId: u64(d, b.next_id), pending, priceDial: d[(b as any).price_dial ?? 79] };
+  // (Slot time: a mark set before it holds unix seconds, which the router counts as long ago.)
+  let markPublish = Number(i64(d, b.mark_publish_time)), markPrev = Number(i64(d, b.mark_prev_publish_time));
+  if (SLOT_TIME && markPublish > LEGACY_TIME) markPublish = markPrev = 0;
+  return { vault: key(d, b.vault), len, hasCarry: d[(b as any).has_carry ?? 78] === 1, markSet: u32(d, b.mark_set_time), markPublish, markPrev, markPrice: u64(d, b.mark_price), nextId: u64(d, b.next_id), pending, priceDial: d[(b as any).price_dial ?? 79] };
 }
 
 /** The router's risk dial (`router/src/risk.rs`), 1 = normal: a trade that opens or grows a

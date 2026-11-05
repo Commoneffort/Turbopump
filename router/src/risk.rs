@@ -23,6 +23,20 @@ pub fn price_dial(disagreement_bps: u64) -> u8 {
     1 + PRICE_STEPS_BPS.iter().filter(|s| disagreement_bps >= **s).count() as u8
 }
 
+/// Slot time (X1): how fast the price moved between two marks, in bps per `SPEED_SLOTS` slots
+/// (about a second), over at least that many slots so that one quick tick is not blown up. It
+/// counts like a disagreement between sources (`PRICE_STEPS_BPS`): the dial reaches 2 when the
+/// price moves 0.2% in about a second. In calm markets X1's majors move 1 to 4 bps a second.
+pub const SPEED_SLOTS: i64 = 3;
+pub fn speed_bps(last: u64, price: u64, slots: i64) -> u64 {
+    if last == 0 {
+        return 0;
+    }
+    let moved = (price as u128).abs_diff(last as u128).saturating_mul(10_000) / last as u128;
+    let per = moved.saturating_mul(SPEED_SLOTS as u128) / slots.max(SPEED_SLOTS) as u128;
+    per.min(10_000) as u64
+}
+
 /// US regular hours in UTC seconds of the day, taken wide enough for both summer and winter
 /// time: the dial is normal from 13:30 (the summer open) to 19:00 (an hour before the summer
 /// close, two before the winter one).
@@ -82,6 +96,19 @@ mod tests {
         assert_eq!(price_dial(40), 3);
         assert_eq!(price_dial(70), 4);
         assert_eq!(price_dial(10_000), 4);
+    }
+
+    #[test]
+    fn speed() {
+        assert_eq!(speed_bps(0, 5, 3), 0);
+        assert_eq!(speed_bps(1_000_000, 1_000_000, 3), 0);
+        // 0.3% in 3 slots, and in 1 slot (counted over 3): 30 bps a second.
+        assert_eq!(speed_bps(1_000_000, 1_003_000, 3), 30);
+        assert_eq!(speed_bps(1_000_000, 997_000, 1), 30);
+        // The same move over 30 slots: 3 bps a second.
+        assert_eq!(speed_bps(1_000_000, 1_003_000, 30), 3);
+        assert_eq!(price_dial(speed_bps(1_000_000, 1_002_000, 3)), 2);
+        assert_eq!(speed_bps(1, u64::MAX, 3), 10_000);
     }
 
     #[test]

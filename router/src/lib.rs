@@ -69,12 +69,61 @@ pub const DELAY_SECS: i64 = 4;
 /// wait only grows: the price is still unknown to everyone when the request lands.
 pub const BATCH_SECS: i64 = 2;
 
+/// Slot time (X1 builds, since 2026-11-05, see docs/SPEED-FORK.md). A request's target and the
+/// mark's price are counted in slots: the target is a slot, and the price it fills at is the
+/// first one posted in a slot at or after it (the router stamps each post with the slot it lands
+/// in, so no key chooses it). The chain clock runs a second or more behind real time and has
+/// one-second steps, so a delay counted on it has to be padded for both; a slot is exact and
+/// about 0.35 s long on X1. Solana builds (verified Pyth prices, stamped in seconds) keep
+/// counting in seconds.
+pub const SLOT_TIME: bool = cfg!(feature = "x1");
+/// The delay in slots at risk dial 1; it doubles with each step of the dial (`request_delay`).
+/// Our price reaches the chain within about a slot of the exchanges, so three slots after a
+/// request lands the price it fills at is still unknown to anyone.
+pub const DELAY_SLOTS: i64 = 3;
+/// Slot-time batch grid: targets are rounded up to a multiple of this many slots.
+pub const BATCH_SLOTS: i64 = 4;
+/// Slot-time `GRACE_SECS` (about 90 s of X1 slots).
+pub const GRACE_SLOTS: i64 = 250;
+/// In slot time, a router time above this was written in unix seconds by a build before slot
+/// time (X1 slots passed 200 million in November 2026 and add about 90 million a year).
+pub const LEGACY_TIME: i64 = 1_000_000_000;
+
+/// Now, in router time (slots or seconds, see `SLOT_TIME`).
+pub fn router_now(clock: &Clock) -> i64 {
+    if SLOT_TIME { clock.slot as i64 } else { clock.unix_timestamp }
+}
+/// The batch grid and the grace period in router time.
+pub fn batch_step() -> i64 {
+    if SLOT_TIME { BATCH_SLOTS } else { BATCH_SECS }
+}
+pub fn grace() -> i64 {
+    if SLOT_TIME { GRACE_SLOTS } else { GRACE_SECS }
+}
+/// The (time, previous time) of the price the mark holds, in router time. In slot time a mark
+/// set by a build before it (unix seconds) counts as long ago.
+pub fn mark_times(b: &Book) -> (i64, i64) {
+    if SLOT_TIME && b.mark_publish_time > LEGACY_TIME { (0, 0) } else { (b.mark_publish_time, b.mark_prev_publish_time) }
+}
+/// True when the mark holds the price a request with target `target` fills at.
+pub fn mark_at_target(b: &Book, target: i64) -> bool {
+    let (publish, prev) = mark_times(b);
+    prev < target && target <= publish
+}
+/// The delay of a request in router time. Slot time: `DELAY_SLOTS` doubled for each step of the
+/// risk dial above 1 (prices moving fast or sources disagreeing, a stock market closed), so the
+/// wait is short in a calm market and longer exactly when knowing the price early is worth more.
+pub fn request_delay(dial: u8) -> i64 {
+    if SLOT_TIME { DELAY_SLOTS << (dial.clamp(1, 4) - 1) } else { DELAY_SECS }
+}
+
 /// The target time of a request landing at `now` while the mark is at `mark_publish`: at least
-/// `delay` seconds after both, rounded up to the batch grid.
+/// `delay` after both, rounded up to the batch grid (all in router time).
 pub fn target_time(now: i64, mark_publish: i64, delay: i64) -> Option<i64> {
+    let step = batch_step();
     let earliest = now.max(mark_publish).checked_add(delay)?;
-    let over = earliest.rem_euclid(BATCH_SECS);
-    if over == 0 { Some(earliest) } else { earliest.checked_add(BATCH_SECS - over) }
+    let over = earliest.rem_euclid(step);
+    if over == 0 { Some(earliest) } else { earliest.checked_add(step - over) }
 }
 /// How long after its target a request can still be filled before anyone may expire it.
 pub const GRACE_SECS: i64 = 90;
@@ -1144,10 +1193,16 @@ fn enqueue<'a>(
     order: Option<u8>,
     deposit: u64,
 ) -> ProgramResult {
-    enqueue_after(program_id, payer, owner, trader, vault_ai, book_ai, b, request_ai, system, size, order, deposit, DELAY_SECS)
+    let delay = if SLOT_TIME {
+        let v = load_vault(vault_ai)?;
+        request_delay(risk::dial(b.price_dial, tier_of_feed(&v.oracle_feeds[0]), Clock::get()?.unix_timestamp))
+    } else {
+        DELAY_SECS
+    };
+    enqueue_after(program_id, payer, owner, trader, vault_ai, book_ai, b, request_ai, system, size, order, deposit, delay)
 }
 
-/// `enqueue` with its own delay (seconds after the later of now and the mark's publish time).
+/// `enqueue` with its own delay (router time after the later of now and the mark's time).
 #[allow(clippy::too_many_arguments)]
 fn enqueue_after<'a>(
     program_id: &Pubkey,
@@ -1165,7 +1220,7 @@ fn enqueue_after<'a>(
     delay: i64,
 ) -> ProgramResult {
     let clock = Clock::get()?;
-    let target = target_time(clock.unix_timestamp, b.mark_publish_time, delay).ok_or(RouterError::Overflow)?;
+    let target = target_time(router_now(&clock), mark_times(b).0, delay).ok_or(RouterError::Overflow)?;
     let id = b.next_id;
     let settlement = trader.is_none();
     // An isolated account's requests live at addresses of its own (see `TraderState::owner`).
@@ -1618,19 +1673,39 @@ fn post_price(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pro
     let feed: [u8; 32] = data[..32].try_into().unwrap();
     let price = u64::from_le_bytes(data[32..40].try_into().unwrap());
     let publish = i64::from_le_bytes(data[40..48].try_into().unwrap());
-    let prev = i64::from_le_bytes(data[48..56].try_into().unwrap());
+    let mut prev = i64::from_le_bytes(data[48..56].try_into().unwrap());
+    let clock = Clock::get()?;
     // A positive price, published after the one before it and not in the future (a few seconds
-    // of clock difference are allowed).
-    if price == 0 || price > i64::MAX as u64 || prev >= publish || publish > Clock::get()?.unix_timestamp.saturating_add(5) {
+    // of clock difference are allowed). In slot time the post's slot orders prices, and several
+    // posts can fall in one second: the publish time only must not go back.
+    if price == 0 || price > i64::MAX as u64 || (!SLOT_TIME && prev >= publish) || publish > clock.unix_timestamp.saturating_add(5) {
         return Err(RouterError::BadOracle.into());
     }
     let (key, bump) = if witness { reporter::witness_address(&feed) } else { reporter::report_address(&feed) };
     let seed = if witness { reporter::SEED_WITNESS } else { reporter::SEED_REPORT };
     key_is(report_ai, &key)?;
+    // The slot of the post before this one (0 for the first).
+    let mut prev_slot = 0u64;
     if report_ai.owner == program_id {
         let stored = reporter::decode(&report_ai.try_borrow_data()?).map_err(|_| RouterError::BadOracle)?;
-        if publish <= stored.publish_time {
+        let (stored_slot, _) = reporter::posted_slots(&report_ai.try_borrow_data()?);
+        if SLOT_TIME {
+            // One post per slot, and its publish time never goes back.
+            if clock.slot <= stored_slot || publish < stored.publish_time {
+                return Err(RouterError::WrongUpdate.into());
+            }
+            prev = stored.publish_time.min(publish.saturating_sub(1));
+        } else if publish <= stored.publish_time {
             return Err(RouterError::WrongUpdate.into());
+        }
+        prev_slot = stored_slot;
+        // An account written before posts recorded their slot: extended to hold them.
+        if report_ai.data_len() < reporter::REPORT_LEN {
+            let need = Rent::get()?.minimum_balance(reporter::REPORT_LEN).saturating_sub(report_ai.lamports());
+            if need > 0 {
+                invoke(&system_instruction::transfer(reporter_ai.key, report_ai.key, need), &[reporter_ai.clone(), report_ai.clone(), system.clone()])?;
+            }
+            report_ai.realloc(reporter::REPORT_LEN, false)?;
         }
     } else {
         create_pda(reporter_ai, report_ai, system, program_id, reporter::REPORT_LEN, 0, &[seed, &feed, &[bump]])?;
@@ -1642,6 +1717,8 @@ fn post_price(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pro
     d[reporter::REPORT_PUBLISH_OFF..reporter::REPORT_PUBLISH_OFF + 8].copy_from_slice(&publish.to_le_bytes());
     d[reporter::REPORT_PREV_OFF..reporter::REPORT_PREV_OFF + 8].copy_from_slice(&prev.to_le_bytes());
     d[reporter::REPORT_BUMP_OFF] = bump;
+    d[reporter::REPORT_SLOT_OFF..reporter::REPORT_SLOT_OFF + 8].copy_from_slice(&clock.slot.to_le_bytes());
+    d[reporter::REPORT_PREV_SLOT_OFF..reporter::REPORT_PREV_SLOT_OFF + 8].copy_from_slice(&prev_slot.to_le_bytes());
     Ok(())
 }
 
@@ -1681,7 +1758,19 @@ fn advance(program_id: &Pubkey, accounts: &[AccountInfo], observation_sequence: 
     }
     .map_err(|_| RouterError::BadOracle)?;
     let price = u.price_e6().ok_or(RouterError::BadOracle)?;
-    if u.publish_time <= b.mark_publish_time {
+    // The price's place in router time: in slot time the slot it was posted in, and the slot of
+    // the post before it (see `SLOT_TIME`); otherwise its publish times.
+    let (at, at_prev) = if SLOT_TIME {
+        let (slot, prev_slot) = if reported { reporter::posted_slots(&pyth_ai.try_borrow_data()?) } else { (0, 0) };
+        if slot == 0 {
+            return Err(RouterError::BadOracle.into());
+        }
+        (slot as i64, prev_slot as i64)
+    } else {
+        (u.publish_time, u.prev_publish_time)
+    };
+    let (mark_at, _) = mark_times(&b);
+    if at <= mark_at {
         return Err(RouterError::WrongUpdate.into());
     }
     // A reported price is the reporter's word. Where Pyth exists it only rescues a queued request
@@ -1707,12 +1796,25 @@ fn advance(program_id: &Pubkey, accounts: &[AccountInfo], observation_sequence: 
         }
     }
     if let Some(earliest) = b.earliest_target() {
-        if earliest <= u.publish_time && !u.is_first_at_or_after(earliest) {
+        // (A request queued by a build before slot time has a target in unix seconds, far above
+        // any slot: it does not hold the mark back, and it expires by the clock.)
+        if earliest <= at && !(at_prev < earliest && earliest <= at) {
             return Err(RouterError::WrongUpdate.into());
         }
     }
-    if !within_band(b.mark_price, price, u.publish_time.saturating_sub(b.mark_publish_time)) {
+    // Seconds between the two prices, for the band: slot time counts 0.4 s a slot (rounded
+    // up), and a mark set before slot time as no time at all (the narrowest band).
+    let band_secs = if SLOT_TIME {
+        if mark_at == 0 && b.mark_price != 0 { 0 } else { (at.saturating_sub(mark_at).saturating_mul(2) + 4) / 5 }
+    } else {
+        u.publish_time.saturating_sub(b.mark_publish_time)
+    };
+    if !within_band(b.mark_price, price, band_secs) {
         return Err(RouterError::PriceBand.into());
+    }
+    // Slot time: how fast the price is moving raises the dial too (`risk::speed_bps`).
+    if SLOT_TIME && mark_at != 0 && b.mark_price != 0 {
+        disagreement = disagreement.max(risk::speed_bps(b.mark_price, price, at.saturating_sub(mark_at)));
     }
     let mut data = vec![TAG_PUSH_MARK];
     data.extend_from_slice(&price.to_le_bytes());
@@ -1732,8 +1834,8 @@ fn advance(program_id: &Pubkey, accounts: &[AccountInfo], observation_sequence: 
         &[authority.clone(), vault_ai.clone(), market.clone(), percolator.clone(), vault_program.clone()],
         &[&[SEED_AUTHORITY, &[abump]]],
     )?;
-    b.mark_publish_time = u.publish_time;
-    b.mark_prev_publish_time = u.prev_publish_time;
+    b.mark_publish_time = at;
+    b.mark_prev_publish_time = at_prev;
     b.mark_price = price;
     b.price_dial = risk::price_dial(disagreement);
     b.mark_set_time = Clock::get()?.unix_timestamp.clamp(1, u32::MAX as i64) as u32;
@@ -1806,7 +1908,7 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     key_is(delegate, &v.matcher_delegate)?;
 
     // The mark is the unique first Pyth price at or after the target, and Percolator's price is it.
-    if !(b.mark_prev_publish_time < r.target_time && r.target_time <= b.mark_publish_time) {
+    if !mark_at_target(&b, r.target_time) {
         return Err(RouterError::NotAtTarget.into());
     }
     perc::expect_market(market)?;
@@ -2081,7 +2183,15 @@ fn request_settle(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResul
     }
     enqueue(program_id, payer, payer.key, None, vault_ai, book_ai, &mut b, request_ai, system, 0, None, 0)?;
     let r: Request = load(request_ai, program_id, REQUEST_MAGIC)?;
-    let until = r.target_time.saturating_add(GRACE_SECS).saturating_add(5).clamp(1, u32::MAX as i64) as u32;
+    // (The vault counts in unix seconds. In slot time a slot is counted as a whole second, more
+    // than any X1 slot takes, so the freeze lasts at least until the request can expire.)
+    let until = if SLOT_TIME {
+        let clock = Clock::get()?;
+        clock.unix_timestamp.saturating_add(r.target_time.saturating_sub(clock.slot as i64)).saturating_add(GRACE_SLOTS).saturating_add(5)
+    } else {
+        r.target_time.saturating_add(GRACE_SECS).saturating_add(5)
+    }
+    .clamp(1, u32::MAX as i64) as u32;
     let mut data = vec![TAG_FREEZE_REQUESTS];
     data.extend_from_slice(&until.to_le_bytes());
     invoke_signed(
@@ -2130,7 +2240,7 @@ fn settle(program_id: &Pubkey, accounts: &[AccountInfo], frontier: u64) -> Progr
         return Err(RouterError::BadAccount.into());
     }
     key_is(market, &v.market)?;
-    if !(b.mark_prev_publish_time < r.target_time && r.target_time <= b.mark_publish_time) {
+    if !mark_at_target(&b, r.target_time) {
         return Err(RouterError::NotAtTarget.into());
     }
     perc::expect_market(market)?;
@@ -2201,10 +2311,14 @@ fn expire(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if b.vault != r.vault {
         return Err(RouterError::BadAccount.into());
     }
-    let now = Clock::get()?.unix_timestamp;
+    let clock = Clock::get()?;
+    let now = clock.unix_timestamp;
     // Past its grace period; or its price has been the mark for `STALL_SECS` and nobody filled it.
-    let at_mark = b.mark_prev_publish_time < r.target_time && r.target_time <= b.mark_publish_time;
+    let at_mark = mark_at_target(&b, r.target_time);
     let stalled = at_mark && b.mark_set_time != 0 && now > (b.mark_set_time as i64).saturating_add(STALL_SECS);
+    // The grace period in the request's own time: slots, or (queued before slot time, or a
+    // Solana build) unix seconds.
+    let (since, grace_left) = if SLOT_TIME && r.target_time <= LEGACY_TIME { (clock.slot as i64, GRACE_SLOTS) } else { (now, GRACE_SECS) };
     // Or a settlement with nothing left to settle: the epoch it was queued for has rolled (another
     // settlement, or the keeper's flat roll, got there first). The mark cannot move past a request
     // in the queue, so it would otherwise hold every trade behind it up for the stall time.
@@ -2217,7 +2331,7 @@ fn expire(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             }
             _ => false,
         };
-    if now <= r.target_time.saturating_add(GRACE_SECS) && !stalled && !dead {
+    if since <= r.target_time.saturating_add(grace_left) && !stalled && !dead {
         return Err(RouterError::TooEarly.into());
     }
     // A settlement request belongs to no trader (account 2 is then ignored).

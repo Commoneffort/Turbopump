@@ -268,6 +268,15 @@ impl World {
         let last = { self.book().mark_price };
         let bps = if last == 0 { 0 } else { (price_e6 as i128 - last as i128).unsigned_abs() * 10_000 / last as u128 };
         let need = if bps > 200 { ((bps - 200) / 50 + 2) as i64 } else { 1 };
+        if cfg!(feature = "x1") {
+            // Slot time: the band counts 0.4 s for each slot since the mark's post.
+            let mark_slot = { self.book().mark_publish_time } as u64;
+            let want = mark_slot + (need as u64 * 5).div_ceil(2);
+            if self.env.current_slot() < want {
+                self.goto_slot(want);
+            }
+            return (self.clock_ts() - self.pyth_time).max(1);
+        }
         let secs = (self.clock_ts() - self.pyth_time).max(need);
         if self.pyth_time + secs > self.clock_ts() {
             let slot = self.env.current_slot() + 1;
@@ -458,11 +467,7 @@ impl World {
     pub fn settle_open(&mut self) -> Result<u64, String> {
         let id = self.request_settle()?;
         let target = self.request_target(id);
-        let slot = self.env.current_slot() + 1;
-        self.env.set_clock(slot, target.max(self.clock_ts()));
-        let prev = self.pyth_time;
-        self.pyth_time = target;
-        let u = self.pyth_update(self.price, target, prev);
+        let u = self.price_at_target(target);
         self.advance_to(u)?;
         self.converge();
         let ix = self.settle_ix(id);
@@ -546,15 +551,36 @@ impl World {
         }
     }
 
-    /// Brings a queued request to its fill: the first Pyth update at its target (at the current
-    /// price), advance, converge, fill.
-    pub fn execute(&mut self, taker: usize, id: u64) -> Result<u64, String> {
-        let target = self.request_target(id);
+    /// Moves the chain to a request's target (router time: seconds, or slots in an X1 build) and
+    /// publishes the first price at it, at the current price.
+    pub fn price_at_target(&mut self, target: i64) -> Pubkey {
+        if cfg!(feature = "x1") {
+            self.goto_slot(target as u64);
+            let publish = self.clock_ts().max(self.pyth_time);
+            let prev = self.pyth_time;
+            self.pyth_time = publish;
+            return self.pyth_update(self.price, publish, prev.min(publish - 1));
+        }
         let slot = self.env.current_slot() + 1;
         self.env.set_clock(slot, target.max(self.clock_ts()));
         let prev = self.pyth_time;
         self.pyth_time = target;
-        let u = self.pyth_update(self.price, target, prev);
+        self.pyth_update(self.price, target, prev)
+    }
+
+    /// Moves to slot `slot` (at least the next one), with the clock 0.4 s a slot later.
+    pub fn goto_slot(&mut self, slot: u64) {
+        let now = self.env.current_slot();
+        let slot = slot.max(now + 1);
+        let ts = self.clock_ts() + (((slot - now) as i64 * 2) / 5).max(1);
+        self.env.set_clock(slot, ts);
+    }
+
+    /// Brings a queued request to its fill: the first Pyth update at its target (at the current
+    /// price), advance, converge, fill.
+    pub fn execute(&mut self, taker: usize, id: u64) -> Result<u64, String> {
+        let target = self.request_target(id);
+        let u = self.price_at_target(target);
         self.advance_to(u)?;
         self.converge();
         self.fill(taker, id)

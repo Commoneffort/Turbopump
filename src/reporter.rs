@@ -76,13 +76,18 @@ pub const FALLBACK_SECS: i64 = 20;
 
 pub const REPORT_MAGIC: u64 = 0x5052_4943_4552_5054; // "PRICERPT"
 pub const SEED_REPORT: &[u8] = b"report";
-/// magic u64, feed [32], price_e6 u64, publish_time i64, prev_publish_time i64, bump u8, pad 7.
-pub const REPORT_LEN: usize = 8 + 32 + 8 + 8 + 8 + 8;
+/// magic u64, feed [32], price_e6 u64, publish_time i64, prev_publish_time i64, bump u8, pad 7,
+/// then (since 2026-11-05) the slot it was posted in u64 and the slot of the post before u64.
+/// An account written before then is `REPORT_LEN_V1` long; the next post extends it.
+pub const REPORT_LEN: usize = 8 + 32 + 8 + 8 + 8 + 8 + 8 + 8;
+pub const REPORT_LEN_V1: usize = 8 + 32 + 8 + 8 + 8 + 8;
 pub const REPORT_FEED_OFF: usize = 8;
 pub const REPORT_PRICE_OFF: usize = 40;
 pub const REPORT_PUBLISH_OFF: usize = 48;
 pub const REPORT_PREV_OFF: usize = 56;
 pub const REPORT_BUMP_OFF: usize = 64;
+pub const REPORT_SLOT_OFF: usize = 72;
+pub const REPORT_PREV_SLOT_OFF: usize = 80;
 
 /// The router's price account for a feed.
 pub fn report_address(feed: &[u8; 32]) -> (Pubkey, u8) {
@@ -90,7 +95,7 @@ pub fn report_address(feed: &[u8; 32]) -> (Pubkey, u8) {
 }
 
 pub fn decode(data: &[u8]) -> Result<PriceUpdate, VaultError> {
-    if data.len() != REPORT_LEN || data[..8] != REPORT_MAGIC.to_le_bytes() {
+    if (data.len() != REPORT_LEN && data.len() != REPORT_LEN_V1) || data[..8] != REPORT_MAGIC.to_le_bytes() {
         return Err(VaultError::BadOracle);
     }
     let rd8 = |o: usize| <[u8; 8]>::try_from(&data[o..o + 8]).unwrap();
@@ -105,6 +110,16 @@ pub fn decode(data: &[u8]) -> Result<PriceUpdate, VaultError> {
         publish_time: i64::from_le_bytes(rd8(REPORT_PUBLISH_OFF)),
         prev_publish_time: i64::from_le_bytes(rd8(REPORT_PREV_OFF)),
     })
+}
+
+/// The slot a report was posted in and the slot of the post before it (both 0 in an account
+/// last written before posts recorded them).
+pub fn posted_slots(data: &[u8]) -> (u64, u64) {
+    if data.len() != REPORT_LEN {
+        return (0, 0);
+    }
+    let rd8 = |o: usize| u64::from_le_bytes(<[u8; 8]>::try_from(&data[o..o + 8]).unwrap());
+    (rd8(REPORT_SLOT_OFF), rd8(REPORT_PREV_SLOT_OFF))
 }
 
 /// Reads the reported price for `feed` from the router's account for it.

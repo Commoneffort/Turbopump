@@ -916,18 +916,20 @@ function Pending({ r, sym, send, busy }: { r: C.RouterRequest; sym: string; send
   const { publicKey } = useWallet();
   const [now, setNow] = useState(Date.now() / 1000);
   useEffect(() => { const id = setInterval(() => setNow(Date.now() / 1000), 250); return () => clearInterval(id); }, []);
-  const left = r.target - now;
-  const done = Math.min(100, Math.max(0, (1 - left / C.ROUTER_DELAY_SECS) * 100));
+  // (Slot time on X1: the target is a slot, shown as the time it is expected at.)
+  const at = C.routerUnix(r.target) || now + C.ROUTER_WAIT_SECS;
+  const left = at - now;
+  const done = Math.min(100, Math.max(0, (1 - left / C.ROUTER_WAIT_SECS) * 100));
   // Nobody filled it in time (the executor is down or far behind). Anyone may then remove it, so
   // the wallet does not have to wait for the executor to come back before it can trade again.
   // (A few seconds are allowed for the chain's clock running behind this one.)
-  const expiresIn = r.target + C.ROUTER_GRACE_SECS - now;
+  const expiresIn = at + C.ROUTER_GRACE_SECS - now;
   const late = expiresIn < -5;
   return (
     <div className="pending">
       <div className="pending-t">
         <b>{r.size === 0n ? `Close-out of ${sym}` : `${r.size > 0n ? "Long" : "Short"} ${units(abs(r.size))} ${sym}`}</b>
-        <span className="mono">{left > 0 ? `price set in ${Math.ceil(left)} s` : late ? "not filled in time" : left > -20 ? "filling…" : `still waiting, expires in ${Math.max(1, Math.ceil(expiresIn))} s`}</span>
+        <span className="mono">{left > 0 ? `price set in ${left < 1 ? left.toFixed(1) : Math.ceil(left)} s` : late ? "not filled in time" : left > -20 ? "filling…" : `still waiting, expires in ${Math.max(1, Math.ceil(expiresIn))} s`}</span>
       </div>
       <div className="pending-bar"><i style={{ width: `${done}%` }} /></div>
       {late && <div className="fine">This order was not filled within {C.ROUTER_GRACE_SECS} s and has traded nothing. Remove it to place a new one.</div>}
@@ -1302,7 +1304,7 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go, tick, accoun
               <div><span>Leverage</span><b>up to {fmt(10_000 / Number(state.levels.open), 0)}×</b></div>
               <div><span>Trading fee</span><b>{C.TRADE_FEE_PCT} per trade</b></div>
               <div><span>Price</span><b>{C.X1 ? "exchange median, posted by the router's reporter" : "Pyth, verified on chain"}</b></div>
-              <div><span>Fill</span><b>first oracle price {C.ROUTER_DELAY_SECS}–{C.ROUTER_DELAY_SECS + C.ROUTER_BATCH_SECS - 1} s after the request</b></div>
+              <div><span>Fill</span><b>{C.SLOT_TIME ? `first oracle price ${C.ROUTER_DELAY_SLOTS} to ${C.ROUTER_DELAY_SLOTS + C.ROUTER_BATCH_SLOTS - 1} slots (about ${C.ROUTER_WAIT_SECS} s) after the request, longer in a fast market` : `first oracle price ${C.ROUTER_DELAY_SECS}–${C.ROUTER_DELAY_SECS + C.ROUTER_BATCH_SECS - 1} s after the request`}</b></div>
               <div><span>Liquidation</span><b>below {fmt(Number(state.levels.liq) / 100, 1)}% margin</b></div>
               <div><span>Funding</span><b>{state.funding.capE9 > 0n ? `${fmt(Math.abs(C.fundingPerHour(state.funding.rateE9)) * 100, 4)}%/h now, ${state.funding.rateE9 > 0n ? "longs pay" : state.funding.rateE9 < 0n ? "shorts pay" : "nobody pays"}; up to ${fmt(C.fundingPerHour(BigInt(L_FUNDING.max ?? 30)) * 100, 3)}%/h, by how one-sided the vault is` : "off on this market"}</b></div>
             </div>

@@ -9,7 +9,8 @@
 #   deploy/crash-drill.sh            the whole drill (~1.5 h), in the background; prints where the logs are
 #   deploy/crash-drill.sh stop       stop everything it started
 #   deploy/crash-drill.sh status     what is running, and the last lines of the driver's log
-#   ROUTER_SO=path/to/percolator_router.so to drill another router build (default: target/deploy-x1)
+#   ROUTER_SO=path/to/percolator_router.so, VAULT_SO=path/to/percolator_vault.so to drill other
+#   builds (default: target/deploy-x1)
 # Logs and the chain: deploy/logs/drill/ (driver.log is the one to read).
 cd "$(dirname "$0")/.."
 ROOT=$PWD
@@ -67,7 +68,7 @@ PERC_SO=${PERCOLATOR_SO:-../percolator-prog/target/deploy/percolator_prog.so}
 say "== local chain on $RPC (programs: the X1 builds in target/deploy-x1 and $PERC_SO)"
 bg validator "$D" solana-test-validator --reset --quiet --ledger "$D/ledger" --rpc-port 18899 --faucet-port 19900 --gossip-port 18001 --dynamic-port-range 18002-18040 \
   --upgradeable-program "$(solana-keygen pubkey keys/percolator-devnet-keypair.json)" "$ROOT/$PERC_SO" "$ME" \
-  --upgradeable-program "$(solana-keygen pubkey keys/percolator_vault-keypair.json)" "$ROOT/target/deploy-x1/percolator_vault.so" "$ME" \
+  --upgradeable-program "$(solana-keygen pubkey keys/percolator_vault-keypair.json)" "${VAULT_SO:-$ROOT/target/deploy-x1/percolator_vault.so}" "$ME" \
   --upgradeable-program "$(solana-keygen pubkey keys/router-keypair.json)" "${ROUTER_SO:-$ROOT/target/deploy-x1/percolator_router.so}" "$ME"
 for i in $(seq 60); do solana cluster-version -u $RPC >/dev/null 2>&1 && break; running validator || { say "the local chain did not start:"; cat "$D/validator.log"; exit 1; }; sleep 2; done
 solana airdrop -u $RPC 100000 "$ME" >/dev/null

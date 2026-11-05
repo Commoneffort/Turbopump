@@ -75,6 +75,7 @@ export default {
   },
   "router": {
     "batch_secs": 2,
+    "batch_slots": 4,
     "behind_refund_slots": 150,
     "bond_lamports": 2000000,
     "book": {
@@ -101,6 +102,7 @@ export default {
     },
     "carry_len": 96,
     "delay_secs": 4,
+    "delay_slots": 3,
     "expiry_deposit_bps": 10,
     "expiry_deposit_cap": 10000000,
     "fallback_secs": 20,
@@ -112,6 +114,7 @@ export default {
     "funding_seq_off_in_slot": 424,
     "funding_tau_slots": 9000,
     "grace_secs": 90,
+    "grace_slots": 250,
     "hold_free_bps": 1000,
     "hold_max_e12": 27778,
     "im_bps_off": 558,

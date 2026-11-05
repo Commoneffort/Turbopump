@@ -8,7 +8,7 @@
 
 mod common;
 use common::*;
-use percolator_router::{client as rclient, RouterError, GRACE_SECS};
+use percolator_router::{client as rclient, RouterError, GRACE_SLOTS};
 use percolator_vault::{error::VaultError, percolator as perc, reporter};
 use solana_sdk::{pubkey::Pubkey, signature::Keypair, signer::Signer};
 
@@ -22,9 +22,14 @@ fn expect(r: Result<u64, String>, code: String) {
     let e = r.expect_err("must fail");
     assert!(e.contains(&code), "expected {code}, got: {}", e.lines().next().unwrap_or(""));
 }
+/// Moves the clock to `ts`, and the slots with it (2.5 a second; at least one).
 fn at(w: &mut World, ts: i64) {
-    let slot = w.env.current_slot() + 1;
+    let dt = (ts - w.clock_ts()).max(0) as u64;
+    let slot = w.env.current_slot() + (dt * 5 / 2).max(1);
     w.env.set_clock(slot, ts.max(w.clock_ts()));
+}
+fn now(w: &World) -> i64 {
+    w.clock_ts().max(w.pyth_time)
 }
 fn position(w: &World, taker: usize) -> i128 {
     let m = w.env.svm.get_account(&w.env.market).unwrap().data;
@@ -121,50 +126,109 @@ fn a_reported_price_moves_the_mark_with_nothing_queued() {
 
 #[test]
 fn a_trade_fills_at_the_first_reported_price_after_its_target_and_nothing_else() {
+    // Slot time: a request's target is a slot, and it fills at the first price posted in a slot
+    // at or after it. The router stamps each post with its slot, so no key picks which one.
     let mut w = live();
     let reporter_kp = w.reporter();
+    let witness = w.witness();
     let size = 10 * UNIT as i128;
     w.trader(0);
     let equity0 = equity(&w, 0);
     // (The mark is a minute old: the price band takes the moves below.)
-    let now = w.clock_ts();
-    at(&mut w, now + 60);
+    let t = w.clock_ts();
+    at(&mut w, t + 60);
+    let landed = w.env.current_slot();
     let id = w.request(0, size).unwrap();
     let target = w.request_target(id);
-    let last = w.pyth_time;
+    // Three slots at dial 1, rounded up to the 4-slot grid.
+    assert!(target >= landed as i64 + 3 && target < landed as i64 + 3 + 4 && target % 4 == 0, "target slot {target} for a request in slot {landed}");
 
-    // A price published before the target can still move the mark, but cannot fill the request.
-    at(&mut w, target - 1);
-    let witness = w.witness();
-    w.post_report(&witness, 1_100_000, target - 1, last).unwrap();
-    let early = w.post_report(&reporter_kp, 1_100_000, target - 1, last).unwrap();
+    // A price posted before the target can still move the mark, but cannot fill the request.
+    w.goto_slot(target as u64 - 1);
+    let n = now(&w);
+    w.post_report(&witness, 1_100_000, n, n - 1).unwrap();
+    let early = w.post_report(&reporter_kp, 1_100_000, n, n - 1).unwrap();
     w.advance_to(early).unwrap();
-    w.pyth_time = target - 1;
-    w.converge();
+    w.pyth_time = n;
     expect(w.fill(0, id), router_code(RouterError::NotAtTarget));
+    assert_eq!(reporter::posted_slots(&w.env.svm.get_account(&early).unwrap().data).0, target as u64 - 1);
 
-    // A price after the target that says it is not the first one after it is refused.
-    at(&mut w, target + 3);
-    w.post_report(&witness, 1_300_000, target + 3, target - 1).unwrap();
-    let late = w.post_report(&reporter_kp, 1_300_000, target + 3, target + 1).unwrap();
-    expect(w.advance_to(late), router_code(RouterError::WrongUpdate));
-
-    // The first price at or after the target is the fill price.
-    w.post_report(&witness, 1_140_000, target + 4, target + 3).unwrap();
-    let first = w.post_report(&reporter_kp, 1_140_000, target + 4, target - 1).unwrap();
+    // The first price posted at or after the target is the fill price, whatever publish time the
+    // reporter wrote.
+    w.goto_slot(target as u64);
+    let n = now(&w);
+    w.post_report(&witness, 1_102_000, n, n - 1).unwrap();
+    let first = w.post_report(&reporter_kp, 1_102_000, n, n - 1).unwrap();
     w.advance_to(first).unwrap();
-    w.price = 1_140_000;
-    w.pyth_time = target + 4;
+    w.price = 1_102_000;
+    w.pyth_time = n;
     w.converge();
     w.fill(0, id).unwrap();
     assert_eq!(position(&w, 0), size);
-    // Bought at 1.14: no gain from the 1.10 and 1.30 prices that were never the trade's price.
-    w.move_price(5, 1_140_000);
+    // Bought at 1.102: no gain from the 1.10 price that was never the trade's price.
+    w.move_price(5, 1_102_000);
     assert!(equity(&w, 0) <= equity0, "the trader paid fees and gained nothing: {} -> {}", equity0, equity(&w, 0));
     // The round trip closes at the next reported price.
     w.taker_trade(0, -size).unwrap();
     assert_eq!(position(&w, 0), 0);
     assert_eq!({ w.vault_state().inventory }, 0);
+}
+
+#[test]
+fn a_later_post_cannot_stand_in_for_the_first_one_after_the_target() {
+    let mut w = live();
+    let reporter_kp = w.reporter();
+    let witness = w.witness();
+    w.trader(0);
+    let t = w.clock_ts();
+    at(&mut w, t + 60);
+    let id = w.request(0, UNIT as i128).unwrap();
+    let target = w.request_target(id) as u64;
+    // Posted at the target, then again a slot later before anyone moved the mark: the second
+    // post is not the first one at or after the target, and cannot move the mark past it.
+    w.goto_slot(target);
+    let n = now(&w);
+    w.post_report(&witness, 1_200_000, n, n - 1).unwrap();
+    w.post_report(&reporter_kp, 1_200_000, n, n - 1).unwrap();
+    w.goto_slot(target + 1);
+    let late = w.post_report(&reporter_kp, 1_210_000, n, n - 1).unwrap();
+    let (slot, prev) = reporter::posted_slots(&w.env.svm.get_account(&late).unwrap().data);
+    assert_eq!((slot, prev), (target + 1, target));
+    expect(w.advance_to(late), router_code(RouterError::WrongUpdate));
+    // Two posts in one slot: refused.
+    expect(w.post_report(&reporter_kp, 1_210_000, n, n - 1).map(|_| 0), router_code(RouterError::WrongUpdate));
+}
+
+#[test]
+fn the_delay_grows_with_the_risk_dial() {
+    // Prices moving fast (here 1% in a few slots) raise the dial, and the delay doubles with each
+    // step: a calm market fills in about a second, a fast one waits longer.
+    let mut w = live();
+    let reporter_kp = w.reporter();
+    let witness = w.witness();
+    w.trader(0);
+    let t = w.clock_ts();
+    at(&mut w, t + 60);
+    let calm = w.request(0, UNIT as i128).unwrap();
+    let landed = w.env.current_slot() as i64;
+    assert!(w.request_target(calm) - landed < 3 + 4);
+    w.execute(0, calm).unwrap();
+    // 1% in 3 slots (just inside the price band)...
+    let mark_slot = { w.book().mark_publish_time } as u64;
+    w.goto_slot(mark_slot + 3);
+    let n = now(&w);
+    w.post_report(&witness, 1_010_000, n, n - 1).unwrap();
+    let r = w.post_report(&reporter_kp, 1_010_000, n, n - 1).unwrap();
+    w.advance_to(r).unwrap();
+    w.price = 1_010_000;
+    w.pyth_time = n;
+    w.converge();
+    assert_eq!(w.book().price_dial, 4);
+    // ...so the next request waits 24 slots (3 doubled three times), rounded up to the grid.
+    let landed = w.env.current_slot() as i64;
+    let fast = w.request(0, -(UNIT as i128)).unwrap();
+    let target = w.request_target(fast);
+    assert!(target >= landed + 24 && target < landed + 24 + 4, "target {target} from slot {landed}");
 }
 
 #[test]
@@ -183,10 +247,7 @@ fn a_fill_pays_its_sender_what_a_fill_costs_on_x1() {
     let posted = trader_before - w.env.svm.get_balance(&trader).unwrap();
     assert!(posted >= BOND, "the trader posts the bond (and the request's rent): {posted}");
     let target = w.request_target(id);
-    at(&mut w, target);
-    let prev = w.pyth_time;
-    w.pyth_time = target;
-    let u = w.pyth_update(w.price, target, prev);
+    let u = w.price_at_target(target);
     w.advance_to(u).unwrap();
     w.converge();
     let before = w.env.svm.get_balance(&executor.pubkey()).unwrap();
@@ -208,7 +269,7 @@ fn a_request_nobody_prices_expires() {
     w.trader(0);
     let id = w.request(0, UNIT as i128).unwrap();
     let target = w.request_target(id);
-    at(&mut w, target + GRACE_SECS + 1);
+    w.goto_slot((target + GRACE_SLOTS + 1) as u64);
     let (t, kp) = (w.traders[&0].1, w.trader_kp(0));
     let ix = rclient::expire(&kp.pubkey(), &w.vault, &t);
     w.send(vec![ix], &[&kp]).unwrap();
