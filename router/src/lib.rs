@@ -972,10 +972,10 @@ fn grow_book(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let mut d = book_ai.try_borrow_mut_data()?;
     let (h, n) = (BOOK_HEADER_LEN, OLD_MAX_PENDING);
     d[..h].copy_from_slice(&old[..h]);
-    // The ids, then the targets, each array now MAX_PENDING long.
-    d[h..h + 8 * n].copy_from_slice(&old[h..h + 8 * n]);
-    d[h + 8 * n..h + 8 * MAX_PENDING].fill(0);
-    d[h + 8 * MAX_PENDING..h + 8 * MAX_PENDING + 8 * n].copy_from_slice(&old[h + 8 * n..h + 16 * n]);
+    // The ids, then the targets, each list now MAX_PENDING long (addresses unknown: zeros).
+    d[BOOK_IDS_OFF..BOOK_IDS_OFF + 8 * n].copy_from_slice(&old[h..h + 8 * n]);
+    d[BOOK_IDS_OFF + 8 * n..BOOK_TARGETS_OFF].fill(0);
+    d[BOOK_TARGETS_OFF..BOOK_TARGETS_OFF + 8 * n].copy_from_slice(&old[h + 8 * n..h + 16 * n]);
     Ok(())
 }
 
@@ -1290,13 +1290,7 @@ fn enqueue_after<'a>(
         },
     )?;
     b.next_id = id.checked_add(1).ok_or(RouterError::Overflow)?;
-    let (mut ids, mut targets) = (b.pending_id, b.pending_target);
-    ids[b.len as usize] = id;
-    targets[b.len as usize] = target;
-    set_book_key(book_ai, b.len as usize, request_ai.key)?;
-    b.pending_id = ids;
-    b.pending_target = targets;
-    b.len += 1;
+    book_push(book_ai, b, id, target, request_ai.key)?;
     store_book(book_ai, &*b)?;
     if let Some((trader_ai, t)) = trader {
         t.has_pending = 1;
@@ -1834,12 +1828,12 @@ fn advance(program_id: &Pubkey, accounts: &[AccountInfo], observation_sequence: 
     }
     if reported && !cfg!(feature = "x1") {
         let now = Clock::get()?.unix_timestamp;
-        let rescues = b.earliest_target().is_some_and(|t| now >= t.saturating_add(reporter::FALLBACK_SECS) && u.is_first_at_or_after(t));
+        let rescues = earliest_target(book_ai, &b)?.is_some_and(|t| now >= t.saturating_add(reporter::FALLBACK_SECS) && u.is_first_at_or_after(t));
         if !rescues {
             return Err(RouterError::FallbackNotAllowed.into());
         }
     }
-    if let Some(earliest) = b.earliest_target() {
+    if let Some(earliest) = earliest_target(book_ai, &b)? {
         // (A request queued by a build before slot time has a target in unix seconds, far above
         // any slot: it does not hold the mark back, and it expires by the clock.)
         if earliest <= at && !(at_prev < earliest && earliest <= at) {
@@ -2094,8 +2088,7 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         social::record_fill(program_id, stats_ai, &t, portfolio, v.asset_index, traded, effective, owed, others);
     }
 
-    let (place, last) = b.remove(r.id)?;
-    move_book_key(book_ai, place, last)?;
+    book_remove(book_ai, &mut b, r.id)?;
     store_book(book_ai, &b)?;
     t.has_pending = 0;
     store(trader_ai, &t)?;
@@ -2336,8 +2329,7 @@ fn settle(program_id: &Pubkey, accounts: &[AccountInfo], frontier: u64) -> Progr
     data.extend_from_slice(&frontier.to_le_bytes());
     invoke_signed(&Instruction { program_id: percolator_vault::id(), accounts: metas, data }, &infos, &[&[SEED_AUTHORITY, &[abump]]])?;
 
-    let (place, last) = b.remove(r.id)?;
-    move_book_key(book_ai, place, last)?;
+    book_remove(book_ai, &mut b, r.id)?;
     store_book(book_ai, &b)?;
     close(request_ai, BOND_LAMPORTS, executor, wallet)
 }
@@ -2428,8 +2420,7 @@ fn expire(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         pay(request_ai, caller, share)?;
         msg!("reward expire {}", share);
     }
-    let (place, last) = b.remove(r.id)?;
-    move_book_key(book_ai, place, last)?;
+    book_remove(book_ai, &mut b, r.id)?;
     b.forfeited_bonds = b.forfeited_bonds.saturating_add(bond);
     store_book(book_ai, &b)?;
     if r.kind == KIND_ORDER {

@@ -545,9 +545,8 @@ fn a_book_and_a_request_from_before_slot_time_keep_working() {
     w.env.svm.set_account(rk, acct).unwrap();
     let mut acct = w.env.svm.get_account(&bk).unwrap();
     let mut b: percolator_router::state::Book = bytemuck::pod_read_unaligned(&acct.data[..percolator_router::state::BOOK_LEN]);
-    let mut targets = b.pending_target;
-    targets[0] = unix_target;
-    b.pending_target = targets;
+    let t0 = percolator_router::state::BOOK_TARGETS_OFF;
+    acct.data[t0..t0 + 8].copy_from_slice(&unix_target.to_le_bytes());
     b.mark_publish_time = unix_target - 10;
     b.mark_prev_publish_time = unix_target - 11;
     acct.data[..percolator_router::state::BOOK_LEN].copy_from_slice(bytemuck::bytes_of(&b));
@@ -629,7 +628,7 @@ fn the_book_names_each_queued_request_in_order() {
     let keys = |w: &World| {
         let d = w.env.svm.get_account(&book_address(&percolator_router::id(), &w.vault).0).unwrap().data;
         let b = w.book();
-        (0..b.len as usize).map(|p| (b.pending_id[p], Pubkey::new_from_array(d[BOOK_KEYS_OFF + 32 * p..BOOK_KEYS_OFF + 32 * p + 32].try_into().unwrap()))).collect::<Vec<_>>()
+        (0..b.len as usize).map(|p| (percolator_router::state::book_entry(&d, p).0, Pubkey::new_from_array(d[BOOK_KEYS_OFF + 32 * p..BOOK_KEYS_OFF + 32 * p + 32].try_into().unwrap()))).collect::<Vec<_>>()
     };
     assert_eq!(keys(&w), vec![(ids[0], key_of(&w, 0)), (ids[1], key_of(&w, 1)), (ids[2], key_of(&w, 2))]);
     // The first fills: the last request takes its place, with its address.

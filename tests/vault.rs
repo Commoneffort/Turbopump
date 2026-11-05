@@ -689,7 +689,12 @@ fn export_layout_for_frontend() {
         },
         "router": {
             "program": percolator_router::id().to_string(),
-            "book": f!(percolator_router::state::Book, 0, vault, len, mark_set_time, has_carry, mark_publish_time, mark_prev_publish_time, mark_price, next_id, forfeited_bonds, pending_id, pending_target),
+            "book": {
+                let mut b = f!(percolator_router::state::Book, 0, vault, len, mark_set_time, has_carry, mark_publish_time, mark_prev_publish_time, mark_price, next_id, forfeited_bonds);
+                b["pending_id"] = serde_json::json!(percolator_router::state::BOOK_IDS_OFF);
+                b["pending_target"] = serde_json::json!(percolator_router::state::BOOK_TARGETS_OFF);
+                b
+            },
             "book_len": size_of::<percolator_router::state::Book>(),
             "book_account_len": percolator_router::state::BOOK_ACCOUNT_LEN,
             "book_keys_off": percolator_router::state::BOOK_KEYS_OFF,

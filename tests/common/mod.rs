@@ -234,6 +234,13 @@ impl World {
         self.vault_state().asset_index
     }
 
+    /// The ids of the requests queued in the vault's book, in its order.
+    pub fn book_ids(&self) -> Vec<u64> {
+        let k = percolator_router::state::book_address(&percolator_router::id(), &self.vault).0;
+        let d = self.env.svm.get_account(&k).unwrap().data;
+        (0..self.book().len as usize).map(|i| percolator_router::state::book_entry(&d, i).0).collect()
+    }
+
     pub fn book(&self) -> percolator_router::state::Book {
         let k = percolator_router::state::book_address(&percolator_router::id(), &self.vault).0;
         bytemuck::pod_read_unaligned(&self.env.svm.get_account(&k).unwrap().data[..percolator_router::state::BOOK_LEN])

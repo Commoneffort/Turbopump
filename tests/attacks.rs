@@ -727,7 +727,7 @@ fn withdrawals_beyond_the_cash_reserve_need_the_vault_flat() {
     assert_eq!({ w.vault_state().epoch }, 1);
     // The request that could not execute expires like any other (executors check first and do
     // not queue one that cannot succeed), forfeiting its bond.
-    let id = { w.book().pending_id }[0];
+    let id = w.book_ids()[0];
     let target = w.request_target(id);
     let slot = w.env.current_slot() + 1;
     w.env.set_clock(slot, target + percolator_router::GRACE_SECS + 1);
