@@ -1373,7 +1373,10 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
     // 10-slot boundary on. Whichever matches the landing slot fills; the other fails harmlessly.
     const version = (n: number) => [...Array(n).fill(plan.lagCrank), ...tuned.settle, ...tail];
     // (A version without lag cranks too, for landing just behind another market's fill.)
-    await race(`${lazy ? "lazy " : ""}${r.size === 0n ? "forced close" : "fill"} ${what} size ${Number(r.size) / 1e6} at ${Number(b.markPrice) / 1e6} (${tuned.k} lag + ${tuned.settle.length} settle cranks)`, tuned.k > 0 && !tuned.settle.length && C.X1 ? [version(tuned.k), version(tuned.k + 1), version(0)] : C.X1 ? [version(tuned.k), version(tuned.k + 1)] : [version(tuned.k), version(tuned.k + 1), version(tuned.k + 2)]);
+    // (Lazy fills land among others on the market: one of them may have brought the asset to the
+    // slot already, which the version without lag cranks is for. The trader's own crank catches
+    // the asset up by itself.)
+    await race(`${lazy ? "lazy " : ""}${r.size === 0n ? "forced close" : "fill"} ${what} size ${Number(r.size) / 1e6} at ${Number(b.markPrice) / 1e6} (${tuned.k} lag + ${tuned.settle.length} settle cranks)`, tuned.k > 0 && (!tuned.settle.length || lazy) && C.X1 ? [version(tuned.k), version(tuned.k + 1), version(0)] : C.X1 ? [version(tuned.k), version(tuned.k + 1)] : [version(tuned.k), version(tuned.k + 1), version(tuned.k + 2)]);
     if (r.target <= C.LEGACY_TIME) log(`  ${what}: done ${(Date.now() / 1000 - C.routerUnix(r.target)).toFixed(1)} s after its price slot ${r.target}`);
     else log(`  ${what}: ${Math.round(Date.now() / 1000 - (r.target - C.ROUTER_DELAY_SECS))} s from request to result (${(Date.now() / 1000 - r.target).toFixed(1)} s after its price time)`);
     break;
@@ -1384,6 +1387,16 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
   if (lazyVault && atMarkReqs.length > 1) {
     for (const ids of await fillTogether(v, b, atMarkReqs, true)) grouped.add(ids);
     const rest = atMarkReqs.filter(r => !grouped.has(r.id));
+    // The vault re-valued once first, if it is out of date: a fill that carried it would fail
+    // as soon as another fill had re-valued it (a crank with nothing to do fails its transaction).
+    if (rest.length > 1) {
+      const p = C.crankPlan(await snapshot(), payer.publicKey, v.lpPortfolio, v.assetIndex);
+      const lp = p.settle.find(ix => ix.keys[2]?.pubkey.equals(v.lpPortfolio));
+      if (lp) {
+        const t = await tune(p.lagCrank, Math.max(0, Math.ceil(p.lag / 10)), [lp], []);
+        if (typeof t !== "string" && t.settle.length) await send(`re-value the vault of ${v.feed?.symbol} for ${rest.length} fills (lazy)`, [...Array(t.k).fill(p.lagCrank), ...t.settle], true);
+      }
+    }
     for (let i = 0; i < rest.length && !notConverged; i += LAZY_PARALLEL) await Promise.all(rest.slice(i, i + LAZY_PARALLEL).map(r => fillOne(r, false)));
   }
   for (const r of live.filter(r => tradeOn && b.markPrev < r.target && r.target <= b.markPublish && !unledgered.has(acctKey(r)))) {
