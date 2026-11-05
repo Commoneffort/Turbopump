@@ -93,7 +93,7 @@ export default {
     },
     "book_account_len": 6264,
     "book_keys_off": 2168,
-    "book_len": 2168,
+    "book_len": 120,
     "carry": {
       "index_long": 40,
       "index_short": 56,

@@ -533,7 +533,7 @@ fn a_request_that_lapses_after_its_price_arrived_loses_its_deposit() {
     // What lapsed requests left in the book goes to the treasury, and nowhere else; the book
     // keeps its rent, and a second sweep finds nothing.
     let treasury = percolator_vault::processor::TREASURY;
-    let book_rent = w.env.svm.minimum_balance_for_rent_exemption(rstate::BOOK_LEN);
+    let book_rent = w.env.svm.minimum_balance_for_rent_exemption(rstate::BOOK_ACCOUNT_LEN);
     let spare = bal(&w, &book) - book_rent;
     assert!(spare >= 2 * (BOND_LAMPORTS - BOND_LAMPORTS / percolator_router::EXPIRE_SHARE_DIV) + deposit);
     let mut wrong = rclient::sweep(&w.vault);
