@@ -47,6 +47,8 @@ pub enum VaultError {
     CoverNotDue,
     /// `InitVault` on a feed that is not in this build's list (`feeds::LISTABLE`).
     FeedNotListable,
+    /// A maker's quote id already used, or below its window (`maker::use_quote`).
+    QuoteUsed,
 }
 
 impl From<VaultError> for ProgramError {

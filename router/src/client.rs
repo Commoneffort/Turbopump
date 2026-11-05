@@ -329,6 +329,41 @@ pub fn with_range(mut ix: Instruction, vault: &Pubkey) -> Instruction {
     ix
 }
 
+/// Takes a maker's signed quote (`quote::take_quote`); the Ed25519 verification of the quote goes
+/// just before it in the transaction.
+#[allow(clippy::too_many_arguments)]
+pub fn take_quote(k: &VaultKeys, t: &TraderKeys, maker: &Pubkey, maker_portfolio: &Pubkey, maker_delegate: &Pubkey, size: i128, price: u64, expiry: u64, quote_id: u64) -> Instruction {
+    let mut data = vec![TAG_TAKE_QUOTE];
+    data.extend_from_slice(&size.to_le_bytes());
+    data.extend_from_slice(&price.to_le_bytes());
+    data.extend_from_slice(&expiry.to_le_bytes());
+    data.extend_from_slice(&quote_id.to_le_bytes());
+    Instruction {
+        program_id: id(),
+        accounts: vec![
+            AccountMeta::new(t.wallet, true),
+            w(t.trader),
+            w(t.portfolio),
+            ro(k.vault),
+            ro(book_address(&id(), &k.vault).0),
+            w(k.market),
+            w(*maker),
+            w(*maker_portfolio),
+            ro(*maker_delegate),
+            ro(authority_address(&id()).0),
+            ro(percolator_vault::id()),
+            ro(perc::PERCOLATOR_PROGRAM_ID),
+            ro(solana_program::sysvar::instructions::ID),
+            w(carry_address(&id(), &k.vault).0),
+            w(ledger_address(&id(), &t.trader).0),
+            ro(tiers_address(&id(), &k.market).0),
+            w(range_address(&id(), &k.vault).0),
+            w(equities_address(&id(), &t.market, &t.wallet).0),
+        ],
+        data,
+    }
+}
+
 /// Grows a vault's book made before 2026-11-05 to `MAX_PENDING` requests (anyone may).
 pub fn grow_book(payer: &Pubkey, vault: &Pubkey) -> Instruction {
     Instruction {

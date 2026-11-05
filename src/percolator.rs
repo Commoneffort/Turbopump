@@ -314,7 +314,13 @@ pub fn read_portfolio(
     {
         return Err(VaultError::BadPercolatorAccount.into());
     }
-    let control = rd_u64(&d, PORTFOLIO_MATCHER_CONTROL_OFF)?;
+    portfolio_view_of(&d)
+}
+
+/// A portfolio's view from its data (no checks of who owns it: see `read_portfolio`).
+pub fn portfolio_view_of(d: &[u8]) -> Result<PortfolioView, ProgramError> {
+    let control = rd_u64(d, PORTFOLIO_MATCHER_CONTROL_OFF)?;
+    let d = &d[..];
     Ok(PortfolioView {
         capital: rd_u128(&d, PORTFOLIO_CAPITAL_OFF)?,
         pnl: rd_i128(&d, PORTFOLIO_PNL_OFF)?,

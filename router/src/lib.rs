@@ -335,6 +335,7 @@ pub const TAG_PAY_FEES: u8 = 34;
 pub const TAG_REFRESH_RECORD: u8 = 35;
 pub const TAG_OPEN_RANGE: u8 = 36;
 pub const TAG_GROW_BOOK: u8 = 37;
+pub const TAG_TAKE_QUOTE: u8 = 38;
 /// Widest trail, in basis points.
 pub const MAX_TRAIL_BPS: u64 = 5_000;
 /// Shortest time between two slices of a TWAP order, and the most slices one can have.
@@ -476,6 +477,10 @@ pub enum RouterError {
     /// A trade that would add a second asset to an isolated account (one asset at a time), or a
     /// copy or track record asked of an isolated account (they belong to the main account).
     Isolated,
+    /// `TakeQuote` without a maker's valid signature over exactly this quote, just before it.
+    BadQuote,
+    /// `TakeQuote` after the quote's last slot, or for a quote good for too long.
+    QuoteExpired,
 }
 
 impl From<RouterError> for ProgramError {
@@ -533,6 +538,9 @@ pub fn process_instruction(program_id: &Pubkey, accounts: &[AccountInfo], data: 
         TAG_OPEN_CARRY => carry::open_carry(program_id, accounts),
         TAG_OPEN_RANGE => lazy::open_range(program_id, accounts),
         TAG_GROW_BOOK => grow_book(program_id, accounts),
+        TAG_TAKE_QUOTE => quote::take_quote(program_id, accounts, rest),
+        #[cfg(not(feature = "devnet"))]
+        quote::TEST_SIGNATURE_STANDIN => Ok(()),
         TAG_OPEN_LEDGER => carry::open_ledger(program_id, accounts),
         TAG_PAY_FEES => carry::pay_fees(program_id, accounts),
         TAG_REFRESH_RECORD => social::refresh_record(program_id, accounts),
@@ -641,6 +649,9 @@ macro_rules! trader_seeds {
         &$t.signer().seeds()[..]
     };
 }
+
+// (After `trader_seeds`, which it uses.)
+pub mod quote;
 
 // ---- accounts ----
 

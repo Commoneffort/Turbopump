@@ -640,3 +640,120 @@ fn the_book_names_each_queued_request_in_order() {
         assert_eq!(key, key_of(&w, i));
     }
 }
+
+// ---- Maker quotes (router `quote`, vault `maker`) ----
+
+struct Maker {
+    kp: Keypair,
+    account: Pubkey,
+    portfolio: Pubkey,
+    delegate: Pubkey,
+}
+
+/// A maker with its own Percolator portfolio on the market, `usdc` deposited, registered and
+/// pointed at the vault program as its matcher.
+fn new_maker(w: &mut World, usdc: u64) -> Maker {
+    use solana_sdk::{instruction::Instruction, system_instruction};
+    let u = w.new_user(usdc);
+    let kp = u.kp.insecure_clone();
+    let market = w.env.market;
+    let pf = Keypair::new();
+    let rent = w.env.svm.minimum_balance_for_rent_exemption(perc::PORTFOLIO_ACCOUNT_LEN);
+    let create = system_instruction::create_account(&kp.pubkey(), &pf.pubkey(), rent, perc::PORTFOLIO_ACCOUNT_LEN as u64, &perc::PERCOLATOR_PROGRAM_ID);
+    w.send(vec![create, perc::init_portfolio(&kp.pubkey(), &market, &pf.pubkey())], &[&kp, &pf]).expect("maker portfolio");
+    let vault_prog = percolator_vault::id();
+    let (account, _) = percolator_vault::maker::maker_address(&vault_prog, &market, &kp.pubkey());
+    let open = Instruction {
+        program_id: vault_prog,
+        accounts: vec![
+            solana_sdk::instruction::AccountMeta::new(kp.pubkey(), true),
+            solana_sdk::instruction::AccountMeta::new_readonly(kp.pubkey(), true),
+            solana_sdk::instruction::AccountMeta::new(account, false),
+            solana_sdk::instruction::AccountMeta::new_readonly(market, false),
+            solana_sdk::instruction::AccountMeta::new_readonly(pf.pubkey(), false),
+            solana_sdk::instruction::AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: vec![percolator_vault::processor::TAG_OPEN_MAKER],
+    };
+    w.send(vec![open], &[&kp]).expect("open maker");
+    let delegate = perc::matcher_delegate(&market, &pf.pubkey(), &kp.pubkey(), &vault_prog, &account);
+    let pv = |w: &World| perc::portfolio_view_of(&w.env.svm.get_account(&pf.pubkey()).unwrap().data).unwrap();
+    let v0 = pv(w);
+    let vault_token = w.env.vault;
+    let dep = perc::deposit(&kp.pubkey(), &market, &pf.pubkey(), &u.collateral, &vault_token, v0.portfolio_id, v0.sequence, usdc as u128);
+    w.send(vec![dep], &[&kp]).expect("maker deposit");
+    let v1 = pv(w);
+    let cap = { w.vault_state().trade_fee_cap_bps };
+    let frontier = w.frontier();
+    let expiry = w.env.current_slot() + 100_000;
+    let cfg = perc::set_matcher_config(&kp.pubkey(), &market, &pf.pubkey(), &vault_prog, &account, &delegate, &v1, frontier, cap, expiry);
+    w.send(vec![cfg], &[&kp]).expect("maker matcher config");
+    Maker { kp, account, portfolio: pf.pubkey(), delegate }
+}
+
+/// The Ed25519 verification of `msg` signed by `kp`, all in its own data.
+fn ed25519_ix(kp: &Keypair, msg: &[u8]) -> solana_sdk::instruction::Instruction {
+    let sig = kp.sign_message(msg);
+    let (pk_off, sig_off, msg_off) = (16u16, 48u16, 112u16);
+    let mut d = vec![1u8, 0];
+    for x in [sig_off, u16::MAX, pk_off, u16::MAX, msg_off, msg.len() as u16, u16::MAX] {
+        d.extend_from_slice(&x.to_le_bytes());
+    }
+    d.extend_from_slice(kp.pubkey().as_ref());
+    d.extend_from_slice(sig.as_ref());
+    d.extend_from_slice(msg);
+    // (The test chain cannot load the Ed25519 precompile: test builds of the router take the same
+    // data in a no-op instruction of its own, `quote::TEST_SIGNATURE_STANDIN`.)
+    let mut standin = vec![percolator_router::quote::TEST_SIGNATURE_STANDIN];
+    standin.extend_from_slice(&d);
+    solana_sdk::instruction::Instruction { program_id: percolator_router::id(), accounts: vec![], data: standin }
+}
+
+fn take_quote_ixs(w: &World, signer: &Keypair, m: &Maker, taker: usize, size: i128, price: u64, expiry: u64, id: u64) -> Vec<solana_sdk::instruction::Instruction> {
+    let t = w.traders[&taker].1;
+    let msg = percolator_router::quote::quote_message(&m.account, &t.trader, w.asset(), size, price, expiry, id);
+    let k = w.keys.clone().unwrap();
+    vec![ed25519_ix(signer, &msg), rclient::take_quote(&k, &t, &m.account, &m.portfolio, &m.delegate, size, price, expiry, id)]
+}
+
+#[test]
+fn a_maker_quote_fills_at_once_at_its_price_and_only_once() {
+    let mut w = live();
+    let m = new_maker(&mut w, 50_000_000);
+    w.trader(0);
+    let tkp = w.trader_kp(0);
+    let size = 5 * UNIT as i128;
+    let slot = w.env.current_slot();
+    let asset = w.asset();
+    w.catch_up(asset, slot, &[]);
+    let price = 1_000_500; // the maker sells 5 at 1.0005
+    let ixs = take_quote_ixs(&w, &m.kp, &m, 0, size, price, slot + 3, 1);
+    w.send(ixs.clone(), &[&tkp]).expect("take the quote");
+    assert_eq!(position(&w, 0), size, "filled in this transaction");
+    let mpos: i128 = perc::positions(&w.env.svm.get_account(&w.env.market).unwrap().data, &w.env.svm.get_account(&m.portfolio).unwrap().data).unwrap().iter().map(|p| p.size).sum();
+    assert_eq!(mpos, -size, "against the maker");
+    assert_eq!({ w.vault_state().inventory }, 0, "the vault took no part");
+    // The same quote again: used.
+    w.goto_slot(w.env.current_slot() + 1);
+    assert!(w.send(ixs, &[&tkp]).is_err());
+    // Expired.
+    let s = w.env.current_slot();
+    expect(w.send(take_quote_ixs(&w, &m.kp, &m, 0, size, price, s - 1, 2), &[&tkp]), router_code(RouterError::QuoteExpired));
+    // Signed by someone else.
+    let mallory = Keypair::new();
+    expect(w.send(take_quote_ixs(&w, &mallory, &m, 0, size, price, s + 3, 3), &[&tkp]), router_code(RouterError::BadQuote));
+    // A price far from Percolator's.
+    expect(w.send(take_quote_ixs(&w, &m.kp, &m, 0, size, 1_100_000, s + 3, 4), &[&tkp]), router_code(RouterError::PriceBand));
+    // A quote for trader 0 taken by trader 1.
+    w.trader(1);
+    let t1kp = w.trader_kp(1);
+    let mut ixs = take_quote_ixs(&w, &m.kp, &m, 0, size, price, s + 3, 5);
+    let t1 = w.traders[&1].1;
+    let k = w.keys.clone().unwrap();
+    ixs[1] = rclient::take_quote(&k, &t1, &m.account, &m.portfolio, &m.delegate, size, price, s + 3, 5);
+    expect(w.send(ixs, &[&t1kp]), router_code(RouterError::BadQuote));
+    // The trader closes against the maker's next quote (buying back at 1.0004).
+    let s = w.env.current_slot();
+    w.send(take_quote_ixs(&w, &m.kp, &m, 0, -size, 1_000_400, s + 3, 6), &[&tkp]).expect("close at the maker's bid");
+    assert_eq!(position(&w, 0), 0);
+}

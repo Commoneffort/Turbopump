@@ -62,10 +62,35 @@ pub fn reduce_only(v: &state::VaultState, now_slot: u64) -> bool {
     epoch_over && v.needs_flat != 0
 }
 
+/// Writes the matcher's answer into the context account (where Percolator reads it): a valid
+/// fill of `exec_size` at `exec_price`, partial fills allowed, with the backing-fee cap and the
+/// lazy-settlement flag.
+pub fn write_return(ctx: &AccountInfo, req: &Request, exec_price: u64, exec_size: i128, backing_fee_cap_bps: u16, tolerant: bool) -> ProgramResult {
+    let flags = FLAG_VALID
+        | FLAG_PARTIAL_OK
+        | ((backing_fee_cap_bps as u32) << FLAG_BACKING_FEE_CAP_SHIFT)
+        | if tolerant { FLAG_COHORT_TOLERANT } else { 0 };
+    let mut ret = [0u8; state::MATCHER_RETURN_LEN];
+    ret[0..4].copy_from_slice(&ABI_VERSION.to_le_bytes());
+    ret[4..8].copy_from_slice(&flags.to_le_bytes());
+    ret[8..16].copy_from_slice(&exec_price.to_le_bytes());
+    ret[16..32].copy_from_slice(&exec_size.to_le_bytes());
+    ret[32..40].copy_from_slice(&req.req_id.to_le_bytes());
+    ret[40..48].copy_from_slice(&req.lp_account_id.to_le_bytes());
+    ret[48..56].copy_from_slice(&req.oracle_price_e6.to_le_bytes());
+    ret[56..64].copy_from_slice(&(req.asset_index as u64).to_le_bytes());
+    ctx.try_borrow_mut_data()?[..state::MATCHER_RETURN_LEN].copy_from_slice(&ret);
+    Ok(())
+}
+
 pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let req = decode(data)?;
     let delegate = accounts.first().ok_or(VaultError::BadAccount)?;
     let ctx = accounts.get(1).ok_or(VaultError::BadAccount)?;
+    // A maker's portfolio (see `maker`): its signed quote, as the router armed it.
+    if ctx.owner == program_id && ctx.data_len() == crate::maker::MAKER_ACCOUNT_LEN {
+        return crate::maker::process_match(program_id, accounts, &req);
+    }
     if !ctx.is_writable {
         return Err(VaultError::NotWritable.into());
     }

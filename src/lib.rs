@@ -10,6 +10,7 @@
 pub mod client;
 pub mod error;
 pub mod feeds;
+pub mod maker;
 pub mod math;
 pub mod matcher;
 pub mod percolator;

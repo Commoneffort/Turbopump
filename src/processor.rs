@@ -196,6 +196,9 @@ pub const TAG_COVER_LOSS: u8 = 40;
 pub const TAG_WITHDRAW_COVER: u8 = 41;
 pub const TAG_PUSH_FUNDING: u8 = 42;
 pub const TAG_SET_FUNDING_CAP: u8 = 43;
+/// Makers (`maker`): register a portfolio as a maker; the router arms one signed quote.
+pub const TAG_OPEN_MAKER: u8 = 44;
+pub const TAG_ARM_QUOTE: u8 = 45;
 
 /// The bound on every funding rate of a governed market (e9 per slot); 0 on a market means no
 /// funding at all, and `SetFundingCap` sets a governed market's cap to this.
@@ -546,6 +549,11 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
             claim(program_id, accounts)
         }
         TAG_REFRESH_MATCHER => refresh_matcher(program_id, accounts, arg_u64(rest)?),
+        TAG_OPEN_MAKER => {
+            no_args(rest)?;
+            crate::maker::open_maker(program_id, accounts)
+        }
+        TAG_ARM_QUOTE => crate::maker::arm_quote(program_id, accounts, rest),
         TAG_CONVERT_PNL => {
             no_args(rest)?;
             convert_pnl(program_id, accounts)
