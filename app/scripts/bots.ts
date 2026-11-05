@@ -318,7 +318,7 @@ async function marketChecks() {
     const price = Number(a.price) / 1e6;
     const h = history.get(m.symbol) ?? history.set(m.symbol, []).get(m.symbol)!;
     h.push(price); if (h.length > 20) h.shift();
-    const markAge = book ? Math.round(now / 1000 - book.markPublish) : undefined;
+    const markAge = book ? Math.round(now / 1000 - (book.slotTime ? book.markSet : book.markPublish)) : undefined;
     const out = outside.get(m.symbol);
     const lpData = byKey.get(m.lpPortfolio.toBase58());
     const lpP = lpData ? C.decodePortfolio(lpData, m.assetIndex, snap.market) : undefined;
@@ -928,10 +928,13 @@ async function adversaryRoutine(bot: Bot) {
       const [c2, b2] = await conn.getMultipleAccountsInfo([SYSVAR_CLOCK_PUBKEY, C.bookAddress(v.key)]);
       if (!c2 || !b2) continue;
       const now2 = Number(new DataView(c2.data.buffer, c2.data.byteOffset).getBigInt64(32, true));
+      const slot2 = Number(new DataView(c2.data.buffer, c2.data.byteOffset).getBigUint64(0, true));
       const book2 = C.decodeBook(new Uint8Array(b2.data));
       const atMark2 = book2.markPrev < r.target && r.target <= book2.markPublish;
       const stalled = atMark2 && book2.markSet > 0 && now2 > book2.markSet + C.ROUTER_STALL_SECS - 8;
-      if (now2 < r.target + C.ROUTER_GRACE_SECS - 10 && !stalled) {
+      // Seconds the request has left (its target in slots, X1 slot time, or unix seconds).
+      const left = (now: number, slot: number) => (r.target > C.LEGACY_TIME ? r.target + C.ROUTER_GRACE_SECS - now : (r.target + C.ROUTER_GRACE_SLOTS - slot) * C.SLOT_SECS);
+      if (left(now2, slot2) > 10 && !stalled) {
         const { code, seen } = await simulate(kp, [C.expireRequest(me, r)], [SYSVAR_CLOCK_PUBKEY, C.bookAddress(v.key)]);
         // Accepted: wrong only if the request still had time when the simulation ran. On a
         // throttled RPC (public devnet) the simulation can run many seconds after the clock was
@@ -940,23 +943,26 @@ async function adversaryRoutine(bot: Bot) {
         if (code === "ok") {
           const [c3, b3] = seen.length === 2 ? seen.map(d => (d ? { data: d } : null)) : await conn.getMultipleAccountsInfo([SYSVAR_CLOCK_PUBKEY, C.bookAddress(v.key)]).catch(() => [null, null]);
           const now3 = c3 ? Number(new DataView(c3.data.buffer, c3.data.byteOffset).getBigInt64(32, true)) : Infinity;
+          const slot3 = c3 ? Number(new DataView(c3.data.buffer, c3.data.byteOffset).getBigUint64(0, true)) : Infinity;
           const book3 = b3 ? C.decodeBook(new Uint8Array(b3.data)) : null;
           const atMark3 = !!book3 && book3.markPrev < r.target && r.target <= book3.markPublish;
-          const ranOut = now3 > r.target + C.ROUTER_GRACE_SECS || (atMark3 && book3!.markSet > 0 && now3 > book3!.markSet + C.ROUTER_STALL_SECS);
+          const ranOut = left(now3, slot3) < 0 || (atMark3 && book3!.markSet > 0 && now3 > book3!.markSet + C.ROUTER_STALL_SECS);
           if (ranOut) { note({ type: "unchecked", bot: bot.name, what: "expiring a request that still has time" }); continue; }
         }
-        expect(code, ["0x570b", "0x5701"], "expiring a request that still has time", { secsLeft: r.target + C.ROUTER_GRACE_SECS - now2, atMark: atMark2, markHeldSecs: book2.markSet ? now2 - book2.markSet : undefined }); // 0x5701: it was filled between the two reads, the account is gone
+        expect(code, ["0x570b", "0x5701"], "expiring a request that still has time", { secsLeft: left(now2, slot2), atMark: atMark2, markHeldSecs: book2.markSet ? now2 - book2.markSet : undefined }); // 0x5701: it was filled between the two reads, the account is gone
       }
     }
     // The price cannot be moved to one that is not newer than the mark. (The price account and
     // the mark are read together, right before the attempt, for the same reason as above.)
     const [pa, b3] = await conn.getMultipleAccountsInfo([v.oracle, C.bookAddress(v.key)]);
     // (Refused by the router; or, if a newer price arrived between the two reads, by Percolator for want of cranks.)
-    if (pa && b3 && C.decodePrice(new Uint8Array(pa.data)).publish <= C.decodeBook(new Uint8Array(b3.data)).markPublish) {
+    // (Slot time: a price's place is the slot it was posted in.)
+    const placeOf = (d: Uint8Array, b: C.Book) => { const p = C.decodePrice(d) as { publish: number; slot?: number }; return b.slotTime ? p.slot ?? 0 : p.publish; };
+    if (pa && b3 && placeOf(new Uint8Array(pa.data), C.decodeBook(new Uint8Array(b3.data))) <= C.decodeBook(new Uint8Array(b3.data)).markPublish) {
       const code = await wouldFail(kp, [C.advanceMark(v, v.oracle, marketData)]);
       // (The same second look as above: a price account that moved on in between is no finding.)
       const [pz, bz] = code === "ok" ? await conn.getMultipleAccountsInfo([v.oracle, C.bookAddress(v.key)]) : [null, null];
-      const newer = !!pz && !!bz && C.decodePrice(new Uint8Array(pz.data)).publish > C.decodeBook(new Uint8Array(bz.data)).markPublish;
+      const newer = !!pz && !!bz && placeOf(new Uint8Array(pz.data), C.decodeBook(new Uint8Array(bz.data))) > C.decodeBook(new Uint8Array(bz.data)).markPublish;
       if (code === "rpc" || (code === "ok" && newer)) note({ type: "unchecked", bot: bot.name, what: "moving the price to one that is not newer" });
       else {
         note({ type: "refusal", bot: bot.name, what: "moving the price to one that is not newer", code, ok: code !== "ok" });

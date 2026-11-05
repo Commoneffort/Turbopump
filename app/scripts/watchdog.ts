@@ -136,7 +136,7 @@ async function prices() {
     const s = await C.fetchVault(conn, v.key).catch(() => null);
     if (!s?.book) continue;
     // (Slot time on X1: the mark's own times are slots; its age counts from when it was set.)
-    const age = Date.now() / 1000 - (C.SLOT_TIME ? s.book.markSet : s.book.markPublish);
+    const age = Date.now() / 1000 - (s.book.slotTime ? s.book.markSet : s.book.markPublish);
     const held = s.asset.oiLong > 0n || s.asset.oiShort > 0n;
     if (held && age > 300) stale.push(`${v.feed?.symbol} ${Math.round(age / 60)} min`);
   }

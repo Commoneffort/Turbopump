@@ -80,7 +80,7 @@ async function readHealth(): Promise<Health> {
       assetIndex: v.assetIndex,
       limit: s.asset.price > 0n ? Number(C.liveNav(s)) * C.tierPositionBps(C.tierOfFeed(v.feedHex)) / 10_000 / Number(s.asset.price) : 0,
       cover: cover && coverTokens ? { held: tokenAmount(new Uint8Array(coverTokens.data)), paid: C.decodeCover(new Uint8Array(cover.data)).totalCovered } : undefined,
-      markAge: C.SLOT_TIME ? (b && b.markSet > 0 ? now - b.markSet : undefined) : b && b.markPublish > 0 ? now - b.markPublish : undefined,
+      markAge: b?.slotTime ? (b.markSet > 0 ? now - b.markSet : undefined) : b && b.markPublish > 0 ? now - b.markPublish : undefined,
       witnessAge: w ? now - w.publish : undefined,
       witnessGap: w && r && r.e6 > 0n ? Math.abs(Number(w.e6) / Number(r.e6) - 1) : undefined,
     });

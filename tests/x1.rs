@@ -522,3 +522,59 @@ fn a_wide_price_range_or_a_missed_mark_means_everyone_is_revalued_first() {
 fn lazy_div() -> u64 {
     percolator_router::lazy::RANGE_SHARE_DIV
 }
+
+#[test]
+fn a_book_and_a_request_from_before_slot_time_keep_working() {
+    // The router upgrade to slot time finds marks and targets in unix seconds. An old mark counts
+    // as long ago (the next price moves it, within the narrowest band), and an old request does
+    // not hold the mark back and expires by the clock.
+    let mut w = live();
+    // (A real date: the test chain's clock starts at 1,000 seconds, which looks like a slot.)
+    let s = w.env.current_slot() + 1;
+    w.env.set_clock(s, 1_800_000_000);
+    w.trader(0);
+    let id = w.request(0, UNIT as i128).unwrap();
+    let rk = percolator_router::state::request_address(&percolator_router::id(), &w.vault, &w.traders[&0].1.owner, false).0;
+    let bk = percolator_router::state::book_address(&percolator_router::id(), &w.vault).0;
+    let unix_target = w.clock_ts() + 4;
+    let mut acct = w.env.svm.get_account(&rk).unwrap();
+    let mut r: percolator_router::state::Request = bytemuck::pod_read_unaligned(&acct.data);
+    r.target_time = unix_target;
+    acct.data.copy_from_slice(bytemuck::bytes_of(&r));
+    w.env.svm.set_account(rk, acct).unwrap();
+    let mut acct = w.env.svm.get_account(&bk).unwrap();
+    let mut b: percolator_router::state::Book = bytemuck::pod_read_unaligned(&acct.data);
+    let mut targets = b.pending_target;
+    targets[0] = unix_target;
+    b.pending_target = targets;
+    b.mark_publish_time = unix_target - 10;
+    b.mark_prev_publish_time = unix_target - 11;
+    acct.data.copy_from_slice(bytemuck::bytes_of(&b));
+    w.env.svm.set_account(bk, acct).unwrap();
+    assert_eq!(w.request_target(id), unix_target);
+
+    // The next price moves the old mark, at a small move...
+    let (reporter_kp, witness) = (w.reporter(), w.witness());
+    w.goto_slot(w.env.current_slot() + 1);
+    let n = now(&w);
+    w.post_report(&witness, 1_010_000, n, n - 1).unwrap();
+    let report = w.post_report(&reporter_kp, 1_010_000, n, n - 1).unwrap();
+    w.advance_to(report).expect("an old mark is moved by the next price");
+    assert!({ w.book().mark_publish_time } < percolator_router::LEGACY_TIME, "the mark is in slots now");
+    // ...but not a big one (the band counts no time since an old mark).
+    w.goto_slot(w.env.current_slot() + 1);
+    let n = now(&w);
+    let big = 1_010_000 * 103 / 100;
+    w.post_report(&witness, big, n, n - 1).unwrap();
+    let report = w.post_report(&reporter_kp, big, n, n - 1).unwrap();
+    expect(w.advance_to(report), router_code(RouterError::PriceBand));
+
+    // The old request cannot fill at a slot-time mark, and expires by the clock.
+    expect(w.fill(0, id), router_code(RouterError::NotAtTarget));
+    let (t, kp) = (w.traders[&0].1, w.trader_kp(0));
+    expect(w.send(vec![rclient::expire(&kp.pubkey(), &w.vault, &t)], &[&kp]), router_code(RouterError::TooEarly));
+    let ts = unix_target + percolator_router::GRACE_SECS + 1;
+    at(&mut w, ts);
+    w.send(vec![rclient::expire(&kp.pubkey(), &w.vault, &t)], &[&kp]).expect("expires by the clock");
+    assert_eq!({ w.book().len }, 0);
+}

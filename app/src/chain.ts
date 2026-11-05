@@ -1034,11 +1034,11 @@ export function noteSlot(slot: number | bigint, unixSec = Date.now() / 1000) {
 /** A router time as unix seconds: as it is in second time (and for a value written before slot
  *  time); in slot time estimated from the last slot seen (`noteSlot`), 0 when none was. */
 export function routerUnix(t: number): number {
-  if (!SLOT_TIME || t > LEGACY_TIME || t === 0) return t;
+  if (t > LEGACY_TIME || t === 0) return t;
   return slotRef.slot ? slotRef.unix + (t - slotRef.slot) * slotSecs : 0;
 }
-/** The current router time from a slot and the chain clock. */
-export const routerNow = (slot: number | bigint, unixSec: number) => (SLOT_TIME ? Number(slot) : unixSec);
+/** Whether router time `t` is still ahead, counted in its own unit (slots or unix seconds). */
+export const routerAhead = (t: number, slot: number | bigint, unixSec: number) => (t > LEGACY_TIME ? unixSec < t : Number(slot) < t);
 /** What a request posts and its executor earns. Larger on X1 (the router's X1 build), where a
  *  fill costs its sender about that much in fees. */
 export const ROUTER_BOND_LAMPORTS = X1 ? 20_000_000 : R.bond_lamports;
@@ -1116,15 +1116,20 @@ export const requestAddress = (vault: PublicKey, owner: PublicKey, settlement = 
   rpda(Buffer.from("request"), vault.toBuffer(), owner.toBuffer(), Buffer.from([settlement ? 1 : 0]));
 
 /** `markSet`: chain time at which the mark was last moved (0 if not recorded). */
-export type Book = { vault: PublicKey; len: number; hasCarry: boolean; markSet: number; markPublish: number; markPrev: number; markPrice: bigint; nextId: bigint; pending: { id: bigint; target: number }[]; priceDial: number };
+/** `slotTime`: the router writing this book counts in slots (an X1 router since 2026-11-05: its
+ *  pending targets or its mark are slots). Detected from the values, so services keep working
+ *  with the router before and after its upgrade. */
+export type Book = { vault: PublicKey; len: number; hasCarry: boolean; markSet: number; markPublish: number; markPrev: number; markPrice: bigint; nextId: bigint; pending: { id: bigint; target: number }[]; priceDial: number; slotTime: boolean };
 export function decodeBook(d: Uint8Array): Book {
   const b = R.book;
   const len = d[b.len];
   const pending = Array.from({ length: len }, (_, i) => ({ id: u64(d, b.pending_id + 8 * i), target: Number(i64(d, b.pending_target + 8 * i)) }));
-  // (Slot time: a mark set before it holds unix seconds, which the router counts as long ago.)
   let markPublish = Number(i64(d, b.mark_publish_time)), markPrev = Number(i64(d, b.mark_prev_publish_time));
-  if (SLOT_TIME && markPublish > LEGACY_TIME) markPublish = markPrev = 0;
-  return { vault: key(d, b.vault), len, hasCarry: d[(b as any).has_carry ?? 78] === 1, markSet: u32(d, b.mark_set_time), markPublish, markPrev, markPrice: u64(d, b.mark_price), nextId: u64(d, b.next_id), pending, priceDial: d[(b as any).price_dial ?? 79] };
+  const isSlot = (t: number) => t > 0 && t <= LEGACY_TIME;
+  const slotTime = X1 && (isSlot(markPublish) || pending.some(p => isSlot(p.target)));
+  // (In slot time a mark set before it holds unix seconds, which the router counts as long ago.)
+  if (slotTime && markPublish > LEGACY_TIME) markPublish = markPrev = 0;
+  return { vault: key(d, b.vault), len, hasCarry: d[(b as any).has_carry ?? 78] === 1, markSet: u32(d, b.mark_set_time), markPublish, markPrev, markPrice: u64(d, b.mark_price), nextId: u64(d, b.next_id), pending, priceDial: d[(b as any).price_dial ?? 79], slotTime };
 }
 
 /** The router's risk dial (`router/src/risk.rs`), 1 = normal: a trade that opens or grows a
