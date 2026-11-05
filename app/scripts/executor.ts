@@ -234,9 +234,20 @@ function jackSamples(symbol: string): Sample[] {
 function jackFirstAtOrAfter(symbol: string, t: number): { price: bigint; publish: number; prev: number } | null {
   const list = jackSamples(symbol);
   const i = list.findIndex(x => x.t >= t);
-  if (i <= 0) return null; // nothing at or after t yet, or no earlier sample to bound it
-  return { price: BigInt(Math.round(list[i].price * 1e6)), publish: list[i].t, prev: list[i - 1].t };
+  if (i > 0) return { price: BigInt(Math.round(list[i].price * 1e6)), publish: list[i].t, prev: list[i - 1].t };
+  // The service sends a symbol only when its price changes, and a quiet price went up to 12 s
+  // without a message (measured 2026-11-05), each second of it added to the fill. Once the
+  // target is HOLD_SECS past and the stream is live (jackSamples), no tick at or after the
+  // target means the price at the target is the last one: it is posted at the target time.
+  const last = list[list.length - 1];
+  if (i < 0 && last && last.t < t && Date.now() / 1000 >= t + HOLD_SECS)
+    return { price: BigInt(Math.round(last.price * 1e6)), publish: t, prev: last.t };
+  return null; // too early for either, or no earlier sample to bound it
 }
+/** Seconds after a target with no new tick before the price is taken as unchanged at the
+ *  target: room for a tick from just before the target still on its way (jack0's reached this
+ *  server at most 0.17 s after their quote time, median 0.06 s, measured 2026-11-05). */
+const HOLD_SECS = Number(process.env.HOLD_SECS ?? 0.4);
 function jackLatest(symbol: string) {
   const list = jackSamples(symbol);
   return list.length >= 2 ? { price: BigInt(Math.round(list[list.length - 1].price * 1e6)), publish: list[list.length - 1].t, prev: list[list.length - 2].t } : null;
@@ -978,7 +989,10 @@ async function markPhase(v: C.Vault, now: number, snap: Snapshot, withCatchUp: b
   // The router does not move the mark past a request that is still in the book at or before it
   // (it would lose its price), so such a request is filled, or expired, first: steps 2 and 3.
   const owed = reqs.some(r => r.target <= b.markPublish);
-  if (!owed && earliest !== null && Math.max(now, Date.now() / 1000) >= earliest + 0.6 && now < earliest + C.ROUTER_GRACE_SECS - 3) {
+  // (Hermes is asked 0.6 s after the target, for its update to be out. The price service's stream
+  // is read as it comes: the first tick stamped at the target second goes at once, and a quiet
+  // price HOLD_SECS after it.)
+  if (!owed && earliest !== null && Math.max(now, Date.now() / 1000) >= earliest + (ORACLE === "jack" ? 0 : 0.6) && now < earliest + C.ROUTER_GRACE_SECS - 3) {
     const u = ORACLE === "pyth" ? await firstAtOrAfter(v.feed!.id, earliest).catch(() => null) : null;
     if (u && u.publish > b.markPublish) {
       await advancePosted(v, u);

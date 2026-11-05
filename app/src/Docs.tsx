@@ -199,6 +199,17 @@ export default function Docs() {
           <li><b>Fill.</b> Once the mark is the request's price and Percolator's price has reached it, anyone can execute the fill, the trader included, and earns the bond. Who executes it, and when, does not change the price. The vault's matcher only accepts the fill the router armed for that slot and size, so there is no other way to trade against the vault.</li>
           <li><b>No backing out.</b> A request cannot be cancelled. If nobody fills it within {ROUTER_GRACE_SECS} seconds of its target it expires, nothing is traded, and its bond is forfeited. If its price had already become the mark by then, the deposit is kept too: letting an order lapse after seeing the price is not free.</li>
         </ol>
+        <p>
+          <b>How long a fill takes.</b> Three parts add up. The {ROUTER_DELAY_SECS}-second wait, which is what stops
+          front-running, plus up to {ROUTER_BATCH_SECS - 1} more second{ROUTER_BATCH_SECS - 1 === 1 ? "" : "s"} of rounding to the batch grid. Then the price at the
+          target has to be posted (on X1, when the price has not moved, the executor posts the unchanged price 0.4 seconds after
+          the target instead of waiting for the next change), and the executor needs about a second to move the mark, settle the
+          accounts and send the fill. On X1 a typical trade fills about five seconds after it lands, and rarely more than six.
+          The wait is not shortened because the chain clock it is counted from runs a second or two behind real time, so a
+          shorter wait would leave too little time between the request and its price. A one-second grid was tried in a load
+          test (November 2026): it saved about a tenth of a second when trading was quiet, but under load trades filled later
+          and settling the accounts cost a third more, so the grid stays at {ROUTER_BATCH_SECS} seconds.
+        </p>
         <p>The router has no admin: no pause, no allow or block list, and its upgrade authority is to be burned before mainnet.</p>
 
         <h2 id="orders">Order types</h2>
@@ -212,7 +223,7 @@ export default function Docs() {
         <table className="doc-table">
           <thead><tr><th>Order</th><th>What it does</th></tr></thead>
           <tbody>
-            <tr><td>Market</td><td>Trades a size now. Fills {ROUTER_DELAY_SECS} seconds later at the oracle price: no spread and no price impact, whatever the size, up to what the vault can take.</td></tr>
+            <tr><td>Market</td><td>Trades a size now. Fills a few seconds later (see How long a fill takes) at the oracle price: no spread and no price impact, whatever the size, up to what the vault can take.</td></tr>
             <tr><td>Limit</td><td>Trades once the mark is at your price or better, and only fills at a price no worse than it. If the price has moved away by the time it would fill, the order stays and waits.</td></tr>
             <tr><td>Stop loss</td><td>Closes a position, or part of it, once the mark is at or through your price against you.</td></tr>
             <tr><td>Take profit</td><td>The same in your favour.</td></tr>
@@ -451,7 +462,7 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           <li><b>Executors.</b> Filling needs someone to fetch each target-time Pyth update from Hermes (which needs a Pyth API key; since early November our free-plan key is refused for BTC, ETH and SOL, so devnet fills through the backup price source, about 20 seconds after the target) and send the transactions. Keeping marks fresh between trades uses Pyth's free sponsored feed accounts. Anyone with a key can run an executor; if nobody does, requests expire and nothing trades.</li>
           <li><b>Market authority.</b> On devnet, Percolator's market-level authority belongs to the vault program's governor address, which the program only uses to retire idle markets. Nobody can shut an asset down or resolve the market, and permissionless stale resolution is off. On another market, whoever holds that authority can shut assets down or resolve the market; the vault then winds down and pays out.</li>
           <li><b>Smart contracts.</b> Unaudited code. The program is upgradeable on devnet; a mainnet deployment must burn that authority.</li>
-          <li><b>Keepers.</b> Everything is permissionless, but someone has to send the transactions. If nobody does, epochs don't roll and prices don't update.</li>
+          <li><b>Keepers.</b> Anyone can run a keeper or an executor, and each one is paid for its work (see Keepers and executors), but someone has to. If nobody does, epochs don't roll and prices don't update. On X1 only our reporter key can post prices, so X1 trades also wait on it.</li>
           <li><b>Margin stays in while you hold a position.</b> Percolator pays margin out only from an account with no open position on any market, so a trader closes everything before withdrawing. A queued trade must leave enough margin to open at the asset's level; a trade that only reduces a position is always accepted.</li>
           <li><b>Spot swaps go through xDEX.</b> The router checks what reaches your wallet, but the pool's price and its own fee are xDEX's. A thin pool moves a lot on a large swap; the ticket shows the price impact before you sign.</li>
           <li><b>The loss cover is limited.</b> It pays only as far as the money in it goes, and the treasury can take that money back out. It is a cushion, not a promise.</li>
@@ -561,6 +572,40 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
 
         <h2 id="keeper">Keepers and executors</h2>
         <p>
+          <b>Anyone can run them.</b> Keepers and executors are not part of the platform's trust: there is no sign-up, no
+          allow list, no stake and nothing to ask for. Every piece of their work is an open instruction, and the programs check
+          all of it, so an executor cannot choose a price, fill early, skip ahead of a queued trade or move anyone's money. It can
+          only do the work or leave it. The ones we run are the same code anyone else gets, with no extra powers. Several can run
+          at once: the first transaction to land does the work and is paid, and a duplicate fails without effect and earns nothing.
+        </p>
+        <p>Each piece of work is paid by whoever needed it done, never out of protocol fees, and only when it succeeds:</p>
+        <table className="doc-table">
+          <thead><tr><th>Work</th><th>Pays the executor</th><th>Paid from</th></tr></thead>
+          <tbody>
+            <tr><td>Fill a queued trade</td><td>The request's bond, {X1 ? "0.02 XNT (0.002 SOL)" : "0.002 SOL (0.02 XNT)"}</td><td>The trader's request</td></tr>
+            <tr><td>Carry out a standing order (limit, stop, take-profit, TWAP slice)</td><td>A keeper fee, {X1 ? "0.002 XNT (0.0001 SOL)" : "0.0001 SOL (0.002 XNT)"}, and the cost of the request it queues</td><td>The order's keeper budget, set aside when it was placed</td></tr>
+            <tr><td>Liquidate an account below its level</td><td>Half a bond, and the cost of the close it queues</td><td>That account's keeper deposit</td></tr>
+            <tr><td>Expire a request nobody filled in time</td><td>A quarter of its bond</td><td>The expired request</td></tr>
+            <tr><td>Remove an order that can no longer run</td><td>A keeper fee</td><td>The order's keeper budget</td></tr>
+          </tbody>
+        </table>
+        <p>
+          To run an executor, check out the repository and, from <code>app/</code>, run{" "}
+          <code>NETWORK=x1-testnet KEYPAIR=your-wallet.json npx tsx scripts/executor.ts</code> on X1, or{" "}
+          <code>RPC=your-rpc KEYPAIR=your-wallet.json HERMES_API_KEY=your-key npx tsx scripts/executor.ts</code> on Solana. The
+          wallet pays transaction fees and collects the rewards. <code>EXECUTOR_ROLES</code> picks the work (<code>trade</code>,{" "}
+          <code>maintenance</code>, <code>liquidation</code>; all three by default), and <code>BACKUP_AFTER_SECS=N</code> runs it as
+          a backup that only acts on work nobody else has done for N seconds, so a stopped or unfunded executor is covered without
+          two of them racing all the time.
+        </p>
+        <p>
+          <b>One limit on X1.</b> X1 has no Pyth, so its prices are posted by the router's reporter key, with the witness key
+          confirming each one (see the box at the top). Those keys are ours, and only they can post a price. Everything else is
+          open to anyone on X1 too, but a trade fills only once the reporter has posted the price at its target. If our reporter
+          stops, X1 trades wait for it. On Solana the prices are Pyth's, and anyone with a Hermes key can post them, so nothing
+          there depends on us.
+        </p>
+        <p>
           Nothing needs a trusted operator, but someone has to send maintenance transactions. The reference keeper
           (<code>cargo run --example devnet --features devnet -- keeper</code>) discovers every vault of the program and, for each:
           keeps its asset's price accrual current (each crank advances it by at most 10 slots; idle markets are kept within 40
@@ -576,9 +621,8 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           requests, and every 30 seconds applies loss covers and margin top-ups. It starts each vault's holding-fee meter and opens
           a fee ledger (paying its rent, under a cent) for any trader whose order is waiting without one, and counts what each
           account owes the vaults when it checks for liquidations. On X1 a separate script
-          (<code>app/scripts/witness.ts</code>) posts the witness's prices. It needs
-          a Pyth API key; the free plan covers every market listed here, and it makes only a few Hermes requests per trade.
-          Anyone can run one; the program checks everything, and each fill pays its executor the request's bond.
+          (<code>app/scripts/witness.ts</code>) posts the witness's prices. On Solana it needs
+          a Pyth API key and makes only a few Hermes requests per trade; on X1 it needs none.
         </p>
         <p>
           A fill is more than one instruction. Percolator takes a new position on an asset only when that asset is accrued to
