@@ -1142,7 +1142,18 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
     const want = new Set([v.lpPortfolio.toBase58(), ...atMarkReqs.map(r => C.routerPortfolio(r.wallet, r.sub).toBase58())]);
     const p = C.crankPlan(await snapshot(), payer.publicKey, v.lpPortfolio, v.assetIndex);
     const theirs = p.settle.filter(ix => want.has(ix.keys[2]?.pubkey.toBase58() ?? ""));
-    if (theirs.length > 1 && p.lag < 10) await settleAll(`for ${atMarkReqs.length} fills on ${v.feed?.symbol} (lazy)`, theirs);
+    if (theirs.length > 1) {
+      // Six to a transaction, each simulated first and cleared of accounts that turn out to have
+      // nothing to re-value (one such crank fails its whole transaction); sent together, and the
+      // fills wait for them.
+      const k0 = Math.max(0, Math.ceil(p.lag / 10));
+      const chunks = Array.from({ length: Math.ceil(theirs.length / 6) }, (_, i) => theirs.slice(6 * i, 6 * i + 6));
+      await Promise.all(chunks.map(async (chunk, i) => {
+        const t = await tune(p.lagCrank, i === 0 ? k0 : 0, chunk, []);
+        if (typeof t === "string" || !t.settle.length) return;
+        await send(`settle ${t.settle.length} account(s) for the fills on ${v.feed?.symbol} (lazy)`, [...Array(t.k).fill(p.lagCrank), ...t.settle], true);
+      }));
+    }
   }
   for (const r of live.filter(r => tradeOn && b.markPrev < r.target && r.target <= b.markPublish && !unledgered.has(acctKey(r)))) {
     if (notConverged) break;
