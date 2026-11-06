@@ -90,6 +90,20 @@ fn signed_before(sysvar: &AccountInfo) -> Result<(Pubkey, Vec<u8>), ProgramError
     Ok((Pubkey::new_from_array(pk.try_into().unwrap()), msg.to_vec()))
 }
 
+/// Cranks `portfolio` (paid by `payer`) until it and every asset it holds, and `asset`, are at
+/// the current slot: each crank moves an asset at most 10 slots. Nothing when they are.
+pub fn bring_current<'a>(payer: &AccountInfo<'a>, market: &AccountInfo<'a>, portfolio: &AccountInfo<'a>, percolator: &AccountInfo<'a>, asset: u16) -> ProgramResult {
+    let now = Clock::get()?.slot;
+    for _ in 0..6 {
+        let (work, assets) = perc::crank_work(&market.try_borrow_data()?, &portfolio.try_borrow_data()?, asset, now)?;
+        if !work {
+            return Ok(());
+        }
+        solana_program::program::invoke(&perc::crank(payer.key, market.key, portfolio.key, &assets), &[payer.clone(), market.clone(), portfolio.clone(), percolator.clone()])?;
+    }
+    Ok(())
+}
+
 /// `TakeQuote` (tag 38): trades a maker's signed quote now.
 ///
 /// Accounts: 0 wallet [s, w], 1 trader [w], 2 trader portfolio [w], 3 vault, 4 book, 5 market [w],
@@ -179,6 +193,11 @@ pub fn take_quote(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
         }
         None => false,
     };
+    // The maker's and the taker's accounts, and the asset, brought to the current slot here, as
+    // far as they need it: the taker sends no cranks (which fail when another transaction in the
+    // same slot did the work first).
+    bring_current(wallet, market, maker_pf, percolator, v.asset_index)?;
+    bring_current(wallet, market, portfolio, percolator, v.asset_index)?;
     // Arm the maker for exactly this quote (used up there), then trade it through Percolator.
     let mut arm = vec![TAG_ARM_QUOTE];
     arm.extend_from_slice(&size.to_le_bytes());

@@ -853,6 +853,58 @@ pub fn trade_cpi(
     }
 }
 
+const TAG_PERMISSIONLESS_CRANK: u8 = 5;
+
+/// Percolator's permissionless crank of `portfolio`, accruing each of `assets` (by at most 10
+/// slots) and settling the portfolio when every asset it holds is then at the current slot.
+pub fn crank(payer: &Pubkey, market: &Pubkey, portfolio: &Pubkey, assets: &[u16]) -> Instruction {
+    let mut data = vec![TAG_PERMISSIONLESS_CRANK];
+    data.extend_from_slice(&0u64.to_le_bytes()); // now_slot: Percolator takes the clock's
+    data.push(assets.len() as u8);
+    for a in assets {
+        data.extend_from_slice(&a.to_le_bytes());
+        data.push(0);
+    }
+    Instruction {
+        program_id: PERCOLATOR_PROGRAM_ID,
+        accounts: vec![AccountMeta::new(*payer, true), AccountMeta::new(*market, false), AccountMeta::new(*portfolio, false)],
+        data,
+    }
+}
+
+/// The assets a crank of `portfolio` should name (those it holds, and `also` last), and whether
+/// it has work: one of them behind `now`, or a position not yet re-valued at its asset's latest
+/// move or left over from a side that was reset. (A crank with nothing to do fails its whole
+/// transaction, so it is sent only when this says so.)
+pub fn crank_work(market: &[u8], portfolio: &[u8], also: u16, now: u64) -> Result<(bool, Vec<u16>), ProgramError> {
+    let mut assets = Vec::new();
+    let mut work = false;
+    for i in 0..PORTFOLIO_LEG_COUNT {
+        let l = PORTFOLIO_LEGS_OFF + i * PORTFOLIO_LEG_LEN;
+        if *portfolio.get(l + LEG_ACTIVE).ok_or(VaultError::BadPercolatorAccount)? != 1 {
+            continue;
+        }
+        let asset = u32::from_le_bytes(portfolio[l + LEG_ASSET_INDEX..l + LEG_ASSET_INDEX + 4].try_into().unwrap());
+        let asset = u16::try_from(asset).map_err(|_| VaultError::BadPercolatorAccount)?;
+        let e = MARKET_SLOTS_OFF + asset as usize * MARKET_ASSET_SLOT_LEN + SLOT_ENGINE;
+        let (epoch_off, kf_off) = if portfolio[l + LEG_SIDE] == 0 { (ASSET_EPOCH_LONG, ASSET_KF_EPOCH_LONG) } else { (ASSET_EPOCH_SHORT, ASSET_KF_EPOCH_SHORT) };
+        if rd_u64(portfolio, l + LEG_KF_EPOCH_SNAP)? < rd_u64(market, e + kf_off)? || rd_u64(portfolio, l + LEG_EPOCH_SNAP)? != rd_u64(market, e + epoch_off)? {
+            work = true;
+        }
+        if asset != also && !assets.contains(&asset) {
+            assets.push(asset);
+        }
+    }
+    assets.push(also);
+    for a in &assets {
+        let e = MARKET_SLOTS_OFF + *a as usize * MARKET_ASSET_SLOT_LEN + SLOT_ENGINE;
+        if rd_u64(market, e + ASSET_SLOT_LAST)? < now {
+            work = true;
+        }
+    }
+    Ok((work, assets))
+}
+
 /// Owner-signed unilateral reduction of one leg toward zero, at the engine's effective price and
 /// within its unilateral close capacity. Never over-closes.
 pub fn rebalance_reduce(

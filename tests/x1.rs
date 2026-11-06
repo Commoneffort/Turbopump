@@ -723,9 +723,9 @@ fn a_maker_quote_fills_at_once_at_its_price_and_only_once() {
     w.trader(0);
     let tkp = w.trader_kp(0);
     let size = 5 * UNIT as i128;
+    // The asset 25 slots behind and nobody cranked: TakeQuote brings it and the accounts up itself.
+    w.goto_slot(w.env.current_slot() + 25);
     let slot = w.env.current_slot();
-    let asset = w.asset();
-    w.catch_up(asset, slot, &[]);
     let price = 1_000_500; // the maker sells 5 at 1.0005
     let ixs = take_quote_ixs(&w, &m.kp, &m, 0, size, price, slot + 3, 1);
     w.send(ixs.clone(), &[&tkp]).expect("take the quote");

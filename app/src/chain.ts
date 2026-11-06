@@ -1674,22 +1674,12 @@ export async function quotedTrade(conn: Connection, v: Vault, wallet: PublicKey,
   const r = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) }).catch(() => null);
   if (!r || !r.ok) return null;
   const q = (await r.json()) as Quote;
-  const [[pf, m], slot] = await Promise.all([conn.getMultipleAccountsInfo([routerPortfolio(wallet, sub), MARKET], "processed"), conn.getSlot("processed")]);
-  const mine = pf ? portfolioAssets(new Uint8Array(pf.data)) : [];
-  const last = (as: number[]) => [...as.filter(a => a !== v.assetIndex), v.assetIndex];
-  const makerAssets = last(q.makerAssets.length ? q.makerAssets : [v.assetIndex]);
-  const makerCrank = crank(wallet, new PublicKey(q.portfolio), makerAssets);
-  const traderCrank = mine.length ? [crank(wallet, routerPortfolio(wallet, sub), last(mine))] : [];
-  // Every asset involved has to reach the current slot in this transaction, and a crank moves an
-  // asset at most 10 slots: the assets far behind (routine cranking pauses while trades wait) get
-  // catch-up cranks on the vault's account in front, as many as the lag needs beyond the others.
-  const assets = [...new Set([...makerAssets, ...mine])];
-  const lag = m ? Math.max(0, ...assets.map(a => slot + 2 - Number(decodeAsset(new Uint8Array(m.data), a).slotLast))) : 0;
-  const catchUp = (n: number) => Array(Math.max(0, Math.ceil(lag / 10) - n)).fill(0).map(() => crank(wallet, v.lpPortfolio, last(assets)));
-  const variants = [[makerCrank, ...traderCrank], [makerCrank], traderCrank, []].map(c => takeQuoteIxs(v, wallet, sub, q, [...catchUp(c.length), ...c]));
-  const sims = await Promise.all(variants.map(ixs => conn.simulateTransaction(new VersionedTransaction(new TransactionMessage({ payerKey: wallet, recentBlockhash: PublicKey.default.toBase58(), instructions: [ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }), ...ixs] }).compileToV0Message()), { sigVerify: false, replaceRecentBlockhash: true }).catch(() => null)));
-  const i = sims.findIndex(s => s && !s.value.err);
-  if (i < 0) return null;
-  const units = Math.min(1_400_000, Math.ceil((sims[i]!.value.unitsConsumed ?? 1_000_000) * 1.3) + 20_000);
-  return { ixs: variants[i], quote: q, units };
+  // (TakeQuote brings the maker's and the taker's accounts and the asset to the current slot
+  // itself, cranking only what needs it: the transaction is the signature check and the trade.)
+  const ixs = takeQuoteIxs(v, wallet, sub, q);
+  const sim = await conn.simulateTransaction(new VersionedTransaction(new TransactionMessage({ payerKey: wallet, recentBlockhash: PublicKey.default.toBase58(), instructions: [ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }), ...ixs] }).compileToV0Message()), { sigVerify: false, replaceRecentBlockhash: true }).catch(() => null);
+  if (!sim || sim.value.err) return null;
+  // (More room than simulated: the transaction may land a slot later, with more to catch up.)
+  const units = Math.min(1_400_000, Math.ceil((sim.value.unitsConsumed ?? 1_000_000) * 1.4) + 150_000);
+  return { ixs, quote: q, units };
 }
