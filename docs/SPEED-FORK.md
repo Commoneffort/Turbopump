@@ -68,7 +68,7 @@ needs several markets (several vaults), which the executor already serves in par
 | 2. Price at the target slot | built (executor posts the latest price one slot before the target, `POST_LEAD_SLOTS`) |
 | 3. Lazy settlement | built and tested: engine `execute_trade_with_fee_cohort_tolerant_not_atomic`, program matcher flag `FLAG_COHORT_TOLERANT`, vault `ARMED_COHORT_TOLERANT`, router `lazy.rs` (`PriceRange`, tag 36), executor `LAZY_FILLS` |
 | 4. Delay follows the market | built: the delay doubles per risk-dial step, and price speed (`risk::speed_bps`) raises the dial |
-| 5. Instant lane | not built (needs makers to quote) |
+| 5. Instant lane | built: maker quotes (see below) |
 
 Built too: price, mark move and the first fill in one transaction (~580k compute units) when few
 trades wait. Not built: a ring of recent prices so that any executor can fill on X1.
@@ -123,3 +123,30 @@ Checks: Percolator program suite on the fork: 272 failures, the same 272 as on t
 Turbopump suite (both builds) passes; engine suite passes plus three new tests; the
 forked program replays a copy of live X1 (`issues/replay-2026-11-05`) identically to the
 deployed one.
+
+## Instant lane: maker quotes (2026-11-06)
+
+A maker signs a quote for one trading account (size, price, last slot); the taker's transaction
+carries the signature (an Ed25519 verification) and the router's `TakeQuote` (tag 38) fills it in
+the same transaction against the maker's own Percolator portfolio. The vault program registers
+makers (`OpenMaker`, tag 44) and prices a maker's trade only as the router armed it
+(`ArmQuote`, tag 45). Quotes are good once (a window of 4,096 ids), for at most 150 slots, within
+1% of Percolator's price, and the taker is held to the router's margin, fees, close-only and
+isolation rules. No engine change: makers are ordinary Percolator LP portfolios.
+
+Our maker: `api/quote` on the site (key in `MAKER_SECRET_X1`, portfolio in
+`MAKER_PORTFOLIO_X1`), quoting around the exchange-median price with a spread that grows with
+size, the maker's position and the quote's life (a wallet that asks its user first gets a
+30-slot quote at a little more spread; the burner wallet 6 slots). `app/scripts/maker.ts`
+sets the maker up (`setup <usdc>`), renews its matcher config (`refresh`, or `serve`, which also
+answers quotes locally) and shows it (`status`). The Trade page takes a quote for a market order
+when one is offered and queues the order otherwise.
+
+Measured (load drill, 400 accounts holding positions, our maker with 200,000 test USDC): a trade
+at a quote filled a median 0.3 to 0.4 s after it was sent at every rate up to 50 trades a second;
+at 50 a second all 400 filled, 332 at a quote, 26.4 fills a second.
+
+Going live on X1 needs, after the program upgrades: `cd app && npx tsx scripts/maker.ts setup
+<usdc>` (with the X1 test USDC mint authority as `PERCOLATOR_FAUCET_KEY`), the two Vercel
+variables it prints, `maker.ts serve` kept running (it renews the matcher config before it
+expires), and the page published.
