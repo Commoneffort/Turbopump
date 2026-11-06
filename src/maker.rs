@@ -26,8 +26,10 @@ use crate::{error::VaultError, matcher, percolator as perc, state};
 
 pub const MAKER_MAGIC: u64 = u64::from_le_bytes(*b"TPMAKER1");
 pub const SEED_MAKER: &[u8] = b"maker";
-/// How many quote ids above `quote_base` a maker may have outstanding.
-pub const QUOTE_WINDOW: u64 = 512;
+/// How many quote ids above `quote_base` a maker may have outstanding (a maker numbering 256 a
+/// slot covers 16 slots).
+pub const QUOTE_WINDOW: u64 = 4096;
+const WORDS: usize = (QUOTE_WINDOW / 64) as usize;
 
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 #[repr(C, packed)]
@@ -48,7 +50,7 @@ pub struct MakerState {
     pub armed_size: i128,
     pub armed_price: u64,
     pub quote_base: u64,
-    pub used: [u64; 8],
+    pub used: [u64; WORDS],
     pub fills: u64,
 }
 pub const MAKER_STATE_OFF: usize = state::MATCHER_RETURN_LEN;
@@ -84,18 +86,16 @@ pub fn use_quote(m: &mut MakerState, id: u64) -> Result<(), VaultError> {
     if id >= m.quote_base.saturating_add(QUOTE_WINDOW) {
         let new_base = id - QUOTE_WINDOW + 1;
         let shift = new_base - m.quote_base;
-        let mut used = m.used;
-        if shift >= QUOTE_WINDOW {
-            used = [0; 8];
-        } else {
-            for _ in 0..shift {
-                // Shift the 512-bit window down by one id.
-                let mut carry = 0u64;
-                for w in used.iter_mut().rev() {
-                    let next = *w & 1;
-                    *w = (*w >> 1) | (carry << 63);
-                    carry = next;
-                }
+        let old = m.used;
+        let mut used = [0u64; WORDS];
+        if shift < QUOTE_WINDOW {
+            // Bit i of the window is id quote_base + i: moving the base up by `shift` moves every
+            // bit down by `shift` (whole words, then the rest).
+            let (words, bits) = ((shift / 64) as usize, (shift % 64) as u32);
+            for (i, w) in used.iter_mut().enumerate() {
+                let lo = old.get(i + words).copied().unwrap_or(0);
+                let hi = old.get(i + words + 1).copied().unwrap_or(0);
+                *w = if bits == 0 { lo } else { (lo >> bits) | (hi << (64 - bits)) };
             }
         }
         m.used = used;
@@ -217,13 +217,19 @@ mod tests {
         use_quote(&mut m, 5).unwrap();
         assert!(use_quote(&mut m, 5).is_err());
         use_quote(&mut m, 3).unwrap();
-        use_quote(&mut m, 600).unwrap();
-        assert_eq!({ m.quote_base }, 600 - QUOTE_WINDOW + 1);
+        let top = QUOTE_WINDOW + 100;
+        use_quote(&mut m, top).unwrap();
+        assert_eq!({ m.quote_base }, top - QUOTE_WINDOW + 1);
         assert!(use_quote(&mut m, 5).is_err(), "below the window: spent");
-        assert!(use_quote(&mut m, 600).is_err());
+        assert!(use_quote(&mut m, top).is_err());
         use_quote(&mut m, 200).unwrap();
-        use_quote(&mut m, 100_000).unwrap();
-        assert!(use_quote(&mut m, 600).is_err());
-        use_quote(&mut m, 99_999).unwrap();
+        // Ids used before a move of the window stay used after it (a move of 70 ids: one word and 6 bits).
+        use_quote(&mut m, top + 70).unwrap();
+        assert!(use_quote(&mut m, 200).is_err());
+        assert!(use_quote(&mut m, top).is_err());
+        use_quote(&mut m, top + 69).unwrap();
+        use_quote(&mut m, 1_000_000).unwrap();
+        assert!(use_quote(&mut m, top + 70).is_err());
+        use_quote(&mut m, 999_999).unwrap();
     }
 }

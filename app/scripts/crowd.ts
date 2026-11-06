@@ -150,11 +150,12 @@ async function takeQuoteOrNot(w: Keypair, v: C.Vault, size: bigint): Promise<boo
   const last = (as: number[]) => [...as.filter(a => a !== v.assetIndex), v.assetIndex];
   const makerCrank = C.crank(w.publicKey, new PublicKey(q.portfolio), last(q.makerAssets.length ? q.makerAssets : [v.assetIndex]));
   const traderCrank = mine.length ? [C.crank(w.publicKey, C.routerPortfolio(w.publicKey), last(mine))] : [];
-  for (const cranks of [[makerCrank, ...traderCrank], [makerCrank], traderCrank, []]) {
-    const ixs = C.takeQuoteIxs(v, w.publicKey, 0, q, cranks);
-    const msg = new TransactionMessage({ payerKey: w.publicKey, recentBlockhash: PublicKey.default.toBase58(), instructions: [ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }), ...ixs] }).compileToV0Message();
-    const sim = await conn.simulateTransaction(new VersionedTransaction(msg), { sigVerify: false, replaceRecentBlockhash: true });
-    if (sim.value.err) continue;
+  // (The variants simulated side by side: the quote is good for a few slots only.)
+  const variants = [[makerCrank, ...traderCrank], [makerCrank], traderCrank, []].map(cranks => C.takeQuoteIxs(v, w.publicKey, 0, q, cranks));
+  const sims = await Promise.all(variants.map(ixs => conn.simulateTransaction(new VersionedTransaction(new TransactionMessage({ payerKey: w.publicKey, recentBlockhash: PublicKey.default.toBase58(), instructions: [ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }), ...ixs] }).compileToV0Message()), { sigVerify: false, replaceRecentBlockhash: true }).catch(() => null)));
+  for (const [i, ixs] of variants.entries()) {
+    const sim = sims[i];
+    if (!sim || sim.value.err) continue;
     const units = Math.min(1_400_000, Math.ceil((sim.value.unitsConsumed ?? 1_000_000) * 1.3) + 20_000);
     const sig = await conn.sendTransaction(new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units }), ...ixs), [w], { skipPreflight: true });
     const res = await conn.confirmTransaction(sig, "processed");

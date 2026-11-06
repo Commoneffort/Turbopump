@@ -21,7 +21,7 @@ export const SKEW_BPS = () => env("MAKER_SKEW_BPS", 1);
 export const MAX_NOTIONAL = () => env("MAKER_MAX_NOTIONAL", 20_000);
 export const MAX_POSITION = () => env("MAKER_MAX_POSITION", 100_000);
 /** How many slots a quote stays good for (X1 slots are ~0.36 s). */
-export const QUOTE_SLOTS = () => env("MAKER_QUOTE_SLOTS", 4);
+export const QUOTE_SLOTS = () => env("MAKER_QUOTE_SLOTS", 6);
 const PRICE_MAX_AGE_MS = 10_000;
 const PRICE_URL = () => (globalThis as any).process?.env?.MAKER_PRICES ?? "http://jack0.x1.xyz:8090";
 const JACK_SYMBOL: Record<string, string> = { XAU: "GOLD", XAG: "SILVER" };
@@ -68,6 +68,7 @@ function makerPositions(d: Uint8Array): Map<number, bigint> {
   return out;
 }
 
+let nextId = Math.floor(Math.random() * 256);
 const prices = new Map<string, { price: number; at: number }>();
 async function priceOf(symbol: string): Promise<number> {
   const sym = JACK_SYMBOL[symbol] ?? symbol;
@@ -75,7 +76,7 @@ async function priceOf(symbol: string): Promise<number> {
   if (cached && Date.now() - cached.at < 300) return cached.price;
   const r = await fetch(`${PRICE_URL()}/v1/prices?symbols=${sym.toLowerCase()}`, { signal: AbortSignal.timeout(1_500) });
   const j: any = await r.json();
-  const p = (j.prices ?? []).find((x: any) => String(x.symbol).toUpperCase() === sym);
+  const p = (j.prices ?? j.data ?? []).find((x: any) => String(x.symbol).toUpperCase() === sym);
   if (!p || p.status !== "ok" || !(p.price > 0)) throw new Error(`no price for ${symbol}`);
   if (Date.now() - new Date(p.updatedAt).getTime() > PRICE_MAX_AGE_MS) throw new Error(`price for ${symbol} is stale`);
   prices.set(sym, { price: p.price, at: Date.now() });
@@ -110,8 +111,9 @@ export async function makeQuote(conn: Connection, m: Maker, vault: PublicKey, tr
   const px = ref * (1 + (size > 0n ? 1 : -1) * spreadBps / 10_000);
   const price = BigInt(Math.round(px * 1e6));
   const expiry = BigInt(slot + QUOTE_SLOTS());
-  // Ids rise with the slot (the maker's window of used ids follows them), 32 a slot.
-  const id = BigInt(slot) * 32n + BigInt(Math.floor(Math.random() * 32));
+  // Ids rise with the slot (the maker's window of 4,096 used ids follows them), 256 a slot: one
+  // after the other within a process, from a random start in a fresh one (a serverless function).
+  const id = BigInt(slot) * 256n + BigInt(nextId++ % 256);
   const maker = makerAccount(m.kp.publicKey, m.market);
   const msg = quoteMessage(maker, trader, asset, size, price, expiry, id);
   const signature = ed25519.sign(msg, m.kp.secretKey.slice(0, 32));
