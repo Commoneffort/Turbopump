@@ -130,13 +130,13 @@ pub fn take_quote(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
     if b.vault != *vault_ai.key {
         return Err(RouterError::BadAccount.into());
     }
-    let m = maker::load(maker_ai, &percolator_vault::id())?;
-    if m.market != *market.key || m.portfolio != *maker_pf.key || m.delegate != *delegate.key || m.wallet == *wallet.key {
+    let [m_market, m_wallet, m_portfolio, m_delegate] = maker::keys(maker_ai, &percolator_vault::id())?;
+    if m_market != *market.key || m_portfolio != *maker_pf.key || m_delegate != *delegate.key || m_wallet == *wallet.key {
         return Err(RouterError::BadAccount.into());
     }
     // The maker signed exactly this, for this trading account.
     let (pk, signed) = signed_before(sysvar)?;
-    if pk != m.wallet || signed != quote_message(maker_ai.key, trader_ai.key, v.asset_index, size, price, expiry, id) {
+    if pk != m_wallet || signed != quote_message(maker_ai.key, trader_ai.key, v.asset_index, size, price, expiry, id) {
         return Err(RouterError::BadQuote.into());
     }
     let clock = Clock::get()?;
@@ -192,7 +192,7 @@ pub fn take_quote(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
     )?;
     let (_, _, fee_bps) = perc::margin_params(&market.try_borrow_data()?)?;
     let taker_view = perc::read_portfolio(portfolio, market.key, trader_ai.key)?;
-    let maker_view = perc::read_portfolio(maker_pf, market.key, &m.wallet)?;
+    let maker_view = perc::read_portfolio(maker_pf, market.key, &m_wallet)?;
     invoke_signed(
         &perc::trade_cpi(trader_ai.key, market.key, portfolio.key, maker_pf.key, &percolator_vault::id(), maker_ai.key, delegate.key, &taker_view, &maker_view, v.asset_index, market_id, size, fee_bps),
         &[trader_ai.clone(), market.clone(), portfolio.clone(), maker_pf.clone(), vault_program.clone(), maker_ai.clone(), delegate.clone(), percolator.clone()],

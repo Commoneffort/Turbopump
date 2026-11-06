@@ -72,6 +72,21 @@ pub fn load(ai: &AccountInfo, program_id: &Pubkey) -> Result<MakerState, VaultEr
     Ok(m)
 }
 
+/// A maker's market, wallet, portfolio and matcher delegate, read without copying the whole
+/// account (the router's `TakeQuote` has little stack to spare).
+pub fn keys(ai: &AccountInfo, program_id: &Pubkey) -> Result<[Pubkey; 4], VaultError> {
+    if ai.owner != program_id || ai.data_len() != MAKER_ACCOUNT_LEN {
+        return Err(VaultError::BadAccount);
+    }
+    let d = ai.try_borrow_data().map_err(|_| VaultError::BadAccount)?;
+    let o = MAKER_STATE_OFF;
+    if d[o..o + 8] != MAKER_MAGIC.to_le_bytes() {
+        return Err(VaultError::BadAccount);
+    }
+    let k = |i: usize| Pubkey::new_from_array(d[o + 8 + 32 * i..o + 40 + 32 * i].try_into().unwrap());
+    Ok([k(0), k(1), k(2), k(3)])
+}
+
 pub fn store(ai: &AccountInfo, m: &MakerState) -> ProgramResult {
     ai.try_borrow_mut_data()?[MAKER_STATE_OFF..].copy_from_slice(bytemuck::bytes_of(m));
     Ok(())
