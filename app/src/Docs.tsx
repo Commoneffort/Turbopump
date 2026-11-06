@@ -230,8 +230,10 @@ export default function Docs() {
           isolation rules as any trade. Without a quote (none offered, too large, expired) the order goes through the queue
           and its short wait as above, against the vault. Anyone can be a maker: register a Percolator account with the vault
           program (<code>OpenMaker</code>), point its matcher at the vault program, and sign quotes; the platform runs the first one.
-          In a load test (November 2026, 400 accounts holding positions) a trade at a maker's quote filled a median 0.3 to 0.4
-          seconds after it was sent, at every rate tried up to 50 trades a second.
+          In a load test (November 2026, 800 accounts holding positions, three markets, one maker) a trade at a maker's quote
+          filled a median 0.2 seconds after it was sent (0.4 at most) at 100 trades a second, and 162 trades a second filled at
+          200 sent a second, none turned away. TakeQuote brings the maker's and your accounts up to date itself, so the
+          transaction is just the signature check and the trade.
         </p>
         <p>The router has no admin: no pause, no allow or block list, and its upgrade authority is to be burned before mainnet.</p>
 
