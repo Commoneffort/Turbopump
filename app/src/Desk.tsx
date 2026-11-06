@@ -163,7 +163,7 @@ function DeskInner({ vaultKey, markets, day, send, busy, tick, go }: { vaultKey:
   const { accounts } = useAccounts(markets, tick);
   const [panel, setPanel] = useState<"trade" | "earn">("trade");
   const [wgHidden, setWgHidden] = useState(() => { try { return localStorage.getItem("pv:widgets-hidden") !== "0"; } catch { return true; } });
-  const wrapped: Send = async (l, ixs) => { const r = await send(l, ixs); reload(); return r; };
+  const wrapped: Send = async (l, ixs, opts) => { const r = await send(l, ixs, opts); reload(); return r; };
   // Fills of every account: the main one's (its whole history for each position it holds, from
   // the server) and each isolated account's that holds a position or is on screen.
   const mainAcct = accounts.find(a => a.sub === 0);
