@@ -1110,16 +1110,15 @@ async function priceAndFill(v: C.Vault, b: C.Book, j: { price: bigint; publish: 
   // would have nothing to do, which fails the whole transaction).
   const holds = !!pf && C.decodePortfolio(new Uint8Array(pf.data), v.assetIndex, market).position !== 0n;
   const moves = j.price !== b.markPrice;
+  // (The router's fill brings the trader's and the vault's accounts and the asset to the current
+  // slot itself: no cranks here.)
+  void holds; void moves;
   const ixs = [
     C.postPrice(reporter.publicKey, v.feed!.id, j.price, publish, Math.min(j.prev, publish - 1)),
     C.advanceMark(v, C.reportAddress(v.feed!.id), market),
-    C.crank(payer.publicKey, v.lpPortfolio, [v.assetIndex]),
-    // (Named with every asset the trader holds: an account is re-valued as a whole, and only with
-    // all of them at the current slot in the same transaction.)
-    ...(holds && moves ? [C.crank(payer.publicKey, C.routerPortfolio(r.wallet, r.sub), [...C.portfolioAssets(new Uint8Array(pf!.data)).filter(a => a !== v.assetIndex), v.assetIndex])] : []),
     C.fillRequest(payer.publicKey, v, r, true),
   ];
-  const tx = new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: 900_000 }), ...ixs);
+  const tx = new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: Number(process.env.ONE_TX_UNITS ?? 1_200_000) }), ...ixs);
   try {
     const sig = await conn.sendTransaction(tx, [payer, reporter], { skipPreflight: true });
     await confirmed(sig);
