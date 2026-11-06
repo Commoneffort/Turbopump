@@ -609,18 +609,30 @@ export function stress(s: State, move: number): number {
  *  the server never answers is given up after `timeoutMs`: every request waits for the one before
  *  it, so without that one hung connection stops its caller for good. */
 export function politeFetch(gapMs = 120, retries = 4, timeoutMs = 20_000): typeof fetch {
+  const MAX_IN_FLIGHT = 6;
+  let inFlight = 0;
+  const waiting: ((v: unknown) => void)[] = [];
   let queue: Promise<unknown> = Promise.resolve();
   let last = 0;
   const pause = (ms: number) => new Promise(r => setTimeout(r, ms));
   return (input, init) => {
     // `gapMs` 0: an RPC that does not throttle (X1's). Requests then go out as they come, side
     // by side, keeping only the time limit and the retry.
+    // (X1's public RPC now refuses bursts too, at about 10 a second: at most `MAX_IN_FLIGHT` go
+    // at once, and a refused one waits and tries again a few more times.)
     if (gapMs <= 0) return (async () => {
-      for (let i = 0; ; i++) {
-        const limit = AbortSignal.timeout(timeoutMs);
-        const res = await fetch(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, limit]) : limit });
-        if (res.status !== 429 || i >= retries) return res;
-        await pause(700 * (i + 1));
+      while (inFlight >= MAX_IN_FLIGHT) await new Promise(r => waiting.push(r));
+      inFlight++;
+      try {
+        for (let i = 0; ; i++) {
+          const limit = AbortSignal.timeout(timeoutMs);
+          const res = await fetch(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, limit]) : limit });
+          if (res.status !== 429 || i >= retries + 2) return res;
+          await pause(500 * (i + 1) + Math.random() * 400);
+        }
+      } finally {
+        inFlight--;
+        waiting.shift()?.(undefined);
       }
     })();
     const run = async () => {
@@ -657,6 +669,23 @@ export async function marketSnapshot(conn: Connection, commitment: Commitment = 
  *  can use several hundred thousand units, and the fee does not depend on the request. On X1 a
  *  transaction pays 10 lamports for every unit it asks for, used or not (0.014 XNT at the
  *  maximum), so it asks for what a simulation says it uses, plus `spare`. */
+/** Waits until `sig` is confirmed, asking for its status every 0.25 s (up to 60 s); throws if
+ *  it failed. */
+export async function confirmFast(conn: Connection, sig: string, timeoutMs = 60_000): Promise<void> {
+  const end = Date.now() + timeoutMs;
+  while (Date.now() < end) {
+    const st = (await conn.getSignatureStatuses([sig]).catch(() => null))?.value[0];
+    if (st?.err) {
+      // (In the form the page's error list reads: "custom program error: 0x...".)
+      const custom = (st.err as any)?.InstructionError?.[1]?.Custom;
+      throw new Error(typeof custom === "number" ? `custom program error: 0x${custom.toString(16)}` : `transaction failed: ${JSON.stringify(st.err)}`);
+    }
+    if (st && (st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized")) return;
+    await new Promise(r => setTimeout(r, 250));
+  }
+  throw new Error(`not confirmed within ${timeoutMs / 1000} s: ${sig}`);
+}
+
 export async function computeLimit(conn: Connection, payer: PublicKey, ixs: TransactionInstruction[], spare = 1.2, alts: AddressLookupTableAccount[] = []): Promise<TransactionInstruction> {
   const max = ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 });
   if (!X1) return max;
@@ -1644,7 +1673,7 @@ export const takeQuote = (v: Vault, wallet: PublicKey, sub: number, q: Quote) =>
     keys: [rw(wallet, true), rw(traderAddress(wallet, sub)), rw(routerPortfolio(wallet, sub)), ro(v.key), ro(bookAddress(v.key)), rw(MARKET),
       rw(new PublicKey(q.maker)), rw(new PublicKey(q.portfolio)), ro(new PublicKey(q.delegate)), ro(routerAuthority()), ro(VAULT_PROGRAM), ro(PERCOLATOR),
       ro(new PublicKey("Sysvar1nstructions1111111111111111111111111")),
-      rw(carryAddress(v.key)), rw(ledgerAddress(wallet, sub)), ro(tiersAddress()), rw(rangeAddress(v.key)), rw(equitiesAddress(wallet))],
+      rw(carryAddress(v.key)), rw(ledgerAddress(wallet, sub)), ro(tiersAddress()), rw(rangeAddress(v.key)), rw(equitiesAddress(wallet)), rw(statsAddress(wallet))],
     data: w.done(),
   });
 };

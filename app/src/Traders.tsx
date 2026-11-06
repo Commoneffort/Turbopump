@@ -144,14 +144,18 @@ export function useBoard(tick: number, every = 20_000): { board?: S.Board; err?:
   const [board, setBoard] = useState<S.Board | undefined>(cache?.net === C.NETWORK ? cache.board : undefined);
   const [err, setErr] = useState<string>();
   const [n, setN] = useState(0);
+  // A new `tick` (this wallet just sent something) reads afresh, past the cache.
+  const lastTick = useRef(tick);
   useEffect(() => {
     let live = true;
+    const ticked = lastTick.current !== tick;
+    lastTick.current = tick;
     const load = (force: boolean) => {
       if (!force && cache?.net === C.NETWORK && Date.now() - cache.board.at < Math.min(15_000, every - 1_000)) return setBoard(cache.board);
       loading ??= S.loadBoard(connection).finally(() => { loading = undefined; });
       loading.then(b => { cache = { net: C.NETWORK, board: b }; takePictures(b.pictures); if (live) { setBoard(b); setErr(undefined); } }).catch(e => live && setErr(String(e?.message ?? e)));
     };
-    load(n > 0);
+    load(n > 0 || ticked);
     const id = setInterval(() => document.hidden || load(false), every);
     return () => { live = false; clearInterval(id); };
   }, [connection, tick, n, every]);

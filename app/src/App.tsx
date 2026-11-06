@@ -83,7 +83,10 @@ function useSend(onDone: () => void): [Send, string | undefined, Toast | undefin
             sig = bs58.encode(signed.signature);
           }
         } else sig = await wallet.sendTransaction(tx, connection);
-        await connection.confirmTransaction(sig, "confirmed");
+        // (On X1 the status is asked for every 0.25 s: the subscription the library waits on
+        // can take seconds longer to report it.)
+        if (C.X1) await C.confirmFast(connection, sig);
+        else await connection.confirmTransaction(sig, "confirmed");
         readDirect(); // what this changed is not in the shared copy yet
         setToast({ ok: true, text: `${label}: confirmed`, sig });
         onDone();

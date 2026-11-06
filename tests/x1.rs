@@ -720,8 +720,10 @@ fn take_quote_ixs(w: &World, signer: &Keypair, m: &Maker, taker: usize, size: i1
 fn a_maker_quote_fills_at_once_at_its_price_and_only_once() {
     let mut w = live();
     let m = new_maker(&mut w, 50_000_000);
-    w.trader(0);
+    let t0 = w.trader(0);
     let tkp = w.trader_kp(0);
+    // A track record, so the fill is written there (the tape and the leaderboard read it).
+    w.send(vec![rclient::open_stats(&w.payer.pubkey(), &t0)], &[]).expect("open track record");
     let size = 5 * UNIT as i128;
     // The asset 25 slots behind and nobody cranked: TakeQuote brings it and the accounts up itself.
     w.goto_slot(w.env.current_slot() + 25);
@@ -733,6 +735,9 @@ fn a_maker_quote_fills_at_once_at_its_price_and_only_once() {
     let mpos: i128 = perc::positions(&w.env.svm.get_account(&w.env.market).unwrap().data, &w.env.svm.get_account(&m.portfolio).unwrap().data).unwrap().iter().map(|p| p.size).sum();
     assert_eq!(mpos, -size, "against the maker");
     assert_eq!({ w.vault_state().inventory }, 0, "the vault took no part");
+    let stats_key = percolator_router::state::stats_address(&percolator_router::id(), &t0.market, &t0.wallet).0;
+    let st: percolator_router::state::Stats = bytemuck::pod_read_unaligned(&w.env.svm.get_account(&stats_key).unwrap().data);
+    assert_eq!({ st.trades }, 1, "the quoted fill is in the track record");
     // The same quote again: used.
     w.goto_slot(w.env.current_slot() + 1);
     assert!(w.send(ixs, &[&tkp]).is_err());

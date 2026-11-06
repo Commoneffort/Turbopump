@@ -221,10 +221,17 @@ pub fn take_quote(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
     let traded = after - before;
     msg!("quote {} {} {}", id, traded, price);
     let owed = book_fees(fees, vault_ai, portfolio, v.asset_index, market_id, v.inventory, before, traded, price, false)?;
+    let mut others = 0i128;
     if let Some(e) = social::equities_for(program_id, accounts, &t)? {
         let (capital, pnl, _) = perc::portfolio_exposure(&portfolio.try_borrow_data()?)?;
         let here = (capital as i128).saturating_add(pnl).saturating_sub(owed as i128);
-        social::set_equity(program_id, e, t.sub, Some(here), 0)?;
+        others = social::set_equity(program_id, e, t.sub, Some(here), 0)?;
+    }
+    // The trader's track record, as for a fill, when the transaction names it (found by its
+    // address): the tape, the leaderboard and copy trading read trades from it.
+    let sk = crate::state::stats_address(program_id, &t.market, &t.wallet).0;
+    if let Some(stats_ai) = accounts.iter().skip(13).find(|a| *a.key == sk) {
+        social::record_fill(program_id, stats_ai, &t, portfolio, v.asset_index, traded, price, owed, others);
     }
     Ok(())
 }

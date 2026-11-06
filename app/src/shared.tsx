@@ -116,7 +116,7 @@ export function useCards(tick: number) {
 }
 
 /** A market as read, and the wallet whose own accounts were read with it ("" for none). */
-export type VaultState = C.State & { readFor: string };
+export type VaultState = C.State & { readFor: string; readErr?: string };
 const statesNow = new Map<string, { s: VaultState; at: number }>();
 /** `sub`: which of the wallet's trading accounts to show (0 its main, cross-margin one; else the
  *  isolated one: see `C.traderAddress`). */
@@ -140,7 +140,12 @@ export function useVault(vaultKey: PublicKey, tick: number, sub = 0) {
       setErr(undefined);
       const p = num(s.asset.price, 1e6);
       setHistory(h => (h.length && h[h.length - 1].p === p && Date.now() - h[h.length - 1].t < 30_000 ? h : [...h.slice(-240), { t: Date.now(), p }]));
-    } catch (e: any) { setErr(e.message); }
+    } catch (e: any) {
+      setErr(e.message);
+      console.warn("account read failed:", e);
+      // (Shown on the trade button while the wallet's own accounts cannot be read.)
+      setState(now => now && now.readFor !== (publicKey?.toBase58() ?? "") ? { ...now, readErr: String(e?.message ?? e) } : now);
+    }
   }, [connection, vaultKey.toString(), publicKey?.toString(), sub]);
   useEffect(() => { setHistory([]); }, [vaultKey.toString()]);
   // Another account chosen (cross or isolated): what shows is that account's, never the last one's.
@@ -153,7 +158,7 @@ export function useVault(vaultKey: PublicKey, tick: number, sub = 0) {
   }, [stateKey]);
   // Poll faster while a trade of this wallet is queued, so its fill shows up promptly.
   const waiting = !!state?.trader?.hasPending;
-  useEffect(() => { load(); const id = setInterval(() => document.hidden || load(), waiting ? 2000 : 6000); return () => clearInterval(id); }, [load, tick, waiting]);
+  useEffect(() => { load(); const id = setInterval(() => document.hidden || load(), waiting ? (C.X1 ? 500 : 2000) : 6000); return () => clearInterval(id); }, [load, tick, waiting]);
   return { state, err, history, reload: load };
 }
 

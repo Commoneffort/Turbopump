@@ -497,7 +497,7 @@ function Stress({ state }: { state: C.State }) {
 
 // ---------------------------------------------------------------- order ticket
 
-function Ticket({ state, send, busy, copying, margin, setMargin, vaults }: { state: C.State & { readFor?: string }; send: Send; busy?: string; copying?: { leader: string; name: string }; margin: MarginMode; setMargin: (m: MarginMode) => void; vaults: C.Vault[] }) {
+function Ticket({ state, send, busy, copying, margin, setMargin, vaults }: { state: C.State & { readFor?: string; readErr?: string }; send: Send; busy?: string; copying?: { leader: string; name: string }; margin: MarginMode; setMargin: (m: MarginMode) => void; vaults: C.Vault[] }) {
   const { publicKey, wallet } = useWallet();
   const { connection } = useConnection();
   // The wallet's coins: an order takes a bond and a deposit (0.1% of its value) in the chain's
@@ -667,7 +667,7 @@ function Ticket({ state, send, busy, copying, margin, setMargin, vaults }: { sta
       send(label, async conn => {
         // (The burner wallet signs at once; a wallet that asks its user needs the quote longer.)
         const instant = wallet?.adapter?.name === BurnerName;
-        const q = await C.quotedTrade(conn, v, publicKey, sub, sent * side, instant ? 6 : 30).catch(() => null);
+        const q = await C.quotedTrade(conn, v, publicKey, sub, sent * side, instant ? 6 : 30, 1_500).catch(() => null);
         return withNote(q ? q.ixs : queued);
       }).then(r => { if (r) setNote(""); });
       return;
@@ -777,7 +777,7 @@ function Ticket({ state, send, busy, copying, margin, setMargin, vaults }: { sta
       )}
       <div className="ticket-go">
       {!publicKey ? <div className="connect"><WalletMultiButton /></div>
-        : !mine ? <button className="submit neutral" disabled>Reading your account…</button>
+        : !mine ? <button className="submit neutral" disabled title={state.readErr}>{state.readErr ? `Could not read your account (${/429|Too Many/i.test(state.readErr) ? "the network's RPC is refusing this browser's requests: too many" : state.readErr.replace(/^failed to get [a-z ]*info about account \S+: /i, "").slice(0, 120)}), trying again…` : "Reading your account…"}</button>
         : !state.trader && !iso ? <button className="submit neutral" disabled={!!busy} onClick={() => send("Create trading account", [C.openTradingAccount(publicKey), C.openLedger(publicKey, publicKey), S.openStats(publicKey, publicKey)])}>Create trading account</button>
         : <button className={`submit ${side > 0n ? "up" : "down"}`} disabled={!!blocker || !!busy} onClick={submit}>{busy ? `${busy}…` : `${side > 0n ? "Long" : "Short"} ${want > 0n ? `${units(sent)} ` : ""}${sym}`}</button>}
       {state.trader && held !== 0n && (

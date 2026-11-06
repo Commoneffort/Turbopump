@@ -359,6 +359,7 @@ pub fn take_quote(k: &VaultKeys, t: &TraderKeys, maker: &Pubkey, maker_portfolio
             ro(tiers_address(&id(), &k.market).0),
             w(range_address(&id(), &k.vault).0),
             w(equities_address(&id(), &t.market, &t.wallet).0),
+            w(stats_address(&id(), &t.market, &t.wallet).0),
         ],
         data,
     }
