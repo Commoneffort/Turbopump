@@ -237,6 +237,20 @@ export default function Docs() {
         </p>
         <p>The router has no admin: no pause, no allow or block list, and its upgrade authority is to be burned before mainnet.</p>
 
+        <h2 id="oneclick">One-click trading{X1 ? "" : " (X1)"}</h2>
+        <p>
+          Your wallet approves a trading key once, and after that trades sign with the key, with no wallet popup. The key is a new
+          random key made in your browser, never one worked out from a wallet signature (a signature over a known text can be
+          obtained by any site that asks for it, and the key with it). Where the browser supports it, the key cannot be copied out:
+          the page can ask it to sign, but no script or extension can read it.
+        </p>
+        <ul>
+          <li><b>What it can do:</b> market orders, maker quotes and closes on your market, through the router, until it expires (1, 7 or 30 days), up to the size a trade and the number of trades a day you chose. Closing a position is never limited.</li>
+          <li><b>What it cannot do:</b> withdraw, deposit, copy, change your profile or place standing orders. Withdrawals always need your wallet and only ever pay your wallet.</li>
+          <li><b>Changing or ending it:</b> turning it on again replaces the old key at once; turning it off (no popup) ends it and sends what it holds for fees back to your wallet.</li>
+        </ul>
+        <p>On your first visit one approval opens your account, deposits and turns one-click trading on. The router enforces every limit on chain, so a page or a key cannot go past what your wallet approved.</p>
+
         <h2 id="orders">Order types</h2>
         <p>
           A market order is the request described above. Everything else is a <b>standing order</b>: an instruction your wallet
