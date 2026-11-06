@@ -9,7 +9,11 @@
 # `stop` ends the restart loop with it. The logs are appended to, so a restart keeps what
 # happened before it.
 cd "$(dirname "$0")/.."
-RPC=${X1_RPC:-https://rpc.testnet.x1.xyz}
+# Every service sends through the local relay (app/scripts/rpc-relay.ts): one HTTP/2 connection to
+# the public RPC, paced under its per-IP caps (requests, transactions and connections a 5 s).
+UPSTREAM=${X1_RPC:-https://rpc.testnet.x1.xyz}
+RELAY_PORT=18899
+RPC=${X1_SERVICES_RPC:-http://127.0.0.1:$RELAY_PORT}
 KEY=${PERCOLATOR_KEYPAIR:-$HOME/.config/solana/percolator-x1/deployer.json}
 mkdir -p deploy/logs
 # The witness runs on another machine once this file exists (docs: "Run the Turbopump price witness
@@ -18,6 +22,10 @@ mkdir -p deploy/logs
 running() { [ -f "deploy/logs/$1.pid" ] && kill -0 -- "-$(cat "deploy/logs/$1.pid")" 2>/dev/null; }
 case "$1" in
   start)
+    if ! running x1-rpc-relay; then
+      (cd app && RPC_UPSTREAM=$UPSTREAM PORT=$RELAY_PORT setsid sh -c 'echo $$ > ../deploy/logs/x1-rpc-relay.pid; while :; do npx tsx scripts/rpc-relay.ts; echo "$(date -u +%T) restart: x1-rpc-relay exited with status $?, starting it again in 2 s"; sleep 2; done' >> ../deploy/logs/x1-rpc-relay.log 2>&1 < /dev/null &)
+      sleep 4
+    fi
     if ! running price-service; then
       (cd app && PORT=8091 EXCHANGES=coinbase,kraken,okx,bybit,kucoin SYMBOLS=${PRICE_SYMBOLS:-BTC,ETH,SOL} setsid sh -c 'echo $$ > ../deploy/logs/price-service.pid; while :; do npx tsx scripts/price-service.ts; echo "$(date -u +%T) restart: price-service exited with status $?, starting it again in 5 s"; sleep 5; done' >> ../deploy/logs/price-service.log 2>&1 < /dev/null &)
     fi
@@ -58,6 +66,15 @@ case "$1" in
     if [ -f "$MAKER_KEY" ] && ! running x1-maker; then
       (cd app && NETWORK=x1-testnet RPC=$RPC MAKER_KEY=$MAKER_KEY PERCOLATOR_KEYPAIR=$KEY setsid sh -c 'echo $$ > ../deploy/logs/x1-maker.pid; while :; do npx tsx scripts/maker.ts serve 18300; echo "$(date -u +%T) restart: x1-maker exited with status $?, starting it again in 30 s"; sleep 30; done' >> ../deploy/logs/x1-maker.log 2>&1 < /dev/null &)
     fi
+    # Per-asset makers on the original market (maker-<SYM>.json; MAKER_ASSETS_X1 for /api/quote):
+    # their matcher configs renewed the same way, quotes on :1831x.
+    for SYM in SOL BTC ETH; do
+      AK=$HOME/.config/solana/percolator-x1/maker-$SYM.json
+      if [ -f "$AK" ] && ! running x1-maker-$SYM; then
+        P=$((18310 + $(echo "SOL BTC ETH" | tr ' ' '\n' | grep -n "^$SYM$" | cut -d: -f1)))
+        (cd app && NETWORK=x1-testnet RPC=$RPC MAKER_KEY=$AK PERCOLATOR_KEYPAIR=$KEY S=$SYM P=$P setsid sh -c 'echo $$ > ../deploy/logs/x1-maker-$S.pid; while :; do npx tsx scripts/maker.ts serve $P; echo "$(date -u +%T) restart: x1-maker-$S exited with status $?, starting it again in 30 s"; sleep 30; done' >> ../deploy/logs/x1-maker-$SYM.log 2>&1 < /dev/null &)
+      fi
+    done
     # The markets added by the split (deploy/x1-testnet.m<N>.json): each one its own executor
     # (checking every 1 s, not 0.15: the public RPC limits this server), keeper and maker
     # renewal. The original market's services are the ones above.
@@ -83,13 +100,13 @@ case "$1" in
     "$0" status
     ;;
   stop)
-    for s in price-service price-witness-source x1-witness x1-alerts x1-watchdog x1-fills-log x1-executor x1-backup-executor x1-maker x1-keeper $(for MF in deploy/x1-testnet.m[0-9].json; do [ -f "$MF" ] && N=$(basename "$MF" .json | sed "s/.*\.m//") && echo x1-executor-m$N x1-keeper-m$N x1-maker-m$N; done); do
+    for s in x1-rpc-relay price-service price-witness-source x1-witness x1-alerts x1-watchdog x1-fills-log x1-executor x1-backup-executor x1-maker x1-maker-SOL x1-maker-BTC x1-maker-ETH x1-keeper $(for MF in deploy/x1-testnet.m[0-9].json; do [ -f "$MF" ] && N=$(basename "$MF" .json | sed "s/.*\.m//") && echo x1-executor-m$N x1-keeper-m$N x1-maker-m$N; done); do
       if running $s; then kill -- "-$(cat deploy/logs/$s.pid)"; echo "$s stopped"; fi
       rm -f deploy/logs/$s.pid
     done
     ;;
   status)
-    for s in price-service price-witness-source x1-witness x1-alerts x1-watchdog x1-fills-log x1-executor x1-backup-executor x1-maker x1-keeper $(for MF in deploy/x1-testnet.m[0-9].json; do [ -f "$MF" ] && N=$(basename "$MF" .json | sed "s/.*\.m//") && echo x1-executor-m$N x1-keeper-m$N x1-maker-m$N; done); do
+    for s in x1-rpc-relay price-service price-witness-source x1-witness x1-alerts x1-watchdog x1-fills-log x1-executor x1-backup-executor x1-maker x1-maker-SOL x1-maker-BTC x1-maker-ETH x1-keeper $(for MF in deploy/x1-testnet.m[0-9].json; do [ -f "$MF" ] && N=$(basename "$MF" .json | sed "s/.*\.m//") && echo x1-executor-m$N x1-keeper-m$N x1-maker-m$N; done); do
       if running $s; then echo "$s running (process group $(cat deploy/logs/$s.pid))"; else echo "$s not running"; fi
     done
     ;;

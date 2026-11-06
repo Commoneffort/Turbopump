@@ -69,7 +69,9 @@ const M: typeof D = override ? JSON.parse(override) : X1 ? X : D;
 if (!M.market) throw new Error(`no market for ${NETWORK} yet (src/${NETWORK}.json is filled in when the market is set up)`);
 export const MANIFEST = M;
 
-export const RPC_URL: string = (import.meta as any).env?.VITE_RPC_URL ?? (X1 ? "https://rpc.testnet.x1.xyz" : "https://api.devnet.solana.com");
+/** The RPC: the page's build setting, or (services on our server) `RPC`, which deploy/x1-services.sh
+ *  points at the local relay (scripts/rpc-relay.ts) so that every service shares its connection. */
+export const RPC_URL: string = (import.meta as any).env?.VITE_RPC_URL ?? (globalThis as any).process?.env?.RPC ?? (X1 ? "https://rpc.testnet.x1.xyz" : "https://api.devnet.solana.com");
 export const VAULT_PROGRAM = new PublicKey(M.vault_program);
 export const PERCOLATOR = new PublicKey(M.percolator_program);
 export const MARKET = new PublicKey(M.market);
@@ -742,6 +744,9 @@ export async function confirmFast(conn: Connection, sig: string, timeoutMs = 60_
   };
   let sub: number | undefined, done = false;
   const pushed = new Promise<void>((ok, fail) => {
+    // (In the browser only: each visitor has their own connections, while a websocket per service
+    // process on our server would count against the RPC's cap on connections from one address.)
+    if (typeof window === "undefined") return;
     try {
       sub = conn.onSignature(sig, r => { done = true; sub = undefined; r.err ? fail(failed(r.err)) : ok(); }, "confirmed");
     } catch { /* no websocket here: polling only */ }

@@ -12,7 +12,8 @@
 #   bots trade every 360 s instead of 240. BOT_SKIP= (empty) runs them all.
 cd "$(dirname "$0")/.."
 case "$1" in
-  x1)     NET=x1-testnet; NAME=x1-bots; RPC=${X1_RPC:-https://rpc.testnet.x1.xyz}; SYMBOLS=${BOT_SYMBOLS:-SOL,BTC,ETH}; PACE=${BOT_PACE_SECS:-360}; SKIP=${BOT_SKIP-bot-edge-long,bot-edge-short,bot-max,bot-scalper,bot-random} ;;
+  # (X1: through the local RPC relay that deploy/x1-services.sh starts.)
+  x1)     NET=x1-testnet; NAME=x1-bots; RPC=${X1_BOTS_RPC:-http://127.0.0.1:18899}; SYMBOLS=${BOT_SYMBOLS:-SOL,BTC,ETH}; PACE=${BOT_PACE_SECS:-360}; SKIP=${BOT_SKIP-bot-edge-long,bot-edge-short,bot-max,bot-scalper,bot-random} ;;
   devnet) NET=devnet; NAME=devnet-bots; RPC=${DEVNET_RPC:-$(cat ~/.config/percolator/devnet-rpc 2>/dev/null || echo https://api.devnet.solana.com)}; SYMBOLS=${BOT_SYMBOLS:-SOL,BTC,ETH}; PACE=${BOT_PACE_SECS:-600}; SKIP=${BOT_SKIP-bot-scalper,bot-random} ;;
   *) echo "usage: $0 x1|devnet start | stop | status | report [hours] | failures"; exit 1 ;;
 esac
