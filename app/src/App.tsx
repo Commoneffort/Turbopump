@@ -37,7 +37,7 @@ function useRoute(): [string[], (to: string) => void] {
 const ERRORS: Record<string, string> = {
   "0x1": `not enough test USDC (use Get test USDC), or not enough ${C.COIN} in the wallet for the fee, the order's bond and its deposit`, "0x5608": "vault not active", "0x560a": "claim your previous request first",
   "0x560b": "nothing to claim", "0x560c": "epoch not over", "0x560d": "epoch not settled yet", "0x560e": "vault not flat yet",
-  "0x5610": "amount is zero", "0x5611": "unknown asset", "0x15": "market busy: try again in a few seconds",
+  "0x5610": "amount is zero", "0x5611": "unknown asset", "0x15": "the market was being updated by another transaction at that moment: try again",
   "0x13": "close your open positions first (margin can only be withdrawn from an account with none)", "0xe": "not enough margin", "0x12": "asset generation changed: retry",
   "0x5705": "you already have a trade queued: it has to fill or expire first",
   "0x5706": "not enough margin for this size (the order must survive a further 10% price move): add margin or lower the size",
@@ -65,22 +65,34 @@ function useSend(onDone: () => void): [Send, string | undefined, Toast | undefin
       if (!wallet.publicKey) return;
       setBusy(label);
       try {
-        const ixs = typeof build === "function" ? await build(connection) : build;
         if (opts?.key) {
-          // The trading key signs alone (it pays the fee): no wallet popup.
-          const sized = ixs[0]?.programId.equals(ComputeBudgetProgram.programId);
-          const tx = new Transaction().add(...(sized ? [] : [await C.computeLimit(connection, opts.key.publicKey, ixs)]), ...ixs);
-          tx.recentBlockhash = await C.recentBlockhash(connection);
-          tx.feePayer = opts.key.publicKey;
-          await signWithKey(opts.key, tx);
-          const sig = await connection.sendRawTransaction(tx.serialize());
-          if (C.X1) await C.confirmFast(connection, sig);
-          else await connection.confirmTransaction(sig, "confirmed");
-          readDirect();
-          setToast({ ok: true, text: `${label}: confirmed`, sig });
-          onDone();
-          return sig;
+          // The trading key signs alone (it pays the fee): no wallet popup. As nothing has to be
+          // approved again, a failure that passes (the market caught up by another transaction
+          // in between, a catch-up that ran out of compute) is tried again, with a fresh build
+          // (a fresh quote), up to KEY_TRIES times.
+          for (let attempt = 1; ; attempt++) {
+            try {
+              const ixs = typeof build === "function" ? await build(connection) : build;
+              const sized = ixs[0]?.programId.equals(ComputeBudgetProgram.programId);
+              const tx = new Transaction().add(...(sized ? [] : [await C.computeLimit(connection, opts.key.publicKey, ixs)]), ...ixs);
+              tx.recentBlockhash = await C.recentBlockhash(connection);
+              tx.feePayer = opts.key.publicKey;
+              await signWithKey(opts.key, tx);
+              const sig = await connection.sendRawTransaction(tx.serialize());
+              if (C.X1) await C.confirmFast(connection, sig);
+              else await connection.confirmTransaction(sig, "confirmed");
+              readDirect();
+              setToast({ ok: true, text: `${label}: confirmed${attempt > 1 ? ` (try ${attempt})` : ""}`, sig });
+              onDone();
+              return sig;
+            } catch (e: any) {
+              const text = [String(e?.message ?? e), ...(e?.logs ?? [])].join(" ");
+              if (attempt >= KEY_TRIES || !/custom program error: 0x1[56]\b|exceeded CUs|ProgramFailedToComplete|ComputationalBudgetExceeded|Blockhash not found/.test(text)) throw Object.assign(e ?? new Error("failed"), { byKey: true });
+              await new Promise(r => setTimeout(r, 350 * attempt));
+            }
+          }
         }
+        const ixs = typeof build === "function" ? await build(connection) : build;
         // Percolator instructions can use several hundred thousand compute units.
         // (A build that sets its own compute limit, a quoted trade, already simulated it.)
         const sized = ixs[0]?.programId.equals(ComputeBudgetProgram.programId);
@@ -112,7 +124,9 @@ function useSend(onDone: () => void): [Send, string | undefined, Toast | undefin
       } catch (e: any) {
         const logs: string[] = e?.logs ?? [];
         const code = logs.map(l => l.match(/custom program error: (0x[0-9a-f]+)/)?.[1]).find(Boolean) ?? String(e?.message ?? "").match(/custom program error: (0x[0-9a-f]+)/)?.[1];
-        setToast({ ok: false, text: `${label} failed${code ? `: ${ERRORS[code] ?? code}` : `: ${e?.message ?? e}`}` });
+        // (Signed by the trading key, a lack of coin is the key's, not the wallet's.)
+        const why = code === "0x1" && e?.byKey ? `the one-click trading key has too little ${C.COIN} for this order's deposit (it comes back to your wallet): add ${C.COIN} to the key, below the ticket` : code ? ERRORS[code] ?? code : e?.message ?? e;
+        setToast({ ok: false, text: `${label} failed: ${why}` });
       } finally {
         setBusy(undefined);
       }
@@ -121,6 +135,9 @@ function useSend(onDone: () => void): [Send, string | undefined, Toast | undefin
   );
   return [send, busy, toast, () => setToast(undefined)];
 }
+
+/** How many times a transaction signed by the trading key is tried when it fails in passing. */
+const KEY_TRIES = 3;
 
 // ---------------------------------------------------------------- app shell
 

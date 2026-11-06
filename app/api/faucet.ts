@@ -8,7 +8,8 @@ import { networkOf } from "./_config.js";
 const USDC = 1_000_000;
 const DRIP_USDC = 1_000;
 const MAX_HELD_USDC = 5_000;
-// The coin drip (0.3) is enough to launch a market (~0.12) or open a trading account (~0.07).
+// The coin drip (0.3 on devnet, 2 XNT on X1) covers opening a trading account (~0.07), and on X1
+// one-click trading's key with its fees (OneClick.tsx).
 
 export default async function handler(req: any, res: any) {
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
