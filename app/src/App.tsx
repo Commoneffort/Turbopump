@@ -108,8 +108,27 @@ function useSend(onDone: () => void): [Send, string | undefined, Toast | undefin
 
 // ---------------------------------------------------------------- app shell
 
+/** The market of the connected wallet (C.homeMarket), set as the page's active market before
+ *  anything of the wallet's is read; undefined while it is found. */
+function useHome(): string | undefined {
+  const { publicKey } = useWallet();
+  const { connection } = useConnection();
+  const [home, setHome] = useState<{ wallet: string; market: string }>();
+  const me = publicKey?.toBase58() ?? "";
+  useEffect(() => {
+    if (!publicKey || !C.NEW_MARKETS.length) { C.setActiveMarket(C.MARKET); setHome({ wallet: me, market: C.MARKET.toBase58() }); return; }
+    let live = true;
+    const find = () => C.homeMarket(connection, publicKey).then(m => { if (live) { C.setActiveMarket(m); setHome({ wallet: me, market: m.toBase58() }); } }).catch(() => { if (live) setTimeout(find, 2_000); });
+    find();
+    return () => { live = false; };
+  }, [me]);
+  if (!publicKey || !C.NEW_MARKETS.length) return C.MARKET.toBase58();
+  return home?.wallet === me ? home.market : undefined;
+}
+
 export default function App() {
   const [route, go] = useRoute();
+  const home = useHome();
   const [tick, setTick] = useState(0);
   const refresh = useCallback(() => setTick(t => t + 1), []);
   const [send, busy, toast, clearToast] = useSend(refresh);
@@ -148,12 +167,14 @@ export default function App() {
         </div>
       </header>
 
-      {spot ? (
-        <SpotDesk route={route} send={send} busy={busy} tick={tick} go={go} />
+      {!home ? (
+        <div className="desk-msg">Finding your market…</div>
+      ) : spot ? (
+        <SpotDesk key={home} route={route} send={send} busy={busy} tick={tick} go={go} />
       ) : desk ? (
-        <Desk route={route} send={send} busy={busy} tick={tick} go={go} />
+        <Desk key={home} route={route} send={send} busy={busy} tick={tick} go={go} />
       ) : (
-        <div className={`page${page === "how" || page === "docs" ? "" : " wide"}`}>
+        <div key={home} className={`page${page === "how" || page === "docs" ? "" : " wide"}`}>
           {C.X1 && (
             <p className="muted small net-note">
               X1 testnet: the same programs as on Solana devnet, with test USDC as collateral. X1 has no Pyth, so prices here are posted by the

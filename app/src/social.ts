@@ -27,7 +27,7 @@ export const statsAddress = C.statsAddress;
 export const profileAddress = (wallet: PublicKey) => rpda(Buffer.from("profile"), wallet.toBuffer());
 export const nameAddress = (name: string) => rpda(Buffer.from("name"), Buffer.from(name.toLowerCase(), "ascii"));
 export const followAddress = (follower: PublicKey, leader: PublicKey) => rpda(Buffer.from("follow"), follower.toBuffer(), leader.toBuffer());
-export const copyAddress = (follower: PublicKey) => rpda(Buffer.from("copy"), C.MARKET.toBuffer(), follower.toBuffer());
+export const copyAddress = (follower: PublicKey, market = C.activeMarket()) => rpda(Buffer.from("copy"), market.toBuffer(), follower.toBuffer());
 export const validName = (name: string) => new RegExp(`^[A-Za-z0-9_]{${NAME_MIN},${NAME_MAX}}$`).test(name);
 
 // ---------------------------------------------------------------- accounts
@@ -77,7 +77,7 @@ export const decodeCopy = (k: PublicKey, d: Uint8Array): Copy => ({ key: k, mark
 export const openStats = (payer: PublicKey, wallet: PublicKey) => new TransactionInstruction({
   programId: C.ROUTER,
   // (Last: the wallet's record of values, whether or not it exists; its isolated accounts count from the start.)
-  keys: [rw(payer, true), rw(C.traderAddress(wallet)), ro(wallet), rw(statsAddress(wallet)), ro(C.MARKET), ro(C.routerPortfolio(wallet)), ro(SystemProgram.programId), rw(C.equitiesAddress(wallet))],
+  keys: [rw(payer, true), rw(C.traderAddress(wallet)), ro(wallet), rw(statsAddress(wallet)), ro(C.activeMarket()), ro(C.routerPortfolio(wallet)), ro(SystemProgram.programId), rw(C.equitiesAddress(wallet))],
   data: Buffer.from([15]),
 });
 /** Brings a trading account's track record up to its value now, without a trade (router
@@ -85,7 +85,7 @@ export const openStats = (payer: PublicKey, wallet: PublicKey) => new Transactio
  *  shows its loss in the record's days too. `trader`: the account's address (main or isolated). */
 export const refreshRecord = (t: C.Trader & { key: PublicKey }) => new TransactionInstruction({
   programId: C.ROUTER,
-  keys: [ro(t.key), ro(t.portfolio), ro(C.MARKET), rw(C.equitiesAddress(t.wallet)), rw(statsAddress(t.wallet)), ro(C.ledgerAddress(t.wallet, t.sub))],
+  keys: [ro(t.key), ro(t.portfolio), ro(C.activeMarket()), rw(C.equitiesAddress(t.wallet)), rw(statsAddress(t.wallet)), ro(C.ledgerAddress(t.wallet, t.sub))],
   data: Buffer.from([35]),
 });
 /** Sets the wallet's name and badge; `oldName` is the name it holds now, if any. Taking a name,
@@ -176,7 +176,7 @@ export const triggerCopy = (payer: PublicKey, c: Copy, vault: PublicKey, size = 
   programId: C.ROUTER,
   keys: [
     rw(payer, true), rw(c.key), rw(C.traderAddress(c.follower)), ro(c.follower), ro(vault), rw(C.bookAddress(vault)), rw(C.requestAddress(vault, c.follower)),
-    ro(C.MARKET), ro(C.routerPortfolio(c.follower)), ro(C.traderAddress(c.leader)), ro(C.routerPortfolio(c.leader)), ro(SystemProgram.programId),
+    ro(C.activeMarket()), ro(C.routerPortfolio(c.follower)), ro(C.traderAddress(c.leader)), ro(C.routerPortfolio(c.leader)), ro(SystemProgram.programId),
     ro(C.tiersAddress()),
   ],
   data: Buffer.concat([Buffer.from([21]), i128le(size)]),
@@ -262,6 +262,8 @@ export function copyDue(held: bigint, target: bigint, price: bigint): boolean {
 
 export type TraderRow = {
   wallet: string;
+  /** The market the wallet's accounts are on (see C.MARKETS). */
+  market?: string;
   profile?: Profile;
   stats?: Stats;
   /** Equity now, and the profit the record shows with it (live: the record itself only moves at a fill). */
@@ -289,26 +291,38 @@ export type Board = {
 export async function loadBoard(conn: Connection): Promise<Board> {
   // Each kind of account starts with its own eight letters: other router accounts can have the same size.
   const kind = (tag: string) => ({ memcmp: { offset: 0, bytes: bs58.encode(Buffer.from(tag, "ascii")) } });
-  const [statAccs, profAccs, followAccs, copyAccs, market, badgeAccs, portfolioAccs, traderAccs] = await Promise.all([
-    conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: STATS_LEN }, kind("PRSTATS1"), { memcmp: { offset: 40, bytes: C.MARKET.toBase58() } }] }),
+  // Every market of the site (since the split each wallet lives on one): records and copies in one
+  // scan each, portfolios and trading accounts market by market.
+  const ours = (k: PublicKey) => C.isOurMarket(k);
+  const perMarket = <T,>(f: (m: PublicKey) => Promise<T[]>) => Promise.all(C.MARKETS.map(x => f(x.key))).then(xs => xs.flat());
+  const [statAll, profAccs, followAccs, copyAll, marketAccs, badgeAccs, portfolioAccs, traderAccs] = await Promise.all([
+    conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: STATS_LEN }, kind("PRSTATS1")] }),
     conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: PROFILE_LEN }, kind("PRPROFL1")] }),
     conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: FOLLOW_LEN }, kind("PRFOLLW1")] }),
-    conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: COPY_LEN }, kind("PRCOPY01"), { memcmp: { offset: 8, bytes: C.MARKET.toBase58() } }] }),
-    conn.getAccountInfo(C.MARKET),
+    conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: COPY_LEN }, kind("PRCOPY01")] }),
+    conn.getMultipleAccountsInfo(C.MARKETS.map(x => x.key)),
     // (A router that has no badge pictures yet, or an RPC that refuses the scan: no pictures.)
     conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: BADGE_LEN }, kind("PRBADGE1")] }).catch(() => []),
-    // Every portfolio on the market, in one scan (the traders' are picked out below by address).
-    conn.getProgramAccounts(C.PERCOLATOR, { filters: [{ dataSize: C.PORTFOLIO_LEN }, { memcmp: { offset: 16, bytes: C.MARKET.toBase58() } }] }),
-    // The trading accounts on the market: a wallet's isolated accounts count in its results too.
-    conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: C.TRADER_LEN }, { memcmp: { offset: 8, bytes: C.MARKET.toBase58() } }] }).catch(() => []),
+    // Every portfolio on the markets (the traders' are picked out below by address).
+    perMarket(m => conn.getProgramAccounts(C.PERCOLATOR, { filters: [{ dataSize: C.PORTFOLIO_LEN }, { memcmp: { offset: 16, bytes: m.toBase58() } }] }) as Promise<any[]>),
+    // The trading accounts on the markets: a wallet's isolated accounts count in its results too.
+    perMarket(m => (conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: C.TRADER_LEN }, { memcmp: { offset: 8, bytes: m.toBase58() } }] }) as Promise<any[]>).catch(() => [])),
   ]);
+  const statAccs = statAll.filter(a => ours(new PublicKey(a.account.data.subarray(40, 72))));
+  const copyAccs = copyAll.filter(a => ours(new PublicKey(a.account.data.subarray(8, 40))));
+  const marketData = new Map(C.MARKETS.flatMap((x, i) => (marketAccs[i] ? [[x.key.toBase58(), C.noteMarketData(new Uint8Array(marketAccs[i]!.data), x.key)] as const] : [])));
   const pictures = new Map<string, Uint8Array>();
   for (const a of badgeAccs) {
     const b = decodeBadgeImage(new Uint8Array(a.account.data));
     // Only at its own wallet's address, whole, and beginning as a JPEG does.
     if (b && b.written === b.len && isJpeg(b.bytes) && a.pubkey.equals(badgeAddress(b.wallet))) pictures.set(b.wallet.toBase58(), b.bytes);
   }
-  const stats = statAccs.map(a => decodeStats(new Uint8Array(a.account.data)));
+  // A wallet's market: where its record is (the busiest one, should it have two).
+  const statsWithMarket = statAccs.map(a => ({ s: decodeStats(new Uint8Array(a.account.data)), market: new PublicKey(a.account.data.subarray(40, 72)) }))
+    .sort((a, b) => b.s.volume - a.s.volume);
+  const homeOf = new Map<string, PublicKey>();
+  for (const x of statsWithMarket) if (!homeOf.has(x.s.wallet.toBase58())) homeOf.set(x.s.wallet.toBase58(), x.market);
+  const stats = statsWithMarket.filter(x => homeOf.get(x.s.wallet.toBase58())!.equals(x.market)).map(x => x.s);
   const profiles = new Map(profAccs.map(a => { const p = decodeProfile(new Uint8Array(a.account.data)); return [p.wallet.toBase58(), p] as const; }));
   const follows = followAccs.map(a => decodeFollow(new Uint8Array(a.account.data)));
   const copies = copyAccs.map(a => decodeCopy(a.pubkey, new Uint8Array(a.account.data)));
@@ -317,16 +331,16 @@ export async function loadBoard(conn: Connection): Promise<Board> {
   // Every one of a wallet's accounts: its main one, and its isolated ones (from the trader accounts).
   const portfolios = new Map<string, Uint8Array[]>();
   const add = (w: string, d?: Uint8Array) => { if (d) portfolios.set(w, [...(portfolios.get(w) ?? []), d]); };
-  for (const w of wallets) add(w, byAddress.get(C.routerPortfolio(new PublicKey(w)).toBase58()));
+  const home = (w: string) => homeOf.get(w) ?? C.placedMarket(new PublicKey(w));
+  for (const w of wallets) add(w, byAddress.get(C.routerPortfolio(new PublicKey(w), 0, home(w)).toBase58()));
   const known = new Set(wallets);
   for (const a of traderAccs) {
     const t = C.decodeTrader(new Uint8Array(a.account.data));
-    if (t.sub !== 0 && known.has(t.wallet.toBase58())) add(t.wallet.toBase58(), byAddress.get(t.portfolio.toBase58()));
+    if (t.sub !== 0 && known.has(t.wallet.toBase58()) && t.market.equals(home(t.wallet.toBase58()))) add(t.wallet.toBase58(), byAddress.get(t.portfolio.toBase58()));
   }
-  const m = market ? new Uint8Array(market.data) : undefined;
   const byWallet = new Map(stats.map(s => [s.wallet.toBase58(), s]));
   const count = (xs: { leader: PublicKey }[], w: string) => xs.filter(x => x.leader.toBase58() === w).length;
-  const rows = wallets.map(w => row(w, byWallet.get(w), profiles.get(w), portfolios.get(w), m, count(follows, w), count(copies, w), copies.find(c => c.follower.toBase58() === w)?.leader.toBase58()));
+  const rows = wallets.map(w => ({ ...row(w, byWallet.get(w), profiles.get(w), portfolios.get(w), marketData.get(home(w).toBase58()), count(follows, w), count(copies, w), copies.find(c => c.follower.toBase58() === w)?.leader.toBase58()), market: home(w).toBase58() }));
   rows.sort((a, b) => b.pnl - a.pnl);
   return { rows, follows, copies, profiles, pictures, at: Date.now() };
 }

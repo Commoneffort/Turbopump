@@ -54,7 +54,7 @@ export function useMarket(tick: number) {
   const at = useRef(0);
   useEffect(() => {
     if (m && Date.now() - at.current < 60_000) return;
-    view.getAccountInfo(C.MARKET).then(a => { if (a) { at.current = Date.now(); setM(new Uint8Array(a.data)); } }).catch(() => {});
+    view.getAccountInfo(C.activeMarket()).then(a => { if (a) { at.current = Date.now(); setM(new Uint8Array(a.data)); } }).catch(() => {});
   }, [tick]);
   return m;
 }

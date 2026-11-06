@@ -22,7 +22,8 @@ const load = (p: string) => Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.
 const payer = load(process.env.PERCOLATOR_KEYPAIR ?? `${process.env.HOME}/.config/solana/percolator-x1/deployer.json`);
 const KEY = process.env.MAKER_KEY ?? `../deploy/logs/maker-${C.NETWORK}.json`;
 // (Kept next to the maker's key, so a drill's maker and the network's never mix.)
-const INFO = `${KEY.replace(/\.json$/, "")}-portfolio.json`;
+// (One portfolio per market: the same maker key quotes on every market of the split.)
+const INFO = `${KEY.replace(/\.json$/, "")}-portfolio${process.env.MANIFEST_JSON ? "-" + C.MARKET.toBase58().slice(0, 8) : ""}.json`;
 const TTL = Number(process.env.MATCHER_TTL ?? 216_000);
 const say = (...a: unknown[]) => console.log(new Date().toISOString().slice(11, 19), ...a);
 

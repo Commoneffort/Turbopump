@@ -6,5 +6,27 @@
   "market": "281YHBA8J4DyU8yiyjZJgWE7FaA5G1ax4F5iPeB3WSZn",
   "percolator_vault": "8VerPJUzTqWmxTRAtxEVzdn5UMtHtYTDTMd8ENArDphe",
   "percolator_vault_authority": "DxmcgpA3TjL67b9itQC55Z8xYTbhaKoY9w47iuxKDBMQ",
-  "admin": "AGrJS23h2GHm99BXLChQgANAUxZpsGkQBhU3zzKgU8hD"
+  "admin": "AGrJS23h2GHm99BXLChQgANAUxZpsGkQBhU3zzKgU8hD",
+  "markets": [
+    {
+      "market": "5fBaKk5DzL7wz35n3LwwUM9Y1DnEXvYhjof5NyRYpFt1",
+      "percolator_vault": "9KxoXG13TiQkF6kbijVcfHh8AduT6U7wc7npcbnrx6Xw",
+      "percolator_vault_authority": "xxSsruFCfsnvWmNdEmmk5quFc4H5jDuin1AMzsEqX8t"
+    },
+    {
+      "market": "74jd4xa2KiSrT126d96NcQBGiAjm6JjZZQ5g5NXcfmZc",
+      "percolator_vault": "CyNJWeVybGFUK23VVBHHDiCkrPE7NjRXQPWTaLwgM3Nk",
+      "percolator_vault_authority": "EwSAGVcbGSq2EYEokQVhE2i67QR9NyEXWRgWSYdu4tih"
+    },
+    {
+      "market": "EHurKZwocopwjYTJDjtBBWwZkKuwXrSj598NhX753VqT",
+      "percolator_vault": "H9cUJaM5KXK573pYsnK5UHrg7rczmhqg2Dt3pcykNeD8",
+      "percolator_vault_authority": "2K8Mb59YQcBhjvJ5db8zDb59YZqBESxXkVfM4XVWmwK1"
+    },
+    {
+      "market": "7a56g7R3NtdFQsHZcAZmydRjEzYRJkiv8qqhPoEDe1p1",
+      "percolator_vault": "4LgPUDK6KmsYpXQDVJ39t88K3HReSxmGrWocT5hdrTH9",
+      "percolator_vault_authority": "5AwVZNp8BkFXTyzVD8sdo7EXHyYBKmzDkpfE7BsVaDeB"
+    }
+  ]
 }

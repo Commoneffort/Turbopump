@@ -1,0 +1,11 @@
+{
+  "admin": "AGrJS23h2GHm99BXLChQgANAUxZpsGkQBhU3zzKgU8hD",
+  "collateral_mint": "7jpUVrakCqTm68aatnDHYe7qhSF7Zq39PWoSKM1u2Aaw",
+  "market": "7a56g7R3NtdFQsHZcAZmydRjEzYRJkiv8qqhPoEDe1p1",
+  "network": "x1-testnet",
+  "percolator_program": "8o3uV87X2CvPYfPwM1sxeaYYE7sGWsTUiEy7SskEMM3P",
+  "percolator_vault": "4LgPUDK6KmsYpXQDVJ39t88K3HReSxmGrWocT5hdrTH9",
+  "percolator_vault_authority": "5AwVZNp8BkFXTyzVD8sdo7EXHyYBKmzDkpfE7BsVaDeB",
+  "treasury_collateral": "988vce6AvgTavKziyncia22MY7p2Lwm7znhPpX6BGTzM",
+  "vault_program": "BSync6F8gtJs3Wj4w8L6H3ZtS397w2XoCYGEAJGmeYX"
+}

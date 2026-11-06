@@ -360,7 +360,7 @@ export function useAccounts(markets: Card[], tick: number): { accounts: AcctView
     if (!publicKey) { setOut({ accounts: [] }); return; }
     let on = true;
     const subs = [0, ...assets.split(",").filter(Boolean).map(a => C.isolatedSub(Number(a)))];
-    const keys = [C.MARKET, ...subs.map(n => C.routerPortfolio(publicKey, n))];
+    const keys = [C.activeMarket(), ...subs.map(n => C.routerPortfolio(publicKey, n))];
     connection.getMultipleAccountsInfo(keys, "confirmed").then(accs => {
       if (!on || !accs[0]) return;
       const m = new Uint8Array(accs[0].data);

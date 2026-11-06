@@ -76,6 +76,47 @@ export const MARKET = new PublicKey(M.market);
 export const MINT = new PublicKey(M.collateral_mint);
 export const PERC_VAULT = new PublicKey(M.percolator_vault);
 export const PERC_VAULT_AUTH = new PublicKey(M.percolator_vault_authority);
+/** Every Percolator market this site trades on. The first is the network's original market
+ *  (`market` in the manifest: every account opened before the split lives there, all assets
+ *  on it); `markets` adds more, each with its own collateral account, so that trades on
+ *  different markets do not wait on one another (a chain limits the compute that may write one
+ *  account in a block). A market's assets are listed by its vaults. */
+export type MarketInfo = { key: PublicKey; percVault: PublicKey; percVaultAuth: PublicKey };
+export const MARKETS: MarketInfo[] = [
+  { key: MARKET, percVault: PERC_VAULT, percVaultAuth: PERC_VAULT_AUTH },
+  ...(((M as any).markets ?? []) as { market: string; percolator_vault: string; percolator_vault_authority: string }[])
+    .filter(x => x.market !== M.market)
+    .map(x => ({ key: new PublicKey(x.market), percVault: new PublicKey(x.percolator_vault), percVaultAuth: new PublicKey(x.percolator_vault_authority) })),
+];
+export const isOurMarket = (m: PublicKey) => MARKETS.some(x => x.key.equals(m));
+/** The market of the wallet the page serves (`setActiveMarket`): addresses and listings default
+ *  to it. Services that serve every market name the market (or the vault) instead. Each wallet
+ *  lives on one market with all its accounts, so its margin is shared across assets as before. */
+let ACTIVE = MARKET;
+export const activeMarket = () => ACTIVE;
+export const setActiveMarket = (m: PublicKey) => { ACTIVE = isOurMarket(m) ? m : MARKET; };
+/** The markets added by the split: a new wallet is placed on one of them by its address, the
+ *  same one every time (a wallet with an account on the original market stays there). */
+export const NEW_MARKETS = MARKETS.slice(1);
+/** The market `wallet` lives on: the first market where it has a main trading account (the
+ *  original market first), else the one it is placed on. One read. */
+export async function homeMarket(conn: Connection, wallet: PublicKey): Promise<PublicKey> {
+  if (!NEW_MARKETS.length) return MARKET;
+  const accs = await conn.getMultipleAccountsInfo(MARKETS.map(m => traderAddress(wallet, 0, m.key)), "confirmed");
+  const i = accs.findIndex(a => !!a);
+  return i >= 0 ? MARKETS[i].key : placedMarket(wallet);
+}
+export const placedMarket = (wallet: PublicKey) => (NEW_MARKETS.length ? NEW_MARKETS[new DataView(wallet.toBytes().buffer).getUint32(0, true) % NEW_MARKETS.length].key : MARKET);
+export const marketInfo = (m: PublicKey) => MARKETS.find(x => x.key.equals(m)) ?? MARKETS[0];
+/** Which market each vault read so far belongs to (`decodeVault` notes it), so that what is built
+ *  for a vault names that market's accounts. */
+const vaultMarkets = new Map<string, PublicKey>();
+export const marketOfVault = (vault: PublicKey) => vaultMarkets.get(vault.toBase58()) ?? ACTIVE;
+/** Which market a copy of a market account's data came from (noted where it is read). */
+const marketOfData = new WeakMap<Uint8Array, string>();
+/** The market a copy of market data was read from (the original market when not noted). */
+export const marketKeyOf = (d: Uint8Array) => { const k = marketOfData.get(d); return k ? new PublicKey(k) : ACTIVE; };
+export const noteMarketData = (d: Uint8Array, market: PublicKey) => { marketOfData.set(d, market.toBase58()); return d; };
 export const PUSH_ORACLE = new PublicKey("pythWSnswVUd12oZpeFP8e9CVaEqJg25g1Vtc2biRsT");
 export const USDC = 1_000_000;
 /** Epoch length of every canonical vault on devnet (the program's CANON_EPOCH_LEN_SLOTS). */
@@ -192,6 +233,7 @@ export type Vault = {
 
 export function decodeVault(k: PublicKey, d: Uint8Array): Vault {
   const v = L.vault;
+  vaultMarkets.set(k.toBase58(), key(d, v.market));
   const feedHex = toHex(d.slice(v.oracle_feeds, v.oracle_feeds + 32));
   return {
     key: k,
@@ -361,20 +403,20 @@ const le8 = (n: bigint) => {
   return b;
 };
 const enc = (s: string) => new TextEncoder().encode(s);
-export const vaultAddress = (creator: PublicKey, seed: bigint) =>
-  PublicKey.findProgramAddressSync([enc("vault"), MARKET.toBytes(), creator.toBytes(), le8(seed)], VAULT_PROGRAM)[0];
+export const vaultAddress = (creator: PublicKey, seed: bigint, market = activeMarket()) =>
+  PublicKey.findProgramAddressSync([enc("vault"), market.toBytes(), creator.toBytes(), le8(seed)], VAULT_PROGRAM)[0];
 /** The one vault (and so the one market) the program allows for a feed. */
-export const canonicalVaultAddress = (feedHex: string) =>
-  PublicKey.findProgramAddressSync([enc("canon"), MARKET.toBytes(), hexBytes(feedHex), le8(0n)], VAULT_PROGRAM)[0];
+export const canonicalVaultAddress = (feedHex: string, market = activeMarket()) =>
+  PublicKey.findProgramAddressSync([enc("canon"), market.toBytes(), hexBytes(feedHex), le8(0n)], VAULT_PROGRAM)[0];
 export const childAddress = (tag: string, vault: PublicKey) =>
   PublicKey.findProgramAddressSync([enc(tag), vault.toBytes()], VAULT_PROGRAM)[0];
 export const ticketAddress = (v: PublicKey, user: PublicKey) =>
   PublicKey.findProgramAddressSync([enc("ticket"), v.toBytes(), user.toBytes()], VAULT_PROGRAM)[0];
 export const epochAddress = (v: PublicKey, epoch: bigint) =>
   PublicKey.findProgramAddressSync([enc("epoch"), v.toBytes(), le8(epoch)], VAULT_PROGRAM)[0];
-export const matcherDelegate = (portfolio: PublicKey, vault: PublicKey) =>
+export const matcherDelegate = (portfolio: PublicKey, vault: PublicKey, market = marketOfVault(vault)) =>
   PublicKey.findProgramAddressSync(
-    [enc("matcher"), MARKET.toBytes(), portfolio.toBytes(), vault.toBytes(), VAULT_PROGRAM.toBytes(), vault.toBytes()],
+    [enc("matcher"), market.toBytes(), portfolio.toBytes(), vault.toBytes(), VAULT_PROGRAM.toBytes(), vault.toBytes()],
     PERCOLATOR,
   )[0];
 export const ata = (owner: PublicKey, mint: PublicKey) => getAssociatedTokenAddressSync(mint, owner);
@@ -402,8 +444,9 @@ export const OPEN_MARKET_FEE = NETWORK === "x1-testnet" ? 10_000_000_000n : 20_0
 export const OPEN_MARKET_FEE_TEXT = NETWORK === "x1-testnet" ? "10 XNT" : "0.02 SOL";
 /** InitVault in operate mode. The program replaces every parameter with its canonical template;
  *  only the feed and the listing-fee budget matter. */
-export function initVault(payer: PublicKey, feedHex: string, frontier: bigint) {
-  const vault = canonicalVaultAddress(feedHex);
+export function initVault(payer: PublicKey, feedHex: string, frontier: bigint, market = activeMarket()) {
+  const vault = canonicalVaultAddress(feedHex, market);
+  vaultMarkets.set(vault.toBase58(), market);
   const portfolio = childAddress("portfolio", vault);
   const data = new W()
     .u8(16).u64(0n).u16(0).u16(10).u16(0).u16(10_000).u16(0)
@@ -420,9 +463,9 @@ export function initVault(payer: PublicKey, feedHex: string, frontier: bigint) {
     ix: new TransactionInstruction({
       programId: VAULT_PROGRAM,
       keys: [
-        rw(payer, true), ro(payer, true), rw(vault), rw(MARKET), ro(MINT),
+        rw(payer, true), ro(payer, true), rw(vault), rw(market), ro(MINT),
         rw(childAddress("shares", vault)), rw(childAddress("buffer", vault)), rw(childAddress("escrow", vault)),
-        rw(portfolio), ro(matcherDelegate(portfolio, vault)), ro(PERCOLATOR), ro(VAULT_PROGRAM), ro(TOKEN_PROGRAM_ID), ro(SystemProgram.programId),
+        rw(portfolio), ro(matcherDelegate(portfolio, vault, market)), ro(PERCOLATOR), ro(VAULT_PROGRAM), ro(TOKEN_PROGRAM_ID), ro(SystemProgram.programId),
         rw(TREASURY), // the opening fee (`OPEN_MARKET_FEE`)
       ],
       data,
@@ -431,11 +474,11 @@ export function initVault(payer: PublicKey, feedHex: string, frontier: bigint) {
 }
 
 /** ListAsset: the vault activates its own asset and configures its Pyth feed. */
-export function listAsset(payer: PublicKey, vault: PublicKey, feedHex: string, assetIndex: number, marketId: bigint, initialPrice: bigint) {
+export function listAsset(payer: PublicKey, vault: PublicKey, feedHex: string, assetIndex: number, marketId: bigint, initialPrice: bigint, market = marketOfVault(vault)) {
   return new TransactionInstruction({
     programId: VAULT_PROGRAM,
     keys: [
-      rw(payer, true), rw(ata(payer, MINT)), rw(vault), rw(MARKET), rw(childAddress("buffer", vault)), rw(PERC_VAULT),
+      rw(payer, true), rw(ata(payer, MINT)), rw(vault), rw(market), rw(childAddress("buffer", vault)), rw(marketInfo(market).percVault),
       ro(TOKEN_PROGRAM_ID), ro(SystemProgram.programId), ro(PERCOLATOR), ro(priceAccount(feedHex)),
     ],
     data: new W().u8(26).u16(assetIndex).u64(marketId).u64(0n).u64(initialPrice).u64(1n).u64(0n).done(),
@@ -655,14 +698,14 @@ export function politeFetch(gapMs = 120, retries = 4, timeoutMs = 20_000): typeo
 /** What `crankPlan` reads: the market account, the slot it was read at, and every portfolio. */
 export type MarketSnapshot = { market: Uint8Array; slot: number; portfolios: { pubkey: PublicKey; data: Uint8Array }[] };
 
-export async function marketSnapshot(conn: Connection, commitment: Commitment = "confirmed"): Promise<MarketSnapshot> {
+export async function marketSnapshot(conn: Connection, commitment: Commitment = "confirmed", market = activeMarket()): Promise<MarketSnapshot> {
   const [m, slot, accs] = await Promise.all([
-    conn.getAccountInfo(MARKET, commitment),
+    conn.getAccountInfo(market, commitment),
     conn.getSlot(commitment),
-    conn.getProgramAccounts(PERCOLATOR, { commitment, filters: [{ dataSize: PORTFOLIO_LEN }, { memcmp: { offset: 16, bytes: MARKET.toBase58() } }] }),
+    conn.getProgramAccounts(PERCOLATOR, { commitment, filters: [{ dataSize: PORTFOLIO_LEN }, { memcmp: { offset: 16, bytes: market.toBase58() } }] }),
   ]);
-  await fetchTiers(conn).catch(() => {}); // the margins and liquidation levels below depend on it
-  return { market: new Uint8Array(m!.data), slot, portfolios: accs.map(a => ({ pubkey: a.pubkey, data: new Uint8Array(a.account.data) })) };
+  await fetchTiers(conn, market).catch(() => {}); // the margins and liquidation levels below depend on it
+  return { market: noteMarketData(new Uint8Array(m!.data), market), slot, portfolios: accs.map(a => ({ pubkey: a.pubkey, data: new Uint8Array(a.account.data) })) };
 }
 
 /** The compute a transaction asks for. On Solana that is the maximum: Percolator instructions
@@ -705,10 +748,10 @@ export const MAX_CRANK_ASSETS = 16;
 
 /** Percolator's permissionless crank on `portfolio`, naming the assets it may accrue (each by at
  *  most 10 slots a call, up to the current slot). It fails (NonProgress) when it finds nothing to do. */
-export const crank = (payer: PublicKey, portfolio: PublicKey, assets: number[]) => {
+export const crank = (payer: PublicKey, portfolio: PublicKey, assets: number[], market = activeMarket()) => {
   const w = new W().u8(5).u64(0n).u8(assets.length);
   for (const a of assets) w.u16(a).u8(0);
-  return new TransactionInstruction({ programId: PERCOLATOR, keys: [rw(payer, true), rw(MARKET), rw(portfolio)], data: w.done() });
+  return new TransactionInstruction({ programId: PERCOLATOR, keys: [rw(payer, true), rw(market), rw(portfolio)], data: w.done() });
 };
 
 /** The cranks Percolator needs before it accepts new risk on asset `focus`, as it works on chain:
@@ -748,7 +791,7 @@ export function crankPlan(s: MarketSnapshot, payer: PublicKey, vehicle: PublicKe
     }
     return out;
   };
-  const mine = trader && routerPortfolio(trader, sub);
+  const mine = trader && routerPortfolio(trader, sub, marketKeyOf(s.market));
   const held = s.portfolios.map(p => ({ key: p.pubkey, legs: legs(p.data) })).filter(p => p.legs.length);
   // Percolator refuses a trade while any asset the trader holds has an out-of-date account
   // (loss-stale: `account_has_loss_stale_live_leg`), not only the asset traded. So a fill on
@@ -786,9 +829,9 @@ export function crankPlan(s: MarketSnapshot, payer: PublicKey, vehicle: PublicKe
   };
   return {
     lag: s.slot - Number(oldest),
-    lagCrank: crank(payer, vehicle, all),
-    settle: due.map(p => crank(payer, p.key, [focus !== undefined && p.legs.some(l => l.asset === focus) ? focus : p.legs[0].asset])),
-    settleAlone: due.map(p => crank(payer, p.key, own(p))),
+    lagCrank: crank(payer, vehicle, all, marketKeyOf(s.market)),
+    settle: due.map(p => crank(payer, p.key, [focus !== undefined && p.legs.some(l => l.asset === focus) ? focus : p.legs[0].asset], marketKeyOf(s.market))),
+    settleAlone: due.map(p => crank(payer, p.key, own(p), marketKeyOf(s.market))),
     resets: focus === undefined ? all.flatMap(a => finalizeResets(s.market, a)) : finalizeResets(s.market, focus),
   };
 }
@@ -804,16 +847,17 @@ export function finalizeResets(market: Uint8Array, assetIndex: number): Transact
   ];
   return sides.flatMap(([mode, stored, stale], side) =>
     market[a + mode] === 2 && u64(market, a + stored) === 0n && u64(market, a + stale) === 0n
-      ? [new TransactionInstruction({ programId: PERCOLATOR, keys: [rw(MARKET)], data: new W().u8(45).u16(assetIndex).u8(side).done() })]
+      ? [new TransactionInstruction({ programId: PERCOLATOR, keys: [rw(marketKeyOf(market))], data: new W().u8(45).u16(assetIndex).u8(side).done() })]
       : []);
 }
 
 /** The trader takes `sizeQ` (positive = long) against the vault through Percolator's TradeCpi. */
-export async function listVaults(conn: Connection): Promise<Vault[]> {
+/** The vaults on the active market (`all`: on every market of the site). */
+export async function listVaults(conn: Connection, all = false): Promise<Vault[]> {
   const accs = await conn.getProgramAccounts(VAULT_PROGRAM, { commitment: "confirmed", filters: [{ dataSize: VAULT_LEN }] });
   return accs
     .map(a => decodeVault(a.pubkey, new Uint8Array(a.account.data)))
-    .filter(v => v.market.equals(MARKET) && v.feed && (v.status !== 0 || v.canonical))
+    .filter(v => (all ? isOurMarket(v.market) : v.market.equals(ACTIVE)) && v.feed && (v.status !== 0 || v.canonical))
     .sort((a, b) => Number(b.createdSlot - a.createdSlot));
 }
 
@@ -823,26 +867,29 @@ export async function fetchVault(conn: Connection, vaultKey: PublicKey, user?: P
   if (!va) throw new Error("vault not found");
   const v = decodeVault(vaultKey, new Uint8Array(va.data));
   // Traders trade through the router: their portfolio belongs to the router's address for them.
-  const pf = user ? routerPortfolio(user, sub) : undefined;
-  const keys = [MARKET, v.lpPortfolio, v.buffer, v.shareMint, v.oracle, bookAddress(v.key)];
-  if (user) keys.push(ticketAddress(v.key, user), ata(user, MINT), ata(user, v.shareMint), pf!, traderAddress(user, sub));
+  const mkt = v.market;
+  const pf = user ? routerPortfolio(user, sub, mkt) : undefined;
+  const keys = [mkt, v.lpPortfolio, v.buffer, v.shareMint, v.oracle, bookAddress(v.key)];
+  if (user) keys.push(ticketAddress(v.key, user), ata(user, MINT), ata(user, v.shareMint), pf!, traderAddress(user, sub, mkt));
   const firstOrder = keys.length;
-  if (user) for (let i = 0; i < MAX_ORDERS; i++) keys.push(orderAddress(v.key, accountOwner(user, sub), i));
+  if (user) for (let i = 0; i < MAX_ORDERS; i++) keys.push(orderAddress(v.key, accountOwner(user, sub, mkt), i));
   // The vault's holding-fee meter, and the account's fee ledger (router `carry`).
   const carryAt = keys.length;
   keys.push(carryAddress(v.key));
-  if (user) keys.push(ledgerAddress(user, sub));
-  keys.push(tiersAddress()); // last: the market's tier record (margins depend on it)
+  if (user) keys.push(ledgerAddress(user, sub, mkt));
+  keys.push(tiersAddress(mkt)); // last: the market's tier record (margins depend on it)
   const [accs, slot] = await Promise.all([conn.getMultipleAccountsInfo(keys, "confirmed"), conn.getSlot("confirmed")]);
   noteSlot(slot);
-  const data = (i: number) => (accs[i] ? new Uint8Array(accs[i]!.data) : undefined);
+  // (The market's data is one copy, noted as this market's: margins are looked up by it.)
+  const marketData = accs[0] ? noteMarketData(new Uint8Array(accs[0]!.data), mkt) : undefined;
+  const data = (i: number) => (i === 0 ? marketData : accs[i] ? new Uint8Array(accs[i]!.data) : undefined);
   setTiers(data(keys.length - 1));
   const tokenAmount = (d?: Uint8Array) => (d ? u64(d, 64) : 0n);
   const book = data(5) ? decodeBook(data(5)!) : undefined;
   const trader = user && data(10) ? decodeTrader(data(10)!) : undefined;
   let pending: RouterRequest | undefined;
   if (trader?.hasPending && trader.pendingVault.equals(v.key)) {
-    const k = requestAddress(v.key, accountOwner(user!, sub));
+    const k = requestAddress(v.key, accountOwner(user!, sub, mkt));
     const ra = await conn.getAccountInfo(k, "confirmed");
     if (ra) pending = decodeRequest(k, new Uint8Array(ra.data), sub);
   }
@@ -943,15 +990,18 @@ const tierRow = (key: string, tier: number, fallback: number) => Number(((L.rout
 export const tierInsuranceBps = (tier: number) => tierRow("insurance_nav_bps", tier, tier === TIER_MAJOR ? 300 : 800);
 export const tierPositionBps = (tier: number) => tierRow("tier_position_nav_bps", tier, tier === TIER_MAJOR ? 20_000 : 10_000);
 export const tierFillBps = (tier: number) => tierRow("tier_fill_nav_bps", tier, tier === TIER_MAJOR ? 5_000 : 2_500);
-export const tiersAddress = () => rpda(Buffer.from("tiers"), MARKET.toBuffer());
-/** The market's tier record as last read with the market (fetchVault, marketSnapshot, fetchTiers). */
-let TIERS: Uint8Array | null = null;
-export const setTiers = (d?: Uint8Array | null) => { TIERS = d && d.length === (L.router as any).tiers_len ? d : null; };
-export async function fetchTiers(conn: Connection) { const a = await conn.getAccountInfo(tiersAddress(), "confirmed"); setTiers(a ? new Uint8Array(a.data) : null); return TIERS; }
+export const tiersAddress = (market = activeMarket()) => cached(`tiers${mk(market)}`, () => rpda(Buffer.from("tiers"), market.toBuffer()));
+/** Each market's tier record as last read (fetchVault, marketSnapshot, fetchTiers); it names its
+ *  market (offset 8). */
+const TIERS_OF = new Map<string, Uint8Array>();
+export const setTiers = (d?: Uint8Array | null) => { if (d && d.length === (L.router as any).tiers_len) TIERS_OF.set(new PublicKey(d.slice(8, 40)).toBase58(), d); };
+/** The tier record of the market `market` (data) was read from, else of the original market. */
+const tiersFor = (market?: Uint8Array) => TIERS_OF.get((market && marketOfData.get(market)) ?? ACTIVE.toBase58()) ?? null;
+export async function fetchTiers(conn: Connection, market = activeMarket()) { const a = await conn.getAccountInfo(tiersAddress(market), "confirmed"); setTiers(a ? new Uint8Array(a.data) : null); return TIERS_OF.get(market.toBase58()) ?? null; }
 /** bps to open, bps below which it is liquidated, and Percolator's own maintenance margin, for
  *  `asset`: a mirror of the router's `levels` (never below what Percolator requires; without the
  *  asset's tier recorded, open as the strictest tier and, with no record at all, liquidate as a major). */
-export function levels(market: Uint8Array, asset: number, tiers: Uint8Array | null = TIERS) {
+export function levels(market: Uint8Array, asset: number, tiers: Uint8Array | null = tiersFor(market)) {
   const RR = L.router as any;
   const im = u64(market, RR.im_bps_off), mm = u64(market, RR.mm_bps_off);
   const generation = u64(market, L.market.slots + asset * L.market.slot_len + L.market.engine + L.market.market_id);
@@ -1026,8 +1076,8 @@ export const marketRates = (market: Uint8Array) => ({ feeBps: u64(market, L.rout
 export const navOf = (s: State) =>
   s.lp.capital + (s.lp.pnl > 0n ? s.lp.pnl : 0n) + s.buffer - s.vault.reserved - s.vault.pendingDeposit;
 
-export async function fetchMarket(conn: Connection) {
-  const d = new Uint8Array((await conn.getAccountInfo(MARKET, "confirmed"))!.data);
+export async function fetchMarket(conn: Connection, market = activeMarket()) {
+  const d = noteMarketData(new Uint8Array((await conn.getAccountInfo(market, "confirmed"))!.data), market);
   return { data: d, ...marketHeader(d) };
 }
 
@@ -1106,39 +1156,41 @@ export const routerAuthority = () => rpda(Buffer.from("authority"));
 // own isolated account (`isolatedSub`). Addresses are cached: they are derived on every render.
 const pdaCache = new Map<string, PublicKey>();
 const cached = (k: string, f: () => PublicKey) => { let v = pdaCache.get(k); if (!v) { v = f(); pdaCache.set(k, v); } return v; };
-export const isolatedAddress = (wallet: PublicKey, sub: number) => cached(`i${wallet.toBase58()}:${sub}`, () => rpda(Buffer.from("isolated"), MARKET.toBuffer(), wallet.toBuffer(), Buffer.from([sub])));
-export const traderAddress = (wallet: PublicKey, sub = 0) => sub ? isolatedAddress(wallet, sub) : cached(`t${wallet.toBase58()}`, () => rpda(Buffer.from("trader"), MARKET.toBuffer(), wallet.toBuffer()));
-export const routerPortfolio = (wallet: PublicKey, sub = 0) => sub
-  ? cached(`p${wallet.toBase58()}:${sub}`, () => rpda(Buffer.from("portfolio"), isolatedAddress(wallet, sub).toBuffer()))
-  : cached(`p${wallet.toBase58()}`, () => rpda(Buffer.from("portfolio"), MARKET.toBuffer(), wallet.toBuffer()));
-export const routerCollateral = (wallet: PublicKey, sub = 0) => sub
-  ? cached(`c${wallet.toBase58()}:${sub}`, () => rpda(Buffer.from("collateral"), isolatedAddress(wallet, sub).toBuffer()))
-  : cached(`c${wallet.toBase58()}`, () => rpda(Buffer.from("collateral"), MARKET.toBuffer(), wallet.toBuffer()));
+// (`market`: which market the account is on; every one before the split is on MARKET.)
+const mk = (m: PublicKey) => (m.equals(MARKET) ? "" : `@${m.toBase58()}`);
+export const isolatedAddress = (wallet: PublicKey, sub: number, market = activeMarket()) => cached(`i${wallet.toBase58()}:${sub}${mk(market)}`, () => rpda(Buffer.from("isolated"), market.toBuffer(), wallet.toBuffer(), Buffer.from([sub])));
+export const traderAddress = (wallet: PublicKey, sub = 0, market = activeMarket()) => sub ? isolatedAddress(wallet, sub, market) : cached(`t${wallet.toBase58()}${mk(market)}`, () => rpda(Buffer.from("trader"), market.toBuffer(), wallet.toBuffer()));
+export const routerPortfolio = (wallet: PublicKey, sub = 0, market = activeMarket()) => sub
+  ? cached(`p${wallet.toBase58()}:${sub}${mk(market)}`, () => rpda(Buffer.from("portfolio"), isolatedAddress(wallet, sub, market).toBuffer()))
+  : cached(`p${wallet.toBase58()}${mk(market)}`, () => rpda(Buffer.from("portfolio"), market.toBuffer(), wallet.toBuffer()));
+export const routerCollateral = (wallet: PublicKey, sub = 0, market = activeMarket()) => sub
+  ? cached(`c${wallet.toBase58()}:${sub}${mk(market)}`, () => rpda(Buffer.from("collateral"), isolatedAddress(wallet, sub, market).toBuffer()))
+  : cached(`c${wallet.toBase58()}${mk(market)}`, () => rpda(Buffer.from("collateral"), market.toBuffer(), wallet.toBuffer()));
 /** The wallet's record of every one of its accounts' values on the market (router `Equities`):
  *  its track record counts its isolated accounts through it. Instructions name it whether or not
  *  it exists (the router requires it once it does). */
-export const equitiesAddress = (wallet: PublicKey) => cached(`e${wallet.toBase58()}`, () => rpda(Buffer.from("equities"), MARKET.toBuffer(), wallet.toBuffer()));
+export const equitiesAddress = (wallet: PublicKey, market = activeMarket()) => cached(`e${wallet.toBase58()}${mk(market)}`, () => rpda(Buffer.from("equities"), market.toBuffer(), wallet.toBuffer()));
 /** What a trading account's request and order addresses are derived from: the wallet for its
  *  main account, the isolated account itself otherwise (router `TraderState::owner`). */
-export const accountOwner = (wallet: PublicKey, sub = 0) => (sub ? isolatedAddress(wallet, sub) : wallet);
+export const accountOwner = (wallet: PublicKey, sub = 0, market = activeMarket()) => (sub ? isolatedAddress(wallet, sub, market) : wallet);
 /** The isolated account the site uses for an asset slot. */
 export const isolatedSub = (assetIndex: number) => (assetIndex % 255) + 1;
 /** Which of `wallet`'s accounts a request or order at `key` belongs to: the main one (0) when
  *  `derive(wallet)` is `key`, else the isolated number whose `derive` gives it (-1: none). */
 const subCache = new Map<string, number>();
-export function subOf(key: PublicKey, wallet: PublicKey, derive: (owner: PublicKey) => PublicKey, hint?: number): number {
+export function subOf(key: PublicKey, wallet: PublicKey, derive: (owner: PublicKey) => PublicKey, hint?: number, market = activeMarket()): number {
   const k = key.toBase58();
   const known = subCache.get(k);
   if (known !== undefined) return known;
   let found = -1;
   if (derive(wallet).equals(key)) found = 0;
-  else for (const n of [...(hint ? [hint] : []), ...Array.from({ length: 255 }, (_, i) => i + 1)]) if (derive(isolatedAddress(wallet, n)).equals(key)) { found = n; break; }
+  else for (const n of [...(hint ? [hint] : []), ...Array.from({ length: 255 }, (_, i) => i + 1)]) if (derive(isolatedAddress(wallet, n, market)).equals(key)) { found = n; break; }
   if (found >= 0) subCache.set(k, found);
   return Math.max(found, 0);
 }
 export const bookAddress = (vault: PublicKey) => rpda(Buffer.from("book"), vault.toBuffer());
 /** A trading account's track record (see social.ts). Deposits, withdrawals and fills name it. */
-export const statsAddress = (wallet: PublicKey) => rpda(Buffer.from("stats"), MARKET.toBuffer(), wallet.toBuffer());
+export const statsAddress = (wallet: PublicKey, market = activeMarket()) => cached(`s${wallet.toBase58()}${mk(market)}`, () => rpda(Buffer.from("stats"), market.toBuffer(), wallet.toBuffer()));
 /** A pending request lives at its owner's address: the trader's wallet (one request at a time),
  *  or for an epoch settlement whoever queued it. */
 export const requestAddress = (vault: PublicKey, owner: PublicKey, settlement = false) =>
@@ -1196,7 +1248,7 @@ export const decodeRequest = (k: PublicKey, d: Uint8Array, hint?: number): Route
   return {
     key: k, vault, wallet, id: u64(d, R.request.id), size: i128(d, R.request.size), target: Number(i64(d, R.request.target_time)),
     settle, order: d[R.request.kind] === 2 ? d[R.request.order_index] : undefined,
-    sub: settle ? 0 : subOf(k, wallet, o => requestAddress(vault, o), hint),
+    sub: settle ? 0 : subOf(k, wallet, o => requestAddress(vault, o), hint, marketOfVault(vault)),
     closeOnly: d[RQ.reduce_only ?? 116] === 1,
   };
 };
@@ -1236,7 +1288,7 @@ export const decodeOrder = (k: PublicKey, d: Uint8Array): StandingOrder => {
   const o = R.order;
   return {
     key: k, vault: key(d, o.vault), wallet: key(d, o.wallet), index: d[o.index], kind: d[o.kind], reduceOnly: d[o.reduce_only] === 1,
-    sub: subOf(k, key(d, o.wallet), w => orderAddress(key(d, o.vault), w, d[o.index])),
+    sub: subOf(k, key(d, o.wallet), w => orderAddress(key(d, o.vault), w, d[o.index]), undefined, marketOfVault(key(d, o.vault))),
     side: d[o.side] === 1 ? 1 : d[o.side] === 255 ? -1 : 0, size: i128(d, o.size), trigger: u64(d, o.trigger), peak: u64(d, o.peak), slice: u64(d, o.slice),
     interval: Number(i64(d, o.interval)), nextTime: Number(i64(d, o.next_time)), expiry: Number(i64(d, o.expiry)), queued: u64(d, o.queued_id) !== 0n,
   };
@@ -1244,20 +1296,20 @@ export const decodeOrder = (k: PublicKey, d: Uint8Array): StandingOrder => {
 export type OrderParams = { index: number; kind: number; reduceOnly?: boolean; size: bigint; trigger: bigint; interval?: number; slices?: number; expiry?: number };
 export const placeOrder = (wallet: PublicKey, vault: PublicKey, o: OrderParams, sub = 0) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [rw(wallet, true), ro(traderAddress(wallet, sub)), ro(vault), ro(bookAddress(vault)), rw(orderAddress(vault, accountOwner(wallet, sub), o.index)), ro(MARKET), ro(routerPortfolio(wallet, sub)), ro(SystemProgram.programId)],
+  keys: [rw(wallet, true), ro(traderAddress(wallet, sub, marketOfVault(vault))), ro(vault), ro(bookAddress(vault)), rw(orderAddress(vault, accountOwner(wallet, sub, marketOfVault(vault)), o.index)), ro(marketOfVault(vault)), ro(routerPortfolio(wallet, sub, marketOfVault(vault))), ro(SystemProgram.programId)],
   data: KEEPER_REWARDS
     ? new W().u8(12).u8(o.index).u8(o.kind).u8(o.reduceOnly ? 1 : 0).i128(o.size).u64(o.trigger).i64(BigInt(o.interval ?? 0)).u32(o.slices ?? 0).i64(BigInt(o.expiry ?? 0)).u64(BigInt(keeperBudget(o.kind, o.slices))).done()
     : new W().u8(12).u8(o.index).u8(o.kind).u8(o.reduceOnly ? 1 : 0).i128(o.size).u64(o.trigger).i64(BigInt(o.interval ?? 0)).u32(o.slices ?? 0).i64(BigInt(o.expiry ?? 0)).done(),
 });
 export const cancelOrder = (wallet: PublicKey, vault: PublicKey, index: number, sub = 0) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [rw(wallet, true), rw(orderAddress(vault, accountOwner(wallet, sub), index))],
+  keys: [rw(wallet, true), rw(orderAddress(vault, accountOwner(wallet, sub, marketOfVault(vault)), index))],
   data: new W().u8(13).done(),
 });
 /** Carries a standing order out (anyone may). */
 export const triggerOrder = (payer: PublicKey, o: StandingOrder) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [rw(payer, true), rw(o.key), rw(traderAddress(o.wallet, o.sub)), rw(o.wallet), ro(o.vault), rw(bookAddress(o.vault)), rw(requestAddress(o.vault, accountOwner(o.wallet, o.sub))), ro(MARKET), ro(routerPortfolio(o.wallet, o.sub)), ro(SystemProgram.programId), ro(tiersAddress())],
+  keys: [rw(payer, true), rw(o.key), rw(traderAddress(o.wallet, o.sub, marketOfVault(o.vault))), rw(o.wallet), ro(o.vault), rw(bookAddress(o.vault)), rw(requestAddress(o.vault, accountOwner(o.wallet, o.sub, marketOfVault(o.vault)))), ro(marketOfVault(o.vault)), ro(routerPortfolio(o.wallet, o.sub, marketOfVault(o.vault))), ro(SystemProgram.programId), ro(tiersAddress(marketOfVault(o.vault)))],
   data: new W().u8(14).done(),
 });
 /** What an order would do at mark price `mark` with the wallet's position `held`, as the router
@@ -1282,8 +1334,9 @@ export function orderAction(o: StandingOrder, mark: bigint, held: bigint, now: n
   return now >= o.nextTime ? "fire" : "wait";
 }
 /** `sub`: 0 for the wallet's main account, 1..255 for an isolated one. */
-export type Trader = { wallet: PublicKey; portfolio: PublicKey; collateral: PublicKey; hasPending: boolean; hasStats: boolean; hasLedger: boolean; sub: number; pendingVault: PublicKey; pendingId: bigint };
+export type Trader = { market: PublicKey; wallet: PublicKey; portfolio: PublicKey; collateral: PublicKey; hasPending: boolean; hasStats: boolean; hasLedger: boolean; sub: number; pendingVault: PublicKey; pendingId: bigint };
 export const decodeTrader = (d: Uint8Array): Trader => ({
+  market: key(d, 8),
   wallet: key(d, R.trader.wallet), portfolio: key(d, R.trader.portfolio), collateral: key(d, R.trader.collateral),
   hasPending: d[R.trader.has_pending] === 1, hasStats: d[R.trader.has_pending + 1] === 1, hasLedger: d[R.trader.has_pending + 2] === 1, sub: d[R.trader.has_pending + 3],
   pendingVault: key(d, R.trader.pending_vault), pendingId: u64(d, R.trader.pending_id),
@@ -1352,7 +1405,7 @@ export function lazyReady(market: Uint8Array, asset: number, b: Book, r: PriceRa
   const mm = u64(market, (L.router as any).mm_bps_off ?? 550);
   return (r.high - r.low) * 10_000n <= r.low * (mm / 4n);
 }
-export const ledgerAddress = (wallet: PublicKey, sub = 0) => cached(`l${wallet.toBase58()}:${sub}`, () => rpda(Buffer.from("ledger"), traderAddress(wallet, sub).toBuffer()));
+export const ledgerAddress = (wallet: PublicKey, sub = 0, market = activeMarket()) => cached(`l${wallet.toBase58()}:${sub}${mk(market)}`, () => rpda(Buffer.from("ledger"), traderAddress(wallet, sub, market).toBuffer()));
 /** Starts a vault's holding-fee meter (anyone may, and pays its rent). */
 export const openCarry = (payer: PublicKey, vault: PublicKey) => new TransactionInstruction({
   programId: ROUTER,
@@ -1361,16 +1414,16 @@ export const openCarry = (payer: PublicKey, vault: PublicKey) => new Transaction
 });
 /** Starts a trading account's fee ledger (anyone may, and pays its rent). Without one an account
  *  can only reduce its positions. */
-export const openLedger = (payer: PublicKey, wallet: PublicKey, sub = 0) => new TransactionInstruction({
+export const openLedger = (payer: PublicKey, wallet: PublicKey, sub = 0, market = activeMarket()) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [rw(payer, true), rw(traderAddress(wallet, sub)), rw(ledgerAddress(wallet, sub)), ro(SystemProgram.programId)],
+  keys: [rw(payer, true), rw(traderAddress(wallet, sub, market)), rw(ledgerAddress(wallet, sub, market)), ro(SystemProgram.programId)],
   data: new W().u8(33).done(),
 });
 /** Pays what `wallet` owes vault `v` out of its capital into the vault (anyone may; the account
  *  must hold no position). */
 export const payFees = (v: Vault, wallet: PublicKey, sub = 0) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [ro(traderAddress(wallet, sub)), rw(ledgerAddress(wallet, sub)), rw(MARKET), rw(routerPortfolio(wallet, sub)), rw(routerCollateral(wallet, sub)), rw(PERC_VAULT), ro(PERC_VAULT_AUTH), ro(v.key), rw(v.buffer), ro(TOKEN_PROGRAM_ID), ro(PERCOLATOR)],
+  keys: [ro(traderAddress(wallet, sub, v.market)), rw(ledgerAddress(wallet, sub, v.market)), rw(v.market), rw(routerPortfolio(wallet, sub, v.market)), rw(routerCollateral(wallet, sub, v.market)), rw(marketInfo(v.market).percVault), ro(marketInfo(v.market).percVaultAuth), ro(v.key), rw(v.buffer), ro(TOKEN_PROGRAM_ID), ro(PERCOLATOR)],
   data: new W().u8(34).done(),
 });
 export type Owed = { asset: number; owed: bigint };
@@ -1399,34 +1452,34 @@ export function controlSequences(market: Uint8Array, asset: number) {
 }
 
 /** Opens the wallet's main trading account (`sub` 0) or one of its isolated ones. */
-export const openTradingAccount = (wallet: PublicKey, sub = 0) => new TransactionInstruction({
+export const openTradingAccount = (wallet: PublicKey, sub = 0, market = activeMarket()) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [rw(wallet, true), rw(traderAddress(wallet, sub)), rw(routerPortfolio(wallet, sub)), rw(routerCollateral(wallet, sub)), rw(MARKET), ro(MINT), ro(PERCOLATOR), ro(SystemProgram.programId), ro(TOKEN_PROGRAM_ID),
+  keys: [rw(wallet, true), rw(traderAddress(wallet, sub, market)), rw(routerPortfolio(wallet, sub, market)), rw(routerCollateral(wallet, sub, market)), rw(market), ro(MINT), ro(PERCOLATOR), ro(SystemProgram.programId), ro(TOKEN_PROGRAM_ID),
     // The wallet's record of values, its main trader account and main portfolio (an isolated
     // account creates the record and marks the main account; a main account only looks).
-    rw(equitiesAddress(wallet)), ...(sub ? [rw(traderAddress(wallet)), ro(routerPortfolio(wallet))] : [])],
+    rw(equitiesAddress(wallet, market)), ...(sub ? [rw(traderAddress(wallet, 0, market)), ro(routerPortfolio(wallet, 0, market))] : [])],
   data: sub ? new W().u8(0).u8(sub).done() : new W().u8(0).done(),
 });
-export const routerDeposit = (wallet: PublicKey, amount: bigint, sub = 0) => new TransactionInstruction({
+export const routerDeposit = (wallet: PublicKey, amount: bigint, sub = 0, market = activeMarket()) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [ro(wallet, true), ro(traderAddress(wallet, sub)), rw(ata(wallet, MINT)), rw(routerCollateral(wallet, sub)), rw(routerPortfolio(wallet, sub)), rw(MARKET), rw(PERC_VAULT), ro(TOKEN_PROGRAM_ID), ro(PERCOLATOR), rw(statsAddress(wallet)), rw(equitiesAddress(wallet))],
+  keys: [ro(wallet, true), ro(traderAddress(wallet, sub, market)), rw(ata(wallet, MINT)), rw(routerCollateral(wallet, sub, market)), rw(routerPortfolio(wallet, sub, market)), rw(market), rw(marketInfo(market).percVault), ro(TOKEN_PROGRAM_ID), ro(PERCOLATOR), rw(statsAddress(wallet, market)), rw(equitiesAddress(wallet, market))],
   data: new W().u8(1).u64(amount).done(),
 });
-export const routerWithdraw = (wallet: PublicKey, amount: bigint, sub = 0) => new TransactionInstruction({
+export const routerWithdraw = (wallet: PublicKey, amount: bigint, sub = 0, market = activeMarket()) => new TransactionInstruction({
   programId: ROUTER,
   // Last: the fee ledger (what is owed to the vaults must be paid before a withdrawal). The
   // wallet and trader account writable: a withdrawal with no position left returns the keeper
   // deposit (see `KEEPER_DEPOSIT`).
-  keys: [rw(wallet, true), rw(traderAddress(wallet, sub)), rw(routerPortfolio(wallet, sub)), rw(MARKET), rw(routerCollateral(wallet, sub)), rw(ata(wallet, MINT)), rw(PERC_VAULT), ro(PERC_VAULT_AUTH), ro(TOKEN_PROGRAM_ID), ro(PERCOLATOR), rw(statsAddress(wallet)), ro(ledgerAddress(wallet, sub)),
+  keys: [rw(wallet, true), rw(traderAddress(wallet, sub, market)), rw(routerPortfolio(wallet, sub, market)), rw(market), rw(routerCollateral(wallet, sub, market)), rw(ata(wallet, MINT)), rw(marketInfo(market).percVault), ro(marketInfo(market).percVaultAuth), ro(TOKEN_PROGRAM_ID), ro(PERCOLATOR), rw(statsAddress(wallet, market)), ro(ledgerAddress(wallet, sub, market)),
     // The copy address: only while it is empty (no copy running) does a flat withdrawal return the keeper deposit.
-    ro(rpda(Buffer.from("copy"), MARKET.toBuffer(), wallet.toBuffer())), rw(equitiesAddress(wallet))],
+    ro(rpda(Buffer.from("copy"), market.toBuffer(), wallet.toBuffer())), rw(equitiesAddress(wallet, market))],
   data: new W().u8(2).u64(amount).done(),
 });
 /** Turns a trading account's released profit into capital (what a withdrawal pays out). Anyone
  *  may send it; it fails when there is nothing to convert. */
-export const routerConvertPnl = (wallet: PublicKey, sub = 0) => new TransactionInstruction({
+export const routerConvertPnl = (wallet: PublicKey, sub = 0, market = activeMarket()) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [ro(traderAddress(wallet, sub)), rw(MARKET), rw(routerPortfolio(wallet, sub)), ro(PERCOLATOR)],
+  keys: [ro(traderAddress(wallet, sub, market)), rw(market), rw(routerPortfolio(wallet, sub, market)), ro(PERCOLATOR)],
   data: new W().u8(22).done(),
 });
 export const openBook = (payer: PublicKey, vault: PublicKey) => new TransactionInstruction({
@@ -1441,7 +1494,7 @@ export const requestTrade = (wallet: PublicKey, vault: PublicKey, size: bigint, 
   const sub = opts.sub ?? 0;
   return new TransactionInstruction({
     programId: ROUTER,
-    keys: [rw(wallet, true), rw(traderAddress(wallet, sub)), ro(vault), rw(bookAddress(vault)), rw(requestAddress(vault, accountOwner(wallet, sub))), ro(MARKET), ro(routerPortfolio(wallet, sub)), ro(SystemProgram.programId), ro(tiersAddress())],
+    keys: [rw(wallet, true), rw(traderAddress(wallet, sub, marketOfVault(vault))), ro(vault), rw(bookAddress(vault)), rw(requestAddress(vault, accountOwner(wallet, sub, marketOfVault(vault)))), ro(marketOfVault(vault)), ro(routerPortfolio(wallet, sub, marketOfVault(vault))), ro(SystemProgram.programId), ro(tiersAddress(marketOfVault(vault)))],
     data: opts.closeOnly ? new W().u8(4).i128(size).u8(1).done() : new W().u8(4).i128(size).done(),
   });
 };
@@ -1476,7 +1529,7 @@ export const settleEpoch = (executor: PublicKey, v: Vault, r: RouterRequest, fro
   programId: ROUTER,
   keys: [
     rw(executor, true), rw(r.key), rw(r.wallet), rw(bookAddress(v.key)), ro(routerAuthority()),
-    rw(v.key), rw(MARKET), rw(v.lpPortfolio), rw(v.buffer), rw(PERC_VAULT), ro(PERC_VAULT_AUTH), rw(v.shareMint), rw(v.escrow),
+    rw(v.key), rw(v.market), rw(v.lpPortfolio), rw(v.buffer), rw(marketInfo(v.market).percVault), ro(marketInfo(v.market).percVaultAuth), rw(v.shareMint), rw(v.escrow),
     rw(epochAddress(v.key, v.epoch)), ro(v.delegate), ro(PERCOLATOR), ro(VAULT_PROGRAM), ro(TOKEN_PROGRAM_ID), ro(SystemProgram.programId),
   ],
   data: new W().u8(10).u64(frontier).done(),
@@ -1484,7 +1537,7 @@ export const settleEpoch = (executor: PublicKey, v: Vault, r: RouterRequest, fro
 /** Switches a vault to closing-only when its overdue epoch's withdrawals exceed its cash. */
 export const requireFlat = (v: Vault) => new TransactionInstruction({
   programId: VAULT_PROGRAM,
-  keys: [rw(v.key), ro(MARKET), ro(v.lpPortfolio), ro(v.buffer), ro(v.shareMint)],
+  keys: [rw(v.key), ro(v.market), ro(v.lpPortfolio), ro(v.buffer), ro(v.shareMint)],
   data: new W().u8(35).done(),
 });
 /** Whether an epoch's withdrawals fit in the vault's cash, so it can settle with the vault's
@@ -1502,7 +1555,7 @@ export function canSettleOpen(s: State): boolean {
 export const TOPUP_BELOW_BPS = 4_000n;
 export const topUpMargin = (v: Vault) => new TransactionInstruction({
   programId: VAULT_PROGRAM,
-  keys: [ro(v.key), rw(MARKET), rw(v.lpPortfolio), rw(v.buffer), rw(PERC_VAULT), ro(TOKEN_PROGRAM_ID), ro(PERCOLATOR)],
+  keys: [ro(v.key), rw(v.market), rw(v.lpPortfolio), rw(v.buffer), rw(marketInfo(v.market).percVault), ro(TOKEN_PROGRAM_ID), ro(PERCOLATOR)],
   data: new W().u8(38).done(),
 });
 /** Whether `TopUpMargin` would be accepted now. */
@@ -1535,7 +1588,7 @@ export const withdrawCover = (v: Vault, treasury: PublicKey, dest: PublicKey, am
  *  outside a fill: a liquidation or a close-out on the other side). Anyone can send it. */
 export const syncInventory = (v: Vault) => new TransactionInstruction({
   programId: VAULT_PROGRAM,
-  keys: [rw(v.key), ro(MARKET), ro(v.lpPortfolio)],
+  keys: [rw(v.key), ro(v.market), ro(v.lpPortfolio)],
   data: new W().u8(34).done(),
 });
 /** Queues the forced close of `wallet`'s position on a vault's market (`payer` may be anyone):
@@ -1543,7 +1596,7 @@ export const syncInventory = (v: Vault) => new TransactionInstruction({
 export const requestClose = (payer: PublicKey, wallet: PublicKey, vault: PublicKey, sub = 0) => new TransactionInstruction({
   programId: ROUTER,
   // (The fee ledger: what the account owes the vaults counts toward its liquidation.)
-  keys: [rw(payer, true), rw(traderAddress(wallet, sub)), ro(wallet), ro(vault), rw(bookAddress(vault)), rw(requestAddress(vault, accountOwner(wallet, sub))), ro(MARKET), ro(SystemProgram.programId), ro(routerPortfolio(wallet, sub)), ro(tiersAddress()), ro(ledgerAddress(wallet, sub))],
+  keys: [rw(payer, true), rw(traderAddress(wallet, sub, marketOfVault(vault))), ro(wallet), ro(vault), rw(bookAddress(vault)), rw(requestAddress(vault, accountOwner(wallet, sub, marketOfVault(vault)))), ro(marketOfVault(vault)), ro(SystemProgram.programId), ro(routerPortfolio(wallet, sub, marketOfVault(vault))), ro(tiersAddress(marketOfVault(vault))), ro(ledgerAddress(wallet, sub, marketOfVault(vault)))],
   data: new W().u8(8).done(),
 });
 /** Moves a vault's mark to a verified Pyth update (a PriceUpdateV2 account). */
@@ -1551,7 +1604,7 @@ export const advanceMark = (v: Vault, pyth: PublicKey, market: Uint8Array) => {
   const s = controlSequences(market, v.assetIndex);
   return new TransactionInstruction({
     programId: ROUTER,
-    keys: [ro(routerAuthority()), ro(v.key), rw(bookAddress(v.key)), rw(MARKET), ro(pyth), ro(VAULT_PROGRAM), ro(PERCOLATOR),
+    keys: [ro(routerAuthority()), ro(v.key), rw(bookAddress(v.key)), rw(v.market), ro(pyth), ro(VAULT_PROGRAM), ro(PERCOLATOR),
       // X1: a reported price is only taken with the witness's price for the feed (router WitnessDisagrees otherwise).
       ...(X1 && v.feed && pyth.equals(reportAddress(v.feed.id)) ? [ro(witnessAddress(v.feed.id))] : []),
       // The vault's price range takes the new mark in (lazy settlement; ignored if not open).
@@ -1562,14 +1615,14 @@ export const advanceMark = (v: Vault, pyth: PublicKey, market: Uint8Array) => {
 /** Records `vault`'s asset tier for the market (anyone may; the router decides it from the feed). */
 export const setTier = (payer: PublicKey, vault: PublicKey) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [rw(payer, true), rw(tiersAddress()), ro(vault), ro(MARKET), ro(SystemProgram.programId)],
+  keys: [rw(payer, true), rw(tiersAddress(marketOfVault(vault))), ro(vault), ro(marketOfVault(vault)), ro(SystemProgram.programId)],
   data: new W().u8(29).done(),
 });
 /** Turns funding on for the market: its cap set to the vault program's constant (vault
  *  `SetFundingCap`, anyone; the program's governor address signs, as for the trade fee). */
-export const setFundingCap = () => new TransactionInstruction({
+export const setFundingCap = (market = activeMarket()) => new TransactionInstruction({
   programId: VAULT_PROGRAM,
-  keys: [ro(PublicKey.findProgramAddressSync([Buffer.from("governor"), MARKET.toBuffer()], VAULT_PROGRAM)[0]), rw(MARKET), ro(PERCOLATOR)],
+  keys: [ro(PublicKey.findProgramAddressSync([Buffer.from("governor"), market.toBuffer()], VAULT_PROGRAM)[0]), rw(market), ro(PERCOLATOR)],
   data: Buffer.from([43]),
 });
 /** One step of a market's funding rate toward its target (router `RefreshFunding`, anyone). It
@@ -1577,26 +1630,26 @@ export const setFundingCap = () => new TransactionInstruction({
  *  that bring it there, in the same transaction; otherwise it does nothing (and fails nothing). */
 export const refreshFunding = (v: Vault) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [ro(v.key), rw(MARKET), ro(routerAuthority()), ro(VAULT_PROGRAM), ro(PERCOLATOR)],
+  keys: [ro(v.key), rw(v.market), ro(routerAuthority()), ro(VAULT_PROGRAM), ro(PERCOLATOR)],
   data: Buffer.from([31]),
 });
 /** Fills a request whose target the mark is at. Anyone can; the executor earns the bond. */
 export const fillRequest = (executor: PublicKey, v: Vault, r: RouterRequest, lazy = false) => new TransactionInstruction({
   programId: ROUTER,
   keys: [
-    rw(executor, true), rw(r.key), rw(traderAddress(r.wallet, r.sub)), rw(r.wallet), rw(bookAddress(v.key)), rw(v.key), rw(MARKET),
-    rw(routerPortfolio(r.wallet, r.sub)), rw(v.lpPortfolio), ro(v.delegate), ro(routerAuthority()), ro(VAULT_PROGRAM), ro(PERCOLATOR),
+    rw(executor, true), rw(r.key), rw(traderAddress(r.wallet, r.sub, v.market)), rw(r.wallet), rw(bookAddress(v.key)), rw(v.key), rw(v.market),
+    rw(routerPortfolio(r.wallet, r.sub, v.market)), rw(v.lpPortfolio), ro(v.delegate), ro(routerAuthority()), ro(VAULT_PROGRAM), ro(PERCOLATOR),
     // A request queued by a standing order comes with that order.
-    ...(r.order !== undefined ? [rw(orderAddress(r.vault, accountOwner(r.wallet, r.sub), r.order))] : []),
+    ...(r.order !== undefined ? [rw(orderAddress(r.vault, accountOwner(r.wallet, r.sub, v.market), r.order))] : []),
     // The vault's holding-fee meter and the trader's fee ledger (router `carry`), the market's
     // leverage-tier record, then last the trader's track record (ignored when the trader has none,
     // as an isolated account always does).
-    rw(carryAddress(v.key)), rw(ledgerAddress(r.wallet, r.sub)),
-    ro(tiersAddress()),
-    rw(equitiesAddress(r.wallet)),
+    rw(carryAddress(v.key)), rw(ledgerAddress(r.wallet, r.sub, v.market)),
+    ro(tiersAddress(v.market)),
+    rw(equitiesAddress(r.wallet, v.market)),
     // With the vault's price range the fill may skip re-valuing the other holders (lazy).
     ...(lazy ? [rw(rangeAddress(v.key))] : []),
-    rw(statsAddress(r.wallet)),
+    rw(statsAddress(r.wallet, v.market)),
   ],
   data: new W().u8(6).done(),
 });
@@ -1632,7 +1685,7 @@ export const expireRequest = (caller: PublicKey, r: RouterRequest) => new Transa
   // (A settlement names its vault: it can then go as soon as its epoch has rolled. A trader's own
   // request names its vault and the market: if the market was behind, its deposit goes back.)
   // (The caller writable: the router pays whoever expires a request a quarter of its bond.)
-  keys: [rw(caller, true), rw(r.key), rw(traderAddress(r.wallet, r.sub)), rw(r.wallet), rw(bookAddress(r.vault)), ...(r.order !== undefined ? [rw(orderAddress(r.vault, accountOwner(r.wallet, r.sub), r.order))] : r.settle ? [ro(r.vault)] : [ro(r.vault), ro(MARKET)])],
+  keys: [rw(caller, true), rw(r.key), rw(traderAddress(r.wallet, r.sub, marketOfVault(r.vault))), rw(r.wallet), rw(bookAddress(r.vault)), ...(r.order !== undefined ? [rw(orderAddress(r.vault, accountOwner(r.wallet, r.sub, marketOfVault(r.vault)), r.order))] : r.settle ? [ro(r.vault)] : [ro(r.vault), ro(marketOfVault(r.vault))])],
   data: new W().u8(7).done(),
 });
 
@@ -1643,7 +1696,7 @@ export const expireRequest = (caller: PublicKey, r: RouterRequest) => new Transa
 
 /** Makers are on where the deployed programs have them (X1 first; QUOTES=0 turns them off). */
 export const QUOTES_ON = X1 && (typeof process === "undefined" || process.env?.QUOTES !== "0");
-export const makerAddress = (wallet: PublicKey, market = MARKET) => PublicKey.findProgramAddressSync([Buffer.from("maker"), market.toBuffer(), wallet.toBuffer()], VAULT_PROGRAM)[0];
+export const makerAddress = (wallet: PublicKey, market = activeMarket()) => PublicKey.findProgramAddressSync([Buffer.from("maker"), market.toBuffer(), wallet.toBuffer()], VAULT_PROGRAM)[0];
 export const QUOTE_MSG_LEN = 114;
 /** The bytes a maker signs (router `quote::quote_message`). */
 export function quoteMessage(maker: PublicKey, trader: PublicKey, asset: number, size: bigint, price: bigint, expiry: bigint, id: bigint): Uint8Array {
@@ -1670,17 +1723,17 @@ export const takeQuote = (v: Vault, wallet: PublicKey, sub: number, q: Quote) =>
   w.u64(size & ((1n << 64n) - 1n)).u64(size >> 64n).u64(BigInt(q.price)).u64(BigInt(q.expiry)).u64(BigInt(q.id));
   return new TransactionInstruction({
     programId: ROUTER,
-    keys: [rw(wallet, true), rw(traderAddress(wallet, sub)), rw(routerPortfolio(wallet, sub)), ro(v.key), ro(bookAddress(v.key)), rw(MARKET),
+    keys: [rw(wallet, true), rw(traderAddress(wallet, sub, v.market)), rw(routerPortfolio(wallet, sub, v.market)), ro(v.key), ro(bookAddress(v.key)), rw(v.market),
       rw(new PublicKey(q.maker)), rw(new PublicKey(q.portfolio)), ro(new PublicKey(q.delegate)), ro(routerAuthority()), ro(VAULT_PROGRAM), ro(PERCOLATOR),
       ro(new PublicKey("Sysvar1nstructions1111111111111111111111111")),
-      rw(carryAddress(v.key)), rw(ledgerAddress(wallet, sub)), ro(tiersAddress()), rw(rangeAddress(v.key)), rw(equitiesAddress(wallet)), rw(statsAddress(wallet))],
+      rw(carryAddress(v.key)), rw(ledgerAddress(wallet, sub, v.market)), ro(tiersAddress(v.market)), rw(rangeAddress(v.key)), rw(equitiesAddress(wallet, v.market)), rw(statsAddress(wallet, v.market))],
     data: w.done(),
   });
 };
 /** The instructions that take quote `q`: its signature check, then TakeQuote. `cranks` (to bring
  *  the maker's and the trader's accounts and the asset to the current slot) go in front. */
 export function takeQuoteIxs(v: Vault, wallet: PublicKey, sub: number, q: Quote, cranks: TransactionInstruction[] = []): TransactionInstruction[] {
-  const msg = quoteMessage(new PublicKey(q.maker), traderAddress(wallet, sub), q.asset, BigInt(q.size), BigInt(q.price), BigInt(q.expiry), BigInt(q.id));
+  const msg = quoteMessage(new PublicKey(q.maker), traderAddress(wallet, sub, v.market), q.asset, BigInt(q.size), BigInt(q.price), BigInt(q.expiry), BigInt(q.id));
   const verify = Ed25519Program.createInstructionWithPublicKey({ publicKey: new PublicKey(q.wallet).toBytes(), message: msg, signature: Buffer.from(q.signature, "base64") });
   return [...cranks, verify, takeQuote(v, wallet, sub, q)];
 }
@@ -1696,7 +1749,7 @@ const QUOTE_URL = (typeof process !== "undefined" && process.env?.QUOTE_URL) || 
  *  instruction (`units` is what the simulation used). */
 export async function quotedTrade(conn: Connection, v: Vault, wallet: PublicKey, sub: number, size: bigint, life = 6, timeoutMs = 700, useReady = true): Promise<{ ixs: TransactionInstruction[]; quote: Quote; units: number } | null> {
   if (!QUOTES_ON || size === 0n) return null;
-  const trader = traderAddress(wallet, sub);
+  const trader = traderAddress(wallet, sub, v.market);
   // A quote fetched ahead (`prefetchQuote`) for exactly this trade, while it has life enough
   // left: used once.
   const k = readyKey(v, trader, size, life);
@@ -1737,7 +1790,7 @@ export const slotEstimate = () => (slotRef.slot ? slotRef.slot + Math.floor((Dat
  *  and side it may trade. */
 export function prefetchQuote(conn: Connection, v: Vault, wallet: PublicKey, sub: number, size: bigint, life = 6, timeoutMs = 1_500): void {
   if (!QUOTES_ON || size === 0n) return;
-  const k = readyKey(v, traderAddress(wallet, sub), size, life);
+  const k = readyKey(v, traderAddress(wallet, sub, v.market), size, life);
   const p = quotedTrade(conn, v, wallet, sub, size, life, timeoutMs, false).catch(() => null);
   // (Kept while it is fetched, so a click meanwhile waits for it instead of asking again.)
   ready.set(k, p);

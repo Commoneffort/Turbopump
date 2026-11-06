@@ -26,7 +26,12 @@ export default async function handler(req: any, res: any) {
     const conn = (conns[net.rpc] ??= new Connection(net.rpc, "processed"));
     const kp = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(secret)));
     const life = req.query.life ? Number(req.query.life) : undefined;
-    const q = await makeQuote(conn, { kp, portfolio: new PublicKey(portfolio), market: new PublicKey(net.market) }, vault, trader, size, life);
+    // (MAKER_PORTFOLIOS_X1: {"<market>": "<portfolio>", ...} for the markets added by the split;
+    // the original market's portfolio stays in MAKER_PORTFOLIO_X1.)
+    const more = JSON.parse(process.env[x1 ? "MAKER_PORTFOLIOS_X1" : "MAKER_PORTFOLIOS"] ?? "{}") as Record<string, string>;
+    const makers = [{ kp, portfolio: new PublicKey(portfolio), market: new PublicKey(net.market) },
+      ...Object.entries(more).map(([mk, pf]) => ({ kp, portfolio: new PublicKey(pf), market: new PublicKey(mk) }))];
+    const q = await makeQuote(conn, makers, vault, trader, size, life);
     return res.status(200).json(q);
   } catch (e: any) {
     return res.status(404).json({ error: String(e?.message ?? e).replace(/https?:\/\/\S+/g, "the RPC") });

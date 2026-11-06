@@ -68,7 +68,9 @@ const landed = (st: { confirmationStatus?: string | null; err?: unknown } | null
 // 0.1 s and does not throttle (170 requests a second went through); the public devnet one does.
 // (Devnet's public RPC allows few getSignatureStatuses calls: polled every 0.4 s it answered 429
 // to all of them for many minutes, and nothing was confirmed any more.)
-const POLL_MS = C.X1 ? 150 : 1_200;
+// (POLL_MS: an executor of one of the markets added by the split checks less often, to stay inside
+// the public RPC's limit for this server.)
+const POLL_MS = Number(process.env.POLL_MS ?? (C.X1 ? 150 : 1_200));
 const payer = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(
   process.env.KEYPAIR ?? `${process.env.HOME}/.config/solana/${C.X1 ? "percolator-x1" : "percolator-test"}/deployer.json`, "utf8"))));
 // ---- the exchange-median price service, recorded locally ----
@@ -630,7 +632,8 @@ const FIRST_ALONE_MS = Number(process.env.RACE_FIRST_MS ?? 1_500);
 // 1,232 bytes). One table per executor key, kept in deploy/logs; ALT=0 turns it off.
 let ALTS: AddressLookupTableAccount[] = [];
 const ALT_ON = C.X1 && process.env.ALT !== "0";
-const altFile = () => `../deploy/logs/alt-${C.NETWORK}-${payer.publicKey.toBase58()}.json`;
+// (One per market: an executor serves one market, and several may share a wallet.)
+const altFile = () => `../deploy/logs/alt-${C.NETWORK}-${payer.publicKey.toBase58()}${process.env.MANIFEST_JSON ? "-" + C.MARKET.toBase58().slice(0, 8) : ""}.json`;
 async function ensureAlt(vaults: C.Vault[]) {
   if (!ALT_ON || !vaults.length) return;
   const want = new Set<string>([C.MARKET, C.ROUTER, C.VAULT_PROGRAM, C.PERCOLATOR, C.routerAuthority(), C.tiersAddress(), SystemProgram.programId, ComputeBudgetProgram.programId, SYSVAR_CLOCK_PUBKEY,

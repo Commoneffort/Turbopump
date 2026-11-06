@@ -92,15 +92,21 @@ export type QuoteOut = { maker: string; wallet: string; portfolio: string; deleg
 
 /** A signed quote for `trader` (a router trading account) to trade `size` (e6 units, + = buy) on
  *  `vault`'s market. Throws when no quote is offered. */
-export async function makeQuote(conn: Connection, m: Maker, vault: PublicKey, trader: PublicKey, size: bigint, life = QUOTE_SLOTS()): Promise<QuoteOut> {
+/** `makers`: our maker on each market (one key, a portfolio per market); the vault's market picks
+ *  which one quotes. The vault and every portfolio are read at once. */
+export async function makeQuote(conn: Connection, makers: Maker | Maker[], vault: PublicKey, trader: PublicKey, size: bigint, life = QUOTE_SLOTS()): Promise<QuoteOut> {
   life = Math.max(3, Math.min(MAX_LIFE(), Math.round(life)));
   if (size === 0n) throw new Error("no size");
+  const all = Array.isArray(makers) ? makers : [makers];
   const V = (L as any).vault;
-  const [accs, slot] = await Promise.all([conn.getMultipleAccountsInfo([vault, m.portfolio], "processed"), conn.getSlot("processed")]);
-  const [va, pa] = accs;
-  if (!va || !va.owner.equals(new PublicKey(VAULT_PROGRAM)) || !pa) throw new Error("unknown vault or maker");
-  const vd = new Uint8Array(va.data), pd = new Uint8Array(pa.data);
-  if (!new PublicKey(vd.slice(V.market, V.market + 32)).equals(m.market)) throw new Error("vault on another market");
+  const [accs, slot] = await Promise.all([conn.getMultipleAccountsInfo([vault, ...all.map(x => x.portfolio)], "processed"), conn.getSlot("processed")]);
+  const va = accs[0];
+  if (!va || !va.owner.equals(new PublicKey(VAULT_PROGRAM))) throw new Error("unknown vault");
+  const vd = new Uint8Array(va.data);
+  const vm = new PublicKey(vd.slice(V.market, V.market + 32));
+  const at = all.findIndex(x => x.market.equals(vm));
+  if (at < 0 || !accs[1 + at]) throw new Error("no maker on this vault's market");
+  const m = all[at], pd = new Uint8Array(accs[1 + at]!.data);
   const asset = u16(vd, V.asset_index);
   const symbol = FEED_SYMBOLS[Buffer.from(vd.slice(V.oracle_feeds, V.oracle_feeds + 32)).toString("hex")];
   if (!symbol) throw new Error("unknown feed");

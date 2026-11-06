@@ -58,6 +58,23 @@ case "$1" in
     if [ -f "$MAKER_KEY" ] && ! running x1-maker; then
       (cd app && NETWORK=x1-testnet RPC=$RPC MAKER_KEY=$MAKER_KEY PERCOLATOR_KEYPAIR=$KEY setsid sh -c 'echo $$ > ../deploy/logs/x1-maker.pid; while :; do npx tsx scripts/maker.ts serve 18300; echo "$(date -u +%T) restart: x1-maker exited with status $?, starting it again in 30 s"; sleep 30; done' >> ../deploy/logs/x1-maker.log 2>&1 < /dev/null &)
     fi
+    # The markets added by the split (deploy/x1-testnet.m<N>.json): each one its own executor
+    # (checking every 1 s, not 0.15: the public RPC limits this server), keeper and maker
+    # renewal. The original market's services are the ones above.
+    for MF in deploy/x1-testnet.m[0-9].json; do
+      [ -f "$MF" ] && grep -q '"market"' "$MF" || continue
+      N=$(basename "$MF" .json | sed 's/.*\.m//'); MJ=$(cat "$MF")
+      if ! running x1-executor-m$N; then
+        (cd app && MANIFEST_JSON="$MJ" NETWORK=x1-testnet RPC=$RPC KEYPAIR=$KEY POLL_MS=${MARKET_POLL_MS:-1000} N=$N setsid sh -c 'echo $$ > ../deploy/logs/x1-executor-m$N.pid; while :; do npx tsx scripts/executor.ts; echo "$(date -u +%T) restart: x1-executor-m$N exited with status $?, starting it again in 5 s"; sleep 5; done' >> ../deploy/logs/x1-executor-m$N.log 2>&1 < /dev/null &)
+      fi
+      if ! running x1-keeper-m$N; then
+        (PERCOLATOR_FIT_COMPUTE=1 PERCOLATOR_MANIFEST=$MF PERCOLATOR_NETWORK=x1-testnet DEVNET_RPC=$RPC PERCOLATOR_KEYPAIR=$KEY PERCOLATOR_FAUCET_KEY=keys/x1-faucet.json N=$N \
+          setsid sh -c 'echo $$ > deploy/logs/x1-keeper-m$N.pid; while :; do deploy/x1-tool keeper; echo "$(date -u +%T) restart: x1-keeper-m$N exited with status $?, starting it again in 5 s"; sleep 5; done' >> deploy/logs/x1-keeper-m$N.log 2>&1 < /dev/null &)
+      fi
+      if [ -f "$MAKER_KEY" ] && ! running x1-maker-m$N; then
+        (cd app && MANIFEST_JSON="$MJ" NETWORK=x1-testnet RPC=$RPC MAKER_KEY=$MAKER_KEY PERCOLATOR_KEYPAIR=$KEY N=$N setsid sh -c 'echo $$ > ../deploy/logs/x1-maker-m$N.pid; while :; do npx tsx scripts/maker.ts serve $((18300 + N)); echo "$(date -u +%T) restart: x1-maker-m$N exited with status $?, starting it again in 30 s"; sleep 30; done' >> ../deploy/logs/x1-maker-m$N.log 2>&1 < /dev/null &)
+      fi
+    done
     if ! running x1-keeper; then
       (PERCOLATOR_FIT_COMPUTE=1 PERCOLATOR_MANIFEST=deploy/x1-testnet.json PERCOLATOR_NETWORK=x1-testnet DEVNET_RPC=$RPC PERCOLATOR_KEYPAIR=$KEY PERCOLATOR_FAUCET_KEY=keys/x1-faucet.json \
         setsid sh -c 'echo $$ > deploy/logs/x1-keeper.pid; while :; do deploy/x1-tool keeper; echo "$(date -u +%T) restart: x1-keeper exited with status $?, starting it again in 5 s"; sleep 5; done' >> deploy/logs/x1-keeper.log 2>&1 < /dev/null &)
@@ -66,13 +83,13 @@ case "$1" in
     "$0" status
     ;;
   stop)
-    for s in price-service price-witness-source x1-witness x1-alerts x1-watchdog x1-fills-log x1-executor x1-backup-executor x1-maker x1-keeper; do
+    for s in price-service price-witness-source x1-witness x1-alerts x1-watchdog x1-fills-log x1-executor x1-backup-executor x1-maker x1-keeper $(for MF in deploy/x1-testnet.m[0-9].json; do [ -f "$MF" ] && N=$(basename "$MF" .json | sed "s/.*\.m//") && echo x1-executor-m$N x1-keeper-m$N x1-maker-m$N; done); do
       if running $s; then kill -- "-$(cat deploy/logs/$s.pid)"; echo "$s stopped"; fi
       rm -f deploy/logs/$s.pid
     done
     ;;
   status)
-    for s in price-service price-witness-source x1-witness x1-alerts x1-watchdog x1-fills-log x1-executor x1-backup-executor x1-maker x1-keeper; do
+    for s in price-service price-witness-source x1-witness x1-alerts x1-watchdog x1-fills-log x1-executor x1-backup-executor x1-maker x1-keeper $(for MF in deploy/x1-testnet.m[0-9].json; do [ -f "$MF" ] && N=$(basename "$MF" .json | sed "s/.*\.m//") && echo x1-executor-m$N x1-keeper-m$N x1-maker-m$N; done); do
       if running $s; then echo "$s running (process group $(cat deploy/logs/$s.pid))"; else echo "$s not running"; fi
     done
     ;;

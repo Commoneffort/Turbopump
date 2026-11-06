@@ -390,11 +390,19 @@ export function useActions(me: Me, send: Send, reload: () => void) {
     unfollow: (leader: string, name: string) => publicKey && run(`Unfollow ${name}`, [S.unfollow(publicKey, new PublicKey(leader))]),
     /** One click: a trading account and its track record if the wallet has none yet, a follow
      *  (so the trader's fills show on the chart), and the copy itself. */
-    copy: (leader: string, name: string, ratioBps = 10_000, maxNotional = 0n) => publicKey && run(me.copy?.leader.toBase58() === leader ? `New terms for copying ${name}` : `Copy ${name} (${S.COPY_FEE_TEXT})`, [
+    copy: async (leader: string, name: string, ratioBps = 10_000, maxNotional = 0n) => {
+      if (!publicKey) return;
+      // Since the market split a copy works between two accounts on the same market only.
+      if (C.NEW_MARKETS.length && !(await C.homeMarket(view, new PublicKey(leader)).catch(() => C.activeMarket())).equals(C.activeMarket())) {
+        window.alert(`${name} trades on another of the exchange's markets than your wallet, and copying works only within one market. Copying ${name} is not possible from this wallet.`);
+        return;
+      }
+      return run(me.copy?.leader.toBase58() === leader ? `New terms for copying ${name}` : `Copy ${name} (${S.COPY_FEE_TEXT})`, [
       ...setup(publicKey, me),
       ...(me.following.has(leader) ? [] : [S.follow(publicKey, new PublicKey(leader))]),
       S.setCopy(publicKey, new PublicKey(leader), ratioBps, maxNotional),
-    ]),
+    ]);
+    },
     stop: () => publicKey && run("Stop copying", [S.stopCopy(publicKey)]),
     feature: () => publicKey && run(`A day in the featured row (${S.SMALL_FEE_TEXT})`, [S.feature(publicKey)]),
   };

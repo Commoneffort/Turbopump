@@ -40,7 +40,7 @@ export type Held = {
  *  sized from this: a position the page shows can be seconds old, and a stop or take-profit that
  *  filled meanwhile would turn a close of the old size into a new position the other way. */
 async function heldNow(conn: Connection, wallet: PublicKey, asset: number, sub = 0): Promise<bigint> {
-  const [pf, m] = await conn.getMultipleAccountsInfo([C.routerPortfolio(wallet, sub), C.MARKET], "confirmed");
+  const [pf, m] = await conn.getMultipleAccountsInfo([C.routerPortfolio(wallet, sub), C.activeMarket()], "confirmed");
   if (!pf || !m) return 0n;
   return C.decodePortfolio(new Uint8Array(pf.data), asset, new Uint8Array(m.data)).position;
 }
@@ -96,7 +96,7 @@ export function liqIn(h: ReturnType<typeof C.accountHealth>, market: Uint8Array,
  *  released profit turned into capital, what it owes the vaults paid, the rest withdrawn. Only for
  *  an account with no position (the router allows nothing else). */
 export async function returnMargin(conn: Connection, wallet: PublicKey, sub: number, vaults: C.Vault[]): Promise<TransactionInstruction[]> {
-  const [pf, led, m] = await conn.getMultipleAccountsInfo([C.routerPortfolio(wallet, sub), C.ledgerAddress(wallet, sub), C.MARKET], "confirmed");
+  const [pf, led, m] = await conn.getMultipleAccountsInfo([C.routerPortfolio(wallet, sub), C.ledgerAddress(wallet, sub), C.activeMarket()], "confirmed");
   if (!pf || !m) return [];
   const p = C.decodePortfolio(new Uint8Array(pf.data), 0, new Uint8Array(m.data));
   const owed = C.decodeLedger(led ? new Uint8Array(led.data) : null).filter(o => o.owed > 0n);
