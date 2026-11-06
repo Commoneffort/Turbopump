@@ -150,3 +150,32 @@ Going live on X1 needs, after the program upgrades: `cd app && npx tsx scripts/m
 <usdc>` (with the X1 test USDC mint authority as `PERCOLATOR_FAUCET_KEY`), the two Vercel
 variables it prints, `maker.ts serve` kept running (it renews the matcher config before it
 expires), and the page published.
+
+## More room: five markets on X1 (2026-11-06)
+
+A chain caps the compute that may write one account in a block: X1 runs Solana's limits, 12M
+units for one account in a 60M block (the 100M block feature is not on for X1 testnet). Every
+trade writes its Percolator market account, and a trade costs about 270k to 550k units (about 85%
+of it Percolator's own trade call; building the engine with other optimisation settings did not
+change it), so one market account takes about 22 to 44 trades a block. Four more markets
+(`deploy/x1-testnet.m1.json` to `m4.json`), each listing SOL, BTC and ETH at the same asset numbers
+as the original (4, 5, 6), spread trading over five accounts, close to what a whole block holds.
+
+- **One market per wallet.** A wallet keeps all its accounts on one market, so its margin is
+  still shared across assets: the first market where it has an account (the original market
+  first, so every account from before stays where it is), else the one its address places it on
+  (`C.homeMarket`, `C.placedMarket`). The page finds it before reading anything of the wallet's.
+- **Liquidity per market.** Each market has its own vaults (15,000 test USDC seeded each) and a
+  maker portfolio (50,000 each, the same maker key; `MAKER_PORTFOLIOS_X1` for the quote API).
+- **Services per market:** an executor (checks every 1 s, `POLL_MS`), a keeper and a maker renewal
+  (`deploy/x1-services.sh`).
+- **Not across markets:** copying a trader on another market (the page refuses it).
+
+Measured on X1 (`scripts/split-smoke.ts`, `scripts/split-drill.ts`): a quoted trade on a new market
+fills 0.6 to 1.0 s after the quote is asked for; a queued one 1.8 s after it is queued. In a burst
+of 50 trades over five markets, 12 to 14 landed in one block from several markets at once. The
+burst itself was limited by the public RPC, which allows this server only a few transactions a
+second on top of its services (every visitor sends from their own address, so this limits our
+services and drills, not the traders). Open: some trades in a burst on the new markets failed
+with Percolator's `EngineLockActive` (cause not yet found; a single trade then goes through).
+
