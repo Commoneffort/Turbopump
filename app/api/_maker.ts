@@ -10,7 +10,7 @@
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { ed25519 } from "@noble/curves/ed25519";
 import L from "./_layout.js";
-import { FEED_SYMBOLS, PERCOLATOR, VAULT_PROGRAM } from "./_config.js";
+import { FEED_SYMBOLS, PERCOLATOR, ROUTER, VAULT_PROGRAM } from "./_config.js";
 
 const env = (k: string, d: number) => Number((globalThis as any).process?.env?.[k] ?? d);
 export const SPREAD_BPS = () => env("MAKER_SPREAD_BPS", 2);
@@ -28,10 +28,16 @@ export const QUOTE_SLOTS = () => env("MAKER_QUOTE_SLOTS", 6);
 export const MAX_LIFE = () => env("MAKER_MAX_LIFE", 40);
 export const LIFE_BPS_PER_SEC = () => env("MAKER_LIFE_BPS_PER_SEC", 0.5);
 const PRICE_MAX_AGE_MS = 10_000;
+/** No quote while the exchanges' price is further than this (bps) from the market's mark: a
+ *  trading key's quote must be within its band (0.5% by default) of Percolator's price, so such a
+ *  quote would fail; the order then queues and fills at the oracle price instead. */
+export const MAX_DRIFT_BPS = () => env("MAKER_MAX_DRIFT_BPS", 40);
 const PRICE_URL = () => (globalThis as any).process?.env?.MAKER_PRICES ?? "http://jack0.x1.xyz:8090";
 const JACK_SYMBOL: Record<string, string> = { XAU: "GOLD", XAG: "SILVER" };
 
-export type Maker = { kp: Keypair; portfolio: PublicKey; market: PublicKey };
+/** A maker on a market; `asset` set: it quotes only that asset (a portfolio holding one asset is
+ *  cheaper to bring current in TakeQuote than one holding them all). */
+export type Maker = { kp: Keypair; portfolio: PublicKey; market: PublicKey; asset?: number };
 const u16 = (d: Uint8Array, o: number) => d[o] | (d[o + 1] << 8);
 const u32 = (d: Uint8Array, o: number) => (d[o] | (d[o + 1] << 8) | (d[o + 2] << 16)) + d[o + 3] * 2 ** 24;
 const u64 = (d: Uint8Array, o: number) => new DataView(d.buffer, d.byteOffset).getBigUint64(o, true);
@@ -99,18 +105,24 @@ export async function makeQuote(conn: Connection, makers: Maker | Maker[], vault
   if (size === 0n) throw new Error("no size");
   const all = Array.isArray(makers) ? makers : [makers];
   const V = (L as any).vault;
-  const [accs, slot] = await Promise.all([conn.getMultipleAccountsInfo([vault, ...all.map(x => x.portfolio)], "processed"), conn.getSlot("processed")]);
+  const book = PublicKey.findProgramAddressSync([Buffer.from("book"), vault.toBuffer()], new PublicKey(ROUTER))[0];
+  const [accs, slot] = await Promise.all([conn.getMultipleAccountsInfo([vault, book, ...all.map(x => x.portfolio)], "processed"), conn.getSlot("processed")]);
   const va = accs[0];
   if (!va || !va.owner.equals(new PublicKey(VAULT_PROGRAM))) throw new Error("unknown vault");
   const vd = new Uint8Array(va.data);
   const vm = new PublicKey(vd.slice(V.market, V.market + 32));
-  const at = all.findIndex(x => x.market.equals(vm));
-  if (at < 0 || !accs[1 + at]) throw new Error("no maker on this vault's market");
-  const m = all[at], pd = new Uint8Array(accs[1 + at]!.data);
   const asset = u16(vd, V.asset_index);
+  // The asset's own maker on this market if there is one, else the market's.
+  let at = all.findIndex((x, i) => x.market.equals(vm) && x.asset === asset && !!accs[2 + i]);
+  if (at < 0) at = all.findIndex((x, i) => x.market.equals(vm) && x.asset === undefined && !!accs[2 + i]);
+  if (at < 0) throw new Error("no maker on this vault's market");
+  const m = all[at], pd = new Uint8Array(accs[2 + at]!.data);
   const symbol = FEED_SYMBOLS[Buffer.from(vd.slice(V.oracle_feeds, V.oracle_feeds + 32)).toString("hex")];
   if (!symbol) throw new Error("unknown feed");
   const ref = await priceOf(symbol);
+  const bd = accs[1] ? new Uint8Array(accs[1].data) : undefined;
+  const mark = bd ? Number(u64(bd, (L as any).router.book.mark_price)) / 1e6 : 0;
+  if (mark > 0 && Math.abs(ref - mark) / mark * 10_000 > MAX_DRIFT_BPS()) throw new Error("the market's price is too far from the exchanges' for a quote");
   const notional = (Math.abs(Number(size)) / 1e6) * ref;
   if (notional > MAX_NOTIONAL()) throw new Error("too large for a quote");
   const held = makerPositions(pd).get(asset) ?? 0n;

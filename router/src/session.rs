@@ -13,7 +13,7 @@
 //! (one key per wallet and market); `CloseSession`, by the wallet or by the key itself, ends it and
 //! returns the account's rent to the wallet.
 use bytemuck::{Pod, Zeroable};
-use solana_program::{account_info::AccountInfo, clock::Clock, entrypoint::ProgramResult, msg, pubkey::Pubkey, system_program, sysvar::Sysvar};
+use solana_program::{account_info::AccountInfo, clock::Clock, entrypoint::ProgramResult, msg, program::invoke, pubkey::Pubkey, rent::Rent, system_instruction, system_program, sysvar::Sysvar};
 
 use crate::state::*;
 use crate::*;
@@ -46,17 +46,54 @@ pub struct Session {
     pub opened: i64,
     pub bump: u8,
     pub _pad: [u8; 7],
+    // Since 2026-11-07 (sessions opened before have 152 bytes and read these as 0):
+    /// The most notional the key may open or grow positions by in the current window (0: no cap).
+    pub max_day_notional: u64,
+    /// What it has opened or grown by in the current window.
+    pub day_notional: u64,
+    /// How far (bps) from Percolator's price a maker's quote taken by the key may be (0: the
+    /// default, `DEFAULT_SLIPPAGE_BPS`). A quote is the price paid, so this is the most a key can
+    /// lose to a bad quote on one trade.
+    pub max_slippage_bps: u16,
+    pub _pad2: [u8; 6],
 }
 pub const SESSION_LEN: usize = core::mem::size_of::<Session>();
+/// The length of sessions opened before 2026-11-07.
+pub const LEGACY_SESSION_LEN: usize = 152;
+const _: () = assert!(SESSION_LEN == 176);
+/// A key's quote band when the wallet set none.
+pub const DEFAULT_SLIPPAGE_BPS: u16 = 50;
+
+/// Reads a session of either length (a legacy one with the newer fields 0).
+fn load_session(ai: &AccountInfo, program_id: &Pubkey) -> Result<Session, solana_program::program_error::ProgramError> {
+    let n = ai.data_len();
+    if ai.owner != program_id || (n != SESSION_LEN && n != LEGACY_SESSION_LEN) {
+        return Err(RouterError::BadAccount.into());
+    }
+    let mut buf = [0u8; SESSION_LEN];
+    buf[..n].copy_from_slice(&ai.try_borrow_data()?);
+    if buf[..8] != SESSION_MAGIC.to_le_bytes() {
+        return Err(RouterError::BadAccount.into());
+    }
+    Ok(bytemuck::pod_read_unaligned(&buf))
+}
+/// Writes a session back at its account's length.
+fn store_session(ai: &AccountInfo, s: &Session) -> ProgramResult {
+    let n = ai.data_len();
+    ai.try_borrow_mut_data()?.copy_from_slice(&bytemuck::bytes_of(s)[..n]);
+    Ok(())
+}
 
 pub fn session_address(program_id: &Pubkey, market: &Pubkey, wallet: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[SEED_SESSION, market.as_ref(), wallet.as_ref()], program_id)
 }
 
 /// OpenSession: accounts [wallet (signer, pays), session (writable), market, system];
-/// data: key (32), expires (i64, unix), max_notional (u64), max_trades (u32).
+/// data: key (32), expires (i64, unix), max_notional (u64), max_trades (u32), then optionally
+/// max_day_notional (u64, 0 = no cap) and max_slippage_bps (u16, 0 = the default, at most the
+/// router's quote band).
 pub fn open_session(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
-    if data.len() != 52 {
+    if data.len() != 52 && data.len() != 62 {
         return Err(RouterError::InvalidInstruction.into());
     }
     let (wallet, session_ai, market, system) = (acc(accounts, 0)?, acc(accounts, 1)?, acc(accounts, 2)?, acc(accounts, 3)?);
@@ -69,6 +106,14 @@ pub fn open_session(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) 
     let expires = i64::from_le_bytes(data[32..40].try_into().unwrap());
     let max_notional = u64::from_le_bytes(data[40..48].try_into().unwrap());
     let max_trades = u32::from_le_bytes(data[48..52].try_into().unwrap());
+    let (max_day_notional, max_slippage_bps) = if data.len() == 62 {
+        (u64::from_le_bytes(data[52..60].try_into().unwrap()), u16::from_le_bytes(data[60..62].try_into().unwrap()))
+    } else {
+        (0, 0)
+    };
+    if max_slippage_bps as u128 > crate::quote::QUOTE_BAND_BPS || (max_day_notional != 0 && max_day_notional < max_notional) {
+        return Err(RouterError::SessionLimit.into());
+    }
     let now = Clock::get()?.unix_timestamp;
     // The key must be a key of its own: not the wallet, not empty. (A key that is not a real
     // public key could never sign, so approving one only approves nothing.)
@@ -84,12 +129,23 @@ pub fn open_session(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) 
         create_pda(wallet, session_ai, system, program_id, SESSION_LEN, 0, &[SEED_SESSION, market.key.as_ref(), wallet.key.as_ref(), &[bump]])?;
     } else {
         // A key approved before is replaced: it signs nothing from now on.
-        let old: Session = load(session_ai, program_id, SESSION_MAGIC)?;
+        let old = load_session(session_ai, program_id)?;
         if old.wallet != *wallet.key || old.market != *market.key {
             return Err(RouterError::BadAccount.into());
         }
+        // A session from before the daily cap grows to the current layout (the wallet pays).
+        if session_ai.data_len() == LEGACY_SESSION_LEN {
+            let need = Rent::get()?.minimum_balance(SESSION_LEN).saturating_sub(session_ai.lamports());
+            if need > 0 {
+                invoke(&system_instruction::transfer(wallet.key, session_ai.key, need), &[wallet.clone(), session_ai.clone(), system.clone()])?;
+            }
+            session_ai.realloc(SESSION_LEN, true)?;
+        }
     }
-    store(session_ai, &Session { magic: SESSION_MAGIC, market: *market.key, wallet: *wallet.key, key, expires, max_notional, max_trades, trades: 0, window_start: now, opened: now, bump, _pad: [0; 7] })?;
+    store_session(session_ai, &Session {
+        magic: SESSION_MAGIC, market: *market.key, wallet: *wallet.key, key, expires, max_notional, max_trades, trades: 0, window_start: now, opened: now, bump, _pad: [0; 7],
+        max_day_notional, day_notional: 0, max_slippage_bps, _pad2: [0; 6],
+    })?;
     msg!("session {} until {}", key, expires);
     Ok(())
 }
@@ -100,7 +156,7 @@ pub fn close_session(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramRe
     signer(who)?;
     writable(session_ai)?;
     writable(wallet)?;
-    let s: Session = load(session_ai, program_id, SESSION_MAGIC)?;
+    let s = load_session(session_ai, program_id)?;
     key_is(wallet, &s.wallet)?;
     if *who.key != s.wallet && *who.key != s.key {
         return Err(RouterError::SessionInvalid.into());
@@ -110,16 +166,17 @@ pub fn close_session(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramRe
 
 /// Whether `actor` may trade for `wallet` on `market` (a trade of `notional`, or one that only
 /// reduces): the wallet itself, or its approved key within the key's limits. A trade by the key
-/// counts toward its daily limit (the session account must then be passed, writable).
-pub(crate) fn authorize(program_id: &Pubkey, accounts: &[AccountInfo], actor: &AccountInfo, wallet: &Pubkey, market: &Pubkey, notional: u128, reducing: bool) -> ProgramResult {
+/// counts toward its daily limits (the session account must then be passed, writable). Returns
+/// the band (bps) a quote taken by the key must be within, or `None` for the wallet itself.
+pub(crate) fn authorize(program_id: &Pubkey, accounts: &[AccountInfo], actor: &AccountInfo, wallet: &Pubkey, market: &Pubkey, notional: u128, reducing: bool) -> Result<Option<u16>, solana_program::program_error::ProgramError> {
     signer(actor)?;
     if actor.key == wallet {
-        return Ok(());
+        return Ok(None);
     }
     let sk = session_address(program_id, market, wallet).0;
     let session_ai = accounts.iter().find(|a| *a.key == sk).ok_or(RouterError::SessionInvalid)?;
     writable(session_ai)?;
-    let mut s: Session = load(session_ai, program_id, SESSION_MAGIC)?;
+    let mut s = load_session(session_ai, program_id)?;
     if s.wallet != *wallet || s.market != *market || s.key != *actor.key {
         return Err(RouterError::SessionInvalid.into());
     }
@@ -133,12 +190,21 @@ pub(crate) fn authorize(program_id: &Pubkey, accounts: &[AccountInfo], actor: &A
     if now.saturating_sub(s.window_start) >= SESSION_WINDOW_SECS {
         s.window_start = now;
         s.trades = 0;
+        s.day_notional = 0;
     }
     if !reducing && s.trades >= s.max_trades {
         return Err(RouterError::SessionLimit.into());
     }
+    if !reducing {
+        let day = (s.day_notional as u128).saturating_add(notional);
+        if s.max_day_notional != 0 && day > s.max_day_notional as u128 {
+            return Err(RouterError::SessionLimit.into());
+        }
+        s.day_notional = day.min(u64::MAX as u128) as u64;
+    }
     s.trades = s.trades.saturating_add(1);
-    store(session_ai, &s)
+    store_session(session_ai, &s)?;
+    Ok(Some(if s.max_slippage_bps == 0 { DEFAULT_SLIPPAGE_BPS } else { s.max_slippage_bps }))
 }
 
 /// The notional of `size` (asset atoms, e6) at `price` (e6 per unit): collateral atoms.

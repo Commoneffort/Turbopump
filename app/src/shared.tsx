@@ -496,7 +496,27 @@ function PastResults({ state }: { state: C.State }) {
   );
 }
 
-export function LiquidityPanel({ state, send, busy }: { state: C.State; send: Send; busy?: string }) {
+/** The same asset's vault on every market (X1 runs five since 2026-11-06), with the wallet's
+ *  shares, ticket and share price in each, refreshed every 20 s while the panel is open. */
+function useSiblings(state: C.State, user: PublicKey | null, tick: number) {
+  const { connection } = useConnection();
+  const [rows, setRows] = useState<C.State[]>([]);
+  const feed = state.vault.feedHex, me = user?.toBase58();
+  useEffect(() => {
+    if (C.MARKETS.length < 2) { setRows([]); return; }
+    let live = true;
+    (async () => {
+      const all = (await C.listVaults(connection, true)).filter(v => v.canonical && v.feedHex === feed && v.status === 1);
+      const got: C.State[] = [];
+      for (const v of all) got.push(await C.fetchVault(connection, v.key, user ?? undefined));
+      if (live) setRows(got);
+    })().catch(() => {});
+    return () => { live = false; };
+  }, [feed, me, Math.floor(tick / 20), connection]);
+  return rows;
+}
+
+export function LiquidityPanel({ state, send, busy, tick = 0 }: { state: C.State; send: Send; busy?: string; tick?: number }) {
   const { publicKey } = useWallet();
   const [amount, setAmount] = useState("100");
   const [out, setOut] = useState("");
@@ -513,6 +533,32 @@ export function LiquidityPanel({ state, send, busy }: { state: C.State; send: Se
     createAssociatedTokenAccountIdempotentInstruction(u, C.ata(u, C.MINT), u, C.MINT),
     C.claim(v, u, t!.epoch),
   ];
+  // Every market's vault for this asset: one deposit spread over all of them (so the split
+  // markets do not leave each pool thin), claims and withdrawals from all of them at once.
+  const sibs = useSiblings(state, publicKey, tick);
+  const [spread, setSpread] = useState(true);
+  const live = sibs.filter(x => x.vault.frozenUntil * 1000 < Date.now());
+  const many = sibs.length > 1;
+  const priceOf = (x: C.State) => x.shareSupply > 0n ? num(C.navOf(x), C.USDC) / num(x.shareSupply, 10 ** C.SHARE_DECIMALS) : 1;
+  const claimOf = (x: C.State, u: PublicKey) => x.ticket && (x.ticket.deposit > 0n || x.ticket.withdraw > 0n) && x.ticket.epoch < x.vault.epoch ? [
+    createAssociatedTokenAccountIdempotentInstruction(u, C.ata(u, x.vault.shareMint), u, x.vault.shareMint),
+    C.claim(x.vault, u, x.ticket.epoch),
+  ] : [];
+  // (Two vaults' claims to a transaction: five would not fit in one.)
+  const claimAll = async (u: PublicKey) => {
+    const due = sibs.filter(x => claimOf(x, u).length);
+    for (let i = 0; i < due.length; i += 2) {
+      const r = await send(`Claim on every market (${Math.min(i + 2, due.length)} of ${due.length})`, [createAssociatedTokenAccountIdempotentInstruction(u, C.ata(u, C.MINT), u, C.MINT), ...due.slice(i, i + 2).flatMap(x => claimOf(x, u))]);
+      if (!r) return;
+    }
+  };
+  const claimableAll = many && !!publicKey && sibs.some(x => claimOf(x, publicKey).length > 0);
+  const totalValue = sibs.reduce((a, x) => a + num(x.userShares, 10 ** C.SHARE_DECIMALS) * priceOf(x), 0);
+  const depositAll = (u: PublicKey) => {
+    const n = BigInt(live.length), each = atoms / n;
+    return [createAssociatedTokenAccountIdempotentInstruction(u, C.ata(u, C.MINT), u, C.MINT),
+      ...live.flatMap((x, i) => { const a = i === live.length - 1 ? atoms - each * (n - 1n) : each; return a > 0n ? [C.requestDeposit(x.vault, u, a)] : []; })];
+  };
   return (
     <>
       <section className="card">
@@ -524,7 +570,17 @@ export function LiquidityPanel({ state, send, busy }: { state: C.State; send: Se
             <div className="row"><span>Share price</span><b>${fmt(price, 4)}</b></div>
             <div className="row"><span>Wallet test USDC</span><b>{usd(state.userCollateral)}</b></div>
             {pending && <div className="note">Queued for epoch {String(t!.epoch)}: {t!.deposit > 0n && `${usd(t!.deposit)} deposit`} {t!.withdraw > 0n && `${shares(t!.withdraw)} shares out`}. It settles at one price when the epoch ends{state.slot < v.epochStart + v.epochLen ? ` (about ${Math.max(1, Math.ceil(Number(v.epochStart + v.epochLen - state.slot) * C.slotSeconds() / 60))} min from now)` : v.needsFlat ? " (this epoch's withdrawals exceed the vault's cash reserve, so the vault has to close its position first: it now only takes trades that reduce it)" : " (being settled now, usually within half a minute)"}; then come back here to claim.</div>}
-            {claimable && <button className="btn primary wide" disabled={!!busy} onClick={() => send("Claim", claimIxs(publicKey))}>Claim epoch {String(t!.epoch)} result</button>}
+            {claimable && !claimableAll && <button className="btn primary wide" disabled={!!busy} onClick={() => send("Claim", claimIxs(publicKey))}>Claim epoch {String(t!.epoch)} result</button>}
+            {many && (
+              <>
+                <div className="row"><span>On all {sibs.length} markets</span><b>${fmt(totalValue)}</b></div>
+                {sibs.map((x, i) => {
+                  const q = x.ticket && x.ticket.epoch === x.vault.epoch && (x.ticket.deposit > 0n || x.ticket.withdraw > 0n);
+                  return <div className="row small" key={x.vault.key.toBase58()}><span>Market {C.MARKETS.findIndex(m => m.key.equals(x.vault.market)) + 1 || i + 1}{x.vault.key.equals(v.key) ? " (this one)" : ""}</span><b>${fmt(num(x.userShares, 10 ** C.SHARE_DECIMALS) * priceOf(x))}{q ? " · queued" : claimOf(x, publicKey).length ? " · to claim" : ""}</b></div>;
+                })}
+                {claimableAll && <button className="btn primary wide" disabled={!!busy} onClick={() => claimAll(publicKey)}>Claim on every market</button>}
+              </>
+            )}
             <Faucet />
           </>
         )}
@@ -533,12 +589,14 @@ export function LiquidityPanel({ state, send, busy }: { state: C.State; send: Se
         <h3>Deposit or withdraw</h3>
         <label className="field"><span>Deposit USDC</span><input value={amount} onChange={e => setAmount(e.target.value)} inputMode="decimal" /></label>
         {frozen && <p className="small">This epoch is being settled at a price that is already fixed, so new requests wait until it has rolled (a minute or two at most).</p>}
-        <button className="btn primary wide" disabled={!publicKey || !!busy || v.status !== 1 || atoms <= 0n || tooMuch || frozen}
-          onClick={() => publicKey && send("Deposit request", [
+        {many && <label className="check small"><input type="checkbox" checked={spread} onChange={e => setSpread(e.target.checked)} /> Spread it over this asset's vaults on all {sibs.length} markets (each market trades against its own vault; spread, every one of them is deeper)</label>}
+        <button className="btn primary wide" disabled={!publicKey || !!busy || v.status !== 1 || atoms <= 0n || tooMuch || (frozen && !(many && spread)) || (many && spread && claimableAll)}
+          onClick={() => publicKey && (many && spread && live.length ? send(`Deposit request on ${live.length} markets`, depositAll(publicKey)) : send("Deposit request", [
             ...(claimable ? claimIxs(publicKey) : []),
             createAssociatedTokenAccountIdempotentInstruction(publicKey, C.ata(publicKey, C.MINT), publicKey, C.MINT),
             C.requestDeposit(v, publicKey, atoms),
-          ])}>Request deposit</button>
+          ]))}>Request deposit</button>
+        {many && spread && claimableAll && <p className="small">Claim on every market first: a vault takes a new deposit once the last one's result is claimed.</p>}
         {publicKey && tooMuch && <p className="small down">You have {usd(state.userCollateral)} test USDC. Use "Get test USDC" first.</p>}
         <label className="field"><span>Withdraw shares</span><input value={out} placeholder={shares(state.userShares)} onChange={e => setOut(e.target.value)} inputMode="decimal" /></label>
         <button className="btn wide" disabled={!publicKey || !!busy || state.userShares === 0n || v.status !== 1 || frozen}
@@ -546,6 +604,10 @@ export function LiquidityPanel({ state, send, busy }: { state: C.State; send: Se
             ...(claimable ? claimIxs(publicKey) : []),
             C.requestWithdraw(v, publicKey, out ? BigInt(Math.floor(Number(out) * 10 ** C.SHARE_DECIMALS)) : state.userShares),
           ])}>Request withdrawal</button>
+        {many && publicKey && sibs.filter(x => x.userShares > 0n).length > 1 && (
+          <button className="btn wide" disabled={!!busy || live.length < sibs.length || claimableAll} title={claimableAll ? "Claim on every market first" : "Withdraws every share you hold in this asset's vaults, on every market"}
+            onClick={() => send("Withdraw from every market", sibs.filter(x => x.userShares > 0n).map(x => C.requestWithdraw(x.vault, publicKey, x.userShares)))}>Withdraw everything, all markets</button>
+        )}
       </section>
       <PastResults state={state} />
     </>

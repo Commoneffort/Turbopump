@@ -78,7 +78,15 @@ function useSend(onDone: () => void): [Send, string | undefined, Toast | undefin
               tx.recentBlockhash = await C.recentBlockhash(connection);
               tx.feePayer = opts.key.publicKey;
               await signWithKey(opts.key, tx);
-              const sig = await connection.sendRawTransaction(tx.serialize());
+              let sig: string;
+              try {
+                sig = await connection.sendRawTransaction(tx.serialize());
+              } catch (e: any) {
+                // The key has no XNT left for the fee: our fee sponsor pays it for a maker-quote
+                // trade (api/relay checks the key is approved and the sponsor's XNT pays nothing else).
+                if (!C.X1 || !/no record of a prior credit|insufficient (funds|lamports)/i.test(String(e?.message ?? e) + (e?.logs ?? []).join(" "))) throw e;
+                sig = await C.sponsoredSend(opts.key, ixs, sized ? [] : [await C.computeLimit(connection, opts.key.publicKey, ixs)], connection, signWithKey);
+              }
               if (C.X1) await C.confirmFast(connection, sig);
               else await connection.confirmTransaction(sig, "confirmed");
               readDirect();

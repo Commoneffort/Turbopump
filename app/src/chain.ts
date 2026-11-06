@@ -1,6 +1,6 @@
 // Account decoding and instruction building for the vault program and Percolator. Offsets come
 // from layout.json, which a Rust test exports from the program and engine types.
-import { Ed25519Program, AddressLookupTableAccount,
+import { Ed25519Program, AddressLookupTableAccount, Transaction,
   AccountMeta,
   Commitment,
   ComputeBudgetProgram,
@@ -712,21 +712,57 @@ export async function marketSnapshot(conn: Connection, commitment: Commitment = 
  *  can use several hundred thousand units, and the fee does not depend on the request. On X1 a
  *  transaction pays 10 lamports for every unit it asks for, used or not (0.014 XNT at the
  *  maximum), so it asks for what a simulation says it uses, plus `spare`. */
-/** Waits until `sig` is confirmed, asking for its status every 0.25 s (up to 60 s); throws if
- *  it failed. */
+/** The fee sponsor (api/relay) of this network, read once. */
+let sponsorKey: Promise<PublicKey | null> | undefined;
+export const feeSponsor = () => (sponsorKey ??= fetch(`/api/relay?network=${NETWORK}`).then(r => r.ok ? r.json() : null).then(j => j?.sponsor ? new PublicKey(j.sponsor) : null).catch(() => null));
+/** Sends a trade signed by a trading key with the fee sponsor as fee payer: the key signs, the
+ *  relay checks and adds the sponsor's signature, and sends it. Returns the signature. */
+export async function sponsoredSend(key: { publicKey: PublicKey; sign: (m: Uint8Array) => Promise<Uint8Array> }, ixs: TransactionInstruction[], pre: TransactionInstruction[], conn: Connection, sign: (k: any, tx: Transaction) => Promise<Transaction>): Promise<string> {
+  const sponsor = await feeSponsor();
+  if (!sponsor) throw new Error(`the one-click trading key has no ${COIN} left for fees: add ${COIN} to it, below the ticket`);
+  const tx = new Transaction().add(...pre, ...ixs);
+  tx.recentBlockhash = await recentBlockhash(conn);
+  tx.feePayer = sponsor;
+  await sign(key, tx);
+  const r = await fetch(`/api/relay?network=${NETWORK}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tx: tx.serialize({ requireAllSignatures: false }).toString("base64") }) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !j.sig) throw new Error(`the one-click trading key has no ${COIN} left for fees (${j.error ?? "the fee sponsor did not take it"}): add ${COIN} to it, below the ticket`);
+  return j.sig;
+}
+
+/** Waits until `sig` is confirmed (up to 60 s); throws if it failed. The RPC pushes the result
+ *  over its websocket the moment the transaction is confirmed (a signature subscription); its
+ *  status is also asked for every 0.25 s, since this RPC's push has at times come seconds late. */
 export async function confirmFast(conn: Connection, sig: string, timeoutMs = 60_000): Promise<void> {
   const end = Date.now() + timeoutMs;
-  while (Date.now() < end) {
-    const st = (await conn.getSignatureStatuses([sig]).catch(() => null))?.value[0];
-    if (st?.err) {
-      // (In the form the page's error list reads: "custom program error: 0x...".)
-      const custom = (st.err as any)?.InstructionError?.[1]?.Custom;
-      throw new Error(typeof custom === "number" ? `custom program error: 0x${custom.toString(16)}` : `transaction failed: ${JSON.stringify(st.err)}`);
+  const failed = (err: unknown) => {
+    // (In the form the page's error list reads: "custom program error: 0x...".)
+    const custom = (err as any)?.InstructionError?.[1]?.Custom;
+    return new Error(typeof custom === "number" ? `custom program error: 0x${custom.toString(16)}` : `transaction failed: ${JSON.stringify(err)}`);
+  };
+  let sub: number | undefined, done = false;
+  const pushed = new Promise<void>((ok, fail) => {
+    try {
+      sub = conn.onSignature(sig, r => { done = true; sub = undefined; r.err ? fail(failed(r.err)) : ok(); }, "confirmed");
+    } catch { /* no websocket here: polling only */ }
+  });
+  const polled = (async () => {
+    while (!done && Date.now() < end) {
+      const st = (await conn.getSignatureStatuses([sig]).catch(() => null))?.value[0];
+      if (st?.err) throw failed(st.err);
+      if (st && (st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized")) return;
+      await new Promise(r => setTimeout(r, 250));
     }
-    if (st && (st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized")) return;
-    await new Promise(r => setTimeout(r, 250));
+    if (!done) throw new Error(`not confirmed within ${timeoutMs / 1000} s: ${sig}`);
+  })();
+  // (The loser of the race may still settle later: nothing waits for it.)
+  pushed.catch(() => {}); polled.catch(() => {});
+  try {
+    await Promise.race([pushed, polled]);
+  } finally {
+    done = true;
+    if (sub !== undefined) conn.removeSignatureListener(sub).catch(() => {});
   }
-  throw new Error(`not confirmed within ${timeoutMs / 1000} s: ${sig}`);
 }
 
 export async function computeLimit(conn: Connection, payer: PublicKey, ixs: TransactionInstruction[], spare = 1.2, alts: AddressLookupTableAccount[] = []): Promise<TransactionInstruction> {
@@ -1306,6 +1342,12 @@ export const cancelOrder = (wallet: PublicKey, vault: PublicKey, index: number, 
   keys: [rw(wallet, true), rw(orderAddress(vault, accountOwner(wallet, sub, marketOfVault(vault)), index))],
   data: new W().u8(13).done(),
 });
+/** Cancels a standing order of `wallet`'s, signed by its trading key `actor` (router 2026-11-07): the rent goes to the wallet. */
+export const cancelOrderByKey = (actor: PublicKey, wallet: PublicKey, vault: PublicKey, index: number, sub = 0) => new TransactionInstruction({
+  programId: ROUTER,
+  keys: [rw(actor, true), rw(orderAddress(vault, accountOwner(wallet, sub, marketOfVault(vault)), index)), rw(wallet), ro(vault), rw(sessionAddress(wallet, marketOfVault(vault)))],
+  data: new W().u8(13).done(),
+});
 /** Carries a standing order out (anyone may). */
 export const triggerOrder = (payer: PublicKey, o: StandingOrder) => new TransactionInstruction({
   programId: ROUTER,
@@ -1702,18 +1744,27 @@ export const QUOTES_ON = X1 && (typeof process === "undefined" || process.env?.Q
 // trades through the router: queued trades and maker quotes on one market, for a limited time, at
 // most `maxNotional` a trade and `maxTrades` a day (closing is never limited). It cannot withdraw,
 // deposit, copy or change anything else; a new key replaces the old one at once.
-export const SESSION_LEN = 152;
+/** Router `session::SESSION_LEN` (176 since 2026-11-07; sessions approved before have 152 bytes and no day cap or band of their own). */
+export const SESSION_LEN = 176, LEGACY_SESSION_LEN = 152;
+/** The band a key's quotes must be within when the wallet set none (router `DEFAULT_SLIPPAGE_BPS`). */
+export const DEFAULT_SLIPPAGE_BPS = 50;
 export const sessionAddress = (wallet: PublicKey, market = activeMarket()) => cached(`ss${wallet.toBase58()}${mk(market)}`, () => rpda(Buffer.from("session"), market.toBuffer(), wallet.toBuffer()));
-export type Session = { market: PublicKey; wallet: PublicKey; key: PublicKey; expires: number; maxNotional: bigint; maxTrades: number; trades: number; windowStart: number };
-export const decodeSession = (d?: Uint8Array | null): Session | null => (d && d.length === SESSION_LEN ? {
+export type Session = { market: PublicKey; wallet: PublicKey; key: PublicKey; expires: number; maxNotional: bigint; maxTrades: number; trades: number; windowStart: number;
+  /** Most notional the key may open in a day (0: no cap), and what it opened in the current window. */
+  maxDayNotional: bigint; dayNotional: bigint; slippageBps: number };
+export const decodeSession = (d?: Uint8Array | null): Session | null => (d && (d.length === SESSION_LEN || d.length === LEGACY_SESSION_LEN) ? {
   market: key(d, 8), wallet: key(d, 40), key: key(d, 72), expires: Number(i64(d, 104)), maxNotional: u64(d, 112),
   maxTrades: d[120] | (d[121] << 8) | (d[122] << 16) | (d[123] << 24), trades: d[124] | (d[125] << 8) | (d[126] << 16) | (d[127] << 24), windowStart: Number(i64(d, 128)),
+  maxDayNotional: d.length === SESSION_LEN ? u64(d, 152) : 0n, dayNotional: d.length === SESSION_LEN ? u64(d, 160) : 0n,
+  slippageBps: (d.length === SESSION_LEN ? d[168] | (d[169] << 8) : 0) || DEFAULT_SLIPPAGE_BPS,
 } : null);
-/** The wallet approves `sessionKey` until `expires` (unix seconds, at most 30 days ahead). */
-export const openSession = (wallet: PublicKey, sessionKey: PublicKey, expires: number, maxNotional: bigint, maxTrades: number, market = activeMarket()) => new TransactionInstruction({
+/** The wallet approves `sessionKey` until `expires` (unix seconds, at most 30 days ahead), up to
+ *  `maxNotional` a trade, `maxTrades` and `maxDayNotional` (0: no cap) a day, taking quotes within
+ *  `slippageBps` of Percolator's price (0: the router's default, 0.5%). */
+export const openSession = (wallet: PublicKey, sessionKey: PublicKey, expires: number, maxNotional: bigint, maxTrades: number, market = activeMarket(), maxDayNotional = 0n, slippageBps = 0) => new TransactionInstruction({
   programId: ROUTER,
   keys: [rw(wallet, true), rw(sessionAddress(wallet, market)), ro(market), ro(SystemProgram.programId)],
-  data: new W().u8(39).bytes(sessionKey.toBytes()).i64(BigInt(expires)).u64(maxNotional).u32(maxTrades).done(),
+  data: new W().u8(39).bytes(sessionKey.toBytes()).i64(BigInt(expires)).u64(maxNotional).u32(maxTrades).u64(maxDayNotional).u16(slippageBps).done(),
 });
 /** Ends the wallet's trading key; `signer` is the wallet or the key itself. */
 export const closeSession = (signer: PublicKey, wallet: PublicKey, market = activeMarket()) => new TransactionInstruction({
@@ -1721,7 +1772,7 @@ export const closeSession = (signer: PublicKey, wallet: PublicKey, market = acti
   keys: [rw(signer, true), rw(sessionAddress(wallet, market)), rw(wallet)],
   data: new W().u8(40).done(),
 });
-/** `ix` (a Request or TakeQuote of `wallet`'s) signed by its trading key `actor` instead. */
+/** `ix` (a Request, TakeQuote or PlaceOrder of `wallet`'s) signed by its trading key `actor` instead. */
 export function byKey(ix: TransactionInstruction, actor: PublicKey, wallet: PublicKey, market: PublicKey): TransactionInstruction {
   return new TransactionInstruction({ programId: ix.programId, data: ix.data, keys: [rw(actor, true), ...ix.keys.slice(1), rw(sessionAddress(wallet, market))] });
 }

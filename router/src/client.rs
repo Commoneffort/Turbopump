@@ -868,3 +868,39 @@ pub fn by_key(mut ix: Instruction, key: &Pubkey, market: &Pubkey, wallet: &Pubke
     ix.accounts.push(w(crate::session::session_address(&crate::id(), market, wallet).0));
     ix
 }
+
+/// `open_session` with a cap on what the key may open in a day (`max_day_notional`, 0 = none)
+/// and the band its quotes must be within (`max_slippage_bps`, 0 = the default).
+pub fn open_session_with(wallet: &Pubkey, market: &Pubkey, key: &Pubkey, expires: i64, max_notional: u64, max_trades: u32, max_day_notional: u64, max_slippage_bps: u16) -> Instruction {
+    let mut ix = open_session(wallet, market, key, expires, max_notional, max_trades);
+    ix.data.extend_from_slice(&max_day_notional.to_le_bytes());
+    ix.data.extend_from_slice(&max_slippage_bps.to_le_bytes());
+    ix
+}
+
+/// Cancels a standing order of `wallet`'s main account, signed by its trading `key`.
+pub fn cancel_order_by_key(key: &Pubkey, market: &Pubkey, wallet: &Pubkey, vault: &Pubkey, index: u8) -> Instruction {
+    Instruction {
+        program_id: crate::id(),
+        accounts: vec![
+            AccountMeta::new(*key, true),
+            w(order_address(&crate::id(), vault, wallet, index).0),
+            w(*wallet),
+            ro(*vault),
+            w(crate::session::session_address(&crate::id(), market, wallet).0),
+        ],
+        data: vec![crate::TAG_CANCEL_ORDER],
+    }
+}
+
+/// `trigger_copy` for a leader trading on `leader_market`: its trader account and portfolio are
+/// on that market, and `leader_vault` is that market's vault for the same feed as `vault`.
+pub fn trigger_copy_across(payer: &Pubkey, t: &TraderKeys, leader: &Pubkey, leader_market: &Pubkey, vault: &Pubkey, leader_vault: &Pubkey, size: i128) -> Instruction {
+    let mut ix = trigger_copy(payer, t, leader, vault, size);
+    let l = TraderKeys::new(*leader_market, *leader);
+    ix.accounts[9] = ro(l.trader);
+    ix.accounts[10] = ro(l.portfolio);
+    ix.accounts.insert(12, ro(*leader_market));
+    ix.accounts.insert(13, ro(*leader_vault));
+    ix
+}

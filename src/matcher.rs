@@ -27,6 +27,11 @@ const FLAG_PARTIAL_OK: u32 = 2;
 /// trade may go through while other accounts' re-valuations on the asset are pending. Set only
 /// when the router armed the fill so (`state::ARMED_COHORT_TOLERANT`).
 pub const FLAG_COHORT_TOLERANT: u32 = 1 << 22;
+/// Percolator fork flag (percolator-prog `matcher_abi::FLAG_AT_PRICE`, 2026-11-06): the trade is
+/// economically at the returned price; the engine settles its difference from Percolator's price
+/// in principal between the two accounts. Set for makers' quotes only (`write_return`), so a
+/// quote is the price the taker pays; the vault's own fills stay at the mark.
+pub const FLAG_AT_PRICE: u32 = 1 << 23;
 const FLAG_BACKING_FEE_CAP_SHIFT: u32 = 8;
 
 pub struct Request {
@@ -65,9 +70,11 @@ pub fn reduce_only(v: &state::VaultState, now_slot: u64) -> bool {
 /// Writes the matcher's answer into the context account (where Percolator reads it): a valid
 /// fill of `exec_size` at `exec_price`, partial fills allowed, with the backing-fee cap and the
 /// lazy-settlement flag.
+/// A maker's return (`maker::process_match`): the quote, at its price (`FLAG_AT_PRICE`).
 pub fn write_return(ctx: &AccountInfo, req: &Request, exec_price: u64, exec_size: i128, backing_fee_cap_bps: u16, tolerant: bool) -> ProgramResult {
     let flags = FLAG_VALID
         | FLAG_PARTIAL_OK
+        | FLAG_AT_PRICE
         | ((backing_fee_cap_bps as u32) << FLAG_BACKING_FEE_CAP_SHIFT)
         | if tolerant { FLAG_COHORT_TOLERANT } else { 0 };
     let mut ret = [0u8; state::MATCHER_RETURN_LEN];

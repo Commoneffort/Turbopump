@@ -392,15 +392,13 @@ export function useActions(me: Me, send: Send, reload: () => void) {
      *  (so the trader's fills show on the chart), and the copy itself. */
     copy: async (leader: string, name: string, ratioBps = 10_000, maxNotional = 0n) => {
       if (!publicKey) return;
-      // Since the market split a copy works between two accounts on the same market only.
-      if (C.NEW_MARKETS.length && !(await C.homeMarket(view, new PublicKey(leader)).catch(() => C.activeMarket())).equals(C.activeMarket())) {
-        window.alert(`${name} trades on another of the exchange's markets than your wallet, and copying works only within one market. Copying ${name} is not possible from this wallet.`);
-        return;
-      }
+      // The leader may trade on another of the markets (router 2026-11-07): the copy names its
+      // account there, and follows its positions on the assets both markets list.
+      const leaderMarket = C.NEW_MARKETS.length ? await C.homeMarket(view, new PublicKey(leader)).catch(() => C.activeMarket()) : C.activeMarket();
       return run(me.copy?.leader.toBase58() === leader ? `New terms for copying ${name}` : `Copy ${name} (${S.COPY_FEE_TEXT})`, [
       ...setup(publicKey, me),
       ...(me.following.has(leader) ? [] : [S.follow(publicKey, new PublicKey(leader))]),
-      S.setCopy(publicKey, new PublicKey(leader), ratioBps, maxNotional),
+      S.setCopy(publicKey, new PublicKey(leader), ratioBps, maxNotional, leaderMarket),
     ]);
     },
     stop: () => publicKey && run("Stop copying", [S.stopCopy(publicKey)]),

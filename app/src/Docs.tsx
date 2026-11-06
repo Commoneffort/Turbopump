@@ -101,9 +101,9 @@ export default function Docs() {
           Percolator, Anatoly Yakovenko's risk engine, and adds everything an exchange needs around it: markets that own their
           own keys, a shared liquidity vault for each asset, trading that cannot be front-run, limit, stop, take-profit,
           trailing and TWAP orders, track records and copy trading written by the program itself, spot swaps on xDEX, and a
-          trading desk to use it all from. Every trade fills at Percolator's own price, never at one a trader or a maker picks. A
+          trading desk to use it all from. Nobody can trade against the vault at a price they already know: a
           queued trade fills at the first oracle price published {WAIT} after it was requested, so nobody can trade against the
-          vault at a price they already know.{X1 ? " On X1 a market order can instead fill at once, against a maker who signed to take it, and with one-click trading it needs no wallet popup." : ""}
+          vault at a price they already know.{X1 ? " On X1 a market order can instead fill at once, at the price a maker signed for it, and with one-click trading it needs no wallet popup." : ""}
         </p>
         <div className="callout">
           <b>Status.</b> Live on Solana devnet and X1 testnet. Unaudited: neither Turbopump nor Percolator has been audited. Use test funds only.
@@ -122,7 +122,7 @@ export default function Docs() {
             <tr><td>Its job</td><td>Margin, profit and loss, insurance, its own liquidation, bounded price moves</td><td>Everything else: who lists a market, who provides liquidity, how and at what price a trade fills, orders, fees, records</td></tr>
             <tr><td>Liquidity</td><td>None of its own: a trade needs a counterparty</td><td>One shared vault per asset on each market, the counterparty to every queued trade{X1 ? "; makers who take trades at once" : ""}</td></tr>
             <tr><td>Market keys</td><td>Whoever lists a market holds its admin, insurance and oracle keys</td><td>The vault's own address holds them, and the program has no instruction that uses them</td></tr>
-            <tr><td>Price a trade gets</td><td>The market's mark, whatever it is at that moment</td><td>Queued: the market's price at the first oracle price published {WAIT} after the request, unknown to everyone when the trade is sent.{X1 ? " Quoted: the market's price in the slot it lands in, at once." : ""}</td></tr>
+            <tr><td>Price a trade gets</td><td>The market's mark, whatever it is at that moment</td><td>Queued: the market's price at the first oracle price published {WAIT} after the request, unknown to everyone when the trade is sent.{X1 ? " Quoted: the maker's signed price, at once." : ""}</td></tr>
             <tr><td>Order types</td><td>An immediate trade between two accounts</td><td>Market, limit, stop loss, take profit, trailing stop and TWAP</td></tr>
             <tr><td>Who earns the fees</td><td>The asset's insurance operator</td><td>Depositors 85%, the market's opener 5%, the platform 10%</td></tr>
           </tbody>
@@ -174,8 +174,8 @@ export default function Docs() {
             <tr><td>1. Empty markets</td><td>Every market has a shared vault that takes the other side of every queued trade, so a new market can trade as soon as anyone deposits{X1 ? "; on X1 makers take trades too" : ""}.</td><td>A vault with no deposits takes nothing.</td></tr>
             <tr><td>2. The lister's keys</td><td>The vault program's governor address holds the market's authority and only uses it to retire idle markets; the vault holds each asset's admin, insurance and oracle keys and never uses them otherwise{X1 ? " (checked on chain for all five X1 markets)" : ""}.</td><td>We still hold the programs' upgrade keys (to be burned before mainnet){X1 ? ", and on X1 our reporter and witness keys post the prices" : ""}.</td></tr>
             <tr><td>3. Fragmented liquidity</td><td>One vault per feed on a market: a second SOL vault on the same market cannot exist.</td><td>{X1 ? "On X1 we split trading over five markets for more room per block, so SOL, BTC and ETH each have five vaults. A trade only sees the vault of its wallet's market." : "None on devnet (one market)."}</td></tr>
-            <tr><td>4. No spread to earn</td><td>The vault earns fees and what traders lose instead, and depositors get 85% of what is harvested.</td><td>Still true for makers too: a quoted trade fills at Percolator's price, so a maker's spread earns nothing.</td></tr>
-            <tr><td>5. Front-running</td><td>Queued trades fill at a price posted after they land, so nobody can trade against the vault at a price they know.</td><td>{X1 ? "A quoted trade fills at once at Percolator's price, which follows the exchanges about a second behind: a trader who sees a move first can take a maker's quote at the old price. The maker carries that, not the vault or other traders." : "None for queued trades."}</td></tr>
+            <tr><td>4. No spread to earn</td><td>The vault earns fees and what traders lose instead, and depositors get 85% of what is harvested.</td><td>{X1 ? "Solved for makers on X1: a maker's quote is the price paid (our engine fork settles its difference from Percolator's price between the two accounts), so a maker earns its spread." : "Still true on devnet: trades settle at the mark."}</td></tr>
+            <tr><td>5. Front-running</td><td>Queued trades fill at a price posted after they land, so nobody can trade against the vault at a price they know.</td><td>{X1 ? "A quoted trade fills at once at the maker's price, which the maker set from the exchanges: nobody can trade it at a price they already know better than the maker did, except within the quote's two seconds, which is the maker's own risk and why quotes are short and size-limited." : "None for queued trades."}</td></tr>
           </tbody>
         </table>
 
@@ -240,13 +240,14 @@ export default function Docs() {
           for your trading account only: a size, a price and the last slot it is good for (about two seconds, or ten when your
           wallet asks you to approve). Your transaction carries the signature, the router checks it (the maker's key, your
           account, that the quote is unused and still good, within 1% of Percolator's price) and the trade fills in that same
-          transaction, against the maker's own account. <b>It fills at Percolator's price in that slot</b>, like every trade
-          here: Percolator uses a quote's price only to size the fee (a test round trip bought 0.9% above Percolator's price and
-          sold 0.9% below changed the trader's money by nothing). So a quote is the maker's promise to take your trade now,
-          instead of after the wait; it does not set your price. Nobody else can use your quote, and only the reporter moves
-          Percolator's price. You are held to the same margin, fees, close-only and isolation rules as any trade. The maker
-          carries one risk: Percolator's price follows the exchanges about a second behind, so a trader who sees a move first
-          can take a quote at the old price. That is why quotes live about two seconds and are limited in size. Without a quote (none offered, too large, expired) the order goes through the queue
+          transaction, against the maker's own account, <b>at the quoted price</b>. Percolator itself would put every trade at its
+          own price and use a quote's price only for the fee; our engine fork (since 7 November 2026) settles the difference
+          between the two in the same trade, from one account's capital to the other's, so what you pay is exactly the quote
+          (tested: a round trip bought 0.9% above Percolator's price and sold 0.9% below costs the trader 1.8%, and the maker
+          gets exactly that). Nobody else can use your quote, and the maker fixed the price before you sent anything. You are
+          held to the same margin, fees, close-only and isolation rules as any trade. The maker's risk is the quote's life:
+          it was priced from the exchanges, and they can move in its two seconds, which is why quotes are short and limited in
+          size, and why the maker quotes nothing while the exchanges' price is more than 0.4% from the market's. Without a quote (none offered, too large, expired) the order goes through the queue
           and its short wait as above, against the vault. Anyone can be a maker: register a Percolator account with the vault
           program (<code>OpenMaker</code>), point its matcher at the vault program, and sign quotes; the platform runs the first one.
           In a load test (November 2026, 800 accounts holding positions, three markets, one maker) a trade at a maker's quote
@@ -265,8 +266,11 @@ export default function Docs() {
           market's account. On X1 that is about 22 to 44 trades a block for one market, so X1 runs five Percolator markets, each
           listing SOL, BTC and ETH, with its own vaults, maker and executor. Each wallet trades on one of them, so its margin is
           still shared across its positions: the market where it already has an account (accounts from before November 6
-          stay on the original market), otherwise the one its address picks. The page finds it for you. Copying a trader on
-          another market is not possible yet.
+          stay on the original market), otherwise the one its address picks. The page finds it for you. You can copy a trader on
+          any market: the copy follows the trader's positions on the assets both markets list (SOL, BTC and ETH). Earn spreads a
+          deposit over the asset's vaults on all five markets, so each is deeper, and claims and withdraws on all of them at
+          once. On the original market the SOL, BTC and ETH quotes come from makers that each hold one asset, which keeps a
+          quoted trade's compute well under the limit.
         </p>}
         <p>The router has no admin: no pause, no allow or block list, and its upgrade authority is to be burned before mainnet.</p>
 
@@ -278,13 +282,14 @@ export default function Docs() {
           the page can ask it to sign, but no script or extension can read it.
         </p>
         <ul>
-          <li><b>What it can do:</b> market orders, maker quotes and closes on your market, through the router, until it expires (1, 7 or 30 days), up to the size a trade and the number of trades a day you chose. Closing a position is never limited.</li>
-          <li><b>What it cannot do:</b> withdraw, deposit, copy, change your profile or place standing orders. Withdrawals always need your wallet and only ever pay your wallet.</li>
+          <li><b>What it can do:</b> market orders, maker quotes, closes and standing orders (limit, stop, take-profit, trailing, TWAP; placing and cancelling them) on your market, through the router, until it expires (1, 7 or 30 days), within the limits you chose: the size a trade, the trades a day, the total it may open in a day, and how far from the market's price a quote it takes may be (0.2%, 0.5% or 1%; a quote is the price paid, so this is the most a key could give away on one trade). Closing a position is never limited.</li>
+          <li><b>What it cannot do:</b> withdraw, deposit, copy or change your profile. Withdrawals always need your wallet and only ever pay your wallet; what an order's keeper budget or a queued trade's deposit gives back goes to your wallet, not to the key.</li>
+          <li><b>When you are away:</b> after 2 hours without a click or key press on the page, the key ends itself (no popup), and when you open the page again after longer than that, it ends before anything else.</li>
           <li><b>Changing or ending it:</b> turning it on again replaces the old key at once; turning it off (no popup) ends it and sends what it holds for fees back to your wallet.</li>
         </ul>
         <p>On your first visit one approval opens your account, deposits and turns one-click trading on. The router enforces every limit on chain, so a page or a key cannot go past what your wallet approved.</p>
         <ul>
-          <li><b>Fees.</b> The key pays its own transaction fees in XNT. Turning it on sends it up to 2 XNT from your wallet (about 140 trades); "Add XNT" tops it up, and turning it off sends what is left back. New wallets get 2 test XNT with their test USDC from the faucet.</li>
+          <li><b>Fees.</b> The key pays its own transaction fees in XNT. Turning it on sends it up to 2 XNT from your wallet (about 140 trades); "Add XNT" tops it up, and turning it off sends what is left back. When it has nothing left, the platform's fee sponsor pays the fee of a quoted trade (up to 300 a day per key): it signs only as the fee payer of a trade by an approved key, and its own XNT can pay for nothing else. New wallets get 2 test XNT with their test USDC from the faucet.</li>
           <li><b>No dead ends.</b> The key takes a maker's quote first, closes included, which needs no deposit. If an order has to queue and the key cannot cover the queue's deposit (0.1% of the trade's value in XNT), your wallet signs that one order instead. A trade that fails for a passing reason (the market account was being updated by another transaction at that moment) is sent again, up to three times, with a fresh quote.</li>
         </ul>
         <p>The design follows Jack Levin's Vero session wallet and X1 Terminal, and Hyperliquid's approved agent keys (see Credits).</p>
@@ -540,9 +545,9 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           <li><b>Executors.</b> Filling needs someone to fetch each target-time Pyth update from Hermes (which needs a Pyth API key; since early November our free-plan key is refused for BTC, ETH and SOL, so devnet fills through the backup price source, about 20 seconds after the target) and send the transactions. Keeping marks fresh between trades uses Pyth's free sponsored feed accounts. Anyone with a key can run an executor; if nobody does, requests expire and nothing trades.</li>
           <li><b>Market authority.</b> On both networks (on X1, all five markets), Percolator's market-level authority belongs to the vault program's governor address, which the program only uses to retire idle markets. Nobody can shut an asset down or resolve the market, and permissionless stale resolution is off. On another market, whoever holds that authority can shut assets down or resolve the market; the vault then winds down and pays out.</li>
           <li><b>Smart contracts.</b> Unaudited code. The programs are upgradeable on both test networks (we hold the keys); a mainnet deployment must burn that authority.</li>
-          {X1 && <li><b>Maker quotes.</b> A quoted trade fills against the maker's own account at Percolator's price. A maker can lose to traders who see the exchanges move before Percolator's price does; that is the maker's risk, not the vault's. If no maker quotes, or a quote is too small, the order goes through the queue.</li>}
+          {X1 && <li><b>Maker quotes.</b> A quoted trade fills against the maker's own account at the quoted price, within 1% of Percolator's (a trading key's within its own band). The difference from Percolator's price moves between the two accounts' capital in our engine fork, which is unaudited. If no maker quotes, or a quote is too small, the order goes through the queue.</li>}
           {X1 && <li><b>Trading keys.</b> A trading key can trade your account within the limits you set, until it expires. Malware in your browser could ask the page's key to sign trades (it cannot copy the key out where the browser supports that, and it can never withdraw). Turn one-click trading off on a computer you do not trust; turning it off ends the key on chain.</li>}
-          {X1 && <li><b>Five markets on X1.</b> Each wallet trades on one market, against that market's vaults and maker only, so each pool is smaller than one shared pool would be. Copying a trader on another market is not possible yet.</li>}
+          {X1 && <li><b>Five markets on X1.</b> Each wallet trades on one market, against that market's vaults and maker only, so each pool is smaller than one shared pool would be (Earn can spread a deposit over all five).</li>}
           <li><b>Keepers.</b> Anyone can run a keeper or an executor, and each one is paid for its work (see Keepers and executors), but someone has to. If nobody does, epochs don't roll and prices don't update. On X1 only our reporter key can post prices, so X1 trades also wait on it.</li>
           <li><b>Margin stays in while you hold a position.</b> Percolator pays margin out only from an account with no open position on any market, so a trader closes everything before withdrawing. A queued trade must leave enough margin to open at the asset's level; a trade that only reduces a position is always accepted.</li>
           <li><b>Spot swaps go through xDEX.</b> The router checks what reaches your wallet, but the pool's price and its own fee are xDEX's. A thin pool moves a lot on a large swap; the ticket shows the price impact before you sign.</li>
@@ -835,7 +840,7 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
         <h2 id="faq">FAQ</h2>
         <dl className="faq">
           <dt>Why does a trade fill at the mark, not at a quoted price?</dt>
-          <dd>That is how Percolator v16 works: the matcher's price only sizes fees. The vault earns from fees and from traders' losses, not from a spread. A maker's quote is the same: it fills at the mark, so a quote decides whether your trade fills now, not its price.</dd>
+          <dd>That is how Percolator v16 works: the matcher's price only sizes fees. The vault earns from fees and from traders' losses, not from a spread. {X1 ? "A maker's quote on X1 is the exception: our engine fork settles the quote's difference from the mark, so you pay the quote." : ""}</dd>
           <dt>Is Turbopump part of Percolator?</dt>
           <dd>No. Percolator is the risk engine by Anatoly Yakovenko, and Turbopump calls it. The vault and router programs, the order types, copy trading, the services and this site are Turbopump's own work.</dd>
           <dt>Can a limit or stop order be front-run?</dt>
@@ -855,7 +860,7 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           <dt>Is the vault solvent right now?</dt>
           <dd>See the Health page: it reads what Percolator holds against what it owes, and each vault's cash, margin and loss cover, live from the chain.</dd>
           <dt>What is the "Devnet Burner" wallet?</dt>
-          <dd>A key stored in your browser so you can try the app without installing a wallet, on either test network. Never use it for real funds.</dd>
+          <dd>A key kept in your browser so you can try the app without installing a wallet, on either test network. It is stored encrypted and unlocked once per visit, with a passkey (a security key, your phone, or the computer's own lock where the browser supports it) or with a PIN or passphrase. A passphrase is safer than a short PIN: whoever copies the browser's storage can try PINs. Never use it for real funds.</dd>
           {X1 && <><dt>Do I have to approve every trade in my wallet?</dt>
           <dd>No, with one-click trading on: your wallet approves a trading key once, and the key signs your trades within the limits you set. It can never withdraw (see One-click trading).</dd></>}
         </dl>

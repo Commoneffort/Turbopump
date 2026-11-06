@@ -4,7 +4,7 @@
 // scripts/maker.ts setup). 404 when no quote is offered: the trade then goes through the queue.
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { networkOf } from "./_config.js";
-import { makeQuote } from "./_maker.js";
+import { makeQuote, type Maker } from "./_maker.js";
 
 let conns: Record<string, Connection> = {};
 
@@ -29,8 +29,12 @@ export default async function handler(req: any, res: any) {
     // (MAKER_PORTFOLIOS_X1: {"<market>": "<portfolio>", ...} for the markets added by the split;
     // the original market's portfolio stays in MAKER_PORTFOLIO_X1.)
     const more = JSON.parse(process.env[x1 ? "MAKER_PORTFOLIOS_X1" : "MAKER_PORTFOLIOS"] ?? "{}") as Record<string, string>;
-    const makers = [{ kp, portfolio: new PublicKey(portfolio), market: new PublicKey(net.market) },
-      ...Object.entries(more).map(([mk, pf]) => ({ kp, portfolio: new PublicKey(pf), market: new PublicKey(mk) }))];
+    // (MAKER_ASSETS_X1: [{"secret": [...], "portfolio": "...", "market": "...", "asset": 4}, ...]: a
+    // maker of its own for one asset on a market, chosen before the market's maker for it.)
+    const one = JSON.parse(process.env[x1 ? "MAKER_ASSETS_X1" : "MAKER_ASSETS"] ?? "[]") as { secret: number[]; portfolio: string; market: string; asset: number }[];
+    const makers: Maker[] = [{ kp, portfolio: new PublicKey(portfolio), market: new PublicKey(net.market) },
+      ...Object.entries(more).map(([mk, pf]) => ({ kp, portfolio: new PublicKey(pf), market: new PublicKey(mk) })),
+      ...one.map(x => ({ kp: Keypair.fromSecretKey(Uint8Array.from(x.secret)), portfolio: new PublicKey(x.portfolio), market: new PublicKey(x.market), asset: x.asset }))];
     const q = await makeQuote(conn, makers, vault, trader, size, life);
     return res.status(200).json(q);
   } catch (e: any) {

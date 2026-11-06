@@ -832,3 +832,122 @@ fn a_trading_key_trades_within_its_limits_and_nothing_else() {
     w.send(vec![close_session(&key2.pubkey(), &market, &wallet)], &[&key2]).expect("the key ends itself");
     assert!(w.env.svm.get_account(&percolator_router::session::session_address(&percolator_router::id(), &market, &wallet).0).map_or(true, |a| a.lamports == 0));
 }
+
+/// A quote is the price paid (engine fork `FLAG_AT_PRICE`, 2026-11-07): a round trip bought above
+/// Percolator's price and sold below it costs the taker the difference, which the maker gets.
+#[test]
+fn a_quote_is_the_price_paid() {
+    let mut w = live();
+    let m = new_maker(&mut w, 50_000_000);
+    w.trader(0);
+    let tkp = w.trader_kp(0);
+    let size = 5 * UNIT as i128;
+    let maker_equity = |w: &World| {
+        let d = w.env.svm.get_account(&m.portfolio).unwrap().data;
+        let (capital, pnl, _) = perc::portfolio_exposure(&d).unwrap();
+        capital as i128 + pnl
+    };
+    let (e0, m0) = (equity(&w, 0), maker_equity(&w));
+    let mark = w.env.primary_market_state().1.assets[w.asset() as usize].effective_price;
+    let s = w.env.current_slot();
+    w.send(take_quote_ixs(&w, &m.kp, &m, 0, size, mark * 1009 / 1000, s + 3, 1), &[&tkp]).expect("buy 0.9% above");
+    let paid = (size as u128 * (mark as u128) * 9 / 1000 / 1_000_000) as i128;
+    let e1 = equity(&w, 0);
+    assert!((e0 - e1 - paid).abs() <= 2, "the buy cost the difference: {} vs {}", e0 - e1, paid);
+    w.goto_slot(w.env.current_slot() + 1);
+    let s = w.env.current_slot();
+    w.send(take_quote_ixs(&w, &m.kp, &m, 0, -size, mark * 991 / 1000, s + 3, 2), &[&tkp]).expect("sell 0.9% below");
+    let (e2, m2) = (equity(&w, 0), maker_equity(&w));
+    assert!((e0 - e2 - 2 * paid).abs() <= 4, "the round trip cost 1.8%: {}", e0 - e2);
+    assert_eq!(e0 - e2, m2 - m0, "what the taker paid, the maker got");
+    // The track record books the quoted price, which is now the fill price.
+}
+
+/// A trading key's own limits (2026-11-07): a cap on what it opens in a day, and a band its
+/// quotes must be within (a quote is the price paid); a session from before them still works and
+/// grows to the new layout when the wallet approves again.
+#[test]
+fn a_trading_key_has_a_daily_cap_and_a_price_band() {
+    use percolator_router::client::{by_key, open_session, open_session_with};
+    let mut w = live();
+    let m = new_maker(&mut w, 50_000_000);
+    w.trader(0);
+    let tkp = w.trader_kp(0);
+    let market = w.env.market;
+    let wallet = tkp.pubkey();
+    let key = Keypair::new();
+    w.env.svm.airdrop(&key.pubkey(), 1_000_000_000).unwrap();
+    let now = w.clock_ts();
+    let mark = w.env.primary_market_state().1.assets[w.asset() as usize].effective_price;
+    let quote = |w: &World, size: i128, price: u64, id: u64| {
+        let s = w.env.current_slot();
+        let mut ixs = take_quote_ixs(w, &m.kp, &m, 0, size, price, s + 3, id);
+        ixs[1] = by_key(ixs[1].clone(), &key.pubkey(), &market, &wallet);
+        ixs
+    };
+    // A day cap below the trade size, or a band wider than the router's, is refused.
+    expect(w.send(vec![open_session_with(&wallet, &market, &key.pubkey(), now + 3600, 10 * UNIT as u64, 100, 5 * UNIT as u64, 0)], &[&tkp]), router_code(RouterError::SessionLimit));
+    expect(w.send(vec![open_session_with(&wallet, &market, &key.pubkey(), now + 3600, 10 * UNIT as u64, 100, 0, 200)], &[&tkp]), router_code(RouterError::SessionLimit));
+    // 10 a trade, 25 a day, quotes within 0.2%.
+    w.send(vec![open_session_with(&wallet, &market, &key.pubkey(), now + 3600, 10 * UNIT as u64, 100, 25 * UNIT as u64, 20)], &[&tkp]).expect("approve");
+    expect(w.send(quote(&w, 5 * UNIT as i128, mark * 1003 / 1000, 1), &[&key]), router_code(RouterError::PriceBand));
+    w.send(quote(&w, 5 * UNIT as i128, mark * 1001 / 1000, 2), &[&key]).expect("within 0.2%");
+    for id in 3..5 {
+        w.goto_slot(w.env.current_slot() + 1);
+        w.send(quote(&w, 9 * UNIT as i128, mark, id), &[&key]).expect("within the day's cap");
+    }
+    // 5 + 9 + 9 = 23 opened; 5 more would be 28.
+    w.goto_slot(w.env.current_slot() + 1);
+    expect(w.send(quote(&w, 5 * UNIT as i128, mark, 5), &[&key]), router_code(RouterError::SessionLimit));
+    // Closing is not capped.
+    w.goto_slot(w.env.current_slot() + 1);
+    let held = position(&w, 0);
+    w.send(quote(&w, -held, mark, 6), &[&key]).expect("close");
+    // A session from before (152 bytes, as on X1 before the upgrade): the newer fields read as 0.
+    let sk = percolator_router::session::session_address(&percolator_router::id(), &market, &wallet).0;
+    let mut a = w.env.svm.get_account(&sk).unwrap();
+    a.data.truncate(percolator_router::session::LEGACY_SESSION_LEN);
+    w.env.svm.set_account(sk, a).unwrap();
+    w.goto_slot(w.env.current_slot() + 1);
+    w.send(quote(&w, 5 * UNIT as i128, mark * 1004 / 1000, 7), &[&key]).expect("legacy session, default 0.5% band");
+    w.goto_slot(w.env.current_slot() + 1);
+    expect(w.send(quote(&w, 5 * UNIT as i128, mark * 1006 / 1000, 8), &[&key]), router_code(RouterError::PriceBand));
+    // Approving again grows it.
+    w.send(vec![open_session(&wallet, &market, &key.pubkey(), now + 3600, 10 * UNIT as u64, 100)], &[&tkp]).expect("re-approve a legacy session");
+    assert_eq!(w.env.svm.get_account(&sk).unwrap().data.len(), percolator_router::session::SESSION_LEN);
+}
+
+/// A trading key places and cancels standing orders for its wallet (2026-11-07); a stranger
+/// cannot, and the order's rent goes back to the wallet.
+#[test]
+fn a_trading_key_places_and_cancels_orders() {
+    use percolator_router::client::{by_key, cancel_order_by_key, open_session, OrderParams};
+    let mut w = live();
+    let t0 = w.trader(0);
+    let tkp = w.trader_kp(0);
+    let market = w.env.market;
+    let wallet = tkp.pubkey();
+    let key = Keypair::new();
+    w.env.svm.airdrop(&key.pubkey(), 1_000_000_000).unwrap();
+    let now = w.clock_ts();
+    w.send(vec![open_session(&wallet, &market, &key.pubkey(), now + 3600, 10 * UNIT as u64, 100)], &[&tkp]).expect("approve");
+    let limit = OrderParams { kind: percolator_router::state::ORDER_LIMIT, size: 2 * UNIT as i128, trigger: 990_000, index: 1, ..Default::default() };
+    // A stranger signing for the wallet's account: refused.
+    let stranger = Keypair::new();
+    w.env.svm.airdrop(&stranger.pubkey(), 1_000_000_000).unwrap();
+    let ix = by_key(rclient::place_order(&t0, &w.vault, &limit), &stranger.pubkey(), &market, &wallet);
+    assert!(w.send(vec![ix], &[&stranger]).is_err(), "a stranger places an order for the wallet");
+    // Above the key's size: refused.
+    let big = OrderParams { size: 20 * UNIT as i128, ..limit };
+    expect(w.send(vec![by_key(rclient::place_order(&t0, &w.vault, &big), &key.pubkey(), &market, &wallet)], &[&key]), router_code(RouterError::SessionLimit));
+    // The key places it; the order is the wallet's.
+    w.send(vec![by_key(rclient::place_order(&t0, &w.vault, &limit), &key.pubkey(), &market, &wallet)], &[&key]).expect("the key places a limit order");
+    let ok = percolator_router::state::order_address(&percolator_router::id(), &w.vault, &wallet, 1).0;
+    let o: percolator_router::state::Order = bytemuck::pod_read_unaligned(&w.env.svm.get_account(&ok).unwrap().data);
+    assert_eq!(o.wallet, wallet);
+    // The key cancels it; the rent goes to the wallet, not the key.
+    let before = w.env.svm.get_balance(&wallet).unwrap();
+    w.send(vec![cancel_order_by_key(&key.pubkey(), &market, &wallet, &w.vault, 1)], &[&key]).expect("the key cancels");
+    assert!(w.env.svm.get_balance(&wallet).unwrap() > before);
+    assert!(w.env.svm.get_account(&ok).map_or(true, |a| a.lamports == 0));
+}

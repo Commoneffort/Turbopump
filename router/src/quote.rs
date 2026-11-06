@@ -10,7 +10,10 @@
 //!
 //! The taker is held to everything a router fill holds it to: its margin at its tier (with the
 //! risk dial), the fees owed to the vaults (`carry`), close-only markets and isolated accounts.
-//! The quoted price must be within `QUOTE_BAND_BPS` of Percolator's price.
+//! The quoted price must be within `QUOTE_BAND_BPS` of Percolator's price (a trading key's quote
+//! within its session's band, 0.5% unless the wallet chose less), and it is the price paid: the
+//! maker's matcher returns it with the fork's `FLAG_AT_PRICE`, and the engine settles its
+//! difference from Percolator's price in principal between the taker and the maker.
 
 use percolator_vault::{maker, percolator as perc, processor::TAG_ARM_QUOTE};
 use solana_program::{
@@ -168,7 +171,13 @@ pub fn take_quote(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
     let mut fees = carry::Fees::load(program_id, accounts, &b, &t, vault_ai.key, trader_ai.key)?;
     let debt = fees.settle(v.asset_index, market_id, before, effective, clock.unix_timestamp)?;
     let reduces = before != 0 && (before > 0) != (size > 0) && size.unsigned_abs() <= before.unsigned_abs();
-    session::authorize(program_id, accounts, wallet, &owner, market.key, session::notional(size, price), reduces)?;
+    // A trading key is held to its own, tighter band: a quote is the price paid (the engine
+    // settles its difference from Percolator's price), so this is the most a key can give away.
+    if let Some(bps) = session::authorize(program_id, accounts, wallet, &owner, market.key, session::notional(size, price), reduces)? {
+        if (price as u128).abs_diff(effective as u128).saturating_mul(10_000) > (effective as u128).saturating_mul(bps as u128) {
+            return Err(RouterError::PriceBand.into());
+        }
+    }
     if !reduces {
         if perc::asset_close_only(&market.try_borrow_data()?, v.asset_index)? {
             return Err(RouterError::CloseOnly.into());

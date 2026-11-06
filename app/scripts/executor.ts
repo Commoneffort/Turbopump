@@ -1526,6 +1526,23 @@ const copyTries = new Map<string, { held: bigint; target: bigint; at: number; n:
 /** Brings every follower whose position has left its leader's in line (router `TriggerCopy`:
  *  anyone may, the size is the router's to compute). Where the follower's margin does not take
  *  the whole difference, the step that it does take is sent. One request per wallet at a time. */
+/** Where each leader trades (the first market with its account: `C.homeMarket`'s rule), and the
+ *  vaults of every market, for leaders on another market than their followers (router
+ *  2026-11-07). Refreshed every few minutes. */
+const leaderHome = new Map<string, { market: PublicKey; at: number }>();
+let allVaults: { list: C.Vault[]; at: number } = { list: [], at: 0 };
+async function leaderMarket(leader: PublicKey): Promise<PublicKey> {
+  const k = leader.toBase58(), got = leaderHome.get(k);
+  if (got && Date.now() - got.at < 300_000) return got.market;
+  let m = C.MARKET;
+  if (C.MARKETS.length > 1) {
+    const infos = await conn.getMultipleAccountsInfo(C.MARKETS.map(x => C.traderAddress(leader, 0, x.key)));
+    const i = infos.findIndex(a => !!a);
+    if (i >= 0) m = C.MARKETS[i].key;
+  }
+  leaderHome.set(k, { market: m, at: Date.now() });
+  return m;
+}
 async function serviceCopies(vaults: C.Vault[], books: Map<string, C.Book>, market: Uint8Array) {
   enter("serviceCopies");
   if (Date.now() - copiesAt > (C.X1 ? 6_000 : 20_000)) {
@@ -1535,7 +1552,15 @@ async function serviceCopies(vaults: C.Vault[], books: Map<string, C.Book>, mark
   }
   const due = copyCache.filter(c => (copyRetry.get(c.key.toBase58()) ?? 0) <= Date.now());
   if (!due.length) return;
-  const accs = await conn.getMultipleAccountsInfo(due.flatMap(c => [C.routerPortfolio(c.follower), C.traderAddress(c.follower), C.routerPortfolio(c.leader), C.ledgerAddress(c.follower)]));
+  const homes = await Promise.all(due.map(c => leaderMarket(c.leader)));
+  const away = [...new Set(homes.filter(m => !m.equals(C.MARKET)).map(m => m.toBase58()))].map(k => new PublicKey(k));
+  const awayData = new Map<string, Uint8Array>();
+  if (away.length) {
+    const infos = await conn.getMultipleAccountsInfo(away);
+    away.forEach((m, i) => { if (infos[i]) awayData.set(m.toBase58(), new Uint8Array(infos[i]!.data)); });
+    if (Date.now() - allVaults.at > 300_000) allVaults = { list: await C.listVaults(conn, true), at: Date.now() };
+  }
+  const accs = await conn.getMultipleAccountsInfo(due.flatMap((c, i) => [C.routerPortfolio(c.follower), C.traderAddress(c.follower), C.routerPortfolio(c.leader, 0, homes[i]), C.ledgerAddress(c.follower)]));
   const abs = (x: bigint) => (x < 0n ? -x : x);
   for (const [i, c] of due.entries()) {
     const pf = accs[4 * i], tr = accs[4 * i + 1], lpf = accs[4 * i + 2], led = accs[4 * i + 3];
@@ -1544,11 +1569,16 @@ async function serviceCopies(vaults: C.Vault[], books: Map<string, C.Book>, mark
     if (!pf || !tr || !lpf || C.decodeTrader(new Uint8Array(tr.data)).hasPending) continue;
     const fd = new Uint8Array(pf.data), ld = new Uint8Array(lpf.data);
     const eq = (d: Uint8Array) => { const p = C.decodePortfolio(d, 0); return p.capital + p.pnl; };
+    const home = homes[i], here = home.equals(C.MARKET), homeData = here ? market : awayData.get(home.toBase58());
+    if (!homeData) continue;
     for (const v of vaults) {
+      // The leader's vault for this feed on its own market (the same vault when it trades here).
+      const lv = here ? v : allVaults.list.find(x => x.market.equals(home) && x.canonical && x.feedHex === v.feedHex);
+      if (!lv) continue;
       const b = books.get(v.key.toBase58());
       if (!b || b.pending.length >= 28 || C.closeOnly(market, v.assetIndex)) continue; // (the last 4 places are for forced closes and settlements)
       const price = C.decodeAsset(market, v.assetIndex).price;
-      const held = C.decodePortfolio(fd, v.assetIndex, market).position, lead = C.decodePortfolio(ld, v.assetIndex, market).position;
+      const held = C.decodePortfolio(fd, v.assetIndex, market).position, lead = C.decodePortfolio(ld, lv.assetIndex, homeData).position;
       const target = S.copyTarget(lead, eq(ld), eq(fd), c.ratioBps, c.maxNotional, price);
       if (!S.copyDue(held, target, price)) continue;
       // The whole difference, or as far towards it as the follower's margin goes.
@@ -1576,7 +1606,7 @@ async function serviceCopies(vaults: C.Vault[], books: Map<string, C.Book>, mark
         if (last.n === 1) log("copy", `${who} on ${v.feed?.symbol}: its last copy traded nothing; trying again less often`);
       }
       if (!overdue(`copy ${tryKey}`)) continue;
-      const ok = await send(`copy: bring ${who} in line on ${v.feed?.symbol} (${Number(held) / 1e6} -> ${Number(size === 0n ? target : held + size) / 1e6})`, [S.triggerCopy(payer.publicKey, c, v.key, size)], true);
+      const ok = await send(`copy: bring ${who} in line on ${v.feed?.symbol} (${Number(held) / 1e6} -> ${Number(size === 0n ? target : held + size) / 1e6})`, [S.triggerCopy(payer.publicKey, c, v.key, size, here ? undefined : { market: home, vault: lv.key })], true);
       if (!ok) copyRetry.set(c.key.toBase58(), Date.now() + 30_000);
       else copyTries.set(tryKey, { held, target, at: Date.now(), n: last && last.held === held && last.target === target ? last.n + 1 : 1 });
       break; // one request per wallet at a time: its other markets follow on later passes

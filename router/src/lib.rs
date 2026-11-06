@@ -1232,7 +1232,7 @@ fn request(program_id: &Pubkey, accounts: &[AccountInfo], mut size: i128, reduce
     let price = if b.mark_price != 0 { b.mark_price } else { perc::asset_price(&market.try_borrow_data()?, v.asset_index)?.1 };
     let held = position_on(market, portfolio, v.asset_index)?;
     let reducing = reduce_only || (held != 0 && (held > 0) != (size > 0) && size.unsigned_abs() <= held.unsigned_abs());
-    session::authorize(program_id, accounts, wallet, &owner, market.key, session::notional(size, price), reducing)?;
+    session::authorize(program_id, accounts, wallet, &owner, market.key, session::notional(size, price), reducing)?.map(|_| ());
     // The account's keeper deposit: what whoever liquidates it is paid (see `keeper_deposit`),
     // topped up from the wallet when a liquidation has used it. Paid once; it stays the trader's.
     top_up_deposit(wallet, trader_ai, system)?;
@@ -1422,7 +1422,9 @@ fn closing(held: i128, amount: i128) -> i128 {
 /// cancel it. A stop, take-profit or trailing stop is tied to the position the wallet holds now.
 ///
 /// Accounts: 0 wallet [s, w], 1 trader, 2 vault, 3 book, 4 order [w], 5 market, 6 trader
-/// portfolio, 7 system program.
+/// portfolio, 7 system program; then, when account 0 is the wallet's trading key (`session`,
+/// since 2026-11-07), the session [w]. The key pays the rent and budget, which go back to the
+/// wallet; the order counts as one of the key's trades and is held to its size limit.
 /// Data: index (u8), kind (u8), reduce-only (u8), size (i128), trigger (u64), TWAP interval
 /// seconds (i64), TWAP slices (u32), expiry time (i64, 0 = none), then optionally the keeper
 /// budget (u64 lamports, at most `MAX_KEEPER_BUDGET`): kept in the order's account and paid to
@@ -1455,7 +1457,8 @@ fn place_order(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     let slices = u32::from_le_bytes(data[35..39].try_into().unwrap());
     let expiry = i64::from_le_bytes(data[39..47].try_into().unwrap());
 
-    let t = load_trader(program_id, trader_ai, wallet.key)?;
+    let owner = load::<TraderState>(trader_ai, program_id, TRADER_MAGIC)?.wallet;
+    let t = load_trader(program_id, trader_ai, &owner)?;
     let v = load_vault(vault_ai)?;
     let b: Book = load_book(book_ai, program_id)?;
     key_is(market, &v.market)?;
@@ -1475,7 +1478,7 @@ fn place_order(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     let mut o = Order::zeroed();
     o.magic = ORDER_MAGIC;
     o.vault = *vault_ai.key;
-    o.wallet = *wallet.key;
+    o.wallet = owner;
     o.index = index;
     o.kind = kind;
     o.reduce_only = reduce_only;
@@ -1515,6 +1518,7 @@ fn place_order(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         }
         _ => return Err(RouterError::BadOrder.into()),
     }
+    session::authorize(program_id, accounts, wallet, &owner, market.key, session::notional(size, b.mark_price), o.reduce_only == 1)?;
     create_pda(wallet, order_ai, system, program_id, ORDER_LEN, budget, &[SEED_ORDER, vault_ai.key.as_ref(), at.as_ref(), &[index], &[bump]])?;
     store(order_ai, &o)
 }
@@ -1522,21 +1526,28 @@ fn place_order(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
 /// Removes a standing order; its rent goes back to the wallet. Not while a request it queued is
 /// still waiting to fill: that request cannot be cancelled, like any other.
 ///
-/// Accounts: 0 wallet [s, w], 1 order [w].
+/// Accounts: 0 wallet [s, w], 1 order [w]; or, signed by the wallet's trading key (`session`):
+/// 0 key [s], 1 order [w], 2 wallet [w], 3 vault, 4 session [w] (the rent still goes to the wallet).
 #[inline(never)]
 fn cancel_order(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
-    let wallet = acc(accounts, 0)?;
+    let actor = acc(accounts, 0)?;
     let order_ai = acc(accounts, 1)?;
-    signer(wallet)?;
-    writable(wallet)?;
+    signer(actor)?;
     writable(order_ai)?;
     let o: Order = load(order_ai, program_id, ORDER_MAGIC)?;
-    if o.wallet != *wallet.key {
-        return Err(RouterError::BadAccount.into());
-    }
     if o.queued_id != 0 {
         return Err(RouterError::RequestPending.into());
     }
+    if o.wallet == *actor.key {
+        writable(actor)?;
+        return close(order_ai, 0, actor, actor);
+    }
+    let (wallet, vault_ai) = (acc(accounts, 2)?, acc(accounts, 3)?);
+    key_is(wallet, &o.wallet)?;
+    key_is(vault_ai, &o.vault)?;
+    writable(wallet)?;
+    let v = load_vault(vault_ai)?;
+    session::authorize(program_id, accounts, actor, &o.wallet, &v.market, 0, true)?;
     close(order_ai, 0, wallet, wallet)
 }
 

@@ -159,24 +159,27 @@ export const unfollow = (wallet: PublicKey, leader: PublicKey) => new Transactio
  *  most `maxNotional` (collateral atoms, 0 = no limit) on any one market. Starting to copy a
  *  trader costs `SOCIAL_FEE` to the treasury (router `COPY_FEE_LAMPORTS`) plus `SOCIAL_FEE` to the
  *  leader (`COPY_LEADER_FEE_LAMPORTS`); new terms cost nothing. */
-export const setCopy = (wallet: PublicKey, leader: PublicKey, ratioBps: number, maxNotional: bigint) => {
+export const setCopy = (wallet: PublicKey, leader: PublicKey, ratioBps: number, maxNotional: bigint, leaderMarket = C.activeMarket()) => {
   const data = Buffer.alloc(13);
   data[0] = 19; data.writeUInt32LE(ratioBps, 1); data.writeBigUInt64LE(maxNotional, 5);
   return new TransactionInstruction({
     programId: C.ROUTER,
-    keys: [rw(wallet, true), rw(copyAddress(wallet)), rw(C.traderAddress(wallet)), rw(leader), ro(C.traderAddress(leader)), ro(SystemProgram.programId), rw(C.TREASURY)],
+    keys: [rw(wallet, true), rw(copyAddress(wallet)), rw(C.traderAddress(wallet)), rw(leader), ro(C.traderAddress(leader, 0, leaderMarket)), ro(SystemProgram.programId), rw(C.TREASURY)],
     data,
   });
 };
 export const stopCopy = (wallet: PublicKey) => new TransactionInstruction({
   programId: C.ROUTER, keys: [rw(wallet, true), rw(copyAddress(wallet))], data: Buffer.from([20]),
 });
-/** Brings a follower in line with its leader on a vault's market (`size` 0 = the whole difference). */
-export const triggerCopy = (payer: PublicKey, c: Copy, vault: PublicKey, size = 0n) => new TransactionInstruction({
+/** Brings a follower in line with its leader on a vault's market (`size` 0 = the whole difference).
+ *  A leader trading on another market (router 2026-11-07) is followed through that market's
+ *  vault for the same feed (`leader`: its market and that vault). */
+export const triggerCopy = (payer: PublicKey, c: Copy, vault: PublicKey, size = 0n, leader?: { market: PublicKey; vault: PublicKey }) => new TransactionInstruction({
   programId: C.ROUTER,
   keys: [
     rw(payer, true), rw(c.key), rw(C.traderAddress(c.follower)), ro(c.follower), ro(vault), rw(C.bookAddress(vault)), rw(C.requestAddress(vault, c.follower)),
-    ro(C.activeMarket()), ro(C.routerPortfolio(c.follower)), ro(C.traderAddress(c.leader)), ro(C.routerPortfolio(c.leader)), ro(SystemProgram.programId),
+    ro(C.activeMarket()), ro(C.routerPortfolio(c.follower)), ro(C.traderAddress(c.leader, 0, leader?.market)), ro(C.routerPortfolio(c.leader, 0, leader?.market)), ro(SystemProgram.programId),
+    ...(leader ? [ro(leader.market), ro(leader.vault)] : []),
     ro(C.tiersAddress()),
   ],
   data: Buffer.concat([Buffer.from([21]), i128le(size)]),

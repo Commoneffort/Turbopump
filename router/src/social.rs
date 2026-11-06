@@ -462,9 +462,8 @@ pub(crate) fn set_copy(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
     }
     let t = load_trader(program_id, trader_ai, wallet.key)?;
     let lt = load_trader(program_id, leader_trader, leader.key)?;
-    if lt.market != t.market {
-        return Err(RouterError::BadAccount.into());
-    }
+    // The leader may trade on another market (X1 has five since 2026-11-06): the copy follows its
+    // positions on the assets both markets list (`trigger_copy`).
     // Copying is between main accounts (isolated ones have no track record to follow).
     if t.sub != 0 || lt.sub != 0 {
         return Err(RouterError::Isolated.into());
@@ -564,7 +563,9 @@ pub fn copy_due(held: i128, target: i128, price: u64) -> bool {
 ///
 /// Accounts: 0 payer [s, w], 1 copy [w], 2 follower's trader account [w], 3 follower wallet,
 /// 4 vault, 5 book [w], 6 request [w], 7 market, 8 follower portfolio, 9 leader's trader
-/// account, 10 leader portfolio, 11 system program. Data: size (i128, 0 = the whole difference).
+/// account, 10 leader portfolio, 11 system program; when the leader trades on another market,
+/// 12 the leader's market and 13 the leader market's vault for the same feed (its position on
+/// that asset is the one followed). Data: size (i128, 0 = the whole difference).
 #[inline(never)]
 pub(crate) fn trigger_copy(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let payer = acc(accounts, 0)?;
@@ -596,7 +597,6 @@ pub(crate) fn trigger_copy(program_id: &Pubkey, accounts: &[AccountInfo], data: 
     let mut b: Book = load_book(book_ai, program_id)?;
     key_is(market, &v.market)?;
     key_is(market, &t.market)?;
-    key_is(market, &lt.market)?;
     key_is(market, &c.market)?;
     key_is(portfolio, &t.portfolio)?;
     key_is(leader_portfolio, &lt.portfolio)?;
@@ -612,7 +612,20 @@ pub(crate) fn trigger_copy(program_id: &Pubkey, accounts: &[AccountInfo], data: 
     perc::expect_market(market)?;
     let (_, price, _) = perc::asset_price(&market.try_borrow_data()?, v.asset_index)?;
     let held = position_on(market, portfolio, v.asset_index)?;
-    let leader_pos = position_on(market, leader_portfolio, v.asset_index)?;
+    let leader_pos = if lt.market == t.market {
+        position_on(market, leader_portfolio, v.asset_index)?
+    } else {
+        // The same asset on the leader's market: its vault there lists the same feed.
+        let (leader_market, leader_vault) = (acc(accounts, 12)?, acc(accounts, 13)?);
+        key_is(leader_market, &lt.market)?;
+        perc::expect_market(leader_market)?;
+        let lv = load_vault(leader_vault)?;
+        key_is(leader_market, &lv.market)?;
+        if lv.oracle_feeds[0] != v.oracle_feeds[0] {
+            return Err(RouterError::BadAccount.into());
+        }
+        position_on(leader_market, leader_portfolio, lv.asset_index)?
+    };
     let target = copy_target(leader_pos, equity(leader_portfolio)?, equity(portfolio)?, c.ratio_bps, c.max_notional, price)?;
     if !copy_due(held, target, price) {
         return Err(RouterError::InLine.into());

@@ -130,13 +130,20 @@ deployed one.
 
 A maker signs a quote for one trading account (size, price, last slot); the taker's transaction
 carries the signature (an Ed25519 verification) and the router's `TakeQuote` (tag 38) fills it in
-the same transaction against the maker's own Percolator portfolio. **The fill price is Percolator's
-price in that slot, not the quote's:** Percolator v16 uses a trade's price only to size its fee
-(`exec_price is used by the engine only as fee notional`), so the quoted price only has to be
-within 1% of Percolator's and sets the fee base. Checked 2026-11-06 in `tests/x1.rs`: a round trip
-bought 0.9% above Percolator's price and sold 0.9% below changed the trader's equity by 0. So a
-quote buys immediacy, not a price; a maker's spread earns nothing, and a maker can be picked off
-by a taker who sees the exchanges move before Percolator's price does (see Open). The vault program registers
+the same transaction against the maker's own Percolator portfolio, at the quoted price.
+
+**The quote is the price paid (engine fork, 2026-11-07).** Percolator v16 uses a trade's price only
+to size its fee (`exec_price is used by the engine only as fee notional`): until this change a quoted
+trade filled at Percolator's price (checked 2026-11-06: a round trip bought 0.9% above and sold
+0.9% below changed the trader's equity by 0), so a maker's spread earned nothing and a stale mark
+could be used against the maker. Now the maker's matcher returns `FLAG_AT_PRICE` (percolator-prog
+`matcher_abi`, 1 << 23) and the engine's `execute_trade_with_fee_*_at_price_not_atomic` settles
+`size × (quote − effective price)` in principal from one account to the other right after the fee
+(`settle_trade_price_difference_not_atomic`): `c_tot`, the vault and insurance unchanged, refused
+if the payer does not hold it. Tests: engine `fork_trade_at_price_*` (3), `tests/x1.rs`
+`a_quote_is_the_price_paid` (the round trip now costs the taker 1.8%, exactly what the maker gets).
+A trading key's quotes must be within its session's band (default 0.5%), since a quote now moves
+money. The vault program registers
 makers (`OpenMaker`, tag 44) and prices a maker's trade only as the router armed it
 (`ArmQuote`, tag 45). Quotes are good once (a window of 4,096 ids), for at most 150 slots, within
 1% of Percolator's price, and the taker is held to the router's margin, fees, close-only and
@@ -260,19 +267,20 @@ block of 60M compute units with 12M per account (the 100M block is not on for X1
 ### Open
 
 - **Compute on the original market.** A quoted trade there uses 1.0 to 1.4M compute units out of
-  1.4M allowed, because the router brings both portfolios (the taker's and the maker's, each
-  holding SOL, BTC and ETH) to the current slot. A maker portfolio per asset would cut the
-  maker's share by about two thirds. On the four new markets a quoted trade uses about 550k.
-- **Quotes don't set the price.** The router could settle `(quote − mark) × size` between the taker
-  and the maker so the quote is the price paid: spreads would earn, and a stale mark could not be
-  used against the maker. Until then, short quote lives and size limits are the maker's only
-  protection. The track record and the Trades widget book a quoted fill at the quote's price
-  (`record_fill(…, price, …)`), not at the mark the engine used.
-- **`EngineLockActive` (0x15).** Some trades are refused with it at the moment they are sent and
-  go through when sent again. The retry hides it; the cause in the engine is not found yet.
-- **Standing orders** are not signed by the trading key yet; they still need the wallet.
-- **Executor funding.** The deployer pays the five executors; it needs a top-up job or a wallet
-  each.
+  1.4M allowed (measured 2026-11-07 on an ETH quote: asset catch-up 103k, the maker's portfolio
+  325k, the taker's 287k, the trade 464k; half of a dozen simulations ran out). Part of it is the
+  market itself (19 assets: every Percolator call scans them all; a quoted trade on the 3-asset
+  markets uses about 550k). Per-asset makers (`MAKER_ASSETS_X1`, one portfolio per asset, set up
+  with `MAKER_KEY=…/maker-<SYM>.json maker.ts setup`) take the maker's multi-asset re-valuation out.
+- **`EngineLockActive` (0x15).** Some trades were refused with it at the moment they were sent
+  and went through when sent again; the page retries them. Checked 2026-11-07: every vault's price range was valid and
+  current with spans of 0 to 8 bps (the limit is 62), so quoted trades take the cohort-tolerant
+  path; the refusals measured that day were compute exhaustion, not locks. The engine has 114
+  `LockActive` returns (stale cohorts on the ordinary path, a side reset pending, ADL scaling,
+  market mode); a refused transaction's logs do not say which.
+- **Executor funding.** The five X1 executors and keepers all pay from the deployer, which the
+  watchdog refills from the treasury (below 80 XNT, up to 150, keeping the treasury's 20 XNT
+  reserve). On 2026-11-07 they spent about 10 XNT an hour, more than the treasury takes in.
 
 ## Credits
 

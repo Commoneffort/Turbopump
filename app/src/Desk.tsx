@@ -8,7 +8,7 @@ import { CSSProperties, Fragment, useEffect, useMemo, useRef, useState } from "r
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
 import { ComputeBudgetProgram, Connection, PublicKey, TransactionInstruction } from "@solana/web3.js";
-import { OneClickPanel, SetupCard, useTradingKey } from "./OneClick";
+import { OneClickPanel, SetupCard, sendOrders, useTradingKey } from "./OneClick";
 import { createAssociatedTokenAccountIdempotentInstruction } from "@solana/spl-token";
 import * as C from "./chain";
 import { readDirect } from "./view";
@@ -243,7 +243,7 @@ function DeskInner({ vaultKey, markets, day, send, busy, tick, go }: { vaultKey:
           <button className={panel === "trade" ? "on" : ""} onClick={() => setPanel("trade")}>Trade</button>
           <button className={panel === "earn" ? "on" : ""} onClick={() => setPanel("earn")}>Earn</button>
         </div>
-        {panel === "trade" ? <Ticket state={state} send={wrapped} busy={busy} vaults={markets.map(c => c.v)} margin={margin} setMargin={setMargin} copying={me.copy && !state.sub ? { leader: me.copy.leader.toBase58(), name: board?.profiles.get(me.copy.leader.toBase58())?.name ?? short(me.copy.leader.toBase58()) } : undefined} /> : <div className="earn"><LiquidityPanel state={state} send={wrapped} busy={busy} /></div>}
+        {panel === "trade" ? <Ticket state={state} send={wrapped} busy={busy} vaults={markets.map(c => c.v)} margin={margin} setMargin={setMargin} copying={me.copy && !state.sub ? { leader: me.copy.leader.toBase58(), name: board?.profiles.get(me.copy.leader.toBase58())?.name ?? short(me.copy.leader.toBase58()) } : undefined} /> : <div className="earn"><LiquidityPanel state={state} send={wrapped} busy={busy} tick={tick} /></div>}
         <button className="portfolio-btn" onClick={() => go("/portfolio")} title="Your positions, results and trading statistics across every market">
           <span>Portfolio</span><b aria-hidden>→</b>
         </button>
@@ -873,8 +873,11 @@ function KeeperLine({ lamports }: { lamports: number }) {
 
 /** Limit, TP / SL / trailing stop, and TWAP: orders the wallet signs once and the executor
  *  carries out later, when their condition holds. */
-function StandingForm({ mode, side, state, send, busy }: { mode: "limit" | "protect" | "twap"; side: 1n | -1n; state: C.State; send: Send; busy?: string }) {
+function StandingForm({ mode, side, state, send: wsend, busy }: { mode: "limit" | "protect" | "twap"; side: 1n | -1n; state: C.State; send: Send; busy?: string }) {
   const { publicKey } = useWallet();
+  // With one-click trading on, orders are placed by the trading key (no popup), when it holds their keeper budget.
+  const ok = useTradingKey(busy ? 1 : 0);
+  const send: Send = (label, ixs) => publicKey && Array.isArray(ixs) ? sendOrders(wsend, ok, publicKey, label, ixs, state.vault.key, ixs.reduce((a, ix) => a + (ix.programId.equals(C.ROUTER) && ix.data[0] === 12 && ix.data.length > 48 ? Number(ix.data.readBigUInt64LE(48)) : 0), 0)) : wsend(label, ixs);
   const v = state.vault, sym = v.feed?.symbol ?? "";
   const priceN = num(state.asset.price, 1e6), dp = priceDp(priceN);
   const held = state.portfolio?.position ?? 0n, long = held > 0n;
@@ -1175,6 +1178,7 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go, tick, accoun
 }) {
   const { publicKey } = useWallet();
   const { connection } = useConnection();
+  const ok = useTradingKey(busy ? 1 : 0);
   const [tab, setTab] = useState<"positions" | "orders" | "twap" | "history" | "vault" | "market">("positions");
   const [rowPct, setRowPct] = useState<Map<string, number>>(new Map());
   const rk = (x: { sub: number; asset: number }) => `${x.sub}:${x.asset}`;
@@ -1284,7 +1288,7 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go, tick, accoun
                     <td className="r mono">{trig}</td>
                     <td className="r mono">{fmt(mark, dpp)}</td>
                     <td>{o.queued ? "queued: filling at the next price" : o.kind === C.ORDER.TWAP ? `next slice ${o.nextTime * 1000 <= Date.now() ? "due" : `in ${Math.max(1, Math.round((o.nextTime * 1000 - Date.now()) / 1000))} s`}` : "waiting"}</td>
-                    <td className="r"><button className="btn tiny" disabled={o.queued || !!busy} title={o.queued ? "Its queued request has to fill or expire first" : undefined} onClick={() => publicKey && send(`Cancel ${ORDER_NAME[o.kind].toLowerCase()}`, [C.cancelOrder(publicKey, v.key, o.index, state.sub)])}>Cancel</button></td>
+                    <td className="r"><button className="btn tiny" disabled={o.queued || !!busy} title={o.queued ? "Its queued request has to fill or expire first" : undefined} onClick={() => publicKey && sendOrders(send, ok, publicKey, `Cancel ${ORDER_NAME[o.kind].toLowerCase()}`, [C.cancelOrder(publicKey, v.key, o.index, state.sub)], v.key)}>Cancel</button></td>
                   </tr>
                 );
               })}
@@ -1314,7 +1318,7 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go, tick, accoun
                     <td><span className={`twap-bar ${buys ? "up" : "down"}`} title={share !== undefined ? `${fmt(share * 100, 1)}% filled` : "The full size is not known yet"}><span style={{ width: `${(share ?? 0) * 100}%` }} /></span></td>
                     <td className="r mono">{units(o.slice)} every {every}</td>
                     <td>{o.queued ? "filling at the next price" : due ? "due now" : `in ${Math.max(1, Math.round((o.nextTime * 1000 - Date.now()) / 1000))} s`}</td>
-                    <td className="r"><button className="btn tiny" disabled={o.queued || !!busy} title={o.queued ? "Its queued slice has to fill or expire first" : "Stops the TWAP; slices already filled stay filled"} onClick={() => publicKey && send("Cancel TWAP", [C.cancelOrder(publicKey, v.key, o.index, state.sub)])}>Cancel</button></td>
+                    <td className="r"><button className="btn tiny" disabled={o.queued || !!busy} title={o.queued ? "Its queued slice has to fill or expire first" : "Stops the TWAP; slices already filled stay filled"} onClick={() => publicKey && sendOrders(send, ok, publicKey, "Cancel TWAP", [C.cancelOrder(publicKey, v.key, o.index, state.sub)], v.key)}>Cancel</button></td>
                   </tr>
                 );
               })}

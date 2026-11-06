@@ -2,7 +2,7 @@
 
 Turbopump is permissionless, adminless liquidity vaults for [Percolator](https://github.com/aeyakovenko/percolator), Anatoly Yakovenko's perpetual-futures risk engine on Solana, with trading that cannot be front-run.
 
-A vault pools deposits, lists its own perpetual market on Percolator, acts as the counterparty to every queued trade on it, and pays the market's trading fees to its depositors. Every trade goes through a router, and every trade fills at Percolator's own price, never one a trader or maker picks. A queued trade fills at the first oracle price published after a short wait, a price nobody could know when they traded: on X1 three slots after the trade landed (about a second; counted in slots since November 2026, see docs/SPEED-FORK.md), on Solana four seconds (on the next 2-second mark, so trades sent close together share a price). On X1 a market order can instead fill at once against a maker who signed a quote for it, signed by a trading key the wallet approved once, with no wallet popup. Nobody holds a key over any of it: every parameter is fixed when a vault is created, and every maintenance step can be run by anyone.
+A vault pools deposits, lists its own perpetual market on Percolator, acts as the counterparty to every queued trade on it, and pays the market's trading fees to its depositors. Every trade goes through a router. A queued trade fills at the first oracle price published after a short wait, a price nobody could know when they traded: on X1 three slots after the trade landed (about a second; counted in slots since November 2026, see docs/SPEED-FORK.md), on Solana four seconds (on the next 2-second mark, so trades sent close together share a price). On X1 a market order can instead fill at once at the price a maker signed for it, signed by a trading key the wallet approved once, with no wallet popup. Nobody holds a key over any of it: every parameter is fixed when a vault is created, and every maintenance step can be run by anyone.
 
 **Status:** live on Solana devnet and X1 testnet, unaudited. Do not use with real funds.
 
@@ -16,7 +16,7 @@ Two different things, by two different authors. **Percolator** is the risk engin
 |---|---|---|
 | Liquidity | None of its own: a trade needs a counterparty | One shared vault per asset on each market, the counterparty to every queued trade; on X1 makers too |
 | Market keys | Whoever lists a market holds its admin, insurance and oracle keys | The vault's own address holds them; no instruction uses them |
-| Price a trade gets | The market's mark at that moment | Queued: the first oracle price published after a short wait (on X1 3 slots, about a second; on Solana 4 to 5 seconds). Quoted (X1): the mark in the slot it lands in, at once |
+| Price a trade gets | The market's mark at that moment | Queued: the first oracle price published after a short wait (on X1 3 slots, about a second; on Solana 4 to 5 seconds). Quoted (X1): the maker's signed price, at once |
 | Order types | An immediate trade between two accounts | Market, limit, stop loss, take profit, trailing stop, TWAP |
 | Who earns the fees | The asset's insurance operator | Depositors 85%, the market's opener 5%, the platform 10% |
 
@@ -60,7 +60,7 @@ Before this change the vault filled every trade immediately at Percolator's mark
 5. **No backing out.** A request cannot be cancelled. The trader's margin is locked from request to fill, and the request is only accepted with enough margin to open at the asset's level; if the price moves during the wait so the account can no longer afford the trade, the fill trades nothing, so a trader cannot pick which fills happen after seeing the price. A request nobody fills within 90 seconds of its target expires and its bond is forfeited; nothing is traded.
 6. **Nobody can censor it.** Filling is permissionless: any wallet, the trader included, can execute any request once the mark is at its price, and earns the request's bond for doing so. Each trader's Percolator account is owned by a program address derived from their wallet; only the router can trade it, and withdrawals can only go back to that wallet.
 
-Maker quotes (X1, router tag 38) are the exception: they fill at once, against the maker's own Percolator account, never the vault's. Like every trade they fill at Percolator's price in that slot (a quote's price only sizes the fee and must be within 1% of it), so the maker, not the vault or other traders, carries the risk of a trader who sees the exchanges move before Percolator's price does.
+Maker quotes (X1, router tag 38) are the exception: they fill at once, against the maker's own Percolator account, never the vault's, at the quoted price (within 1% of Percolator's). Percolator itself only uses a trade's price for its fee; our engine fork settles the difference from its price between the two accounts (matcher flag `FLAG_AT_PRICE`, since 2026-11-07), so the taker pays the quote and the maker earns its spread. The maker carries the risk of the exchanges moving during the quote's life (about 2 s).
 
 What is left: the design assumes the chain clock does not run more than a few seconds behind real time (the 4-second delay is the margin), and a request that cannot fill (for example after the account can no longer afford it at the new price) holds the mark at most 90 seconds before it expires, at the cost of its bond.
 
@@ -281,14 +281,19 @@ Live on X1 testnet since 2026-11-06 (details, measurements and the rollback tag 
 - **Slot time and lazy settlement:** the wait before a fill is counted in slots; a fill settles
   only the trader and the vault (engine fork).
 - **Maker quotes:** a market order fills against a maker who signed a quote for it, in its own
-  transaction, at Percolator's price in that slot (about 0.8 s from click to confirmed on X1), quotes fetched while the order is typed. Our maker runs
+  transaction, at the quoted price (engine fork `FLAG_AT_PRICE`; about 0.8 s from click to confirmed on X1), quotes fetched while the order is typed. Our maker runs
   as `api/quote` on the site and `app/scripts/maker.ts`.
 - **Five markets:** four more Percolator markets (`deploy/x1-testnet.m1.json` to `m4.json`), each
   with SOL, BTC and ETH, its vaults, maker and executor (`deploy/x1-services.sh`); each wallet
   trades on one of them.
 - **One-click trading:** a random, non-extractable browser key approved on chain (tags 39/40)
-  signs trades with no wallet popup; setup in one approval; the key falls back to the wallet when
-  it cannot cover a queued order.
+  signs trades and standing orders with no wallet popup, within a size a trade, trades a day, a
+  total a day and a quote band; it ends itself after 2 hours idle; a fee sponsor (`api/relay`) pays
+  its quoted trades' fees when it has no XNT; setup in one approval; the key falls back to the
+  wallet when it cannot cover a queued order.
+- **Across markets:** copying a leader on another market (`TriggerCopy` with the leader's market
+  and vault), Earn deposits spread over all five markets' vaults, per-asset makers on the original
+  market (`MAKER_ASSETS_X1`).
 
 ## Credits
 
