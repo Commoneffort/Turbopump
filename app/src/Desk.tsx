@@ -19,6 +19,7 @@ import { Liquidations, PULSE, PULSE_BOARD_MS, Whale, marketFills, useVolume } fr
 import { WidgetPanel, liqLevels } from "./Widgets";
 import { CloseSlider } from "./PositionTools";
 import { AcctView, Card, Faucet, Fill, Icon, LiquidityPanel, OpenerPanel, Send, ago, capUnits, entryPrice, explorer, fmt, num, priceDp, px, realizedPnl, short, units, usd, useAccounts, useActivity, useCards, useDeepFills, useFillsBySub, useVault, useWalletFills } from "./shared";
+import { BurnerName } from "./burner";
 
 const UP = T.green, DOWN = T.red;
 const pct = (x: number, dp = 2) => `${x >= 0 ? "+" : "−"}${fmt(Math.abs(x) * 100, dp)}%`;
@@ -497,7 +498,7 @@ function Stress({ state }: { state: C.State }) {
 // ---------------------------------------------------------------- order ticket
 
 function Ticket({ state, send, busy, copying, margin, setMargin, vaults }: { state: C.State & { readFor?: string }; send: Send; busy?: string; copying?: { leader: string; name: string }; margin: MarginMode; setMargin: (m: MarginMode) => void; vaults: C.Vault[] }) {
-  const { publicKey } = useWallet();
+  const { publicKey, wallet } = useWallet();
   const { connection } = useConnection();
   // The wallet's coins: an order takes a bond and a deposit (0.1% of its value) in the chain's
   // coin, and without enough of them the transaction is refused with a bare "0x1".
@@ -658,7 +659,20 @@ function Ticket({ state, send, busy, copying, margin, setMargin, vaults }: { sta
     const open = iso && !state.trader ? [C.openTradingAccount(publicKey, sub), C.openLedger(publicKey, publicKey, sub)] : [];
     const ledger = state.trader && !state.trader.hasLedger ? [C.openLedger(publicKey, publicKey, sub)] : [];
     const fund = isoTopUp > 0n ? [createAssociatedTokenAccountIdempotentInstruction(publicKey, C.ata(publicKey, C.MINT), publicKey, C.MINT), C.routerDeposit(publicKey, isoTopUp, sub)] : [];
-    sendNoted(`${side > 0n ? "Long" : "Short"} ${units(sent)} ${sym}${iso ? ` isolated${isoTopUp > 0n ? `, ${money(num(isoTopUp, 1e6))} margin` : ""}` : ""}`, [...open, ...ledger, ...fund, C.requestTrade(publicKey, v.key, sent * side, { sub })]);
+    const label = `${side > 0n ? "Long" : "Short"} ${units(sent)} ${sym}${iso ? ` isolated${isoTopUp > 0n ? `, ${money(num(isoTopUp, 1e6))} margin` : ""}` : ""}`;
+    const queued = [...open, ...ledger, ...fund, C.requestTrade(publicKey, v.key, sent * side, { sub })];
+    // An account ready to trade takes a maker's quote when one is offered: it fills in the slot
+    // the transaction lands in. Otherwise (or a new account, margin to move) the queue.
+    if (C.QUOTES_ON && !open.length && !ledger.length && !fund.length) {
+      send(label, async conn => {
+        // (The burner wallet signs at once; a wallet that asks its user needs the quote longer.)
+        const instant = wallet?.adapter?.name === BurnerName;
+        const q = await C.quotedTrade(conn, v, publicKey, sub, sent * side, instant ? 6 : 30).catch(() => null);
+        return withNote(q ? q.ixs : queued);
+      }).then(r => { if (r) setNote(""); });
+      return;
+    }
+    sendNoted(label, queued);
   };
   // Close all of the position, or a share of it (a smaller trade the other way).
   const closeAll = (share = 100) => {

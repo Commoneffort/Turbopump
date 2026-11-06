@@ -21,7 +21,8 @@ const conn = new Connection(process.env.RPC ?? C.RPC_URL, "confirmed");
 const load = (p: string) => Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(p, "utf8"))));
 const payer = load(process.env.PERCOLATOR_KEYPAIR ?? `${process.env.HOME}/.config/solana/percolator-x1/deployer.json`);
 const KEY = process.env.MAKER_KEY ?? `../deploy/logs/maker-${C.NETWORK}.json`;
-const INFO = `../deploy/logs/maker-${C.NETWORK}-portfolio.json`;
+// (Kept next to the maker's key, so a drill's maker and the network's never mix.)
+const INFO = `${KEY.replace(/\.json$/, "")}-portfolio.json`;
 const TTL = Number(process.env.MATCHER_TTL ?? 216_000);
 const say = (...a: unknown[]) => console.log(new Date().toISOString().slice(11, 19), ...a);
 
@@ -75,7 +76,7 @@ async function setup(usdc: number) {
   say("maker wallet", w.publicKey.toBase58());
   if ((await conn.getBalance(w.publicKey)) < 50_000_000) await send("coin for the maker's fees", [SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: w.publicKey, lamports: 200_000_000 })], []);
   let pf: PublicKey;
-  if (fs.existsSync(INFO)) pf = portfolioKey();
+  if (fs.existsSync(INFO) && (await conn.getAccountInfo(portfolioKey()))) pf = portfolioKey();
   else {
     const kp = Keypair.generate();
     pf = kp.publicKey;
@@ -112,7 +113,8 @@ async function serve(port: number) {
     const u = new URL(req.url ?? "/", "http://x");
     res.setHeader("access-control-allow-origin", "*");
     try {
-      const q = await makeQuote(qconn, m, new PublicKey(u.searchParams.get("vault")!), new PublicKey(u.searchParams.get("trader")!), BigInt(u.searchParams.get("size")!));
+      const life = u.searchParams.get("life");
+      const q = await makeQuote(qconn, m, new PublicKey(u.searchParams.get("vault")!), new PublicKey(u.searchParams.get("trader")!), BigInt(u.searchParams.get("size")!), life ? Number(life) : undefined);
       res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(q));
     } catch (e: any) {
       res.writeHead(404, { "content-type": "application/json" }).end(JSON.stringify({ error: String(e?.message ?? e) }));

@@ -22,6 +22,11 @@ export const MAX_NOTIONAL = () => env("MAKER_MAX_NOTIONAL", 20_000);
 export const MAX_POSITION = () => env("MAKER_MAX_POSITION", 100_000);
 /** How many slots a quote stays good for (X1 slots are ~0.36 s). */
 export const QUOTE_SLOTS = () => env("MAKER_QUOTE_SLOTS", 6);
+/** A taker may ask for a longer life (a wallet that asks its user first): up to MAX_LIFE slots,
+ *  at LIFE_BPS_PER_SEC more spread for each second beyond QUOTE_SLOTS, since the taker holds the
+ *  quote as an option for that long. */
+export const MAX_LIFE = () => env("MAKER_MAX_LIFE", 40);
+export const LIFE_BPS_PER_SEC = () => env("MAKER_LIFE_BPS_PER_SEC", 0.5);
 const PRICE_MAX_AGE_MS = 10_000;
 const PRICE_URL = () => (globalThis as any).process?.env?.MAKER_PRICES ?? "http://jack0.x1.xyz:8090";
 const JACK_SYMBOL: Record<string, string> = { XAU: "GOLD", XAG: "SILVER" };
@@ -87,7 +92,8 @@ export type QuoteOut = { maker: string; wallet: string; portfolio: string; deleg
 
 /** A signed quote for `trader` (a router trading account) to trade `size` (e6 units, + = buy) on
  *  `vault`'s market. Throws when no quote is offered. */
-export async function makeQuote(conn: Connection, m: Maker, vault: PublicKey, trader: PublicKey, size: bigint): Promise<QuoteOut> {
+export async function makeQuote(conn: Connection, m: Maker, vault: PublicKey, trader: PublicKey, size: bigint, life = QUOTE_SLOTS()): Promise<QuoteOut> {
+  life = Math.max(3, Math.min(MAX_LIFE(), Math.round(life)));
   if (size === 0n) throw new Error("no size");
   const V = (L as any).vault;
   const [accs, slot] = await Promise.all([conn.getMultipleAccountsInfo([vault, m.portfolio], "processed"), conn.getSlot("processed")]);
@@ -107,10 +113,11 @@ export async function makeQuote(conn: Connection, m: Maker, vault: PublicKey, tr
   if (Math.abs(after) * ref > MAX_POSITION()) throw new Error("maker position limit");
   const adds = Math.sign(after) === Math.sign(Number(held)) || held === 0n;
   const skew = adds ? (Math.abs(Number(held)) / 1e6 * ref / 10_000) * SKEW_BPS() : 0;
-  const spreadBps = SPREAD_BPS() + (notional / 10_000) * IMPACT_BPS() + skew;
+  const longer = Math.max(0, life - QUOTE_SLOTS()) * 0.36 * LIFE_BPS_PER_SEC();
+  const spreadBps = SPREAD_BPS() + (notional / 10_000) * IMPACT_BPS() + skew + longer;
   const px = ref * (1 + (size > 0n ? 1 : -1) * spreadBps / 10_000);
   const price = BigInt(Math.round(px * 1e6));
-  const expiry = BigInt(slot + QUOTE_SLOTS());
+  const expiry = BigInt(slot + life);
   // Ids rise with the slot (the maker's window of 4,096 used ids follows them), 256 a slot: one
   // after the other within a process, from a random start in a fresh one (a serverless function).
   const id = BigInt(slot) * 256n + BigInt(nextId++ % 256);

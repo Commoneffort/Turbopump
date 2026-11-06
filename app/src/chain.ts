@@ -1655,3 +1655,34 @@ export function takeQuoteIxs(v: Vault, wallet: PublicKey, sub: number, q: Quote,
   const verify = Ed25519Program.createInstructionWithPublicKey({ publicKey: new PublicKey(q.wallet).toBytes(), message: msg, signature: Buffer.from(q.signature, "base64") });
   return [...cranks, verify, takeQuote(v, wallet, sub, q)];
 }
+
+/** Where quotes come from: our maker's service on this site (api/quote), or QUOTE_URL. */
+const QUOTE_URL = (typeof process !== "undefined" && process.env?.QUOTE_URL) || "/api/quote";
+/** The instructions that trade `size` on `v` at a maker's quote now (its signature check, the
+ *  account updates it needs, TakeQuote), or null: no quote offered, or it would not go through
+ *  (the trade then goes through the queue). Each variant of the updates is simulated, side by
+ *  side: an update with nothing to do fails its whole transaction. */
+/** `life`: how many slots the quote should stay good for (a wallet that asks its user first
+ *  needs longer; the maker charges a little more for it). The result has no compute budget
+ *  instruction (`units` is what the simulation used). */
+export async function quotedTrade(conn: Connection, v: Vault, wallet: PublicKey, sub: number, size: bigint, life = 6, timeoutMs = 700): Promise<{ ixs: TransactionInstruction[]; quote: Quote; units: number } | null> {
+  if (!QUOTES_ON || size === 0n) return null;
+  const trader = traderAddress(wallet, sub);
+  // (A maker server run apart, QUOTE_URL=http://host:port, answers on /quote.)
+  const base = QUOTE_URL.endsWith("/api/quote") ? QUOTE_URL : `${QUOTE_URL}/quote`;
+  const url = `${base}?network=${NETWORK}&vault=${v.key.toBase58()}&trader=${trader.toBase58()}&size=${size}&life=${life}`;
+  const r = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) }).catch(() => null);
+  if (!r || !r.ok) return null;
+  const q = (await r.json()) as Quote;
+  const pf = await conn.getAccountInfo(routerPortfolio(wallet, sub), "processed");
+  const mine = pf ? portfolioAssets(new Uint8Array(pf.data)) : [];
+  const last = (as: number[]) => [...as.filter(a => a !== v.assetIndex), v.assetIndex];
+  const makerCrank = crank(wallet, new PublicKey(q.portfolio), last(q.makerAssets.length ? q.makerAssets : [v.assetIndex]));
+  const traderCrank = mine.length ? [crank(wallet, routerPortfolio(wallet, sub), last(mine))] : [];
+  const variants = [[makerCrank, ...traderCrank], [makerCrank], traderCrank, []].map(c => takeQuoteIxs(v, wallet, sub, q, c));
+  const sims = await Promise.all(variants.map(ixs => conn.simulateTransaction(new VersionedTransaction(new TransactionMessage({ payerKey: wallet, recentBlockhash: PublicKey.default.toBase58(), instructions: [ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }), ...ixs] }).compileToV0Message()), { sigVerify: false, replaceRecentBlockhash: true }).catch(() => null)));
+  const i = sims.findIndex(s => s && !s.value.err);
+  if (i < 0) return null;
+  const units = Math.min(1_400_000, Math.ceil((sims[i]!.value.unitsConsumed ?? 1_000_000) * 1.3) + 20_000);
+  return { ixs: variants[i], quote: q, units };
+}

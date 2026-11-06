@@ -1,4 +1,4 @@
-// GET /api/quote?network=x1-testnet&vault=<vault>&trader=<trading account>&size=<e6 units, + = buy>
+// GET /api/quote?network=x1-testnet&vault=<vault>&trader=<trading account>&size=<e6 units, + = buy>[&life=<slots>]
 // Our maker's signed quote (api/_maker.ts), good for a few slots. MAKER_SECRET_X1 holds the
 // maker's keypair (JSON byte array) and MAKER_PORTFOLIO_X1 its Percolator portfolio (set up with
 // scripts/maker.ts setup). 404 when no quote is offered: the trade then goes through the queue.
@@ -25,7 +25,8 @@ export default async function handler(req: any, res: any) {
   try {
     const conn = (conns[net.rpc] ??= new Connection(net.rpc, "processed"));
     const kp = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(secret)));
-    const q = await makeQuote(conn, { kp, portfolio: new PublicKey(portfolio), market: new PublicKey(net.market) }, vault, trader, size);
+    const life = req.query.life ? Number(req.query.life) : undefined;
+    const q = await makeQuote(conn, { kp, portfolio: new PublicKey(portfolio), market: new PublicKey(net.market) }, vault, trader, size, life);
     return res.status(200).json(q);
   } catch (e: any) {
     return res.status(404).json({ error: String(e?.message ?? e).replace(/https?:\/\/\S+/g, "the RPC") });
