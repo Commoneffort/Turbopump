@@ -1,4 +1,4 @@
-import { MANIFEST as M } from "./chain";
+import { MANIFEST as M, MARKETS } from "./chain";
 import { CANON_EPOCH_LEN_SLOTS, CARRY, LAYOUT, holdPctHour, ROUTER, ROUTER_BATCH_SECS, ROUTER_BATCH_SLOTS, ROUTER_DELAY_SECS, ROUTER_DELAY_SLOTS, ROUTER_GRACE_SECS, ROUTER_WAIT_SECS, SLOT_TIME, TRADE_FEE_BPS, TRADE_FEE_PCT, X1, slotSeconds } from "./chain";
 
 /** The wait before a trade's price, in words for this network: slots on X1 (slot time), seconds on Solana. */
@@ -101,8 +101,9 @@ export default function Docs() {
           Percolator, Anatoly Yakovenko's risk engine, and adds everything an exchange needs around it: markets that own their
           own keys, a shared liquidity vault for each asset, trading that cannot be front-run, limit, stop, take-profit,
           trailing and TWAP orders, track records and copy trading written by the program itself, spot swaps on xDEX, and a
-          trading desk to use it all from. Every trade fills at the first oracle price published {WAIT} after it was requested,
-          so nobody can trade against a price they already know.
+          trading desk to use it all from. Every trade fills at Percolator's own price, never at one a trader or a maker picks. A
+          queued trade fills at the first oracle price published {WAIT} after it was requested, so nobody can trade against the
+          vault at a price they already know.{X1 ? " On X1 a market order can instead fill at once, against a maker who signed to take it, and with one-click trading it needs no wallet popup." : ""}
         </p>
         <div className="callout">
           <b>Status.</b> Live on Solana devnet and X1 testnet. Unaudited: neither Turbopump nor Percolator has been audited. Use test funds only.
@@ -119,9 +120,9 @@ export default function Docs() {
           <tbody>
             <tr><td>What it is</td><td>A risk engine: one Solana program by Anatoly Yakovenko</td><td>Two Solana programs (vault and router), the services that run them, and this web app</td></tr>
             <tr><td>Its job</td><td>Margin, profit and loss, insurance, its own liquidation, bounded price moves</td><td>Everything else: who lists a market, who provides liquidity, how and at what price a trade fills, orders, fees, records</td></tr>
-            <tr><td>Liquidity</td><td>None of its own: a trade needs a counterparty</td><td>One shared vault per asset that is the counterparty to every trade</td></tr>
+            <tr><td>Liquidity</td><td>None of its own: a trade needs a counterparty</td><td>One shared vault per asset on each market, the counterparty to every queued trade{X1 ? "; makers who take trades at once" : ""}</td></tr>
             <tr><td>Market keys</td><td>Whoever lists a market holds its admin, insurance and oracle keys</td><td>The vault's own address holds them, and the program has no instruction that uses them</td></tr>
-            <tr><td>Price a trade gets</td><td>The market's mark, whatever it is at that moment</td><td>The first oracle price published {WAIT} after the request: unknown to everyone when the trade is sent</td></tr>
+            <tr><td>Price a trade gets</td><td>The market's mark, whatever it is at that moment</td><td>Queued: the market's price at the first oracle price published {WAIT} after the request, unknown to everyone when the trade is sent.{X1 ? " Quoted: the market's price in the slot it lands in, at once." : ""}</td></tr>
             <tr><td>Order types</td><td>An immediate trade between two accounts</td><td>Market, limit, stop loss, take profit, trailing stop and TWAP</td></tr>
             <tr><td>Who earns the fees</td><td>The asset's insurance operator</td><td>Depositors 85%, the market's opener 5%, the platform 10%</td></tr>
           </tbody>
@@ -129,7 +130,8 @@ export default function Docs() {
         <p>What Turbopump adds, in the order this page describes it:</p>
         <ul>
           <li><b>The vault program</b>: keyless markets, one per price feed, each with a pooled vault that lists the market, quotes it and pays its fees to depositors.</li>
-          <li><b>The router program</b>: the only way to trade. It queues every trade and fills it at a price nobody could know in advance.</li>
+          <li><b>The router program</b>: the only way to trade. It queues trades and fills them at a price nobody could know in advance, or fills a maker's signed quote at once, and it lets a trading key approved by the wallet trade within limits.</li>
+          {X1 && <li><b>Instant trades and one-click trading</b>: maker quotes taken in one transaction, quotes fetched while the order is typed, trades signed by a key the wallet approved once, five markets for more room.</li>}
           <li><b>Standing orders</b>: limit, stop loss, take profit, trailing stop and TWAP, signed once and carried out on chain by anyone.</li>
           <li><b>Track records and copy trading</b>: profit, volume and fills booked by the router itself; names, badges, following and copying.</li>
           <li><b>Liquidations and settlement that keep markets open</b>: positions are closed against the vault before the engine has to step in, and epochs settle while the vault holds a position.</li>
@@ -165,6 +167,17 @@ export default function Docs() {
           <li><b>A spread earns nothing.</b> Because trades settle at the mark, a classic spread-quoting market maker has no edge. The income is in the fees, which belong to whoever operates the asset.</li>
           <li><b>Filling at an oracle price invites front-running.</b> A market maker that fills immediately at the current oracle price can be traded against by anyone who sees the real price first.</li>
         </ol>
+        <p>Where each one stands:</p>
+        <table className="doc-table">
+          <thead><tr><th>Gap</th><th>Turbopump's answer</th><th>What is left</th></tr></thead>
+          <tbody>
+            <tr><td>1. Empty markets</td><td>Every market has a shared vault that takes the other side of every queued trade, so a new market can trade as soon as anyone deposits{X1 ? "; on X1 makers take trades too" : ""}.</td><td>A vault with no deposits takes nothing.</td></tr>
+            <tr><td>2. The lister's keys</td><td>The vault program's governor address holds the market's authority and only uses it to retire idle markets; the vault holds each asset's admin, insurance and oracle keys and never uses them otherwise{X1 ? " (checked on chain for all five X1 markets)" : ""}.</td><td>We still hold the programs' upgrade keys (to be burned before mainnet){X1 ? ", and on X1 our reporter and witness keys post the prices" : ""}.</td></tr>
+            <tr><td>3. Fragmented liquidity</td><td>One vault per feed on a market: a second SOL vault on the same market cannot exist.</td><td>{X1 ? "On X1 we split trading over five markets for more room per block, so SOL, BTC and ETH each have five vaults. A trade only sees the vault of its wallet's market." : "None on devnet (one market)."}</td></tr>
+            <tr><td>4. No spread to earn</td><td>The vault earns fees and what traders lose instead, and depositors get 85% of what is harvested.</td><td>Still true for makers too: a quoted trade fills at Percolator's price, so a maker's spread earns nothing.</td></tr>
+            <tr><td>5. Front-running</td><td>Queued trades fill at a price posted after they land, so nobody can trade against the vault at a price they know.</td><td>{X1 ? "A quoted trade fills at once at Percolator's price, which follows the exchanges about a second behind: a trader who sees a move first can take a maker's quote at the old price. The maker carries that, not the vault or other traders." : "None for queued trades."}</td></tr>
+          </tbody>
+        </table>
 
         <h2 id="frontrun">Front-running, solved</h2>
         <p><b>Who sees prices before Pyth?</b> Almost every professional trader:</p>
@@ -176,7 +189,7 @@ export default function Docs() {
         </ul>
         <p>
           Before the router, the vault filled every trade immediately at Percolator's mark, which followed Pyth, so any of them could
-          buy from it below the real price and sell to it above, and depositors paid. Now every trade is a request that fills at a
+          buy from it below the real price and sell to it above, and depositors paid. Now every trade against the vault is a request that fills at a
           price nobody could know when it was made (below). That is the problem this solves: <b>no one can trade against the vault
           at a price they already know, and no one can choose the price a trade fills at.</b>
         </p>
@@ -188,17 +201,17 @@ export default function Docs() {
           <li><b>Market owner.</b> The vault's own address signs the listing, so the vault becomes the asset's admin, insurance operator, backing authority and oracle authority. The asset is listed in Percolator's authority-mark mode at a fresh, verified Pyth price, and the vault moves its mark only when the router asks, to a verified Pyth price. The program has no other instruction that uses those powers.</li>
           <li><b>Matcher.</b> The vault account doubles as the matcher context. When the router executes a trade against the vault's LP portfolio, Percolator calls the vault program, which returns a fill size within its caps. It only answers calls signed by Percolator's matcher delegate for this vault's own portfolio, and only for the one fill the router armed in that slot.</li>
           <li><b>Pool.</b> Depositors hold vault shares (an SPL token). Deposits and withdrawals queue during an epoch and settle together at one price.</li>
-          <li><b>One market per asset.</b> The vault address is derived from <code>(market, Pyth feed)</code>. A second vault for the same feed cannot exist, so all liquidity for an asset is in one pool and every fill sees all of it.</li>
+          <li><b>One market per asset.</b> The vault address is derived from <code>(market, Pyth feed)</code>. A second vault for the same feed cannot exist on a market, so all of a market's liquidity for an asset is in one pool and every fill sees all of it.{X1 ? " X1 runs five markets (see How trades fill), so there each asset has one vault per market." : ""}</li>
         </ul>
         <p>
           The <b>router program</b> (<code>{ROUTER.toBase58().slice(0, 4)}…</code>) is the only way to trade: it queues requests,
-          moves each vault's mark to verified Pyth prices, and executes fills. Each trader's Percolator account is owned by a
+          moves each vault's mark to verified Pyth prices, and executes fills{X1 ? "; on X1 it also fills makers' quotes and accepts trades signed by approved trading keys" : ""}. Each trader's Percolator account is owned by a
           program address derived from their wallet; only the router can trade it, and withdrawals can only go back to that wallet.
         </p>
 
         <h2 id="fills">How trades fill</h2>
         <ol>
-          <li><b>Request.</b> The trader queues a trade (a size; the fill is at the mark). It lands on chain and gets a target: {SLOT_TIME ? <>on X1 a slot (the chain's ~0.35-second steps): the later of the slot it landed in and the slot of the vault's current price, plus {ROUTER_DELAY_SLOTS} slots, doubled for each step of the risk dial (so 6, 12 or 24 slots while prices move fast, sources disagree or a stock market is closed), rounded up to the next multiple of {ROUTER_BATCH_SLOTS} slots</> : <>the later of the chain clock and the vault's current mark time, plus {ROUTER_DELAY_SECS} seconds, rounded up to the next {ROUTER_BATCH_SECS}-second mark</>}. Rounding only adds wait; it means trades sent within the same {ROUTER_BATCH_SECS} seconds, on any market, share one price and fill together, which is what lets the platform fill many trades a second. The trader's margin is locked from now until it fills or expires, and the request is only accepted with enough margin to open at the asset's level (5% on BTC and ETH, 10% on the rest; see Market rules). If the price moves during the wait so that the account can no longer afford the trade, the fill trades nothing. It takes a small bond, and a deposit of 0.10% of the trade's value in the chain's coin, which comes back when the trade fills.</li>
+          <li><b>Request.</b> The trader queues a trade (a size; the fill is at the mark). It lands on chain and gets a target: {SLOT_TIME ? <>on X1 a slot (the chain's ~0.35-second steps): the later of the slot it landed in and the slot of the vault's current price, plus {ROUTER_DELAY_SLOTS} slots, doubled for each step of the risk dial (so 6, 12 or 24 slots while prices move fast, sources disagree or a stock market is closed), rounded up to the next multiple of {ROUTER_BATCH_SLOTS} slots</> : <>the later of the chain clock and the vault's current mark time, plus {ROUTER_DELAY_SECS} seconds, rounded up to the next {ROUTER_BATCH_SECS}-second mark</>}. Rounding only adds wait; it means trades sent within the same {ROUTER_BATCH_SECS} seconds, on any market, share one price and fill together, which is what lets the platform fill many trades a second. The trader's margin is locked from now until it fills or expires, and the request is only accepted with enough margin to open at the asset's level (5% on BTC and ETH, 10% on the rest; see Market rules). If the price moves during the wait so that the account can no longer afford the trade, the fill trades nothing. It takes a small bond, and a deposit of 0.10% of the trade's value in the chain's coin (at most {X1 ? "5 XNT" : "0.01 SOL"}), which comes back when the trade fills.</li>
           <li><b>The price.</b> It fills at exactly one price: {SLOT_TIME ? <>on X1 the first price posted in a slot at or after the target slot. The router stamps every posted price with the slot it lands in and the slot of the post before it, so the price is the one with <code>previous post slot &lt; target ≤ post slot</code>: the chain fixes which price that is, not whoever posts it</> : <>the first Pyth price published at or after the target. Every Pyth update is signed with its publish time and the previous one's, so the router accepts only the update with <code>previous publish time &lt; target ≤ publish time</code></>}. Nobody could have known it when the request landed, and nobody can substitute another.</li>
           <li><b>The mark.</b> Executors move the vault's mark with verified Pyth updates, always forward in time. The router never moves it past a pending request's target: once that target has passed, the only update it accepts is the first one at or after it. Percolator's price then walks to the mark within its per-slot cap.</li>
           <li><b>Fill.</b> Once the mark is the request's price and Percolator's price has reached it, anyone can execute the fill, the trader included, and earns the bond. Who executes it, and when, does not change the price. The vault's matcher only accepts the fill the router armed for that slot and size, so there is no other way to trade against the vault.</li>
@@ -225,11 +238,15 @@ export default function Docs() {
         <p>
           <b>Instant trades: maker quotes{X1 ? "" : " (X1)"}.</b> A market order first asks makers for a price. A maker signs a quote
           for your trading account only: a size, a price and the last slot it is good for (about two seconds, or ten when your
-          wallet asks you to approve, at a slightly wider spread). Your transaction carries the signature, the router checks it
-          (the maker's key, your account, that the quote is unused and still good, within 1% of Percolator's price) and the
-          trade fills in that same transaction, against the maker's own account, at the quoted price. Nobody can trade ahead of
-          it: the maker fixed the price before you sent anything. You are held to the same margin, fees, close-only and
-          isolation rules as any trade. Without a quote (none offered, too large, expired) the order goes through the queue
+          wallet asks you to approve). Your transaction carries the signature, the router checks it (the maker's key, your
+          account, that the quote is unused and still good, within 1% of Percolator's price) and the trade fills in that same
+          transaction, against the maker's own account. <b>It fills at Percolator's price in that slot</b>, like every trade
+          here: Percolator uses a quote's price only to size the fee (a test round trip bought 0.9% above Percolator's price and
+          sold 0.9% below changed the trader's money by nothing). So a quote is the maker's promise to take your trade now,
+          instead of after the wait; it does not set your price. Nobody else can use your quote, and only the reporter moves
+          Percolator's price. You are held to the same margin, fees, close-only and isolation rules as any trade. The maker
+          carries one risk: Percolator's price follows the exchanges about a second behind, so a trader who sees a move first
+          can take a quote at the old price. That is why quotes live about two seconds and are limited in size. Without a quote (none offered, too large, expired) the order goes through the queue
           and its short wait as above, against the vault. Anyone can be a maker: register a Percolator account with the vault
           program (<code>OpenMaker</code>), point its matcher at the vault program, and sign quotes; the platform runs the first one.
           In a load test (November 2026, 800 accounts holding positions, three markets, one maker) a trade at a maker's quote
@@ -283,7 +300,7 @@ export default function Docs() {
         <table className="doc-table">
           <thead><tr><th>Order</th><th>What it does</th></tr></thead>
           <tbody>
-            <tr><td>Market</td><td>Trades a size now. Fills a few seconds later (see How long a fill takes) at the oracle price: no spread and no price impact, whatever the size, up to what the vault can take.</td></tr>
+            <tr><td>Market</td><td>Trades a size now. {X1 ? "At once against a maker's quote when one is offered, otherwise a" : "A"} few seconds later through the queue (see How trades fill), at the oracle price: no spread and no price impact, whatever the size, up to what the vault can take.</td></tr>
             <tr><td>Limit</td><td>Trades once the mark is at your price or better, and only fills at a price no worse than it. If the price has moved away by the time it would fill, the order stays and waits.</td></tr>
             <tr><td>Stop loss</td><td>Closes a position, or part of it, once the mark is at or through your price against you.</td></tr>
             <tr><td>Take profit</td><td>The same in your favour.</td></tr>
@@ -301,7 +318,7 @@ export default function Docs() {
 
         <h2 id="desk">The trading desk</h2>
         <ul>
-          <li><b>Vault capacity instead of an order book.</b> There is no book: every trade fills at the oracle price against the vault. The panel shows the largest buy and sell the vault can take right now, its own position and its limit, and next to them what the vault can actually absorb: its value now, its insurance, and what it would lose on a 10%, 20% or 30% move against the position it holds. What it lets traders open and what it can afford to lose are not the same thing, and the panel shows both.</li>
+          <li><b>Vault capacity instead of an order book.</b> There is no book: every trade fills at the oracle price, queued trades against the vault{X1 ? " and quoted ones against a maker" : ""}. The panel shows the largest buy and sell the vault can take right now, its own position and its limit, and next to them what the vault can actually absorb: its value now, its insurance, and what it would lose on a 10%, 20% or 30% move against the position it holds. What it lets traders open and what it can afford to lose are not the same thing, and the panel shows both.</li>
           <li><b>Ticket.</b> Market, limit, take-profit and stop, and TWAP tabs; size in coin or dollars. <b>Leverage</b> is set per order, from 1× to the market's maximum (20× on BTC and ETH, 10× on the rest), and remembered per market: the 25%, 50%, 75% and Max buttons size the order from your free margin times that leverage, and the ticket shows the margin the order uses out of what is free. Against a position you hold, the buttons pick a share of it to close instead. Percolator itself only asks for the market's opening margin, so a lower leverage just uses less of what your account could open; the account's overall leverage and the estimated liquidation price (one margin account covers every market) are shown before you sign, with the fee and the position after.</li>
           <li><b>Cross or isolated margin, per market.</b> <i>Cross</i> is your main account: its money stands behind every position you hold in it, on every market, so a gain on one market props up another and a loss on one can use margin you put in for another. <i>Isolated</i> gives a market its own, separate account with only the margin you deposit into it: if that position goes wrong it can lose that margin and nothing else, and your other positions cannot be touched. An isolated account holds one market at a time and is liquidated on its own. It has its own place in the queue, its own orders and its own fees owed. Copy trading and the leaderboard's track records count the main account only. Positions in your other accounts are listed under the positions table, one click away. Positions, open orders, trade history and market details sit under the chart.</li>
           <li><b>Profit and loss everywhere.</b> Each open position shows what it is up or down, with an arrow, in the positions table (with a total), on the chart (a line at its entry price labelled with the market, side, size and PnL) and in the account panel, which also shows today's result and the account's all-time PnL after fees. Trade history covers every market and shows what each trade booked when it reduced or closed a position, with the fees. Entry prices come from the wallet's own fills; a position whose opening trades are no longer on record shows "—" rather than a guess.</li>
@@ -497,7 +514,7 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           <li><b>Cash reserve and margin top-up.</b> The vault keeps 30% of its value as cash outside Percolator, so ordinary withdrawals are paid without closing its position. If its margin inside Percolator runs below 40% of its value, anyone can move cash back in up to 60% (<code>TopUpMargin</code>; the executor checks every 30 seconds).</li>
           <li><b>Loss cover.</b> Each vault can have a cover fund that the platform's treasury puts money into, so that a market's first depositors do not carry its first losses. After each roll, if a share is worth less than the highest it has been, the cover pays the difference for every share into the vault, as far as the fund goes. It pays once per roll, anyone can trigger it (the executor does right after each roll), and only the treasury can take money back out of it.</li>
           <li><b>A second price key on X1.</b> On X1 a reported price only moves the mark if the witness key has posted its own price for the market in the last 30 seconds and the two are within 1.5% of each other. One stolen or broken key cannot set a price alone. The two keys read different exchanges: the reporter reads Jack's oracle, then our price service on Coinbase, Kraken, OKX, Bybit and KuCoin; the witness reads a second copy of the service on Bitstamp, Gemini, Bitfinex and MEXC. Both still run on one server today.</li>
-          <li><b>Places kept for liquidations.</b> The last four places in each market's queue cannot be taken by trades, and the fill of any request from an account below the liquidation level is a liquidation instead. A trader cannot stay ahead of a liquidation by keeping the queue full. The executor fills requests that share a price together, three to a transaction, so many liquidations in a crash do not wait one behind the other.</li>
+          <li><b>Places kept for liquidations.</b> The last four places in each market's queue cannot be taken by trades, and the fill of any request from an account below the liquidation level is a liquidation instead. A trader cannot stay ahead of a liquidation by keeping the queue full. The executor sends liquidations that share a price together, up to six to a transaction, so many liquidations in a crash do not wait one behind the other.</li>
           <li><b>Price band.</b> A new mark may differ from the one before it by at most 2% plus 0.5% for each second between the two prices. A broken feed or a wrong price is refused; a real move that large is accepted once enough time has passed.</li>
           <li><b>Orders that cannot fill do not block the market.</b> A request whose price the mark has held for 30 seconds without a fill can be removed, so the requests behind it, liquidations included, move on.</li>
           <li><b>Deposits freeze before a settlement.</b> Once an epoch's settlement is queued, the vault takes no new deposit or withdrawal for that epoch, because the settlement price is public seconds before it executes.</li>
@@ -521,8 +538,11 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           <li><b>Lazy settlement{X1 ? "" : " (X1)"}.</b> While a fill skips re-valuing the other accounts, one of them could already owe more than it holds, and its shortfall would then be shared among positions opened meanwhile. The router allows it only while the price has stayed within a quarter of Percolator's maintenance margin since every account was last up to date, which an account above maintenance cannot lose all its margin in; an account that was already below maintenance is covered only by the liquidation watch, as before. This is our fork's rule, not upstream Percolator's, and it has not been audited.</li>
           <li><b>A request that cannot fill.</b> If a request cannot fill (for example because the price moved during the wait and the account can no longer afford it), the mark waits at its price until it expires, at most {ROUTER_GRACE_SECS} seconds, before moving on. The requester loses the bond; liquidations on that market wait that long.</li>
           <li><b>Executors.</b> Filling needs someone to fetch each target-time Pyth update from Hermes (which needs a Pyth API key; since early November our free-plan key is refused for BTC, ETH and SOL, so devnet fills through the backup price source, about 20 seconds after the target) and send the transactions. Keeping marks fresh between trades uses Pyth's free sponsored feed accounts. Anyone with a key can run an executor; if nobody does, requests expire and nothing trades.</li>
-          <li><b>Market authority.</b> On devnet, Percolator's market-level authority belongs to the vault program's governor address, which the program only uses to retire idle markets. Nobody can shut an asset down or resolve the market, and permissionless stale resolution is off. On another market, whoever holds that authority can shut assets down or resolve the market; the vault then winds down and pays out.</li>
-          <li><b>Smart contracts.</b> Unaudited code. The program is upgradeable on devnet; a mainnet deployment must burn that authority.</li>
+          <li><b>Market authority.</b> On both networks (on X1, all five markets), Percolator's market-level authority belongs to the vault program's governor address, which the program only uses to retire idle markets. Nobody can shut an asset down or resolve the market, and permissionless stale resolution is off. On another market, whoever holds that authority can shut assets down or resolve the market; the vault then winds down and pays out.</li>
+          <li><b>Smart contracts.</b> Unaudited code. The programs are upgradeable on both test networks (we hold the keys); a mainnet deployment must burn that authority.</li>
+          {X1 && <li><b>Maker quotes.</b> A quoted trade fills against the maker's own account at Percolator's price. A maker can lose to traders who see the exchanges move before Percolator's price does; that is the maker's risk, not the vault's. If no maker quotes, or a quote is too small, the order goes through the queue.</li>}
+          {X1 && <li><b>Trading keys.</b> A trading key can trade your account within the limits you set, until it expires. Malware in your browser could ask the page's key to sign trades (it cannot copy the key out where the browser supports that, and it can never withdraw). Turn one-click trading off on a computer you do not trust; turning it off ends the key on chain.</li>}
+          {X1 && <li><b>Five markets on X1.</b> Each wallet trades on one market, against that market's vaults and maker only, so each pool is smaller than one shared pool would be. Copying a trader on another market is not possible yet.</li>}
           <li><b>Keepers.</b> Anyone can run a keeper or an executor, and each one is paid for its work (see Keepers and executors), but someone has to. If nobody does, epochs don't roll and prices don't update. On X1 only our reporter key can post prices, so X1 trades also wait on it.</li>
           <li><b>Margin stays in while you hold a position.</b> Percolator pays margin out only from an account with no open position on any market, so a trader closes everything before withdrawing. A queued trade must leave enough margin to open at the asset's level; a trade that only reduces a position is always accepted.</li>
           <li><b>Spot swaps go through xDEX.</b> The router checks what reaches your wallet, but the pool's price and its own fee are xDEX's. A thin pool moves a lot on a large swap; the ticket shows the price impact before you sign.</li>
@@ -530,8 +550,8 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           <li><b>Fallback prices are trusted.</b> If Pyth has not served a queued trade 20 seconds after its target, a reporter key may post the price from an exchange-median price service instead, so trades survive an outage of Pyth's API. Nothing on chain can verify that price. Anyone posting the Pyth price within those 20 seconds keeps the fallback out.</li>
           <li><b>Funding follows the vault, not a perp price.</b> There is no separate perp price to compare with the index here (that is what stops front-running), so the rate is set from how one-sided the vault is (see Funding). It is a measure of crowding, bounded and smoothed, and it cannot follow a price spike, because prices do not enter it. While funding is switched off (it is now), the vault carries any imbalance for the fees alone.</li>
           <li><b>An unwind closes the market out.</b> If withdrawals larger than the vault's cash reserve have waited six further epochs and the vault still holds a position, the vault closes it unilaterally. Traders on the other side are scaled down, and the positions left on that market are closed out at the next Pyth price before it reopens. A trader can have a position closed this way without choosing to.</li>
-          <li><b>Cost per position.</b> Each price move leaves every open position on that asset out of date until it is cranked, and Percolator takes no new position on the asset until all of them are. The executor does this once per round for every trade in it (see Keepers and executors), but a round still costs more, and takes longer, the more positions are open.</li>
-          <li><b>Percolator fixes.</b> Devnet runs our Percolator integration branch, which includes fixes not yet merged upstream, among them the one that makes permissionless listing work while traders hold open positions (<a href="https://github.com/aeyakovenko/percolator-prog/pull/447" target="_blank" rel="noreferrer">percolator-prog #447</a>).</li>
+          <li><b>Cost per position{X1 ? " (Solana devnet)" : ""}.</b> Each price move leaves every open position on that asset out of date until it is cranked, and Percolator takes no new position on the asset until all of them are. The executor does this once per round for every trade in it (see Keepers and executors), but a round still costs more, and takes longer, the more positions are open.</li>
+          <li><b>Percolator fixes.</b> {X1 ? "X1 runs our speed fork of the engine (lazy settlement, see How trades fill); devnet" : "Devnet"} runs our Percolator integration branch, which includes fixes not yet merged upstream, among them the one that makes permissionless listing work while traders hold open positions (<a href="https://github.com/aeyakovenko/percolator-prog/pull/447" target="_blank" rel="noreferrer">percolator-prog #447</a>).</li>
         </ul>
 
         <h2 id="security">Security model</h2>
@@ -701,10 +721,16 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           The number of cranks depends on the slot the transaction lands in, and a crank with nothing to do fails, so two
           versions are sent, one crank apart; only the matching one can succeed, and the request fills once. When the last
           position on one side of a market closes, Percolator parks that side until anyone finalizes the reset; the executor
-          does that too.
+          does that too.{X1 ? " On X1 the router's fill brings the trader's and the vault's accounts and the asset to the current slot itself, so a lazy fill needs no cranks in front of it, and the executor sends up to six of them side by side on a market." : ""}
         </p>
+        {X1 && <p>
+          <b>Makers and the services per market.</b> On X1 each of the five markets has its own executor (checking every
+          second), keeper and maker. A maker's quotes come from <code>api/quote</code> on this site; <code>app/scripts/maker.ts</code>
+          sets a maker up and renews its matcher approval before it runs out. Anyone can be a maker: register a Percolator
+          account with <code>OpenMaker</code>, approve the vault program as its matcher, and sign quotes.
+        </p>}
         <p>
-          <b>Many trades at once.</b> Trade targets fall on a shared {ROUTER_BATCH_SECS}-second grid, so every trade sent in the
+          <b>Many trades at once.</b> Trade targets fall on a shared {SLOT_TIME ? `${ROUTER_BATCH_SLOTS}-slot` : `${ROUTER_BATCH_SECS}-second`} grid, so every trade sent in the
           same window, on every market, fills at the same price. The executor works in rounds: it moves every market that has a
           trade due to its target price at once, brings every account those moves left out of date up to date once (losses
           before gains), and then fills each market's trades side by side, several to a transaction. One round of re-valuing the
@@ -714,7 +740,8 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           trade to its fill, and none expiring at any rate tried (up to 24 a second). What still limits it is that each round
           re-values every open account on a market whose price moved, so a round takes longer the more positions are open.
           Above about eight trades a second on three markets, each market's queue (28 places for trades) fills up and further
-          trades are turned away at once, without cost, rather than kept waiting.
+          trades are turned away at once, without cost, rather than kept waiting. Queues have held 128 requests since November
+          2026 (<code>GrowBook</code>), and the executor reads the queued requests by name instead of searching the router's accounts.
         </p>
         <p>
           <b>Lazy settlement{X1 ? "" : " (X1)"}.</b> That limit is gone where our Percolator fork runs (X1 since November 2026). Percolator
@@ -752,6 +779,12 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           nothing needs to be signed after the request. Calling Percolator's <code>TradeCpi</code> against a vault directly is
           refused by its matcher.
         </p>
+        {X1 && <p>
+          <b>Instant trades on X1.</b> Ask <code>/api/quote?network=x1-testnet&amp;vault=…&amp;trader=…&amp;size=…&amp;life=6</code> for a
+          quote (size in asset units of 10⁻⁶, + to buy), then send the Ed25519 signature check and <code>TakeQuote</code> in one
+          transaction (<code>C.takeQuoteIxs</code> in <code>app/src/chain.ts</code>). A bot can approve a key of its own with{" "}
+          <code>OpenSession</code> and sign trades with it (<code>C.byKey</code>); <code>app/scripts/oneclick-smoke.ts</code> does both.
+        </p>}
         <p>
           The addresses and layouts are exported as <code>app/src/layout.json</code>. The TypeScript builders in
           <code>app/src/chain.ts</code> and the Rust builders in <code>src/client.rs</code> and <code>router/src/client.rs</code>
@@ -777,11 +810,11 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
             <tr><td>Vault program</td><td><A k={M.vault_program} /></td></tr>
             <tr><td>Router program</td><td><A k={ROUTER.toBase58()} /></td></tr>
             <tr><td>Percolator program</td><td><A k={M.percolator_program} /></td></tr>
-            <tr><td>Market</td><td><A k={M.market} /></td></tr>
+            {MARKETS.map((m, i) => <tr key={m.key.toBase58()}><td>{MARKETS.length > 1 ? (i ? `Market ${i + 1}` : "Market 1 (the original)") : "Market"}</td><td><A k={m.key.toBase58()} /></td></tr>)}
             <tr><td>Test USDC</td><td><A k={M.collateral_mint} /></td></tr>
           </tbody>
         </table>
-        <p className="muted small">The Percolator program was deployed from the exact build the vault is tested against (engine 6de466b, program 27d758ed on the integration branch). The market's authority is the vault program's governor address.</p>
+        <p className="muted small">{X1 ? "The Percolator program runs our speed fork of the engine (branch speed/2026-11; docs/SPEED-FORK.md has the version to go back to)." : "The Percolator program runs our integration branch, the version from before the speed work (the speed fork is live on X1)."} Each market's authority is the vault program's governor address.</p>
 
         <h2 id="mainnet">Path to mainnet</h2>
         <ol>
@@ -796,13 +829,13 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
         <h2 id="faq">FAQ</h2>
         <dl className="faq">
           <dt>Why does a trade fill at the mark, not at a quoted price?</dt>
-          <dd>That is how Percolator v16 works: the matcher's price only sizes fees. The vault earns from fees and from traders' losses, not from a spread.</dd>
+          <dd>That is how Percolator v16 works: the matcher's price only sizes fees. The vault earns from fees and from traders' losses, not from a spread. A maker's quote is the same: it fills at the mark, so a quote decides whether your trade fills now, not its price.</dd>
           <dt>Is Turbopump part of Percolator?</dt>
           <dd>No. Percolator is the risk engine by Anatoly Yakovenko, and Turbopump calls it. The vault and router programs, the order types, copy trading, the services and this site are Turbopump's own work.</dd>
           <dt>Can a limit or stop order be front-run?</dt>
           <dd>No more than a market order. Carrying out an order only queues a request, and that request fills at the first oracle price after its target time, which nobody knows when it is queued.</dd>
           <dt>Why does my trade take a few seconds?</dt>
-          <dd>It fills at the first oracle price published {WAIT} after your request landed. That wait is what makes the price one nobody, including you, could know in advance, so nobody can trade against the vault, or against you, ahead of it.</dd>
+          <dd>{X1 ? "A trade a maker quotes fills at once. Otherwise it" : "It"} fills at the first oracle price published {WAIT} after your request landed. That wait is what makes the price one nobody, including you, could know in advance, so nobody can trade against the vault, or against you, ahead of it.</dd>
           <dt>Why do deposits wait for the epoch?</dt>
           <dd>Percolator only lets a portfolio withdraw when it holds no position. Settling everyone together at a flat point means nobody can buy or sell shares at a stale price.</dd>
           <dt>Can the same pair be listed twice?</dt>
@@ -816,7 +849,9 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           <dt>Is the vault solvent right now?</dt>
           <dd>See the Health page: it reads what Percolator holds against what it owes, and each vault's cash, margin and loss cover, live from the chain.</dd>
           <dt>What is the "Devnet Burner" wallet?</dt>
-          <dd>A key stored in your browser so you can try the app without installing a wallet. Devnet only; never use it for real funds.</dd>
+          <dd>A key stored in your browser so you can try the app without installing a wallet, on either test network. Never use it for real funds.</dd>
+          {X1 && <><dt>Do I have to approve every trade in my wallet?</dt>
+          <dd>No, with one-click trading on: your wallet approves a trading key once, and the key signs your trades within the limits you set. It can never withdraw (see One-click trading).</dd></>}
         </dl>
 
         <h2 id="credits">Credits</h2>

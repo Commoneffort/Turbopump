@@ -4,24 +4,28 @@
 
 | Party | Can | Cannot |
 |---|---|---|
-| Vault creator (opener) | Pick the feed (every other parameter comes from the canonical template); claim 10% of harvested fees | Open a second market for a feed; change any parameter; move funds; pause; upgrade |
+| Vault creator (opener) | Pick the feed (every other parameter comes from the canonical template); claim 5% of harvested fees | Open a second market for a feed; change any parameter; move funds; pause; upgrade |
 | Depositors | Queue deposits and withdrawals; claim; redeem after wind-down | Affect other depositors' prices |
-| Traders | Queue trades through the router; move margin in, and out to their own wallet | Trade at a price they know; cancel a queued trade; withdraw while one is queued; trade against the vault any other way |
+| Traders | Queue trades through the router; take a maker's quote (X1); approve a trading key; move margin in, and out to their own wallet | Trade at a price they know; cancel a queued trade; withdraw while one is queued; trade against the vault any other way |
 | Executors (anyone) | Move a vault's mark to a newer verified Pyth price; fill a request once the mark is at its target price (earning its bond); expire requests past their grace period | Choose the price a request fills at; move the mark past a pending request's price; move the mark backwards; fill a request early |
+| Trading key (X1, `router/src/session.rs`) | Queue trades and take maker quotes for the wallet that approved it, on its market, within its expiry (at most 30 days), largest trade and trades a day; close positions without limit; end itself | Withdraw, deposit, copy, set a profile, place orders, trade for another wallet or market. A new approval retires it at once |
+| Makers (X1, `src/maker.rs`, `router/src/quote.rs`) | Sign quotes for one trading account, size and last slot (at most 150 slots); their portfolio takes the trade | Set the fill price (it is Percolator's; the quote's price only sizes the fee and must be within 1% of it); have a quote filled twice (4,096-id window) or by another account; trade against the vault |
 | Anyone | Roll, harvest, convert, renew, unwind, settle, sweep, retire an idle market | Choose amounts or destinations: each of these moves value only into the vault's own buffer or portfolio, or (retiring) the asset's leftover insurance to the opener's claimable balance |
-| Percolator market authority (`marketauth`) | Force-shut down any asset (with an exit window); resolve the market | Take the vault's insurance or collateral. On devnet it is the vault program's governor address (`AcceptGovernance`), which the program only uses in `RetireMarket`, so nobody holds these powers |
-| Program upgrade authorities | Replace the vault or router program | On devnet this is the deployer. A mainnet deployment must burn both or put them behind a public timelock |
+| Percolator market authority (`marketauth`) | Force-shut down any asset (with an exit window); resolve the market | Take the vault's insurance or collateral. On devnet and on all five X1 markets (checked on chain 2026-11-06) it is the vault program's governor address (`AcceptGovernance`), which the program only uses in `RetireMarket`, so nobody holds these powers |
+| Program upgrade authorities | Replace the vault or router program | On both test networks this is the deployer. A mainnet deployment must burn both or put them behind a public timelock |
 | Pyth | Provide prices, signed by the Wormhole guardians | Nothing else: the router takes only fully verified updates for the vault's feed, forward in time |
 
 ## Front-running
 
 Anyone who sees the real price before it reaches the chain (traders on the exchanges Pyth aggregates, Pyth's publishers, readers of Pythnet and Hermes, validators and searchers who see pending transactions) could trade against a market maker that fills immediately at an oracle price. The router removes that:
 
-- A trade is a request whose target time is fixed when it lands: `max(chain clock, current mark time) + 4 s`. It fills only at the first Pyth price published at or after that target (the update with `prev_publish_time < target <= publish_time`). Nobody could know that price when the request landed, and nobody can pick another one.
+- A trade is a request whose target time is fixed when it lands: on Solana `max(chain clock, current mark time) + 4 s`, rounded up to 2 s; on X1 `max(landing slot, mark's slot) + 3 slots` (doubled per risk-dial step), rounded up to 2 slots. It fills only at the first Pyth (on X1, reported) price published at or after that target (the update with `prev_publish_time < target <= publish_time`). Nobody could know that price when the request landed, and nobody can pick another one.
 - The vault's asset is in Percolator's authority-mark mode with the vault as oracle authority. The vault moves the mark only on the router's instruction (`PushMark`), and the router passes only fully verified Pyth updates for the vault's feed, newer than the current mark, and never past a pending request's target.
 - The vault's matcher accepts only the fill the router armed for that slot and size (`ArmFill`), so there is no other way to trade against it.
-- A request cannot be cancelled; the trader's margin is locked until it fills or expires; it is accepted only with margin for a further 10% price move on the position it leaves (a request that only reduces a position is always accepted, so thin margin never stops a trader from closing); an unfilled request expires 90 s after its target with its bond forfeited. A trader cannot back out after seeing the price.
+- A request cannot be cancelled; the trader's margin is locked until it fills or expires; it is accepted only with margin to open at the asset's level (`STRESS_BPS` is 0; a request that only reduces a position is always accepted, so thin margin never stops a trader from closing); an unfilled request expires 90 s (on X1 250 slots) after its target with its bond forfeited. A trader cannot back out after seeing the price.
 - Filling is permissionless and pays the executor the request's bond, so no keeper can censor a trader, and the executor's identity and timing do not change the fill.
+
+- Maker quotes (X1) are not front-run for the taker (nobody else can use a quote, and only the reporter moves the price), but the maker can be: a quote fills at Percolator's price, which follows the exchanges about a second behind. Quotes live about 2 s (6 slots) on the page and are size-limited for that reason.
 
 ## Invariants the tests enforce
 
@@ -41,7 +45,7 @@ Anyone who sees the real price before it reaches the chain (traders on the excha
 - Vaults never take on more than 2x their NAV in position, or 0.5x per fill, on BTC and ETH (1x and 0.25x elsewhere; 3x and 0.75x on majors until 2026-11-04), on top of Percolator's margin rules.
 - The risk dial (`router/src/risk.rs`, `tests/router.rs`, `tests/x1.rs`) only tightens: at dial `d` a fill that grows the vault's position gets `d` times less room and the trader needs `d` times the margin to open; a fill that only closes the trader's own position, liquidations included, is never dialled. Only the router can arm a fill with a dial, and a dial byte above 4 is refused.
 - `RetireMarket` only succeeds with no shares outstanding, no queued deposit or withdrawal, no queued trade, a flat LP portfolio and at least three epochs since listing; Percolator additionally refuses unless the asset is empty.
-- The opener's fee share is exactly 10% of each harvest, is held in the buffer as a reserved liability (so it never counts toward NAV), and only the opener can claim it.
+- The opener's fee share is exactly 5% of each harvest (`OPENER_FEE_BPS`), is held in the buffer as a reserved liability (so it never counts toward NAV), and only the opener can claim it.
 - Fees owed to the vaults (router `carry`, `tests/carry.rs`): a fill names the vault's meter and the trader's ledger once they exist (refused otherwise); an account without a ledger, or with all 32 ledger slots in use, can only reduce; what is owed counts against equity in the fill's margin check, the liquidation check and the liquidation size; a withdrawal is refused while anything is owed; `PayFees` moves at most the owed amount, from the account's capital only, only while it holds no position, and only into the buffer of the operate-mode vault of the asset generation it was booked in (a vault opened later on a reused asset slot cannot collect it); a debt never exceeds the account's equity after the fill that added to it; only `OpenLedger` / `OpenCarry` create ledgers and meters, at their PDAs, and both are idempotent.
 
 ## Review of the fee ledger (2026-10-29)

@@ -111,13 +111,14 @@ What changed for it: a queue of 128 requests per market instead of 28 (`GrowBook
 grows a live book in place); the book names each queued request, so the executor reads exactly
 those instead of searching all the router's accounts (that search took 2.2 s with 400 traders);
 an address lookup table, so a transaction holds more fills; a transaction too large to encode is
-split instead of stopping the pass. Tried and left off: lazy fills side by side on one market
-(`LAZY_PARALLEL`), slower because each one's catch-up crank fails once another has caught the
-asset up. What limits it now: on one market the lazy fills of stale traders go one after the
+split instead of stopping the pass. Tried and first left off: lazy fills side by side on one market
+(`LAZY_PARALLEL`), slower because each one's catch-up crank failed once another had caught the
+asset up. Fixed since (commit b1ca74d9): the router's fill brings the trader's and the vault's
+accounts and the asset to the current slot itself, cranking only what has work, so the executor
+sends lazy fills without cranks, `LAZY_PARALLEL` (6) at a time per market. What limits it now: on one market the lazy fills of stale traders go one after the
 other (about 2 a second a market when every trader is out of date), so above about 15 fills a
-second the queues fill. Next: a fill that catches the asset up itself without failing when
-another already did (router or engine), which lets them go side by side; then more markets per
-asset.
+second the queues fill. Both next steps named here were then built: the self-catching-up fill (above) and more markets
+per asset (five on X1, below).
 
 Checks: Percolator program suite on the fork: 272 failures, the same 272 as on the deployed build
 (upstream's stale tests), after registering the new engine call in the INV-088 roster;
@@ -129,7 +130,13 @@ deployed one.
 
 A maker signs a quote for one trading account (size, price, last slot); the taker's transaction
 carries the signature (an Ed25519 verification) and the router's `TakeQuote` (tag 38) fills it in
-the same transaction against the maker's own Percolator portfolio. The vault program registers
+the same transaction against the maker's own Percolator portfolio. **The fill price is Percolator's
+price in that slot, not the quote's:** Percolator v16 uses a trade's price only to size its fee
+(`exec_price is used by the engine only as fee notional`), so the quoted price only has to be
+within 1% of Percolator's and sets the fee base. Checked 2026-11-06 in `tests/x1.rs`: a round trip
+bought 0.9% above Percolator's price and sold 0.9% below changed the trader's equity by 0. So a
+quote buys immediacy, not a price; a maker's spread earns nothing, and a maker can be picked off
+by a taker who sees the exchanges move before Percolator's price does (see Open). The vault program registers
 makers (`OpenMaker`, tag 44) and prices a maker's trade only as the router armed it
 (`ArmQuote`, tag 45). Quotes are good once (a window of 4,096 ids), for at most 150 slots, within
 1% of Percolator's price, and the taker is held to the router's margin, fees, close-only and
@@ -137,7 +144,7 @@ isolation rules. No engine change: makers are ordinary Percolator LP portfolios.
 
 Our maker: `api/quote` on the site (key in `MAKER_SECRET_X1`, portfolio in
 `MAKER_PORTFOLIO_X1`), quoting around the exchange-median price with a spread that grows with
-size, the maker's position and the quote's life (a wallet that asks its user first gets a
+size, the maker's position and the quote's life (the spread only changes the fee base, see above) (a wallet that asks its user first gets a
 30-slot quote at a little more spread; the burner wallet 6 slots). `app/scripts/maker.ts`
 sets the maker up (`setup <usdc>`), renews its matcher config (`refresh`, or `serve`, which also
 answers quotes locally) and shows it (`status`). The Trade page takes a quote for a market order
@@ -244,7 +251,7 @@ Error messages say whose XNT is short, the key's or the wallet's.
 | Click to confirmed, quoted trade | about 0.2 s | about 0.8 s (0.3 to 0.4 s in a local drill) |
 | Wallet popup per trade | none (approved agent key) | none (approved trading key) |
 | What the trading key can do | trade; not withdraw | trade within on-chain limits; not withdraw |
-| Front-running | one sequencer orders trades | quotes fixed before sending; queued trades fill at a price posted after they land |
+| Front-running | one sequencer orders trades | queued trades fill at a price posted after they land; a quoted trade fills at once at Percolator's price, so the maker carries the risk of a stale price |
 
 What still separates us: the public RPC (it limits how many transactions a second our services
 send from one address; a private RPC or sending straight to the leader would lift it), and X1's
@@ -256,6 +263,11 @@ block of 60M compute units with 12M per account (the 100M block is not on for X1
   1.4M allowed, because the router brings both portfolios (the taker's and the maker's, each
   holding SOL, BTC and ETH) to the current slot. A maker portfolio per asset would cut the
   maker's share by about two thirds. On the four new markets a quoted trade uses about 550k.
+- **Quotes don't set the price.** The router could settle `(quote − mark) × size` between the taker
+  and the maker so the quote is the price paid: spreads would earn, and a stale mark could not be
+  used against the maker. Until then, short quote lives and size limits are the maker's only
+  protection. The track record and the Trades widget book a quoted fill at the quote's price
+  (`record_fill(…, price, …)`), not at the mark the engine used.
 - **`EngineLockActive` (0x15).** Some trades are refused with it at the moment they are sent and
   go through when sent again. The retry hides it; the cause in the engine is not found yet.
 - **Standing orders** are not signed by the trading key yet; they still need the wallet.
