@@ -1,6 +1,7 @@
 # Speed work: where we leave upstream, and how to go back
 
-**Status: built on 2026-11-05 on branch `speed/2026-11` (all three repositories); see "Where it
+**Status: built on 2026-11-05 on branch `speed/2026-11` (all three repositories) and live on X1
+testnet since 2026-11-06, with the maker, five markets and one-click trading; see "Where it
 stands" at the end.**
 
 > **Flag.** This work moves Turbopump away from upstream Percolator. The router and executor
@@ -179,3 +180,101 @@ second on top of its services (every visitor sends from their own address, so th
 services and drills, not the traders). Open: some trades in a burst on the new markets failed
 with Percolator's `EngineLockActive` (cause not yet found; a single trade then goes through).
 
+
+## Trading without the wallet in the way (2026-11-06)
+
+What a person waits for after clicking is now mostly the chain, not their wallet. Built on X1
+the same day as the split, in four steps.
+
+**1. Quotes fetched ahead.** The Trade ticket asks for a maker quote for the order as typed, and
+keeps one fresh (`C.prefetchQuote`, `C.ready`), together with a recent blockhash (cached 10 s).
+A click signs at once instead of asking for a quote first. Measured: 0.23 to 0.41 s from click
+to a signed quoted trade, before the wallet. Quoted trades go into the trader's track record like
+queued fills (the router's `record_fill`), so the leaderboard and copy trading see them.
+
+**2. Trading keys: one-click trading (router `session.rs`, tags 39 and 40).** The page makes a
+random Ed25519 key in the browser and the wallet approves it once, on chain:
+`OpenSession(key, expires, max_notional, max_trades)` writes a session account
+(PDA `["session", market, wallet]`, 152 bytes). From then on `Request` and `TakeQuote` accept
+the key as the signer for that wallet's accounts on that market, and nothing else does.
+
+- **Limits, checked on chain (`session::authorize`):** until it expires (at most 30 days), a
+  largest trade, and trades a day (at most 10,000). A trade that only reduces a position is never
+  limited, so a user can always get out. Errors: `SessionInvalid` 0x5722, `SessionExpired`
+  0x5723, `SessionLimit` 0x5724.
+- **What the key cannot do:** deposit, withdraw, copy, change a profile or place standing
+  orders. A withdrawal needs the wallet and only pays the wallet.
+- **One key per wallet and market:** approving a new key replaces the old one in the same
+  transaction. `CloseSession` (the wallet or the key itself) ends it and returns the rent.
+- **The key is random, never worked out from a wallet signature.** A signature over a known text
+  can be obtained by any site that asks for it, and with it the key; Ed25519 signatures are
+  deterministic, so the same text always gives the same key.
+- **Kept where it cannot be read (`app/src/tradingKey.ts`):** where the browser has WebCrypto
+  Ed25519, the key is non-extractable and kept in IndexedDB: the page can ask it to sign, but no
+  script, extension or copy of the page can read it out. Elsewhere it lives in the tab's
+  sessionStorage and is gone when the tab closes.
+- **Fees:** the key pays its own transaction fees. Turning one-click on sends it up to 2 XNT from
+  the wallet (less if the wallet can't spare it; about 140 quoted trades); an "Add XNT" button
+  tops it up, and turning it off sends what is left back.
+
+Tests: `tests/x1.rs` `a_trading_key_trades_within_its_limits_and_nothing_else` (limits out of
+range, a trade by the key, the size limit, a queued trade by the key, a withdrawal by the key
+refused, the daily limit, a close beyond the limit allowed, replacing the key, expiry, the key
+ending itself). Live: `app/scripts/oneclick-smoke.ts`. In a browser on X1: click to confirmed
+0.81 s, no wallet request, the key not exportable.
+
+**3. Setup in one approval (`SetupCard`).** A new wallet's first visit opens the trading account,
+its fee ledger and track record, the token account, the first deposit, and the trading key with
+its fee money, signed together (`signAllTransactions`). Wallets with no XNT get 2 XNT from the
+faucet with their test USDC (the faucet sends to any wallet holding under 1 XNT).
+
+**4. No dead ends.** A trade signed by the key:
+- takes a maker quote first, closes included (a quote puts no deposit down);
+- queues only if the key holds the queue's bond and deposit (0.1% of the trade's value in XNT;
+  5 XNT for a 2.5 ETH close), and otherwise hands that one order to the wallet (one popup)
+  instead of failing;
+- is retried up to three times with a fresh quote when it fails for a passing reason
+  (Percolator's `EngineLockActive` or stale-crank errors, compute running out, an old blockhash).
+Error messages say whose XNT is short, the key's or the wallet's.
+
+### Where it stands against Hyperliquid
+
+| | Hyperliquid | Turbopump on X1 now |
+|---|---|---|
+| Click to confirmed, quoted trade | about 0.2 s | about 0.8 s (0.3 to 0.4 s in a local drill) |
+| Wallet popup per trade | none (approved agent key) | none (approved trading key) |
+| What the trading key can do | trade; not withdraw | trade within on-chain limits; not withdraw |
+| Front-running | one sequencer orders trades | quotes fixed before sending; queued trades fill at a price posted after they land |
+
+What still separates us: the public RPC (it limits how many transactions a second our services
+send from one address; a private RPC or sending straight to the leader would lift it), and X1's
+block of 60M compute units with 12M per account (the 100M block is not on for X1 testnet).
+
+### Open
+
+- **Compute on the original market.** A quoted trade there uses 1.0 to 1.4M compute units out of
+  1.4M allowed, because the router brings both portfolios (the taker's and the maker's, each
+  holding SOL, BTC and ETH) to the current slot. A maker portfolio per asset would cut the
+  maker's share by about two thirds. On the four new markets a quoted trade uses about 550k.
+- **`EngineLockActive` (0x15).** Some trades are refused with it at the moment they are sent and
+  go through when sent again. The retry hides it; the cause in the engine is not found yet.
+- **Standing orders** are not signed by the trading key yet; they still need the wallet.
+- **Executor funding.** The deployer pays the five executors; it needs a top-up job or a wallet
+  each.
+
+## Credits
+
+The trading-key design owes a lot to **Jack Levin's** work on X1:
+- **Vero** (github.com/jacklevin74/vero): a session wallet that trades without a popup per trade,
+  while withdrawals only ever go to the user's main wallet and need its signature. We built the
+  same split into the router: the key trades, the wallet withdraws. Vero's one program per time
+  window, so trades on different windows never share an account, is the same idea as our five
+  markets.
+- **X1 Terminal** (github.com/jacklevin74/x1-terminal), Jack's Hyperliquid trading terminal for X1
+  wallets: one setup that approves a trading key with an expiry, then trading with no popups,
+  and deposits that check the bridge's signatures before showing an address.
+- **Hyperliquid's** approved agent keys, which X1 Terminal and HypeTerminal build on: a random
+  key the wallet approves, that can trade but never withdraw, replaced by the next approval.
+  We checked that behaviour live on Hyperliquid before building ours.
+
+The prices our X1 reporter key posts come first from Jack's oracle.

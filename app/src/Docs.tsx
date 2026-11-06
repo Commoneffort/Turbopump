@@ -24,6 +24,7 @@ const TOC = [
   ["frontrun", "Front-running, solved"],
   ["design", "Design"],
   ["fills", "How trades fill"],
+  ["oneclick", "One-click trading"],
   ["orders", "Order types"],
   ["desk", "The trading desk"],
   ["spot", "Spot swaps on xDEX"],
@@ -45,6 +46,7 @@ const TOC = [
   ["addresses", "Addresses"],
   ["mainnet", "Path to mainnet"],
   ["faq", "FAQ"],
+  ["credits", "Credits"],
 ];
 
 function Diagram() {
@@ -235,6 +237,20 @@ export default function Docs() {
           200 sent a second, none turned away. TakeQuote brings the maker's and your accounts up to date itself, so the
           transaction is just the signature check and the trade.
         </p>
+        {X1 && <p>
+          <b>Quotes fetched ahead.</b> While you type an order, the ticket already asks for a quote for it and keeps one fresh,
+          so a click signs at once instead of asking first: 0.2 to 0.4 seconds from click to a signed trade, before your wallet.
+          With one-click trading (below) there is no wallet step, and a quoted trade is confirmed about 0.8 seconds after the
+          click. Quoted trades count in your track record like any other fill.
+        </p>}
+        {X1 && <p>
+          <b>Five markets.</b> A chain limits how much computing can write one account in a block, and every trade writes its
+          market's account. On X1 that is about 22 to 44 trades a block for one market, so X1 runs five Percolator markets, each
+          listing SOL, BTC and ETH, with its own vaults, maker and executor. Each wallet trades on one of them, so its margin is
+          still shared across its positions: the market where it already has an account (accounts from before November 6
+          stay on the original market), otherwise the one its address picks. The page finds it for you. Copying a trader on
+          another market is not possible yet.
+        </p>}
         <p>The router has no admin: no pause, no allow or block list, and its upgrade authority is to be burned before mainnet.</p>
 
         <h2 id="oneclick">One-click trading{X1 ? "" : " (X1)"}</h2>
@@ -250,6 +266,11 @@ export default function Docs() {
           <li><b>Changing or ending it:</b> turning it on again replaces the old key at once; turning it off (no popup) ends it and sends what it holds for fees back to your wallet.</li>
         </ul>
         <p>On your first visit one approval opens your account, deposits and turns one-click trading on. The router enforces every limit on chain, so a page or a key cannot go past what your wallet approved.</p>
+        <ul>
+          <li><b>Fees.</b> The key pays its own transaction fees in XNT. Turning it on sends it up to 2 XNT from your wallet (about 140 trades); "Add XNT" tops it up, and turning it off sends what is left back. New wallets get 2 test XNT with their test USDC from the faucet.</li>
+          <li><b>No dead ends.</b> The key takes a maker's quote first, closes included, which needs no deposit. If an order has to queue and the key cannot cover the queue's deposit (0.1% of the trade's value in XNT), your wallet signs that one order instead. A trade that fails for a passing reason (the market account was being updated by another transaction at that moment) is sent again, up to three times, with a fresh quote.</li>
+        </ul>
+        <p>The design follows Jack Levin's Vero session wallet and X1 Terminal, and Hyperliquid's approved agent keys (see Credits).</p>
 
         <h2 id="orders">Order types</h2>
         <p>
@@ -521,6 +542,7 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
             <tr><td>Depositors</td><td>Queue deposits and withdrawals, claim, redeem after wind-down</td><td>Affect other depositors' prices</td></tr>
             <tr><td>Anyone</td><td>Roll, harvest, convert, renew, unwind, settle, sweep, retire an idle market</td><td>Choose amounts or destinations: value only moves into the vault's own accounts, or to the opener when a market is retired</td></tr>
             <tr><td>Traders</td><td>Queue trades through the router; move margin in, and out to their own wallet</td><td>Trade at a price they know, cancel a queued trade, withdraw while one is queued, trade against the vault any other way, or lock withdrawals</td></tr>
+            <tr><td>Trading key (one-click)</td><td>Queue trades and take maker quotes for the wallet that approved it, on its market, within its expiry, size and trades-a-day limits; close positions without limit; end itself</td><td>Withdraw, deposit, copy, change a profile, place orders, trade for another wallet or market, or outlive its expiry</td></tr>
             <tr><td>Executors (anyone)</td><td>Move a mark to a newer verified Pyth price; fill a request at its price and earn its bond; expire late requests</td><td>Choose a fill price, move the mark past a pending request's price or backwards, or fill early</td></tr>
             <tr><td>Governor (program address)</td><td>Retire an idle, empty market through <code>RetireMarket</code></td><td>Anything else: the program has no other instruction that uses Percolator's market authority</td></tr>
           </tbody>
@@ -572,6 +594,8 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
             <tr><td>41</td><td>WithdrawCover</td><td>the treasury</td><td>Takes money back out of a vault's cover</td></tr>
             <tr><td>42</td><td>PushFunding</td><td>router only</td><td>Sets the funding rate of the vault's asset in Percolator (the vault is the asset's oracle authority)</td></tr>
             <tr><td>43</td><td>SetFundingCap</td><td>anyone</td><td>Turns funding on for a governed market: its cap set to the program's constant, nothing else</td></tr>
+            <tr><td>44</td><td>OpenMaker</td><td>maker</td><td>Registers a Percolator account as a maker whose signed quotes the router may fill</td></tr>
+            <tr><td>45</td><td>ArmQuote</td><td>router only</td><td>Arms the maker's matcher for exactly the quote the router is filling</td></tr>
           </tbody>
         </table>
         <p>Router program (trading, orders, records):</p>
@@ -607,6 +631,11 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
             <tr><td>32</td><td>OpenCarry</td><td>anyone (pays the rent)</td><td>Starts a vault's holding-fee meter; from then on every fill on it must name it. Does nothing if it is already started</td></tr>
             <tr><td>33</td><td>OpenLedger</td><td>anyone (pays the rent)</td><td>Opens a trading account's fee ledger. Without one an account can only reduce its positions</td></tr>
             <tr><td>34</td><td>PayFees</td><td>anyone</td><td>Pays what an account owes one vault out of its margin into the vault's cash (only when the account holds no position); what an empty account cannot pay is written off</td></tr>
+            <tr><td>35</td><td>RefreshRecord</td><td>anyone</td><td>Brings an account's track record up to its value now</td></tr>
+            <tr><td>36</td><td>OpenRange</td><td>anyone (pays the rent)</td><td>Starts a vault's price range account, used by fills that settle only the trader and the vault</td></tr>
+            <tr><td>37</td><td>GrowBook</td><td>anyone (pays the rent)</td><td>Grows an older queue to 128 requests, keeping what is queued</td></tr>
+            <tr><td>38</td><td>TakeQuote</td><td>wallet or its trading key</td><td>Fills a maker's signed quote in the same transaction, after the signature check, with the usual margin, fee and close-only rules</td></tr>
+            <tr><td>39 / 40</td><td>OpenSession / CloseSession</td><td>wallet / wallet or the key</td><td>Approves a trading key (expiry, largest trade, trades a day), replacing any before it; ends it and returns the rent</td></tr>
           </tbody>
         </table>
 
@@ -706,7 +735,8 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           <b>Scale.</b> With lazy settlement a fill touches two accounts however many traders hold positions, so the number of
           traders no longer slows fills. What remains is the market account: every fill writes it, and a chain caps how much
           compute one account can use in a block, which puts one market at a few hundred fills a second. Beyond that, an asset
-          gets more than one market (more vaults), which executors already serve side by side.
+          gets more than one market (more vaults), which executors already serve side by side. On X1 that is live: five
+          markets since November 2026 (see How trades fill).
         </p>
         <p>
           <b>Forked engine.</b> Lazy settlement changes one of Percolator's own rules, so from November 2026 we run a fork of
@@ -788,6 +818,13 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           <dt>What is the "Devnet Burner" wallet?</dt>
           <dd>A key stored in your browser so you can try the app without installing a wallet. Devnet only; never use it for real funds.</dd>
         </dl>
+
+        <h2 id="credits">Credits</h2>
+        <ul>
+          <li><b>Anatoly Yakovenko</b>: Percolator, the risk engine every trade settles in.</li>
+          <li><b>Jack Levin</b>: one-click trading follows his work on X1. <a href="https://github.com/jacklevin74/vero" target="_blank" rel="noreferrer">Vero</a>'s session wallet trades without a popup while withdrawals only go to the main wallet, the split our router enforces between a trading key and your wallet; its separate account per time window is the same idea as our five markets. <a href="https://github.com/jacklevin74/x1-terminal" target="_blank" rel="noreferrer">X1 Terminal</a> showed the flow: one setup that approves a trading key with an expiry, then trading with no popups. On X1 our reporter reads Jack's oracle first.</li>
+          <li><b>Hyperliquid</b>: approved agent keys, random keys the wallet approves that can trade but not withdraw, replaced by the next approval. Our trading keys work the same way, with the limits checked on chain.</li>
+        </ul>
       </article>
     </main>
   );

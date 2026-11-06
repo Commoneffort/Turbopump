@@ -114,6 +114,8 @@ So the natural liquidity provider on Percolator is the operator of a market, not
 | 39 | `InitCover` | anyone, once per vault | Creates the vault's loss cover and the token account that funds it |
 | 40 | `CoverLoss` | anyone | After a roll, pays a fall of the share price below its high from the cover into the vault, once per roll |
 | 41 | `WithdrawCover` | treasury | Takes money back out of a vault's cover |
+| 44 | `OpenMaker` | maker | Registers a Percolator account as a maker whose signed quotes the router may fill |
+| 45 | `ArmQuote` | router only | Arms the maker's matcher for exactly the quote the router is filling |
 
 ### Router program
 
@@ -148,6 +150,11 @@ So the natural liquidity provider on Percolator is the operator of a market, not
 | 32 | `OpenCarry` | anyone, pays the rent | Starts a vault's holding-fee meter (`router/src/carry.rs`); idempotent |
 | 33 | `OpenLedger` | anyone, pays the rent | Opens a trading account's fee ledger; idempotent |
 | 34 | `PayFees` | anyone | Pays what an account owes one vault from its capital into the vault's buffer (adds to NAV at the next roll); only while the account holds no position; a flat, empty account's remaining debt is written off |
+| 35 | `RefreshRecord` | anyone | Brings an account's track record up to its value now |
+| 36 | `OpenRange` | anyone, pays the rent | Starts a vault's price range account (`router/src/lazy.rs`), used by fills that settle only the trader and the vault |
+| 37 | `GrowBook` | anyone, pays the rent | Grows a queue made before 2026-11-05 to 128 requests, keeping what is queued |
+| 38 | `TakeQuote` | wallet or its trading key | Fills a maker's signed quote (Ed25519 check in the same transaction) against the maker's portfolio, with the usual margin, fee, close-only and isolation rules (`router/src/quote.rs`) |
+| 39 / 40 | `OpenSession` / `CloseSession` | wallet / wallet or the key | Approves a trading key for one market (expiry up to 30 days, largest trade, trades a day), replacing any before it; ends it and returns the rent (`router/src/session.rs`). `Request` and `TakeQuote` accept the key in place of the wallet within those limits; closes are never limited; it can never withdraw |
 
 ## Share pricing
 
@@ -264,6 +271,32 @@ toward the mark more slowly), are the ways to lower it.
 Checked: the X1 build's price rules in LiteSVM (`tests/x1.rs`, 9 tests, run by `./test.sh`); the
 whole sequence on a local validator; and on X1 testnet itself, all 19 markets opened and trades
 on SOL, BTC, ETH and TSLA filled in 7 to 14 seconds.
+
+### X1 speed work (November 2026)
+
+Live on X1 testnet since 2026-11-06 (details, measurements and the rollback tag in
+`docs/SPEED-FORK.md`):
+- **Slot time and lazy settlement:** the wait before a fill is counted in slots; a fill settles
+  only the trader and the vault (engine fork).
+- **Maker quotes:** a market order fills at a maker's signed quote in its own transaction (about
+  0.8 s from click to confirmed on X1), quotes fetched while the order is typed. Our maker runs
+  as `api/quote` on the site and `app/scripts/maker.ts`.
+- **Five markets:** four more Percolator markets (`deploy/x1-testnet.m1.json` to `m4.json`), each
+  with SOL, BTC and ETH, its vaults, maker and executor (`deploy/x1-services.sh`); each wallet
+  trades on one of them.
+- **One-click trading:** a random, non-extractable browser key approved on chain (tags 39/40)
+  signs trades with no wallet popup; setup in one approval; the key falls back to the wallet when
+  it cannot cover a queued order.
+
+## Credits
+
+- **Anatoly Yakovenko**: Percolator, the risk engine.
+- **Jack Levin**: one-click trading follows his
+  [Vero](https://github.com/jacklevin74/vero) session wallet (the key trades, withdrawals only go
+  to the main wallet) and [X1 Terminal](https://github.com/jacklevin74/x1-terminal) (one setup
+  that approves an expiring trading key, then no popups). Vero's account per time window is the
+  same idea as our five markets. Our X1 reporter reads Jack's oracle first.
+- **Hyperliquid**: approved agent keys that trade but cannot withdraw.
 
 ## Layout
 
