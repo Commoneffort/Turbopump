@@ -137,31 +137,14 @@ async function crash(pct: number, secs: number, watch: number) {
 
 /** A maker's quote server (scripts/maker.ts serve), for the load: trades take its quotes first. */
 const QUOTE_URL = process.env.QUOTE_URL ?? "";
-/** Takes a maker's quote for `size` on `v` from `w`'s main account in one transaction; false when
- *  there is none or it cannot be taken. The cranks in front (the maker's account and the trader's,
- *  each with all its assets) are kept only as far as the simulation says they have work. */
+/** Takes a maker's quote for `size` on `v` from `w`'s main account in one transaction (the page's
+ *  own `quotedTrade`); false when there is none or it does not go through. */
 async function takeQuoteOrNot(w: Keypair, v: C.Vault, size: bigint): Promise<boolean> {
-  const trader = C.traderAddress(w.publicKey);
-  const r = await fetch(`${QUOTE_URL}/quote?vault=${v.key.toBase58()}&trader=${trader.toBase58()}&size=${size}`, { signal: AbortSignal.timeout(1_000) });
-  if (!r.ok) return false;
-  const q = (await r.json()) as C.Quote;
-  const pf = await conn.getAccountInfo(C.routerPortfolio(w.publicKey), "processed");
-  const mine = pf ? C.portfolioAssets(new Uint8Array(pf.data)) : [];
-  const last = (as: number[]) => [...as.filter(a => a !== v.assetIndex), v.assetIndex];
-  const makerCrank = C.crank(w.publicKey, new PublicKey(q.portfolio), last(q.makerAssets.length ? q.makerAssets : [v.assetIndex]));
-  const traderCrank = mine.length ? [C.crank(w.publicKey, C.routerPortfolio(w.publicKey), last(mine))] : [];
-  // (The variants simulated side by side: the quote is good for a few slots only.)
-  const variants = [[makerCrank, ...traderCrank], [makerCrank], traderCrank, []].map(cranks => C.takeQuoteIxs(v, w.publicKey, 0, q, cranks));
-  const sims = await Promise.all(variants.map(ixs => conn.simulateTransaction(new VersionedTransaction(new TransactionMessage({ payerKey: w.publicKey, recentBlockhash: PublicKey.default.toBase58(), instructions: [ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }), ...ixs] }).compileToV0Message()), { sigVerify: false, replaceRecentBlockhash: true }).catch(() => null)));
-  for (const [i, ixs] of variants.entries()) {
-    const sim = sims[i];
-    if (!sim || sim.value.err) continue;
-    const units = Math.min(1_400_000, Math.ceil((sim.value.unitsConsumed ?? 1_000_000) * 1.3) + 20_000);
-    const sig = await conn.sendTransaction(new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units }), ...ixs), [w], { skipPreflight: true });
-    const res = await conn.confirmTransaction(sig, "processed");
-    return !res.value.err;
-  }
-  return false;
+  const q = await C.quotedTrade(conn, v, w.publicKey, 0, size, 6, 1_000);
+  if (!q) return false;
+  const sig = await conn.sendTransaction(new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: q.units }), ...q.ixs), [w], { skipPreflight: true });
+  const res = await conn.confirmTransaction(sig, "processed");
+  return !res.value.err;
 }
 
 /** Throughput: small trades (`usd` each) from the crowd's wallets at `rps` a second for `secs`

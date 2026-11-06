@@ -220,6 +220,19 @@ export default function Docs() {
           fill. The wait is not shortened on Solana because the chain clock it is counted from runs a second or two behind real
           time.</>}
         </p>
+        <p>
+          <b>Instant trades: maker quotes{X1 ? "" : " (X1)"}.</b> A market order first asks makers for a price. A maker signs a quote
+          for your trading account only: a size, a price and the last slot it is good for (about two seconds, or ten when your
+          wallet asks you to approve, at a slightly wider spread). Your transaction carries the signature, the router checks it
+          (the maker's key, your account, that the quote is unused and still good, within 1% of Percolator's price) and the
+          trade fills in that same transaction, against the maker's own account, at the quoted price. Nobody can trade ahead of
+          it: the maker fixed the price before you sent anything. You are held to the same margin, fees, close-only and
+          isolation rules as any trade. Without a quote (none offered, too large, expired) the order goes through the queue
+          and its short wait as above, against the vault. Anyone can be a maker: register a Percolator account with the vault
+          program (<code>OpenMaker</code>), point its matcher at the vault program, and sign quotes; the platform runs the first one.
+          In a load test (November 2026, 400 accounts holding positions) a trade at a maker's quote filled a median 0.3 to 0.4
+          seconds after it was sent, at every rate tried up to 50 trades a second.
+        </p>
         <p>The router has no admin: no pause, no allow or block list, and its upgrade authority is to be burned before mainnet.</p>
 
         <h2 id="orders">Order types</h2>
