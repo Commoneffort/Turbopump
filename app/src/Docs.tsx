@@ -801,6 +801,12 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
             <tr><td>Collateral</td><td>Test USDC</td><td>Test USDC</td></tr>
             <tr><td>Fees and rent paid in</td><td>Devnet SOL</td><td>Test XNT</td></tr>
             <tr><td>Bond per request</td><td>0.002 SOL</td><td>0.02 XNT: on X1 a transaction pays for the compute it asks for, so the bond covers what a fill costs</td></tr>
+            <tr><td>Version running</td><td>The version from before the speed work (tagged pre-speed-fork-2026-11-05)</td><td>The speed fork, since 6 November 2026: router, vault and engine checked byte for byte against the builds on chain</td></tr>
+            <tr><td>Wait before a queued trade's price</td><td>4 seconds, on a 2-second grid</td><td>3 slots (about a second), on a 2-slot grid; longer while the risk dial is up</td></tr>
+            <tr><td>Settlement on a fill</td><td>Every account on the market re-valued first</td><td>Only the trader and the vault, while that is safe (lazy settlement, our engine fork)</td></tr>
+            <tr><td>Instant trades (maker quotes)</td><td>No</td><td>Yes, about 0.8 s from click to confirmed</td></tr>
+            <tr><td>One-click trading</td><td>No</td><td>Yes</td></tr>
+            <tr><td>Markets</td><td>One</td><td>Five (each wallet trades on one)</td></tr>
           </tbody>
         </table>
 
