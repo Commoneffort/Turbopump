@@ -1976,6 +1976,11 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         return Err(RouterError::NotAtTarget.into());
     }
     perc::expect_market(market)?;
+    // The trader's and the vault's accounts, and the asset, brought to the current slot here as
+    // far as they need it (which also walks Percolator's price to the mark): an executor need not
+    // send cranks of its own, which fail when another fill in the same slot did the work first.
+    quote::bring_current(executor, market, portfolio, percolator, v.asset_index)?;
+    quote::bring_current(executor, market, lp_portfolio, percolator, v.asset_index)?;
     let (market_id, effective, _) = perc::asset_price(&market.try_borrow_data()?, v.asset_index)?;
     if effective != b.mark_price {
         return Err(RouterError::NotConverged.into());
