@@ -1280,3 +1280,14 @@ h3 { margin: 0 0 12px; font-size: 15px; font-weight: 600; }
 /* "Return ... to wallet" in the account panel */
 .acct .btn.white.wide { width: 100%; margin-top: 8px; background: #FFFFFF; color: var(--bg-primary); border: 0; }
 .acct .btn.white.wide:hover:not(:disabled) { background: #E6E6E6; }
+
+/* One-click trading (OneClick.tsx) and the first-time setup card. */
+.oneclick, .setup { margin-top: 10px; padding: 10px 12px; border: 1px solid var(--line-2); border-radius: 10px; background: var(--bg-secondary); display: flex; flex-direction: column; gap: 8px; }
+.oneclick.on { border-color: var(--up, #3ee0a0); }
+.oneclick-h { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-size: 13px; }
+.oneclick-h .mono { color: var(--muted); font-size: 12px; }
+.oneclick-opts { display: flex; flex-wrap: wrap; gap: 8px; font-size: 12px; color: var(--muted); }
+.oneclick-opts select { margin-left: 4px; background: var(--raised); color: var(--text); border: 1px solid var(--line-2); border-radius: 6px; padding: 3px 6px; font: inherit; }
+.oneclick-b { display: flex; gap: 8px; flex-wrap: wrap; }
+.setup .check { display: flex; gap: 8px; align-items: flex-start; font-size: 12px; color: var(--muted); line-height: 1.4; }
+.setup .check input { margin-top: 2px; }

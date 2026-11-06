@@ -23,7 +23,9 @@ export const ago = (sec: number) => (sec < 60 ? `${Math.max(1, Math.round(sec))}
 export type Toast = { ok: boolean; text: string; sig?: string };
 /** `ixs` may be a function: it is called right before the wallet signs, so what it reads from the
  *  chain (a market's next request id) is as fresh as it can be. */
-export type Send = (label: string, ixs: TransactionInstruction[] | ((conn: Connection) => Promise<TransactionInstruction[]>)) => Promise<string | undefined>;
+/** `opts.key`: sign with the wallet's approved trading key (tradingKey.ts) instead of the wallet:
+ *  the key pays the fee and is the only signer, so the wallet shows nothing. */
+export type Send = (label: string, ixs: TransactionInstruction[] | ((conn: Connection) => Promise<TransactionInstruction[]>), opts?: { key?: import("./tradingKey").TradingKey }) => Promise<string | undefined>;
 
 export function Stat({ label, value, sub }: { label: string; value: string; sub?: string }) {
   return (

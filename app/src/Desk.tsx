@@ -8,6 +8,7 @@ import { CSSProperties, Fragment, useEffect, useMemo, useRef, useState } from "r
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
 import { ComputeBudgetProgram, Connection, PublicKey, TransactionInstruction } from "@solana/web3.js";
+import { OneClickPanel, SetupCard, useTradingKey } from "./OneClick";
 import { createAssociatedTokenAccountIdempotentInstruction } from "@solana/spl-token";
 import * as C from "./chain";
 import { readDirect } from "./view";
@@ -533,6 +534,11 @@ function Ticket({ state, send, busy, copying, margin, setMargin, vaults }: { sta
 
   const pendingHere = state.pending;
   const locked = !!state.trader?.hasPending;
+  // One-click trading (OneClick.tsx): while the wallet's trading key is approved, trades sign with
+  // it instead of the wallet. Notes are the wallet's own signature, so they go with wallet trades only.
+  const ok = useTradingKey(busy ? 1 : 0);
+  const actor = ok.active && ok.key ? ok.key.publicKey : undefined;
+  const keyOpts = ok.active && ok.key ? { key: ok.key } : undefined;
   // The largest order each way that the router's margin check accepts. Shrinking a position is
   // always accepted; past zero, the new position has to fit the margin.
   const held = p?.position ?? 0n, cap = state.margin ?? 0n;
@@ -648,7 +654,8 @@ function Ticket({ state, send, busy, copying, margin, setMargin, vaults }: { sta
     : iso && isoTopUp > state.userCollateral ? `This order moves ${money(num(isoTopUp, 1e6))} of margin from your wallet, which has ${money(num(state.userCollateral, 1e6))} of test USDC`
     : !iso && sent > marginMax(side) ? `Your margin covers at most ${units(marginMax(side))} ${sym} here: add margin or lower the size`
     : overLev ? `At ${lev}× this order needs ${money(orderMargin)} of margin and ${money(freeMargin)} is free: raise the leverage or lower the size`
-    : coins !== undefined && coins < coinsNeeded ? `This order needs ${(coinsNeeded / 1e9).toFixed(3)} ${C.COIN} in your wallet for its deposit and bond (they come back when it fills); the wallet has ${(coins / 1e9).toFixed(3)}`
+    : actor && ok.lamports < coinsNeeded ? `The one-click trading key needs ${(coinsNeeded / 1e9).toFixed(3)} ${C.COIN} for this order's deposit and bond (they come back to your wallet when it fills); it has ${(ok.lamports / 1e9).toFixed(3)}: add ${C.COIN} to it below`
+    : !actor && coins !== undefined && coins < coinsNeeded ? `This order needs ${(coinsNeeded / 1e9).toFixed(3)} ${C.COIN} in your wallet for its deposit and bond (they come back when it fills); the wallet has ${(coins / 1e9).toFixed(3)}`
     : undefined;
 
   const submit = () => {
@@ -666,9 +673,10 @@ function Ticket({ state, send, busy, copying, margin, setMargin, vaults }: { sta
     if (C.QUOTES_ON && !open.length && !ledger.length && !fund.length) {
       send(label, async conn => {
         // (The burner wallet signs at once; a wallet that asks its user needs the quote longer.)
-        const q = await C.quotedTrade(conn, v, publicKey, sub, sent * side, quoteLife, 1_500).catch(() => null);
-        return withNote(q ? [ComputeBudgetProgram.setComputeUnitLimit({ units: q.units }), ...q.ixs] : queued);
-      }).then(r => { if (r) setNote(""); });
+        const q = await C.quotedTrade(conn, v, publicKey, sub, sent * side, quoteLife, 1_500, true, actor).catch(() => null);
+        const ixs = q ? [ComputeBudgetProgram.setComputeUnitLimit({ units: q.units }), ...q.ixs] : actor ? [C.requestTrade(publicKey, v.key, sent * side, { sub, actor })] : queued;
+        return actor ? ixs : withNote(ixs);
+      }, keyOpts).then(r => { if (r) setNote(""); });
       return;
     }
     sendNoted(label, queued);
@@ -676,18 +684,18 @@ function Ticket({ state, send, busy, copying, margin, setMargin, vaults }: { sta
   // A quote for the order as it stands, fetched ahead and kept fresh, so a click signs at once
   // (C.prefetchQuote). Only while it could be used: a market order an account ready to trade
   // can send now.
-  const instantWallet = wallet?.adapter?.name === BurnerName;
+  const instantWallet = wallet?.adapter?.name === BurnerName || !!actor;
   const quoteLife = instantWallet ? 6 : 30;
   const quotable = C.QUOTES_ON && mode === "market" && !!publicKey && mine && !blocker && !busy && !!state.trader && state.trader.hasLedger && !(iso && isoTopUp > 0n) && sent > 0n;
   const quoteSize = quotable ? sent * side : 0n;
   useEffect(() => {
     if (!quoteSize || !publicKey) return;
-    const fetchAhead = () => { if (!document.hidden) C.prefetchQuote(connection, v, publicKey, sub, quoteSize, quoteLife, 1_500); };
+    const fetchAhead = () => { if (!document.hidden) C.prefetchQuote(connection, v, publicKey, sub, quoteSize, quoteLife, 1_500, actor); };
     // (Typing settles first; then a fresh one well inside each quote's life.)
     const first = setTimeout(fetchAhead, 250);
     const id = setInterval(fetchAhead, instantWallet ? 900 : 2_500);
     return () => { clearTimeout(first); clearInterval(id); };
-  }, [quoteSize.toString(), publicKey?.toBase58(), v.key.toBase58(), sub, quoteLife]);
+  }, [quoteSize.toString(), publicKey?.toBase58(), v.key.toBase58(), sub, quoteLife, actor?.toBase58()]);
   // Close all of the position, or a share of it (a smaller trade the other way).
   const closeAll = (share = 100) => {
     if (!publicKey || !state.book || held === 0n) return;
@@ -695,7 +703,8 @@ function Ticket({ state, send, busy, copying, margin, setMargin, vaults }: { sta
     if (state.closeOnly) sendNoted("Close position", [C.requestClose(publicKey, publicKey, v.key, sub)]);
     else closeSize(connection, publicKey, v.assetIndex, share, sub).then(q => {
       // Close only: the router itself refuses to let it open or flip a position.
-      if (q !== 0n) sendNoted(share >= 100 ? "Close position" : `Close ${share}% (${units(abs(q))} ${sym})`, [C.requestTrade(publicKey, v.key, q, { sub, closeOnly: true })]);
+      const label = share >= 100 ? "Close position" : `Close ${share}% (${units(abs(q))} ${sym})`;
+      if (q !== 0n) { if (keyOpts) send(label, [C.requestTrade(publicKey, v.key, q, { sub, closeOnly: true, actor })], keyOpts); else sendNoted(label, [C.requestTrade(publicKey, v.key, q, { sub, closeOnly: true })]); }
     });
   };
   const [closePct, setClosePct] = useState(100);
@@ -707,7 +716,8 @@ function Ticket({ state, send, busy, copying, margin, setMargin, vaults }: { sta
       let part = BigInt(Math.round(n * 1e6));
       if (part >= abs(now)) part = abs(now);
       if (part <= 0n) return;
-      sendNoted(`Close ${units(part)} ${sym}`, [C.requestTrade(publicKey, v.key, now > 0n ? -part : part, { sub, closeOnly: true })]);
+      const ix = C.requestTrade(publicKey, v.key, now > 0n ? -part : part, { sub, closeOnly: true, actor });
+      if (keyOpts) send(`Close ${units(part)} ${sym}`, [ix], keyOpts); else sendNoted(`Close ${units(part)} ${sym}`, [ix]);
     });
   };
 
@@ -792,7 +802,7 @@ function Ticket({ state, send, busy, copying, margin, setMargin, vaults }: { sta
       <div className="ticket-go">
       {!publicKey ? <div className="connect"><WalletMultiButton /></div>
         : !mine ? <button className="submit neutral" disabled title={state.readErr}>{state.readErr ? `Could not read your account (${/429|Too Many/i.test(state.readErr) ? "the network's RPC is refusing this browser's requests: too many" : state.readErr.replace(/^failed to get [a-z ]*info about account \S+: /i, "").slice(0, 120)}), trying again…` : "Reading your account…"}</button>
-        : !state.trader && !iso ? <button className="submit neutral" disabled={!!busy} onClick={() => send("Create trading account", [C.openTradingAccount(publicKey), C.openLedger(publicKey, publicKey), S.openStats(publicKey, publicKey)])}>Create trading account</button>
+        : !state.trader && !iso ? <SetupCard send={send} busy={busy} userCollateral={state.userCollateral} coins={coins} onDone={ok.reload} />
         : <button className={`submit ${side > 0n ? "up" : "down"}`} disabled={!!blocker || !!busy} onClick={submit}>{busy ? `${busy}…` : `${side > 0n ? "Long" : "Short"} ${want > 0n ? `${units(sent)} ` : ""}${sym}`}</button>}
       {state.trader && held !== 0n && (
         <div className="closeparts">
@@ -805,6 +815,7 @@ function Ticket({ state, send, busy, copying, margin, setMargin, vaults }: { sta
         <CloseSlider pct={closePct} onChange={setClosePct} disabled={locked || !!busy} />
       )}
       {blocker && publicKey && (state.trader || iso) && blocker !== "Enter a size" && <div className="why">{blocker}</div>}
+      {publicKey && mine && state.trader && <OneClickPanel ok={ok} send={send} busy={busy} />}
       </div>
       {!blocker && want > vaultMax && <div className="why">The vault takes {units(vaultMax)} {sym} on this side right now, so the order is cut to that.</div>}
 

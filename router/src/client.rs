@@ -836,3 +836,35 @@ pub fn refresh_record(t: &TraderKeys) -> Instruction {
         data: vec![TAG_REFRESH_RECORD],
     }
 }
+
+/// Approves `key` to sign `wallet`'s trades on `market` until `expires` (unix), at most
+/// `max_notional` (collateral atoms) a trade and `max_trades` trades a day (`session`).
+pub fn open_session(wallet: &Pubkey, market: &Pubkey, key: &Pubkey, expires: i64, max_notional: u64, max_trades: u32) -> Instruction {
+    let mut data = vec![crate::TAG_OPEN_SESSION];
+    data.extend_from_slice(key.as_ref());
+    data.extend_from_slice(&expires.to_le_bytes());
+    data.extend_from_slice(&max_notional.to_le_bytes());
+    data.extend_from_slice(&max_trades.to_le_bytes());
+    Instruction {
+        program_id: crate::id(),
+        accounts: vec![AccountMeta::new(*wallet, true), w(crate::session::session_address(&crate::id(), market, wallet).0), ro(*market), ro(solana_program::system_program::ID)],
+        data,
+    }
+}
+
+/// Ends `wallet`'s trading key on `market`; `signer` is the wallet or the key.
+pub fn close_session(signer: &Pubkey, market: &Pubkey, wallet: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: crate::id(),
+        accounts: vec![AccountMeta::new(*signer, true), w(crate::session::session_address(&crate::id(), market, wallet).0), w(*wallet)],
+        data: vec![crate::TAG_CLOSE_SESSION],
+    }
+}
+
+/// `ix` (a `Request` or `TakeQuote` of `wallet`'s) signed by its trading `key` instead: the key
+/// takes the wallet's place first, and the session account goes last.
+pub fn by_key(mut ix: Instruction, key: &Pubkey, market: &Pubkey, wallet: &Pubkey) -> Instruction {
+    ix.accounts[0] = AccountMeta::new(*key, true);
+    ix.accounts.push(w(crate::session::session_address(&crate::id(), market, wallet).0));
+    ix
+}

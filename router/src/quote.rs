@@ -124,7 +124,7 @@ pub fn take_quote(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
     let (wallet, trader_ai, portfolio, vault_ai, book_ai, market) = (acc(accounts, 0)?, acc(accounts, 1)?, acc(accounts, 2)?, acc(accounts, 3)?, acc(accounts, 4)?, acc(accounts, 5)?);
     let (maker_ai, maker_pf, delegate, authority, vault_program, percolator, sysvar) =
         (acc(accounts, 6)?, acc(accounts, 7)?, acc(accounts, 8)?, acc(accounts, 9)?, acc(accounts, 10)?, acc(accounts, 11)?, acc(accounts, 12)?);
-    signer(wallet)?;
+    // `wallet`: the wallet or its approved trading key (`session::authorize`, below).
     for w in [trader_ai, portfolio, market, maker_ai, maker_pf] {
         writable(w)?;
     }
@@ -135,7 +135,8 @@ pub fn take_quote(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
     if size == 0 || size == i128::MIN || price == 0 {
         return Err(RouterError::BadQuote.into());
     }
-    let t = load_trader(program_id, trader_ai, wallet.key)?;
+    let owner = load::<TraderState>(trader_ai, program_id, TRADER_MAGIC)?.wallet;
+    let t = load_trader(program_id, trader_ai, &owner)?;
     let v = load_vault(vault_ai)?;
     let b = load_book(book_ai, program_id)?;
     key_is(market, &v.market)?;
@@ -145,7 +146,7 @@ pub fn take_quote(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
         return Err(RouterError::BadAccount.into());
     }
     let [m_market, m_wallet, m_portfolio, m_delegate] = maker::keys(maker_ai, &percolator_vault::id())?;
-    if m_market != *market.key || m_portfolio != *maker_pf.key || m_delegate != *delegate.key || m_wallet == *wallet.key {
+    if m_market != *market.key || m_portfolio != *maker_pf.key || m_delegate != *delegate.key || m_wallet == owner || m_wallet == *wallet.key {
         return Err(RouterError::BadAccount.into());
     }
     // The maker signed exactly this, for this trading account.
@@ -167,6 +168,7 @@ pub fn take_quote(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
     let mut fees = carry::Fees::load(program_id, accounts, &b, &t, vault_ai.key, trader_ai.key)?;
     let debt = fees.settle(v.asset_index, market_id, before, effective, clock.unix_timestamp)?;
     let reduces = before != 0 && (before > 0) != (size > 0) && size.unsigned_abs() <= before.unsigned_abs();
+    session::authorize(program_id, accounts, wallet, &owner, market.key, session::notional(size, price), reduces)?;
     if !reduces {
         if perc::asset_close_only(&market.try_borrow_data()?, v.asset_index)? {
             return Err(RouterError::CloseOnly.into());

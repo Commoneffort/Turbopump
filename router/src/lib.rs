@@ -336,6 +336,9 @@ pub const TAG_REFRESH_RECORD: u8 = 35;
 pub const TAG_OPEN_RANGE: u8 = 36;
 pub const TAG_GROW_BOOK: u8 = 37;
 pub const TAG_TAKE_QUOTE: u8 = 38;
+/// Trading keys (`session`): the wallet approves a key to sign its trades, or ends it.
+pub const TAG_OPEN_SESSION: u8 = 39;
+pub const TAG_CLOSE_SESSION: u8 = 40;
 /// Widest trail, in basis points.
 pub const MAX_TRAIL_BPS: u64 = 5_000;
 /// Shortest time between two slices of a TWAP order, and the most slices one can have.
@@ -481,6 +484,12 @@ pub enum RouterError {
     BadQuote,
     /// `TakeQuote` after the quote's last slot, or for a quote good for too long.
     QuoteExpired,
+    /// A trade signed by neither the wallet nor its approved trading key (`session`), or a bad key.
+    SessionInvalid,
+    /// The trading key's approval has run out.
+    SessionExpired,
+    /// Beyond the trading key's limits (trade size, trades a day), or limits out of range.
+    SessionLimit,
 }
 
 impl From<RouterError> for ProgramError {
@@ -539,6 +548,8 @@ pub fn process_instruction(program_id: &Pubkey, accounts: &[AccountInfo], data: 
         TAG_OPEN_RANGE => lazy::open_range(program_id, accounts),
         TAG_GROW_BOOK => grow_book(program_id, accounts),
         TAG_TAKE_QUOTE => quote::take_quote(program_id, accounts, rest),
+        TAG_OPEN_SESSION => session::open_session(program_id, accounts, rest),
+        TAG_CLOSE_SESSION => session::close_session(program_id, accounts),
         #[cfg(not(feature = "devnet"))]
         quote::TEST_SIGNATURE_STANDIN => Ok(()),
         TAG_OPEN_LEDGER => carry::open_ledger(program_id, accounts),
@@ -652,6 +663,7 @@ macro_rules! trader_seeds {
 
 // (After `trader_seeds`, which it uses.)
 pub mod quote;
+pub mod session;
 
 // ---- accounts ----
 
@@ -1164,6 +1176,8 @@ fn set_tier(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
 /// (u8, 1 = close only).
 #[inline(never)]
 fn request(program_id: &Pubkey, accounts: &[AccountInfo], mut size: i128, reduce_only: bool) -> ProgramResult {
+    // The wallet, or its approved trading key (`session::authorize`, below): it pays the bond and
+    // the deposit, which go back to the wallet.
     let wallet = acc(accounts, 0)?;
     let trader_ai = acc(accounts, 1)?;
     let vault_ai = acc(accounts, 2)?;
@@ -1172,12 +1186,12 @@ fn request(program_id: &Pubkey, accounts: &[AccountInfo], mut size: i128, reduce
     let market = acc(accounts, 5)?;
     let portfolio = acc(accounts, 6)?;
     let system = acc(accounts, 7)?;
-    signer(wallet)?;
     for w in [wallet, trader_ai, book_ai, request_ai] {
         writable(w)?;
     }
     key_is(system, &system_program::ID)?;
-    let mut t = load_trader(program_id, trader_ai, wallet.key)?;
+    let owner = load::<TraderState>(trader_ai, program_id, TRADER_MAGIC)?.wallet;
+    let mut t = load_trader(program_id, trader_ai, &owner)?;
     let v = load_vault(vault_ai)?;
     let mut b: Book = load_book(book_ai, program_id)?;
     key_is(market, &v.market)?;
@@ -1216,10 +1230,13 @@ fn request(program_id: &Pubkey, accounts: &[AccountInfo], mut size: i128, reduce
     }
     // The deposit is counted at the mark (Percolator's price for a book that has none yet).
     let price = if b.mark_price != 0 { b.mark_price } else { perc::asset_price(&market.try_borrow_data()?, v.asset_index)?.1 };
+    let held = position_on(market, portfolio, v.asset_index)?;
+    let reducing = reduce_only || (held != 0 && (held > 0) != (size > 0) && size.unsigned_abs() <= held.unsigned_abs());
+    session::authorize(program_id, accounts, wallet, &owner, market.key, session::notional(size, price), reducing)?;
     // The account's keeper deposit: what whoever liquidates it is paid (see `keeper_deposit`),
     // topped up from the wallet when a liquidation has used it. Paid once; it stays the trader's.
     top_up_deposit(wallet, trader_ai, system)?;
-    enqueue(program_id, wallet, wallet.key, Some((trader_ai, &mut t)), vault_ai, book_ai, &mut b, request_ai, system, size, None, expiry_deposit(size, price))?;
+    enqueue(program_id, wallet, &owner, Some((trader_ai, &mut t)), vault_ai, book_ai, &mut b, request_ai, system, size, None, expiry_deposit(size, price))?;
     if reduce_only {
         let mut r: Request = load(request_ai, program_id, REQUEST_MAGIC)?;
         r.reduce_only = 1;

@@ -762,3 +762,73 @@ fn a_maker_quote_fills_at_once_at_its_price_and_only_once() {
     w.send(take_quote_ixs(&w, &m.kp, &m, 0, -size, 1_000_400, s + 3, 6), &[&tkp]).expect("close at the maker's bid");
     assert_eq!(position(&w, 0), 0);
 }
+
+/// A trading key (`session`): trades for its wallet within its limits, never withdraws, is
+/// retired by the next key, runs out, and can end itself.
+#[test]
+fn a_trading_key_trades_within_its_limits_and_nothing_else() {
+    use percolator_router::client::{by_key, close_session, open_session};
+    let mut w = live();
+    let m = new_maker(&mut w, 50_000_000);
+    let t0 = w.trader(0);
+    let tkp = w.trader_kp(0);
+    let market = w.env.market;
+    let wallet = tkp.pubkey();
+    let key = Keypair::new();
+    w.env.svm.airdrop(&key.pubkey(), 1_000_000_000).unwrap();
+    let now = w.clock_ts();
+    // Limits out of range are refused: no expiry in the past or beyond 30 days, the wallet itself not a key.
+    expect(w.send(vec![open_session(&wallet, &market, &key.pubkey(), now - 1, 10 * UNIT as u64, 3)], &[&tkp]), router_code(RouterError::SessionLimit));
+    expect(w.send(vec![open_session(&wallet, &market, &key.pubkey(), now + 31 * 86_400, 10 * UNIT as u64, 3)], &[&tkp]), router_code(RouterError::SessionLimit));
+    expect(w.send(vec![open_session(&wallet, &market, &wallet, now + 3600, 10 * UNIT as u64, 3)], &[&tkp]), router_code(RouterError::SessionInvalid));
+    // Approved for an hour, 10 USDC a trade, 3 trades a day.
+    w.send(vec![open_session(&wallet, &market, &key.pubkey(), now + 3600, 10 * UNIT as u64, 3)], &[&tkp]).expect("approve the key");
+    let quote = |w: &World, size: i128, id: u64, signer: &Keypair| {
+        let s = w.env.current_slot();
+        let mut ixs = take_quote_ixs(w, &m.kp, &m, 0, size, if size > 0 { 1_000_500 } else { 999_500 }, s + 3, id);
+        ixs[1] = by_key(ixs[1].clone(), &signer.pubkey(), &market, &wallet);
+        ixs
+    };
+    // Within the limits: the key alone signs (the wallet does not), and the trade is the wallet's.
+    w.send(quote(&w, 5 * UNIT as i128, 1, &key), &[&key]).expect("a quote taken with the key");
+    assert_eq!(position(&w, 0), 5 * UNIT as i128);
+    // Above the trade size: refused.
+    w.goto_slot(w.env.current_slot() + 1);
+    expect(w.send(quote(&w, 20 * UNIT as i128, 2, &key), &[&key]), router_code(RouterError::SessionLimit));
+    // A queued trade with the key.
+    let req = by_key(rclient::request(&t0, &w.vault, 2 * UNIT as i128), &key.pubkey(), &market, &wallet);
+    w.send(vec![req], &[&key]).expect("a request queued with the key");
+    // The key cannot withdraw (only the wallet signs a withdrawal, and it pays the wallet).
+    let k = w.keys.clone().unwrap();
+    let mut wd = rclient::withdraw(&t0, &key.pubkey(), &k.percolator_vault, UNIT as u64);
+    wd.accounts[0] = solana_sdk::instruction::AccountMeta::new(key.pubkey(), true);
+    assert!(w.send(vec![wd], &[&key]).is_err(), "a withdrawal signed by the key");
+    // The daily limit: a third trade passes, a fourth does not; closing is never limited.
+    w.goto_slot(w.env.current_slot() + 1);
+    w.send(quote(&w, UNIT as i128, 3, &key), &[&key]).expect("the third trade");
+    w.goto_slot(w.env.current_slot() + 1);
+    expect(w.send(quote(&w, UNIT as i128, 4, &key), &[&key]), router_code(RouterError::SessionLimit));
+    // A close bigger than the trade size still goes: the wallet grows the position, the key closes it all.
+    w.goto_slot(w.env.current_slot() + 1);
+    let s = w.env.current_slot();
+    w.send(take_quote_ixs(&w, &m.kp, &m, 0, 20 * UNIT as i128, 1_000_500, s + 3, 5), &[&tkp]).expect("the wallet itself, unlimited");
+    let held = position(&w, 0);
+    w.goto_slot(w.env.current_slot() + 1);
+    w.send(quote(&w, -held, 6, &key), &[&key]).expect("the key closes the whole position");
+    assert_eq!(position(&w, 0), 0);
+    // A new key retires the old one at once.
+    let key2 = Keypair::new();
+    w.env.svm.airdrop(&key2.pubkey(), 1_000_000_000).unwrap();
+    w.send(vec![open_session(&wallet, &market, &key2.pubkey(), now + 3600, 10 * UNIT as u64, 3)], &[&tkp]).expect("a new key");
+    w.goto_slot(w.env.current_slot() + 1);
+    expect(w.send(quote(&w, UNIT as i128, 7, &key), &[&key]), router_code(RouterError::SessionInvalid));
+    w.send(quote(&w, UNIT as i128, 8, &key2), &[&key2]).expect("the new key trades");
+    // It runs out.
+    let slot = w.env.current_slot() + 1;
+    let later = w.clock_ts() + 3700;
+    w.env.set_clock(slot, later);
+    expect(w.send(quote(&w, UNIT as i128, 9, &key2), &[&key2]), router_code(RouterError::SessionExpired));
+    // The key can end itself; the rent goes to the wallet, and nothing it signs passes after.
+    w.send(vec![close_session(&key2.pubkey(), &market, &wallet)], &[&key2]).expect("the key ends itself");
+    assert!(w.env.svm.get_account(&percolator_router::session::session_address(&percolator_router::id(), &market, &wallet).0).map_or(true, |a| a.lamports == 0));
+}

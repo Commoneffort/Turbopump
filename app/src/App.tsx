@@ -5,6 +5,7 @@ import { ComputeBudgetProgram, PublicKey, Transaction } from "@solana/web3.js";
 import bs58 from "bs58";
 import { createAssociatedTokenAccountIdempotentInstruction } from "@solana/spl-token";
 import * as C from "./chain";
+import { signWithKey } from "./tradingKey";
 import * as S from "./social";
 import { readDirect, view } from "./view";
 import Desk from "./Desk";
@@ -60,11 +61,26 @@ function useSend(onDone: () => void): [Send, string | undefined, Toast | undefin
   const [busy, setBusy] = useState<string>();
   const [toast, setToast] = useState<Toast>();
   const send = useCallback<Send>(
-    async (label, build) => {
+    async (label, build, opts) => {
       if (!wallet.publicKey) return;
       setBusy(label);
       try {
         const ixs = typeof build === "function" ? await build(connection) : build;
+        if (opts?.key) {
+          // The trading key signs alone (it pays the fee): no wallet popup.
+          const sized = ixs[0]?.programId.equals(ComputeBudgetProgram.programId);
+          const tx = new Transaction().add(...(sized ? [] : [await C.computeLimit(connection, opts.key.publicKey, ixs)]), ...ixs);
+          tx.recentBlockhash = await C.recentBlockhash(connection);
+          tx.feePayer = opts.key.publicKey;
+          await signWithKey(opts.key, tx);
+          const sig = await connection.sendRawTransaction(tx.serialize());
+          if (C.X1) await C.confirmFast(connection, sig);
+          else await connection.confirmTransaction(sig, "confirmed");
+          readDirect();
+          setToast({ ok: true, text: `${label}: confirmed`, sig });
+          onDone();
+          return sig;
+        }
         // Percolator instructions can use several hundred thousand compute units.
         // (A build that sets its own compute limit, a quoted trade, already simulated it.)
         const sized = ixs[0]?.programId.equals(ComputeBudgetProgram.programId);

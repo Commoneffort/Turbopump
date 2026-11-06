@@ -1490,13 +1490,14 @@ export const openBook = (payer: PublicKey, vault: PublicKey) => new TransactionI
 /** Queues a trade; `id` is the book's next id. It cannot be cancelled. `closeOnly`: the router
  *  lets it only shrink the position held when it lands and again when it fills (a close never
  *  opens the other side, whatever the page showed). `sub`: which of the wallet's accounts. */
-export const requestTrade = (wallet: PublicKey, vault: PublicKey, size: bigint, opts: { sub?: number; closeOnly?: boolean } = {}) => {
+export const requestTrade = (wallet: PublicKey, vault: PublicKey, size: bigint, opts: { sub?: number; closeOnly?: boolean; actor?: PublicKey } = {}) => {
   const sub = opts.sub ?? 0;
-  return new TransactionInstruction({
+  const ix = new TransactionInstruction({
     programId: ROUTER,
     keys: [rw(wallet, true), rw(traderAddress(wallet, sub, marketOfVault(vault))), ro(vault), rw(bookAddress(vault)), rw(requestAddress(vault, accountOwner(wallet, sub, marketOfVault(vault)))), ro(marketOfVault(vault)), ro(routerPortfolio(wallet, sub, marketOfVault(vault))), ro(SystemProgram.programId), ro(tiersAddress(marketOfVault(vault)))],
     data: opts.closeOnly ? new W().u8(4).i128(size).u8(1).done() : new W().u8(4).i128(size).done(),
   });
+  return opts.actor ? byKey(ix, opts.actor, wallet, marketOfVault(vault)) : ix;
 };
 /** The router's price account for a feed, written only by the reporter key (`PostPrice`). A
  *  reported price is not verifiable on chain. On Solana the router accepts it only for a queued
@@ -1696,6 +1697,35 @@ export const expireRequest = (caller: PublicKey, r: RouterRequest) => new Transa
 
 /** Makers are on where the deployed programs have them (X1 first; QUOTES=0 turns them off). */
 export const QUOTES_ON = X1 && (typeof process === "undefined" || process.env?.QUOTES !== "0");
+// ---- trading keys (router `session`, 2026-11-06): one-click trading ----
+// A wallet approves a random key of the page's (never one derived from a signature) to sign its
+// trades through the router: queued trades and maker quotes on one market, for a limited time, at
+// most `maxNotional` a trade and `maxTrades` a day (closing is never limited). It cannot withdraw,
+// deposit, copy or change anything else; a new key replaces the old one at once.
+export const SESSION_LEN = 152;
+export const sessionAddress = (wallet: PublicKey, market = activeMarket()) => cached(`ss${wallet.toBase58()}${mk(market)}`, () => rpda(Buffer.from("session"), market.toBuffer(), wallet.toBuffer()));
+export type Session = { market: PublicKey; wallet: PublicKey; key: PublicKey; expires: number; maxNotional: bigint; maxTrades: number; trades: number; windowStart: number };
+export const decodeSession = (d?: Uint8Array | null): Session | null => (d && d.length === SESSION_LEN ? {
+  market: key(d, 8), wallet: key(d, 40), key: key(d, 72), expires: Number(i64(d, 104)), maxNotional: u64(d, 112),
+  maxTrades: d[120] | (d[121] << 8) | (d[122] << 16) | (d[123] << 24), trades: d[124] | (d[125] << 8) | (d[126] << 16) | (d[127] << 24), windowStart: Number(i64(d, 128)),
+} : null);
+/** The wallet approves `sessionKey` until `expires` (unix seconds, at most 30 days ahead). */
+export const openSession = (wallet: PublicKey, sessionKey: PublicKey, expires: number, maxNotional: bigint, maxTrades: number, market = activeMarket()) => new TransactionInstruction({
+  programId: ROUTER,
+  keys: [rw(wallet, true), rw(sessionAddress(wallet, market)), ro(market), ro(SystemProgram.programId)],
+  data: new W().u8(39).bytes(sessionKey.toBytes()).i64(BigInt(expires)).u64(maxNotional).u32(maxTrades).done(),
+});
+/** Ends the wallet's trading key; `signer` is the wallet or the key itself. */
+export const closeSession = (signer: PublicKey, wallet: PublicKey, market = activeMarket()) => new TransactionInstruction({
+  programId: ROUTER,
+  keys: [rw(signer, true), rw(sessionAddress(wallet, market)), rw(wallet)],
+  data: new W().u8(40).done(),
+});
+/** `ix` (a Request or TakeQuote of `wallet`'s) signed by its trading key `actor` instead. */
+export function byKey(ix: TransactionInstruction, actor: PublicKey, wallet: PublicKey, market: PublicKey): TransactionInstruction {
+  return new TransactionInstruction({ programId: ix.programId, data: ix.data, keys: [rw(actor, true), ...ix.keys.slice(1), rw(sessionAddress(wallet, market))] });
+}
+
 export const makerAddress = (wallet: PublicKey, market = activeMarket()) => PublicKey.findProgramAddressSync([Buffer.from("maker"), market.toBuffer(), wallet.toBuffer()], VAULT_PROGRAM)[0];
 export const QUOTE_MSG_LEN = 114;
 /** The bytes a maker signs (router `quote::quote_message`). */
@@ -1717,11 +1747,11 @@ export function quoteMessage(maker: PublicKey, trader: PublicKey, asset: number,
 /** A signed quote as a maker's service returns it (amounts as decimal strings). */
 export type Quote = { maker: string; wallet: string; portfolio: string; delegate: string; makerAssets: number[]; vault: string; trader: string; asset: number; size: string; price: string; expiry: string; id: string; signature: string };
 /** TakeQuote (router tag 38): the Ed25519 verification goes just before it. */
-export const takeQuote = (v: Vault, wallet: PublicKey, sub: number, q: Quote) => {
+export const takeQuote = (v: Vault, wallet: PublicKey, sub: number, q: Quote, actor?: PublicKey) => {
   const w = new W().u8(38);
   const size = BigInt.asUintN(128, BigInt(q.size));
   w.u64(size & ((1n << 64n) - 1n)).u64(size >> 64n).u64(BigInt(q.price)).u64(BigInt(q.expiry)).u64(BigInt(q.id));
-  return new TransactionInstruction({
+  const ix = new TransactionInstruction({
     programId: ROUTER,
     keys: [rw(wallet, true), rw(traderAddress(wallet, sub, v.market)), rw(routerPortfolio(wallet, sub, v.market)), ro(v.key), ro(bookAddress(v.key)), rw(v.market),
       rw(new PublicKey(q.maker)), rw(new PublicKey(q.portfolio)), ro(new PublicKey(q.delegate)), ro(routerAuthority()), ro(VAULT_PROGRAM), ro(PERCOLATOR),
@@ -1729,13 +1759,14 @@ export const takeQuote = (v: Vault, wallet: PublicKey, sub: number, q: Quote) =>
       rw(carryAddress(v.key)), rw(ledgerAddress(wallet, sub, v.market)), ro(tiersAddress(v.market)), rw(rangeAddress(v.key)), rw(equitiesAddress(wallet, v.market)), rw(statsAddress(wallet, v.market))],
     data: w.done(),
   });
+  return actor ? byKey(ix, actor, wallet, v.market) : ix;
 };
 /** The instructions that take quote `q`: its signature check, then TakeQuote. `cranks` (to bring
  *  the maker's and the trader's accounts and the asset to the current slot) go in front. */
-export function takeQuoteIxs(v: Vault, wallet: PublicKey, sub: number, q: Quote, cranks: TransactionInstruction[] = []): TransactionInstruction[] {
+export function takeQuoteIxs(v: Vault, wallet: PublicKey, sub: number, q: Quote, cranks: TransactionInstruction[] = [], actor?: PublicKey): TransactionInstruction[] {
   const msg = quoteMessage(new PublicKey(q.maker), traderAddress(wallet, sub, v.market), q.asset, BigInt(q.size), BigInt(q.price), BigInt(q.expiry), BigInt(q.id));
   const verify = Ed25519Program.createInstructionWithPublicKey({ publicKey: new PublicKey(q.wallet).toBytes(), message: msg, signature: Buffer.from(q.signature, "base64") });
-  return [...cranks, verify, takeQuote(v, wallet, sub, q)];
+  return [...cranks, verify, takeQuote(v, wallet, sub, q, actor)];
 }
 
 /** Where quotes come from: our maker's service on this site (api/quote), or QUOTE_URL. */
@@ -1747,12 +1778,13 @@ const QUOTE_URL = (typeof process !== "undefined" && process.env?.QUOTE_URL) || 
 /** `life`: how many slots the quote should stay good for (a wallet that asks its user first
  *  needs longer; the maker charges a little more for it). The result has no compute budget
  *  instruction (`units` is what the simulation used). */
-export async function quotedTrade(conn: Connection, v: Vault, wallet: PublicKey, sub: number, size: bigint, life = 6, timeoutMs = 700, useReady = true): Promise<{ ixs: TransactionInstruction[]; quote: Quote; units: number } | null> {
+/** `actor`: the wallet's trading key, when it signs instead of the wallet (`openSession`). */
+export async function quotedTrade(conn: Connection, v: Vault, wallet: PublicKey, sub: number, size: bigint, life = 6, timeoutMs = 700, useReady = true, actor?: PublicKey): Promise<{ ixs: TransactionInstruction[]; quote: Quote; units: number } | null> {
   if (!QUOTES_ON || size === 0n) return null;
   const trader = traderAddress(wallet, sub, v.market);
   // A quote fetched ahead (`prefetchQuote`) for exactly this trade, while it has life enough
   // left: used once.
-  const k = readyKey(v, trader, size, life);
+  const k = readyKey(v, trader, size, life) + (actor ? `:${actor.toBase58()}` : "");
   const had = useReady ? ready.get(k) : undefined;
   if (had) {
     ready.delete(k);
@@ -1768,8 +1800,8 @@ export async function quotedTrade(conn: Connection, v: Vault, wallet: PublicKey,
   noteSlot(Number(q.expiry) - life);
   // (TakeQuote brings the maker's and the taker's accounts and the asset to the current slot
   // itself, cranking only what needs it: the transaction is the signature check and the trade.)
-  const ixs = takeQuoteIxs(v, wallet, sub, q);
-  const sim = await conn.simulateTransaction(new VersionedTransaction(new TransactionMessage({ payerKey: wallet, recentBlockhash: PublicKey.default.toBase58(), instructions: [ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }), ...ixs] }).compileToV0Message()), { sigVerify: false, replaceRecentBlockhash: true }).catch(() => null);
+  const ixs = takeQuoteIxs(v, wallet, sub, q, [], actor);
+  const sim = await conn.simulateTransaction(new VersionedTransaction(new TransactionMessage({ payerKey: actor ?? wallet, recentBlockhash: PublicKey.default.toBase58(), instructions: [ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }), ...ixs] }).compileToV0Message()), { sigVerify: false, replaceRecentBlockhash: true }).catch(() => null);
   if (!sim || sim.value.err) return null;
   // (More room than simulated: the transaction may land a slot later, with more to catch up.)
   const units = Math.min(1_400_000, Math.ceil((sim.value.unitsConsumed ?? 1_000_000) * 1.4) + 150_000);
@@ -1788,10 +1820,10 @@ export const slotEstimate = () => (slotRef.slot ? slotRef.slot + Math.floor((Dat
  *  it: `quotedTrade` for the same trade then takes it at once. Call it again every second or two
  *  while the trade may come (a quote lives `life` slots). A bot can keep one ready for each size
  *  and side it may trade. */
-export function prefetchQuote(conn: Connection, v: Vault, wallet: PublicKey, sub: number, size: bigint, life = 6, timeoutMs = 1_500): void {
+export function prefetchQuote(conn: Connection, v: Vault, wallet: PublicKey, sub: number, size: bigint, life = 6, timeoutMs = 1_500, actor?: PublicKey): void {
   if (!QUOTES_ON || size === 0n) return;
-  const k = readyKey(v, traderAddress(wallet, sub, v.market), size, life);
-  const p = quotedTrade(conn, v, wallet, sub, size, life, timeoutMs, false).catch(() => null);
+  const k = readyKey(v, traderAddress(wallet, sub, v.market), size, life) + (actor ? `:${actor.toBase58()}` : "");
+  const p = quotedTrade(conn, v, wallet, sub, size, life, timeoutMs, false, actor).catch(() => null);
   // (Kept while it is fetched, so a click meanwhile waits for it instead of asking again.)
   ready.set(k, p);
   p.then(got => { if (!got && ready.get(k) === p) ready.delete(k); });
