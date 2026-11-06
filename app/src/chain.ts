@@ -1694,15 +1694,25 @@ const QUOTE_URL = (typeof process !== "undefined" && process.env?.QUOTE_URL) || 
 /** `life`: how many slots the quote should stay good for (a wallet that asks its user first
  *  needs longer; the maker charges a little more for it). The result has no compute budget
  *  instruction (`units` is what the simulation used). */
-export async function quotedTrade(conn: Connection, v: Vault, wallet: PublicKey, sub: number, size: bigint, life = 6, timeoutMs = 700): Promise<{ ixs: TransactionInstruction[]; quote: Quote; units: number } | null> {
+export async function quotedTrade(conn: Connection, v: Vault, wallet: PublicKey, sub: number, size: bigint, life = 6, timeoutMs = 700, useReady = true): Promise<{ ixs: TransactionInstruction[]; quote: Quote; units: number } | null> {
   if (!QUOTES_ON || size === 0n) return null;
   const trader = traderAddress(wallet, sub);
+  // A quote fetched ahead (`prefetchQuote`) for exactly this trade, while it has life enough
+  // left: used once.
+  const k = readyKey(v, trader, size, life);
+  const had = useReady ? ready.get(k) : undefined;
+  if (had) {
+    ready.delete(k);
+    const got = await had;
+    if (got && Number(got.quote.expiry) - slotEstimate() >= readyLeft(life)) return got;
+  }
   // (A maker server run apart, QUOTE_URL=http://host:port, answers on /quote.)
   const base = QUOTE_URL.endsWith("/api/quote") ? QUOTE_URL : `${QUOTE_URL}/quote`;
   const url = `${base}?network=${NETWORK}&vault=${v.key.toBase58()}&trader=${trader.toBase58()}&size=${size}&life=${life}`;
   const r = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) }).catch(() => null);
   if (!r || !r.ok) return null;
   const q = (await r.json()) as Quote;
+  noteSlot(Number(q.expiry) - life);
   // (TakeQuote brings the maker's and the taker's accounts and the asset to the current slot
   // itself, cranking only what needs it: the transaction is the signature check and the trade.)
   const ixs = takeQuoteIxs(v, wallet, sub, q);
@@ -1711,4 +1721,34 @@ export async function quotedTrade(conn: Connection, v: Vault, wallet: PublicKey,
   // (More room than simulated: the transaction may land a slot later, with more to catch up.)
   const units = Math.min(1_400_000, Math.ceil((sim.value.unitsConsumed ?? 1_000_000) * 1.4) + 150_000);
   return { ixs, quote: q, units };
+}
+
+type Quoted = Awaited<ReturnType<typeof quotedTrade>>;
+const ready = new Map<string, Promise<Quoted>>();
+const readyKey = (v: Vault, trader: PublicKey, size: bigint, life: number) => `${v.key.toBase58()}:${trader.toBase58()}:${size}:${life}`;
+/** How many slots a fetched-ahead quote must still have to be used: enough to sign and land
+ *  (the burner wallet signs at once; a wallet that asks its user takes seconds). */
+const readyLeft = (life: number) => (life <= 6 ? 3 : Math.ceil(life * 0.7));
+/** The slot now, estimated from the last one seen (`noteSlot`). */
+export const slotEstimate = () => (slotRef.slot ? slotRef.slot + Math.floor((Date.now() / 1000 - slotRef.unix) / slotSecs) : 0);
+/** Fetches (and simulates) the quote for a trade before it is made, replacing the one kept for
+ *  it: `quotedTrade` for the same trade then takes it at once. Call it again every second or two
+ *  while the trade may come (a quote lives `life` slots). A bot can keep one ready for each size
+ *  and side it may trade. */
+export function prefetchQuote(conn: Connection, v: Vault, wallet: PublicKey, sub: number, size: bigint, life = 6, timeoutMs = 1_500): void {
+  if (!QUOTES_ON || size === 0n) return;
+  const k = readyKey(v, traderAddress(wallet, sub), size, life);
+  const p = quotedTrade(conn, v, wallet, sub, size, life, timeoutMs, false).catch(() => null);
+  // (Kept while it is fetched, so a click meanwhile waits for it instead of asking again.)
+  ready.set(k, p);
+  p.then(got => { if (!got && ready.get(k) === p) ready.delete(k); });
+}
+
+/** A recent blockhash, kept for 10 s (one is good for ~150 slots): saves a round trip per send. */
+let hashKept: { hash: string; at: number; conn: Connection } | undefined;
+export async function recentBlockhash(conn: Connection): Promise<string> {
+  if (hashKept && hashKept.conn === conn && Date.now() - hashKept.at < 10_000) return hashKept.hash;
+  const hash = (await conn.getLatestBlockhash("confirmed")).blockhash;
+  hashKept = { hash, at: Date.now(), conn };
+  return hash;
 }

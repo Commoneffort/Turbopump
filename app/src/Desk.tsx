@@ -7,7 +7,7 @@
 import { CSSProperties, Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
-import { Connection, PublicKey, TransactionInstruction } from "@solana/web3.js";
+import { ComputeBudgetProgram, Connection, PublicKey, TransactionInstruction } from "@solana/web3.js";
 import { createAssociatedTokenAccountIdempotentInstruction } from "@solana/spl-token";
 import * as C from "./chain";
 import { readDirect } from "./view";
@@ -666,14 +666,28 @@ function Ticket({ state, send, busy, copying, margin, setMargin, vaults }: { sta
     if (C.QUOTES_ON && !open.length && !ledger.length && !fund.length) {
       send(label, async conn => {
         // (The burner wallet signs at once; a wallet that asks its user needs the quote longer.)
-        const instant = wallet?.adapter?.name === BurnerName;
-        const q = await C.quotedTrade(conn, v, publicKey, sub, sent * side, instant ? 6 : 30, 1_500).catch(() => null);
-        return withNote(q ? q.ixs : queued);
+        const q = await C.quotedTrade(conn, v, publicKey, sub, sent * side, quoteLife, 1_500).catch(() => null);
+        return withNote(q ? [ComputeBudgetProgram.setComputeUnitLimit({ units: q.units }), ...q.ixs] : queued);
       }).then(r => { if (r) setNote(""); });
       return;
     }
     sendNoted(label, queued);
   };
+  // A quote for the order as it stands, fetched ahead and kept fresh, so a click signs at once
+  // (C.prefetchQuote). Only while it could be used: a market order an account ready to trade
+  // can send now.
+  const instantWallet = wallet?.adapter?.name === BurnerName;
+  const quoteLife = instantWallet ? 6 : 30;
+  const quotable = C.QUOTES_ON && mode === "market" && !!publicKey && mine && !blocker && !busy && !!state.trader && state.trader.hasLedger && !(iso && isoTopUp > 0n) && sent > 0n;
+  const quoteSize = quotable ? sent * side : 0n;
+  useEffect(() => {
+    if (!quoteSize || !publicKey) return;
+    const fetchAhead = () => { if (!document.hidden) C.prefetchQuote(connection, v, publicKey, sub, quoteSize, quoteLife, 1_500); };
+    // (Typing settles first; then a fresh one well inside each quote's life.)
+    const first = setTimeout(fetchAhead, 250);
+    const id = setInterval(fetchAhead, instantWallet ? 900 : 2_500);
+    return () => { clearTimeout(first); clearInterval(id); };
+  }, [quoteSize.toString(), publicKey?.toBase58(), v.key.toBase58(), sub, quoteLife]);
   // Close all of the position, or a share of it (a smaller trade the other way).
   const closeAll = (share = 100) => {
     if (!publicKey || !state.book || held === 0n) return;

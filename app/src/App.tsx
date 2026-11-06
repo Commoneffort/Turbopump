@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
-import { PublicKey, Transaction } from "@solana/web3.js";
+import { ComputeBudgetProgram, PublicKey, Transaction } from "@solana/web3.js";
 import bs58 from "bs58";
 import { createAssociatedTokenAccountIdempotentInstruction } from "@solana/spl-token";
 import * as C from "./chain";
@@ -66,12 +66,14 @@ function useSend(onDone: () => void): [Send, string | undefined, Toast | undefin
       try {
         const ixs = typeof build === "function" ? await build(connection) : build;
         // Percolator instructions can use several hundred thousand compute units.
-        const tx = new Transaction().add(await C.computeLimit(connection, wallet.publicKey, ixs), ...ixs);
+        // (A build that sets its own compute limit, a quoted trade, already simulated it.)
+        const sized = ixs[0]?.programId.equals(ComputeBudgetProgram.programId);
+        const tx = new Transaction().add(...(sized ? [] : [await C.computeLimit(connection, wallet.publicKey, ixs)]), ...ixs);
         let sig: string;
         if (C.X1 && wallet.signTransaction) {
           // A wallet sends through its own network. On X1 it only signs, and the page sends, so
           // the transaction goes to X1 whatever network the wallet is set to.
-          tx.recentBlockhash = (await connection.getLatestBlockhash("confirmed")).blockhash;
+          tx.recentBlockhash = await C.recentBlockhash(connection);
           tx.feePayer = wallet.publicKey;
           const signed = await wallet.signTransaction(tx);
           try {
