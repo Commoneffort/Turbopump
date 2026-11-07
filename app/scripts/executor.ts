@@ -1092,6 +1092,7 @@ async function lazyNow(v: C.Vault, b: C.Book, waiting = 1): Promise<boolean> {
   return why(!r.valid ? "range spoilt" : r.markAt !== b.markPublish ? `range missed a mark (${r.markAt} vs ${b.markPublish})` : `range too wide or indices moved (${r.low}-${r.high})`);
 }
 const rangeTried = new Set<string>();
+const tapeTried = new Set<string>();
 const growTriedAt = new Map<string, number>();
 
 /** Slot time with lazy settlement: the target price, the mark move, the vault's (and, when the
@@ -1272,6 +1273,11 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
   if (maintOn && snap.book.length < C.BOOK_LEN && Date.now() - (growTriedAt.get(v.key.toBase58()) ?? 0) > 60_000) {
     growTriedAt.set(v.key.toBase58(), Date.now());
     if (await send(`grow the queue of ${v.feed?.symbol} to 128 places`, [C.growBook(payer.publicKey, v.key)], true)) return false;
+  }
+  // The vault's liquidation tape (liquidation-triggered orders read it): opened once, on X1.
+  if (C.X1 && maintOn && !tapeTried.has(v.key.toBase58())) {
+    tapeTried.add(v.key.toBase58());
+    if (!(await conn.getAccountInfo(C.liqTapeAddress(v.key)))) await send(`open the liquidation tape of ${v.feed?.symbol}`, [C.openLiqTape(payer.publicKey, v.key)]);
   }
   // The vault's price range (lazy settlement): opened once, by whoever gets there first.
   if (C.LAZY_FILLS && maintOn && C.decodeBook(snap.book).slotTime && !rangeTried.has(v.key.toBase58())) {
@@ -1507,13 +1513,17 @@ async function serviceOrders(vaults: C.Vault[], books: Map<string, C.Book>, mark
   const due = orderCache.filter(o => !o.queued && (orderRetry.get(o.key.toBase58()) ?? 0) <= Date.now() && vaults.some(v => v.key.equals(o.vault)) && books.has(o.vault.toBase58()));
   if (!due.length) return;
   const accs = await conn.getMultipleAccountsInfo(due.flatMap(o => [C.routerPortfolio(o.wallet, o.sub), C.traderAddress(o.wallet, o.sub)]));
+  // Liquidation-triggered orders read their vault's liquidation tape.
+  const tapeVaults = [...new Set(due.filter(o => o.kind === C.ORDER.LIQ).map(o => o.vault.toBase58()))];
+  const tapeAccs = tapeVaults.length ? await conn.getMultipleAccountsInfo(tapeVaults.map(k => C.liqTapeAddress(new PublicKey(k)))) : [];
+  const tapes = new Map(tapeVaults.map((k, i) => [k, tapeAccs[i] ? C.decodeTape(new Uint8Array(tapeAccs[i]!.data)) : []] as const));
   const queuedNow = new Set<string>(); // an account has one request at a time: its other orders wait for the next pass
   for (const [i, o] of due.entries()) {
     const v = vaults.find(x => x.key.equals(o.vault))!, b = books.get(o.vault.toBase58())!;
     const pf = accs[2 * i], tr = accs[2 * i + 1];
     if (!pf || !tr) continue;
     const held = C.decodePortfolio(new Uint8Array(pf.data), v.assetIndex, market).position;
-    const what = C.orderAction(o, b.markPrice, held, now, market, v.assetIndex);
+    const what = C.orderAction(o, b.markPrice, held, now, market, v.assetIndex, tapes.get(o.vault.toBase58()));
     if (what === "wait" || !overdue(`${what} order ${o.key.toBase58()}`)) continue;
     // A trail's record is only worth a transaction once the mark is clearly better.
     if (what === "record" && (o.peak === 0n || (b.markPrice > o.peak ? b.markPrice - o.peak : o.peak - b.markPrice) * 1000n < o.peak)) continue;
@@ -1527,7 +1537,7 @@ async function serviceOrders(vaults: C.Vault[], books: Map<string, C.Book>, mark
       const closes = held !== 0n && (held > 0n) !== buys && size <= (held > 0n ? held : -held);
       if (!closes && (buys ? v.inventory <= 0n : v.inventory >= 0n)) { orderRetry.set(o.key.toBase58(), Date.now() + 30_000); continue; }
     }
-    const name = ["stop", "take-profit", "trailing stop", "limit", "TWAP", "grid level", "cross trigger", "ratio trigger"][o.kind] ?? "order";
+    const name = ["stop", "take-profit", "trailing stop", "limit", "TWAP", "grid level", "cross trigger", "ratio trigger", "liquidation trigger"][o.kind] ?? "order";
     const ok = await send(`${what === "fire" ? "carry out" : what === "record" ? "record a better mark for" : "remove"} ${name} of ${o.wallet.toBase58().slice(0, 6)} on ${v.feed?.symbol} (mark ${Number(b.markPrice) / 1e6})`, [C.triggerOrder(payer.publicKey, o)], true);
     // Refused (not enough margin, the mark moved back): leave it a while. Done: read the orders again.
     if (ok) { ordersAt = 0; orderFails.delete(o.key.toBase58()); if (what === "fire") queuedNow.add(acctKey(o)); } else orderRetry.set(o.key.toBase58(), Date.now() + orderBackoff(o.key.toBase58()));

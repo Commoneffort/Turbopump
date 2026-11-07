@@ -343,6 +343,8 @@ pub const TAG_CLOSE_SESSION: u8 = 40;
 pub const TAG_SET_SHIELD: u8 = 41;
 pub const TAG_TRIGGER_SHIELD: u8 = 42;
 pub const TAG_REMOVE_SHIELD: u8 = 43;
+/// Liquidation tape (`liqtape`): anyone starts a vault's.
+pub const TAG_OPEN_LIQ_TAPE: u8 = 44;
 /// Widest trail, in basis points.
 pub const MAX_TRAIL_BPS: u64 = 5_000;
 /// Shortest time between two slices of a TWAP order, and the most slices one can have.
@@ -561,6 +563,7 @@ pub fn process_instruction(program_id: &Pubkey, accounts: &[AccountInfo], data: 
         TAG_SET_SHIELD => shield::set_shield(program_id, accounts, rest),
         TAG_TRIGGER_SHIELD => shield::trigger_shield(program_id, accounts),
         TAG_REMOVE_SHIELD => shield::remove_shield(program_id, accounts),
+        TAG_OPEN_LIQ_TAPE => liqtape::open_tape(program_id, accounts),
         #[cfg(not(feature = "devnet"))]
         quote::TEST_SIGNATURE_STANDIN => Ok(()),
         TAG_OPEN_LEDGER => carry::open_ledger(program_id, accounts),
@@ -676,6 +679,7 @@ macro_rules! trader_seeds {
 pub mod quote;
 pub mod session;
 pub mod shield;
+pub mod liqtape;
 
 // ---- accounts ----
 
@@ -1528,6 +1532,15 @@ fn place_order(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
             o.peak = size.unsigned_abs() as u64;
             o.next_time = slices as i64;
         }
+        ORDER_LIQ => {
+            // `trigger`: the notional liquidated (collateral atoms); `interval`: the window in
+            // seconds; `slices`: 1 = longs liquidated, 2 = shorts liquidated.
+            if size == 0 || trigger == 0 || !(10..=86_400).contains(&interval) || !(1..=2).contains(&slices) {
+                return Err(RouterError::BadOrder.into());
+            }
+            o.slice = interval as u64;
+            o.side = if slices == 1 { 1 } else { -1 };
+        }
         ORDER_CROSS | ORDER_RATIO => {
             // `interval`: the other asset (on this market); `slices`: 1 = at or above, 2 = at or below.
             let other = u16::try_from(interval).map_err(|_| RouterError::BadOrder)?;
@@ -1674,6 +1687,14 @@ fn trigger_order(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
             }
             o.size
         }
+        ORDER_LIQ => {
+            let since = now.saturating_sub(o.slice as i64);
+            let done = liqtape::liquidated_since(program_id, accounts, vault_ai.key, o.side, since).ok_or(RouterError::NotTriggered)?;
+            if done < o.trigger as u128 {
+                return Err(RouterError::NotTriggered.into());
+            }
+            o.size
+        }
         ORDER_CROSS | ORDER_RATIO => {
             let md = market.try_borrow_data()?;
             let (_, other, _) = perc::asset_price(&md, o.slice as u16)?;
@@ -1731,7 +1752,7 @@ fn trigger_order(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
     // An order that can open a position fills in the account's keeper deposit first, when it
     // lacks one (the wallet may have had it refunded while flat): out of the order's budget,
     // which the page sizes to hold it, and only when the keeper's share is still there after.
-    if matches!(o.kind, ORDER_LIMIT | ORDER_TWAP | ORDER_GRID | ORDER_CROSS | ORDER_RATIO) && o.reduce_only == 0 {
+    if matches!(o.kind, ORDER_LIMIT | ORDER_TWAP | ORDER_GRID | ORDER_CROSS | ORDER_RATIO | ORDER_LIQ) && o.reduce_only == 0 {
         let short = deposit_short(trader_ai)?;
         if short > 0 && spare(order_ai, ORDER_LEN)? >= short.saturating_add(cost + KEEPER_FEE) {
             pay(order_ai, trader_ai, short)?;
@@ -2193,6 +2214,10 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     // The trader's track record, when the fill names it (its last account).
     if let Some(stats_ai) = accounts.last() {
         social::record_fill(program_id, stats_ai, &t, portfolio, v.asset_index, traded, effective, owed, others);
+    }
+    // A liquidation goes on the vault's tape (for orders that trigger on liquidations).
+    if liquidation_fee {
+        liqtape::record(program_id, accounts, vault_ai.key, Clock::get()?.unix_timestamp, traded, effective);
     }
 
     book_remove(book_ai, &mut b, r.id)?;

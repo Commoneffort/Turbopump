@@ -1111,3 +1111,46 @@ fn a_shield_adds_margin_from_the_wallet_near_liquidation_and_only_then() {
     w.send(vec![rclient::remove_shield(&u.pubkey(), &t.market)], &[&u]).expect("remove the shield");
     assert!(w.env.svm.get_account(&percolator_router::shield::shield_address(&percolator_router::id(), &t.market, &u.pubkey()).0).map_or(true, |a| a.lamports == 0));
 }
+
+/// Liquidation tape and liquidation-triggered orders (2026-11-07): a fill that liquidates records
+/// itself on the vault's tape, and an order waiting for "longs liquidated" fires once the tape
+/// shows enough within its window, and not before.
+#[test]
+fn a_liquidation_trigger_fires_once_the_tape_shows_enough_liquidated() {
+    use percolator_router::{client::OrderParams, liqtape, state::ORDER_LIQ};
+    let mut w = live();
+    let vault = w.vault;
+    w.send(vec![rclient::open_liq_tape(&w.payer.pubkey(), &vault)], &[]).expect("open the tape");
+    leveraged_long(&mut w);
+    // Trader 0 waits to buy 2 units once at least 1 USDC of longs were liquidated in 10 minutes.
+    let t0 = w.trader(0);
+    let kp0 = w.trader_kp(0);
+    let o = OrderParams { kind: ORDER_LIQ, size: 2 * UNIT as i128, trigger: 1_000_000, interval: 600, slices: 1, ..Default::default() };
+    w.send(vec![rclient::place_order(&t0, &vault, &o)], &[&kp0]).expect("place a liquidation trigger");
+    let trigger = |w: &mut World| { let ix = rclient::with_tape(rclient::trigger_order(&w.payer.pubkey(), &t0, &vault, 0), &vault); w.send(vec![ix], &[]) };
+    expect(trigger(&mut w), router_code(RouterError::NotTriggered));
+    // Trader 7 falls under its level and is liquidated, through a fill that carries the tape.
+    w.move_price(20, 840_000);
+    let t7 = w.trader(7);
+    let id = w.book().next_id;
+    w.send(vec![rclient::request_close(&w.payer.pubkey(), &t7, &vault)], &[]).unwrap();
+    let target = w.request_target(id);
+    let u = w.price_at_target(target);
+    w.advance_to(u).unwrap();
+    w.converge();
+    let fill = rclient::with_tape(w.fill_ix(7, id, &w.payer.pubkey()), &vault);
+    w.send(vec![fill], &[]).expect("the liquidation fill");
+    assert_eq!(position(&w, 7), 15 * UNIT as i128, "partly liquidated");
+    let tk = liqtape::tape_address(&percolator_router::id(), &vault).0;
+    let tape: liqtape::Tape = bytemuck::pod_read_unaligned(&w.env.svm.get_account(&tk).unwrap().data);
+    let e = tape.entries[0];
+    assert_eq!(({ e.side }, { tape.head }), (1, 1), "a long liquidation on the tape");
+    assert!({ e.notional } >= 4_000_000, "about 5 units at 0.84: {}", { e.notional });
+    // Now the order fires: it queues a buy of 2.
+    trigger(&mut w).expect("the liquidation trigger fires");
+    // Without the tape named, the router cannot tell: another such order does not fire.
+    let o2 = OrderParams { index: 1, kind: ORDER_LIQ, size: 2 * UNIT as i128, trigger: 1_000_000, interval: 600, slices: 1, ..Default::default() };
+    w.send(vec![rclient::place_order(&t0, &vault, &o2)], &[&kp0]).unwrap();
+    let bare = rclient::trigger_order(&w.payer.pubkey(), &t0, &vault, 1);
+    assert!(w.send(vec![bare], &[]).is_err(), "a liquidation trigger without the tape");
+}

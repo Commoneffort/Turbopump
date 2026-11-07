@@ -950,3 +950,20 @@ pub fn trigger_shield(payer: &Pubkey, t: &TraderKeys, source: &Pubkey, percolato
         data: vec![crate::TAG_TRIGGER_SHIELD],
     }
 }
+
+/// Starts `vault`'s liquidation tape (anyone; the payer pays the rent).
+pub fn open_liq_tape(payer: &Pubkey, vault: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: crate::id(),
+        accounts: vec![AccountMeta::new(*payer, true), ro(*vault), w(crate::liqtape::tape_address(&crate::id(), vault).0), ro(solana_program::system_program::ID)],
+        data: vec![crate::TAG_OPEN_LIQ_TAPE],
+    }
+}
+
+/// `ix` (a fill, a trigger) with `vault`'s liquidation tape added (writable), just before its last
+/// account (a fill's last account is the trader's track record, which it finds there).
+pub fn with_tape(mut ix: Instruction, vault: &Pubkey) -> Instruction {
+    let at = ix.accounts.len().saturating_sub(1);
+    ix.accounts.insert(at, w(crate::liqtape::tape_address(&crate::id(), vault).0));
+    ix
+}

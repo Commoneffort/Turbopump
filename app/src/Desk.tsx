@@ -116,7 +116,7 @@ export async function returnMargin(conn: Connection, wallet: PublicKey, sub: num
 }
 const abs = (q: bigint) => (q < 0n ? -q : q);
 const e6 = (x: number) => BigInt(Math.round(x * 1e6));
-const ORDER_NAME = ["Stop loss", "Take profit", "Trailing stop", "Limit", "TWAP", "Grid level", "Cross trigger", "Pair (ratio)"];
+const ORDER_NAME = ["Stop loss", "Take profit", "Trailing stop", "Limit", "TWAP", "Grid level", "Cross trigger", "Pair (ratio)", "Liquidation trigger"];
 /** The first of the wallet's order slots on this market that is free (or as many as asked). */
 const freeSlots = (state: C.State, n = 1) => Array.from({ length: C.MAX_ORDERS }, (_, i) => i).filter(i => !state.orders.some(o => o.index === i)).slice(0, n);
 
@@ -901,7 +901,8 @@ function StrategyForm({ side, state, send: wsend, busy, vaults }: { side: 1n | -
   const ok = useTradingKey(busy ? 1 : 0);
   const v = state.vault, sym = v.feed?.symbol ?? "";
   const priceN = num(state.asset.price, 1e6), dp = priceDp(priceN);
-  const [kind, setKind] = useState<"grid" | "ladder" | "cross" | "pair">("grid");
+  const [kind, setKind] = useState<"grid" | "ladder" | "cross" | "pair" | "liq">("grid");
+  const [liqSide, setLiqSide] = useState<1 | -1>(1), [liqUsd, setLiqUsd] = useState("50000"), [liqMin, setLiqMin] = useState("5");
   const [lower, setLower] = useState(""), [upper, setUpper] = useState(""), [levels, setLevels] = useState("6"), [size, setSize] = useState("");
   const [start, setStart] = useState(""), [stepPct, setStepPct] = useState("1");
   const others = vaults.filter(x => x.canonical && !x.key.equals(v.key) && x.feed);
@@ -914,7 +915,7 @@ function StrategyForm({ side, state, send: wsend, busy, vaults }: { side: 1n | -
   const free = freeSlots(state, C.MAX_ORDERS);
   const need = !publicKey ? "Connect a wallet first" : !state.trader ? "Create a trading account first (Market tab)" : undefined;
   const send: Send = (label, ixs) => publicKey && Array.isArray(ixs) ? sendOrders(wsend, ok, publicKey, label, ixs, v.key, ixs.reduce((a, ix) => a + (ix.programId.equals(C.ROUTER) && ix.data[0] === 12 && ix.data.length > 48 ? Number(ix.data.readBigUInt64LE(48)) : 0), 0)) : wsend(label, ixs);
-  const tabs = <div className="seg strat-kinds">{([["grid", "Grid"], ["ladder", "Ladder"], ["cross", "Cross trigger"], ["pair", "Pair trade"]] as const).map(([k, l]) => <button key={k} className={kind === k ? "on" : ""} onClick={() => setKind(k)}>{l}</button>)}</div>;
+  const tabs = <div className="seg strat-kinds">{([["grid", "Grid"], ["ladder", "Ladder"], ["cross", "Cross trigger"], ["pair", "Pair trade"], ["liq", "Liquidations"]] as const).map(([k, l]) => <button key={k} className={kind === k ? "on" : ""} onClick={() => setKind(k)}>{l}</button>)}</div>;
   let body: ReactNode = null, why: string | undefined = need, label = "", build: (() => Promise<TransactionInstruction[]>) | undefined;
 
   if (kind === "grid") {
@@ -949,6 +950,19 @@ function StrategyForm({ side, state, send: wsend, busy, vaults }: { side: 1n | -
     </>;
     label = `Ladder of ${k} ${side > 0n ? "buys" : "sells"} on ${sym}`;
     build = async () => prices.map((p, i) => C.placeOrder(publicKey!, v.key, { index: free[i], kind: C.ORDER.LIMIT, size: e6(q) * side, trigger: e6(p) }, state.sub));
+  } else if (kind === "liq") {
+    const total = n(liqUsd), mins = n(liqMin), usd = n(notional);
+    why ??= !total ? "Enter how much has to be liquidated" : !(mins >= 0.2 && mins <= 1440) ? "A window from 12 seconds to a day" : !usd ? "Enter an amount in dollars" : !free.length ? "All order slots are in use" : undefined;
+    body = <>
+      <div className="seg">{([[1, "Longs liquidated"], [-1, "Shorts liquidated"]] as const).map(([k, l]) => <button key={k} className={liqSide === k ? "on" : ""} onClick={() => setLiqSide(k)}>{l}</button>)}</div>
+      <label className="inp"><span>At least</span><input value={liqUsd} onChange={digits(setLiqUsd)} inputMode="decimal" /><em>USD</em></label>
+      <label className="inp"><span>Within the last</span><input value={liqMin} onChange={digits(setLiqMin)} inputMode="decimal" /><em>min</em></label>
+      <label className="inp"><span>Then {side > 0n ? "buy" : "sell"}</span><input value={notional} onChange={digits(setNotional)} placeholder="0" inputMode="decimal" /><em>USD</em></label>
+      <div className="sum"><div><span>Order</span><b className="mono">{side > 0n ? "buy" : "sell"} {usd && priceN ? fmt(usd / priceN, 4) : "—"} {sym}</b></div></div>
+      <div className="fine">Carried out on chain once the liquidations recorded on {sym} reach your amount within the window: {liqSide > 0 ? "longs forced out usually leave a dip, a buy there is the classic \"buy the wick\"" : "shorts forced out usually leave a spike"}. It fills at the next oracle price like any order.</div>
+    </>;
+    label = `If ${money(total, 0)} of ${liqSide > 0 ? "longs" : "shorts"} are liquidated in ${mins} min: ${side > 0n ? "buy" : "sell"} ${sym}`;
+    build = async () => [C.placeOrder(publicKey!, v.key, { index: free[0], kind: C.ORDER.LIQ, size: e6(usd / priceN) * side, trigger: e6(total), interval: Math.round(mins * 60), slices: liqSide > 0 ? 1 : 2 }, state.sub)];
   } else {
     const lv = n(level), usd = n(notional);
     const ratioNow = otherPrice > 0 ? priceN / otherPrice : 0;
@@ -987,7 +1001,7 @@ function StrategyForm({ side, state, send: wsend, busy, vaults }: { side: 1n | -
       {tabs}
       {body}
       <button className={`submit ${side > 0n ? "up" : "down"}`} disabled={!!why || !!busy} onClick={async () => { if (!build) return; try { const ixs = await build(); await send(label, ixs); } catch (e: any) { window.alert(String(e?.message ?? e)); } }}>
-        {busy ? `${busy}…` : kind === "grid" ? "Place grid" : kind === "ladder" ? "Place ladder" : kind === "cross" ? "Place trigger" : "Place pair trade"}
+        {busy ? `${busy}…` : kind === "grid" ? "Place grid" : kind === "ladder" ? "Place ladder" : kind === "cross" || kind === "liq" ? "Place trigger" : "Place pair trade"}
       </button>
       {why && <div className="why">{why}</div>}
     </div>
@@ -1536,6 +1550,7 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go, tick, accoun
                 const trig = o.kind === C.ORDER.TRAIL ? `${fmt(Number(o.trigger) / 100, 2)}% from ${fmt(num(o.peak, 1e6), dpp)}`
                   : o.kind === C.ORDER.TWAP ? `${units(o.slice)} every ${o.interval >= 120 ? `${fmt(o.interval / 60, 1)} min` : `${o.interval} s`}`
                   : o.kind === C.ORDER.GRID ? `${buys ? "≤ " : "≥ "}${fmt(num(o.trigger, 1e6), dpp)}, then ${buys ? "sell" : "buy"} ${fmt(num(o.slice, 1e6), dpp)} ${buys ? "up" : "down"}`
+                  : o.kind === C.ORDER.LIQ ? `${money(num(o.trigger, 1e6), 0)} of ${o.side > 0 ? "longs" : "shorts"} liquidated in ${Math.round(Number(o.slice) / 60)} min`
                   : o.kind === C.ORDER.CROSS || o.kind === C.ORDER.RATIO ? (() => { const other = state.vault && vaultSym(Number(o.slice)); return o.kind === C.ORDER.CROSS ? `${other} ${o.side > 0 ? "≥" : "≤"} ${fmt(num(o.trigger, 1e6), 2)}` : `${sym}/${other} ${o.side > 0 ? "≥" : "≤"} ${(Number(o.trigger) / 1e6).toFixed(5)}`; })()
                   : `${o.kind === C.ORDER.LIMIT ? (buys ? "≤ " : "≥ ") : ""}${fmt(num(o.trigger, 1e6), dpp)}`;
                 return (

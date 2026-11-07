@@ -1175,7 +1175,7 @@ export const KEEPER_DEPOSIT = REQUEST_RENT + ROUTER_BOND_LAMPORTS + ROUTER_BOND_
 /** A limit or TWAP order can open a position, so it also carries a keeper deposit: its first
  *  execution moves it into the trading account if that has none (router `TriggerOrder`). */
 /** A grid level is carried out once per turn: its budget covers `slices` turns (10 when unlimited). */
-export const keeperBudget = (kind: number, slices = 0) => (kind === ORDER.TWAP ? Math.max(1, slices) : kind === ORDER.GRID ? (slices || 10) : 1) * (ROUTER_BOND_LAMPORTS + KEEPER_FEE) + REQUEST_RENT + (kind === ORDER.LIMIT || kind === ORDER.TWAP || kind === ORDER.GRID || kind === ORDER.CROSS || kind === ORDER.RATIO ? KEEPER_DEPOSIT : 0);
+export const keeperBudget = (kind: number, slices = 0) => (kind === ORDER.TWAP ? Math.max(1, slices) : kind === ORDER.GRID ? (slices || 10) : 1) * (ROUTER_BOND_LAMPORTS + KEEPER_FEE) + REQUEST_RENT + (kind === ORDER.LIMIT || kind === ORDER.TWAP || kind === ORDER.GRID || kind === ORDER.CROSS || kind === ORDER.RATIO || kind === ORDER.LIQ ? KEEPER_DEPOSIT : 0);
 /** The deposit (lamports) a trader's own request carries on top of the bond: a share of its
  *  notional, in the chain's coin at a fixed rate. It comes back when the request fills, and is
  *  kept only if the request expires after its price had arrived. */
@@ -1306,7 +1306,26 @@ export const REQUEST_LEN: number = R.request_len;
 /** Router order kinds; GRID, CROSS and RATIO are the strategy orders (2026-11-07): a grid level
  *  that turns around after each fill, a trigger on another asset's price, and one on the ratio of
  *  this asset's price to another's (see the router's `state.rs`). */
-export const ORDER = { STOP: 0, TAKE: 1, TRAIL: 2, LIMIT: 3, TWAP: 4, GRID: 5, CROSS: 6, RATIO: 7 } as const;
+export const ORDER = { STOP: 0, TAKE: 1, TRAIL: 2, LIMIT: 3, TWAP: 4, GRID: 5, CROSS: 6, RATIO: 7, LIQ: 8 } as const;
+/** A vault's liquidation tape (router `liqtape`): its last 32 liquidations, written at the fills
+ *  that liquidate; liquidation-triggered orders (ORDER.LIQ) read it. */
+export const liqTapeAddress = (vault: PublicKey) => rpda(Buffer.from("liqtape"), vault.toBuffer());
+export const openLiqTape = (payer: PublicKey, vault: PublicKey) => new TransactionInstruction({
+  programId: ROUTER, keys: [rw(payer, true), ro(vault), rw(liqTapeAddress(vault)), ro(SystemProgram.programId)], data: new W().u8(44).done(),
+});
+export type TapeEntry = { time: number; notional: bigint; side: number };
+/** The tape's entries, oldest first (header 48 bytes, then 32 of 24). */
+export function decodeTape(d: Uint8Array): TapeEntry[] {
+  const head = d[40], out: TapeEntry[] = [];
+  for (let k = 0; k < 32; k++) {
+    const i = (head + k) % 32, o = 48 + i * 24;
+    const time = Number(i64(d, o));
+    if (time) out.push({ time, notional: u64(d, o + 8), side: d[o + 16] === 1 ? 1 : -1 });
+  }
+  return out;
+}
+/** What was liquidated on `side` (+1 longs, -1 shorts) since `since` (unix seconds), collateral atoms. */
+export const liquidatedSince = (tape: TapeEntry[], side: number, since: number) => tape.filter(e => e.side === side && e.time >= since).reduce((t, e) => t + e.notional, 0n);
 export const ORDER_LEN: number = R.order_len;
 export const MAX_ORDERS: number = R.max_orders;
 export const orderAddress = (vault: PublicKey, wallet: PublicKey, index: number) => rpda(Buffer.from("order"), vault.toBuffer(), wallet.toBuffer(), Buffer.from([index]));
@@ -1355,14 +1374,15 @@ export const cancelOrderByKey = (actor: PublicKey, wallet: PublicKey, vault: Pub
 /** Carries a standing order out (anyone may). */
 export const triggerOrder = (payer: PublicKey, o: StandingOrder) => new TransactionInstruction({
   programId: ROUTER,
-  keys: [rw(payer, true), rw(o.key), rw(traderAddress(o.wallet, o.sub, marketOfVault(o.vault))), rw(o.wallet), ro(o.vault), rw(bookAddress(o.vault)), rw(requestAddress(o.vault, accountOwner(o.wallet, o.sub, marketOfVault(o.vault)))), ro(marketOfVault(o.vault)), ro(routerPortfolio(o.wallet, o.sub, marketOfVault(o.vault))), ro(SystemProgram.programId), ro(tiersAddress(marketOfVault(o.vault)))],
+  keys: [rw(payer, true), rw(o.key), rw(traderAddress(o.wallet, o.sub, marketOfVault(o.vault))), rw(o.wallet), ro(o.vault), rw(bookAddress(o.vault)), rw(requestAddress(o.vault, accountOwner(o.wallet, o.sub, marketOfVault(o.vault)))), ro(marketOfVault(o.vault)), ro(routerPortfolio(o.wallet, o.sub, marketOfVault(o.vault))), ro(SystemProgram.programId),
+    ...(o.kind === ORDER.LIQ ? [rw(liqTapeAddress(o.vault))] : []), ro(tiersAddress(marketOfVault(o.vault)))],
   data: new W().u8(14).done(),
 });
 /** What an order would do at mark price `mark` with the wallet's position `held`, as the router
  *  decides it: "fire" (queue its trade), "record" (a trail noting a better mark), "void" (it can
  *  do nothing any more and is removed), or "wait". */
 /** `market` (its account data): needed for a cross or ratio order, which watch another asset. */
-export function orderAction(o: StandingOrder, mark: bigint, held: bigint, now: number, market?: Uint8Array, ownAsset?: number): "fire" | "record" | "void" | "wait" {
+export function orderAction(o: StandingOrder, mark: bigint, held: bigint, now: number, market?: Uint8Array, ownAsset?: number, tape?: TapeEntry[]): "fire" | "record" | "void" | "wait" {
   if (o.queued) return "wait";
   const protective = o.kind <= ORDER.TRAIL;
   if ((o.expiry !== 0 && now > o.expiry) || (protective && (held === 0n || (held > 0n) !== (o.side > 0)))) return "void";
@@ -1378,6 +1398,7 @@ export function orderAction(o: StandingOrder, mark: bigint, held: bigint, now: n
   }
   if (!protective && o.reduceOnly && (held === 0n || (held > 0n) === (o.size > 0n))) return "void";
   if (o.kind === ORDER.LIMIT || o.kind === ORDER.GRID) return (o.size > 0n ? mark <= o.trigger : mark >= o.trigger) ? "fire" : "wait";
+  if (o.kind === ORDER.LIQ) return tape && liquidatedSince(tape, o.side, now - Number(o.slice)) >= o.trigger ? "fire" : "wait";
   if (o.kind === ORDER.CROSS || o.kind === ORDER.RATIO) {
     if (!market) return "wait";
     // (The router reads Percolator's own prices of the two assets, as here.)
@@ -1705,6 +1726,7 @@ export const fillRequest = (executor: PublicKey, v: Vault, r: RouterRequest, laz
     rw(equitiesAddress(r.wallet, v.market)),
     // With the vault's price range the fill may skip re-valuing the other holders (lazy).
     ...(lazy ? [rw(rangeAddress(v.key))] : []),
+    ...(X1 ? [rw(liqTapeAddress(v.key))] : []),
     rw(statsAddress(r.wallet, v.market)),
   ],
   data: new W().u8(6).done(),

@@ -13,6 +13,7 @@ import Docs from "./Docs";
 import HealthPage from "./Health";
 import ExecutionPage from "./Execution";
 import PortfolioPage from "./Portfolio";
+import StrategiesPage from "./Strategies";
 import SpotDesk from "./Spot";
 import { TraderPage, TradersPage } from "./Traders";
 import { TraderModalHost } from "./TraderIntel";
@@ -198,6 +199,7 @@ export default function App() {
           <a className={tab(spot)} href="#/spot">Spot</a>
           <a className={tab(page === "markets" || page === "launch")} href="#/markets">Markets</a>
           <a className={tab(page === "portfolio")} href="#/portfolio">Portfolio</a>
+          <a className={tab(page === "strategies")} href="#/strategies">Strategies</a>
           <a className={tab(page === "traders" || page === "trader" || page === "leaderboard")} href="#/leaderboard">Leaderboard<em className="tab-prize" title="Weekly trading contest">🏆 ${S.CONTEST.prizes.reduce((a, b) => a + b, 0)}</em></a>
         </nav>
         <div className="top-right">
@@ -228,6 +230,8 @@ export default function App() {
             <HealthPage tick={tick} />
           ) : page === "portfolio" ? (
             <PortfolioPage tick={tick} go={go} />
+          ) : page === "strategies" ? (
+            <StrategiesPage send={send} busy={busy} go={go} />
           ) : page === "execution" ? (
             <ExecutionPage tick={tick} />
           ) : page === "how" || page === "docs" ? (

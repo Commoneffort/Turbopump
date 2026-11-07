@@ -253,6 +253,10 @@ pub const ORDER_CROSS: u8 = 6;
 /// of the same market), as e6, is at or above `trigger` (`side` +1) or at or below it (`side` -1).
 /// A pair trade is two of them, one on each asset.
 pub const ORDER_RATIO: u8 = 7;
+/// A liquidation trigger: trades `size` once at least `trigger` (collateral atoms of notional) of
+/// longs (`side` +1) or shorts (`side` -1) were liquidated on this vault in the last `slice`
+/// seconds, as its liquidation tape (`liqtape`) shows ("buy the wick").
+pub const ORDER_LIQ: u8 = 8;
 
 /// A standing order: an instruction the wallet signed once, which anyone may carry out when its
 /// condition holds. Carrying it out only queues an ordinary request, so it fills like any trade:
