@@ -17,8 +17,8 @@ async function send(ixs: TransactionInstruction[], signers: Keypair[], units = 1
 }
 (async () => {
   let w = Keypair.generate();
-  while (!C.placedMarket(w.publicKey).equals(C.MARKETS[1].key)) w = Keypair.generate();
-  C.setActiveMarket(C.MARKETS[1].key);
+  
+  C.setActiveMarket(C.MARKETS[0].key);
   await send([SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: w.publicKey, lamports: 300_000_000 }),
     createAssociatedTokenAccountIdempotentInstruction(payer.publicKey, C.ata(w.publicKey, C.MINT), w.publicKey, C.MINT),
     createMintToInstruction(C.MINT, C.ata(w.publicKey, C.MINT), faucet.publicKey, 1_000n * BigInt(C.USDC))], [payer, faucet]);
