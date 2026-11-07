@@ -92,6 +92,11 @@ const dueSince = new Map<string, number>();
 const markLateSecs = () => (C.X1 ? 2 * HELD_MARK_SECS : 300);
 /** Whether to do a piece of work that is due now: always for a primary; for a backup, once it has
  *  been due `BACKUP_SECS` (asked about on every pass while it is). */
+/** After a refused mark refresh, how long that vault waits before the next (see `serviceMarks`). */
+const REFRESH_HOLD_MS = Number(process.env.REFRESH_HOLD_MS ?? 5_000);
+const refreshHold = new Map<string, number>();
+/** Requests whose expiry the router refused, and when to try again (see the expire loop). */
+const expireHold = new Map<string, number>(), expireTries = new Map<string, number>();
 function overdue(work: string): boolean {
   if (!BACKUP_SECS) return true;
   const now = Date.now();
@@ -1414,8 +1419,14 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
     const cur = va && C.decodeVault(v.key, new Uint8Array(va.data));
     dead = !!cur && (snap.slot < cur.epochStart + cur.epochLen || (cur.pendingDeposit === 0n && cur.pendingWithdraw === 0n));
   }
-  for (const r of reqs.filter(r => maintOn && (graceOver(r.target, snap.slot, now) || (dead && r.settle && !tried.has(r.id)) || (stalled && refused.has(r.id) && b.markPrev < r.target && r.target <= b.markPublish)) && overdue(`expire ${r.id}`))) {
-    await send(`expire ${v.feed?.symbol} #${r.id}${graceOver(r.target, snap.slot, now) ? "" : dead && r.settle ? " (its epoch has rolled)" : " (it cannot fill, and others are waiting behind it)"}`, [C.expireRequest(payer.publicKey, r)]);
+  for (const r of reqs.filter(r => maintOn && (expireHold.get(r.key.toBase58()) ?? 0) <= Date.now() && (graceOver(r.target, snap.slot, now) || (dead && r.settle && !tried.has(r.id)) || (stalled && refused.has(r.id) && b.markPrev < r.target && r.target <= b.markPublish)) && overdue(`expire ${r.id}`))) {
+    const ok = await send(`expire ${v.feed?.symbol} #${r.id}${graceOver(r.target, snap.slot, now) ? "" : dead && r.settle ? " (its epoch has rolled)" : " (it cannot fill, and others are waiting behind it)"}`, [C.expireRequest(payer.publicKey, r)]);
+    // A request the router will not expire (a leftover no queue lists) is not tried again at
+    // once: each try is a simulation, and these ran at ~12 a second, most of the RPC's
+    // transaction allowance. A minute, doubling to an hour.
+    const k = r.key.toBase58();
+    if (ok) { expireHold.delete(k); expireTries.delete(k); }
+    else { const n = (expireTries.get(k) ?? 0) + 1; expireTries.set(k, n); expireHold.set(k, Date.now() + Math.min(3_600_000, 60_000 * 2 ** (n - 1))); }
   }
 
   // 4. Free: move the mark to Pyth's sponsored feed account when it is newer, never past a
@@ -1442,7 +1453,14 @@ async function serviceVault(v: C.Vault, now: number, snap: Snapshot, queued: boo
     // (Slot time: the mark's own times are slots; its age is counted from when it was set.)
     const age = j ? (b.slotTime ? (b.markSet ? now - b.markSet : every) : j.publish - b.markPublish) : 0;
     const newer = !!j && (b.slotTime || j.publish > b.markPublish);
-    if ((!queued || urgent) && j && newer && (age >= every || moved >= move || (held && age >= 30 && moved >= HELD_MARK_MOVE))) await advanceReported(v, j, urgent && queued ? "refresh: the price moved 1% or more" : held ? "refresh" : "refresh, no positions", false, b.slotTime);
+    // (A refresh the router refused, nearly always the witness's price not yet there or too far
+    // off, waits REFRESH_HOLD_MS before the next try: each try is a simulation against the RPC's
+    // transaction allowance, and they ran at ~3 a second. A price a queued trade needs never waits.)
+    const rk = v.key.toBase58();
+    if ((!queued || urgent) && j && newer && (urgent || (refreshHold.get(rk) ?? 0) <= Date.now()) && (age >= every || moved >= move || (held && age >= 30 && moved >= HELD_MARK_MOVE))) {
+      const ok = await advanceReported(v, j, urgent && queued ? "refresh: the price moved 1% or more" : held ? "refresh" : "refresh, no positions", false, b.slotTime);
+      if (ok) refreshHold.delete(rk); else refreshHold.set(rk, Date.now() + REFRESH_HOLD_MS);
+    }
   } else if (snap.feed && live.length === 0 && reqs.length === 0) {
     const p = C.decodePyth(snap.feed);
     const a = C.decodeAsset(snap.market, v.assetIndex);
