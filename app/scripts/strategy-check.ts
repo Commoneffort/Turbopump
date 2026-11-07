@@ -44,6 +44,17 @@ async function send(ixs: TransactionInstruction[], signers: Keypair[], units = 6
   await send([C.placeOrder(w.publicKey, sol.key, { index: 1, kind: C.ORDER.GRID, size: 100_000n, trigger: p * 98n / 100n, interval: Number(p / 100n), slices: 0 })], [w]);
   const o = C.decodeOrder(C.orderAddress(sol.key, w.publicKey, 1), new Uint8Array((await conn.getAccountInfo(C.orderAddress(sol.key, w.publicKey, 1)))!.data));
   say(o.kind === C.ORDER.GRID ? "ok  " : "FAIL", `grid level on chain: buy 0.1 at ${Number(o.trigger) / 1e6}, then turn ${Number(o.slice) / 1e6} up`);
+  // A liquidation trigger: buy 0.1 SOL once $50,000 of longs were liquidated in 5 minutes.
+  await send([C.placeOrder(w.publicKey, sol.key, { index: 2, kind: C.ORDER.LIQ, size: 100_000n, trigger: 50_000n * BigInt(C.USDC), interval: 300, slices: 1 })], [w]);
+  const lo = C.decodeOrder(C.orderAddress(sol.key, w.publicKey, 2), new Uint8Array((await conn.getAccountInfo(C.orderAddress(sol.key, w.publicKey, 2)))!.data));
+  const tape = await conn.getAccountInfo(C.liqTapeAddress(sol.key));
+  say(lo.kind === C.ORDER.LIQ ? "ok  " : "FAIL", `liquidation trigger on chain: $${Number(lo.trigger) / 1e6} of ${lo.side > 0 ? "longs" : "shorts"} in ${Number(lo.slice)} s; SOL's tape ${tape ? "open, " + C.decodeTape(new Uint8Array(tape.data)).length + " entries" : "NOT open"}`);
+  // A published strategy (a memo to the strategies board, signed by this wallet).
+  const { PublicKey: PK, TransactionInstruction: TI } = await import("@solana/web3.js");
+  const MEMO = new PK("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"), BOARD = PK.findProgramAddressSync([Buffer.from("turbopump-strategies")], MEMO)[0];
+  const spec = { v: 1, name: "SOL range grid", note: "Six levels across ±5% of the price; each level buys low and sells one step higher, again and again.", sym: "SOL", kind: "grid", side: 1, p: { rangePct: 5, levels: 6, usd: 200 } };
+  await send([SystemProgram.transfer({ fromPubkey: w.publicKey, toPubkey: BOARD, lamports: 0 }), new TI({ programId: MEMO, keys: [{ pubkey: w.publicKey, isSigner: true, isWritable: false }], data: Buffer.from("tps:" + JSON.stringify(spec), "utf8") })], [w]);
+  say("ok   published", JSON.stringify(spec.name));
   // A shield: 5 USDC a step, 20 in all, within 25% of liquidation. Healthy now: refused.
   await send([createApproveInstruction(C.ata(w.publicKey, C.MINT), C.routerAuthority(), w.publicKey, 20n * BigInt(C.USDC)), C.setShield(w.publicKey, 5n * BigInt(C.USDC), 20n * BigInt(C.USDC), 2_500)], [w]);
   const sh = C.decodeShield(C.shieldAddress(w.publicKey), new Uint8Array((await conn.getAccountInfo(C.shieldAddress(w.publicKey)))!.data));

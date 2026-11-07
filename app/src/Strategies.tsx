@@ -201,7 +201,7 @@ function ResultView({ r }: { r: Result }) {
     <div className="strat-result">
       <div><span>Profit, 30 days</span><b className={`mono ${r.pnl >= 0 ? "up" : "down"}`}>{money(r.pnl)} ({(r.ret * 100).toFixed(1)}%)</b></div>
       <div><span>Largest fall</span><b className="mono down">{money(-r.maxDd)}</b></div>
-      <div><span>Trades · won</span><b className="mono">{r.trades} · {r.wins}</b></div>
+      <div><span>Fills · winning exits</span><b className="mono">{r.trades} · {r.wins}</b></div>
       <div><span>Money used</span><b className="mono">{money(r.capital)}</b></div>
       <Curve r={r} />
     </div>
