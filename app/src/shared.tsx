@@ -626,7 +626,7 @@ export function Faucet({ compact }: { compact?: boolean }) {
       setMsg(r.ok ? `Sent ${j.usdc} test USDC${j.sol ? ` and ${j.sol} ${j.coin ?? C.COIN}` : ""}` : j.error);
     } catch (e: any) { setMsg(e.message); }
   };
-  if (compact) return <button className="btn tiny ghost" disabled={!publicKey} title={msg} onClick={drip}>{msg && msg.length < 40 ? msg : "Get test USDC"}</button>;
+  if (compact) return <button className="btn tiny ghost faucet-btn" disabled={!publicKey} title={msg} onClick={drip}>{msg && msg.length < 40 ? msg : "Get test USDC"}</button>;
   return (
     <div className="faucet">
       <button className="btn ghost wide" onClick={drip}>Get test USDC</button>

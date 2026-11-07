@@ -18,7 +18,9 @@ const UP = T.green, DOWN = T.red;
 export const ALL = 1;
 export const TIMEFRAMES: [label: string, tf: number][] = [["1m", 60], ["5m", 300], ["15m", 900], ["1h", 3600], ["4h", 14400], ["1d", 86400], ["1w", WEEK], ["1M", MONTH], ["All", ALL]];
 /** The ones with a button of their own on the chart bar; the rest are in its menu. */
-const QUICK = [60, 3600, 86400];
+/** Timeframes shown as buttons of their own: none (2026-11-07). The bar shows the current one, and
+ *  its menu every other, so the bar fits a phone and a split window. */
+const QUICK: number[] = [];
 
 type History = { source: string; candles: Candle[]; at: number };
 // Histories this browser has had, by network, symbol and timeframe: a chart seen before draws

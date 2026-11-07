@@ -835,6 +835,7 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           <li>Audit the vault program, then burn its upgrade authority (or put it behind a public timelock).</li>
           <li>Set mainnet template values (for example one-hour epochs) and a real collateral with its freeze authority revoked.</li>
           <li>Run redundant keepers and a Pyth price pusher.</li>
+          <li>No free coin that can walk away: the faucet goes, the setup pays account rent itself, and gas the fee sponsor gives a trading key is booked as a debt in the trading account's fee ledger (in USDC, at a fixed rate) and repaid from the margin at withdrawal, like the vault fees; only accounts holding at least $1 are sponsored, and a debt never exceeds what the account holds.</li>
         </ol>
 
         <h2 id="faq">FAQ</h2>

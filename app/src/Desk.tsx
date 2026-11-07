@@ -1296,6 +1296,14 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go, tick, accoun
         <button className={tab === "vault" ? "on" : ""} onClick={() => setTab("vault")}>Vault capacity</button>
         <button className={tab === "market" ? "on" : ""} onClick={() => setTab("market")}>Market details</button>
       </div>
+      <select className="ptabs-pick" value={tab} aria-label="Show" onChange={e => setTab(e.target.value as typeof tab)}>
+        <option value="positions">Positions{positions.length ? ` (${positions.length})` : ""}</option>
+        <option value="orders">Open orders{standing.length ? ` (${standing.length})` : ""}</option>
+        <option value="twap">TWAP{twaps.length ? ` (${twaps.length})` : ""}</option>
+        <option value="history">Trade history</option>
+        <option value="vault">Vault capacity</option>
+        <option value="market">Market details</option>
+      </select>
       <div className="bottom-body">
         {tab === "positions" && (!publicKey ? <div className="quiet">Connect a wallet to see your positions.</div> : positions.length === 0 ? <div className="quiet">No open positions.{idleList}</div> : (<>
           <table className="tbl lefts">
