@@ -298,7 +298,7 @@ a.cell-link:hover .cell-l, a.cell-link:hover .cell-s { color: var(--accent-green
 .elsewhere { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; padding: 10px 12px 2px; font-size: 12px; color: var(--muted); }
 .elsewhere .link { font-size: 12px; font-weight: 600; }
 .elsewhere .link i { font-style: normal; font-weight: 400; color: var(--muted); margin-left: 2px; }
-.otabs { display: grid; grid-template-columns: repeat(4, 1fr); gap: 2px; margin-bottom: 10px; }
+.otabs { display: grid; grid-template-columns: repeat(5, 1fr); gap: 2px; margin-bottom: 10px; }
 .otabs button { background: none; border: 0; border-bottom: 2px solid var(--line); padding: 0 0 8px; color: var(--muted); font-size: 12px; font-weight: 600; cursor: pointer; }
 .otabs button:hover { color: var(--text); }
 .otabs button.on { color: var(--text); border-bottom-color: var(--accent-green); }
@@ -1328,3 +1328,10 @@ h3 { margin: 0 0 12px; font-size: 15px; font-weight: 600; }
 /* Strategy and shield forms */
 .strat-kinds { flex-wrap: wrap; }
 .oneclick-opts input.mini { width: 56px; padding: 3px 6px; background: var(--raised); color: var(--text); border: 1px solid var(--line-2); border-radius: 4px; font: inherit; }
+
+/* The liquidation map inside the Liquidations widget */
+.liqw-lmap { height: 260px; display: flex; margin-top: 8px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.liqw-lmap.big { height: 440px; }
+.liqw-lmap > .lmap { flex: 1; }
+.liqw-lmap .lmap-body { min-height: 0; }
+.liqw-lmap .lmap-foot { display: none; }

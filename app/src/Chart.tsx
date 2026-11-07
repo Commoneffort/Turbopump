@@ -193,7 +193,9 @@ const shown = (l: Layers) => Object.values(l).some(Boolean);
 /** A price at which open positions would be liquidated, and how much (dollars). */
 export type HeatLevel = { price: number; value: number };
 
-export default function Chart({ symbol, label, price, lines, marks = [], mine, whales, heat, compare, slot = 0, compact = false, dense = false, head }: { symbol: string; label?: string; price: number; lines: Line[]; marks?: Mark[]; mine?: Trade[]; whales?: Whale[]; heat?: HeatLevel[]; compare?: { sym: string; long: boolean }[]; slot?: number; compact?: boolean; dense?: boolean; head?: ReactNode }) {
+export default function Chart({ symbol, label, price, lines, marks = [], mine, whales, heat, compare, slot = 0, compact = false, dense = false, head, after }: { symbol: string; label?: string; price: number; lines: Line[]; marks?: Mark[]; mine?: Trade[]; whales?: Whale[]; heat?: HeatLevel[]; compare?: { sym: string; long: boolean }[]; slot?: number; compact?: boolean; dense?: boolean; head?: ReactNode;
+  /** Shown in the bar right after the "On chart" menu (the liquidation map's button). */
+  after?: ReactNode }) {
   const name = label ?? `${symbol}`, spot = isSpot(symbol);
   const own = slot ? `:${slot}` : "";
   const el = useRef<HTMLDivElement>(null);
@@ -584,6 +586,7 @@ export default function Chart({ symbol, label, price, lines, marks = [], mine, w
             )}
           </div>
         )}
+        {!full && after}
         {spot && <div className="chart-src" title="Where the candles come from: xDEX's record of this pair's swaps. The last one follows the pool's own price.">xDEX swaps · live pool price</div>}
         <div className="chart-acts">
           {!spot && (

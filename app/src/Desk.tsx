@@ -317,7 +317,7 @@ function Charts({ sym, price, lines, linesOf, compare, marks, mine, whales, heat
   return (
     <div className={`charts l-${layout}`}>
       {map ? <LiqMap symbol={sym} price={price} exact={heat} back={() => showMap(false)} />
-        : <Chart symbol={sym} price={price} lines={lines} compare={compare} marks={marks} mine={mine} whales={whales} heat={heat} dense={n > 1} head={<>{picker}{mapBtn}{n > 1 && <div className="pane-sym main"><b>{sym}</b></div>}</>} />}
+        : <Chart symbol={sym} price={price} lines={lines} compare={compare} marks={marks} mine={mine} whales={whales} heat={heat} dense={n > 1} head={<>{picker}{n > 1 && <div className="pane-sym main"><b>{sym}</b></div>}</>} after={mapBtn} />}
       {Array.from({ length: n - 1 }, (_, k) => {
         const i = k + 1, s = paneSym(i);
         return (

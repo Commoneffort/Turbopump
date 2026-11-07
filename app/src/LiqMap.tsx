@@ -30,7 +30,8 @@ function binExact(levels: ExactLevel[], price: number, range: number): Bin[] {
   return bins;
 }
 
-export default function LiqMap({ symbol, price, exact, back }: { symbol: string; price: number; exact?: ExactLevel[]; back: () => void }) {
+/** `back`: the button back to the price chart (left out in a widget, which also shows no title). */
+export default function LiqMap({ symbol, price, exact, back }: { symbol: string; price: number; exact?: ExactLevel[]; back?: () => void }) {
   const [range, setRange] = useState<number>(() => { const r = Number(localStorage.getItem("pv:liqmap-range")); return RANGES.includes(r as any) ? r : 0.1; });
   const [source, setSource] = useState<"market" | "exact">(() => (localStorage.getItem("pv:liqmap-source") === "exact" ? "exact" : "market"));
   const [vertical, setVertical] = useState(() => localStorage.getItem("pv:liqmap-vertical") === "1");
@@ -82,7 +83,9 @@ export default function LiqMap({ symbol, price, exact, back }: { symbol: string;
   const vLen = vertical ? W - m.l - m.r : H - m.t - m.b;
   const bar = (v: number) => (v / barMax) * vLen;
   const cum = (v: number) => (v / cumMax) * vLen;
-  const ticks = Array.from({ length: 7 }, (_, i) => lo + ((hi - lo) * i) / 6);
+  // As many price labels as fit (about one per 90 pixels; one per 40 up the side).
+  const nTicks = Math.max(2, Math.min(7, Math.floor((vertical ? H : W) / (vertical ? 40 : 90))));
+  const ticks = Array.from({ length: nTicks }, (_, i) => lo + ((hi - lo) * i) / (nTicks - 1));
   const pick = (e: React.MouseEvent<SVGSVGElement>) => {
     const r = e.currentTarget.getBoundingClientRect();
     const t = vertical ? (pAxis[0] - (e.clientY - r.top)) / (pAxis[0] - pAxis[1]) : (e.clientX - r.left - pAxis[0]) / (pAxis[1] - pAxis[0]);
@@ -95,8 +98,8 @@ export default function LiqMap({ symbol, price, exact, back }: { symbol: string;
   return (
     <div className="lmap">
       <div className="chart-bar lmap-bar">
-        <button className="btn tiny" onClick={back} title="Back to the price chart">Chart</button>
-        <b className="lmap-title">{symbol} liquidation map</b>
+        {back && <button className="btn tiny" onClick={back} title="Back to the price chart">Chart</button>}
+        {back && <b className="lmap-title">{symbol} liquidation map</b>}
         <div className="seg-tf">{(["market", "exact"] as const).map(s => <button key={s} className={source === s ? "on" : ""} onClick={() => { setSource(s); keep("pv:liqmap-source", s); }} title={s === "market" ? "Estimated across the big exchanges (Binance volume, scaled to Hyperliquid's open interest)" : "Every open position on Turbopump at its own liquidation price, read from chain"}>{s === "market" ? "Market (est.)" : "Turbopump (exact)"}</button>)}</div>
         <div className="seg-tf">{RANGES.map(r => <button key={r} className={range === r ? "on" : ""} onClick={() => { setRange(r); keep("pv:liqmap-range", String(r)); }}>±{r * 100}%</button>)}</div>
         <button className={`btn tiny${vertical ? " on" : ""}`} onClick={() => { setVertical(v => !v); keep("pv:liqmap-vertical", vertical ? "0" : "1"); }} title="Turn the map on its side">{vertical ? "Horizontal" : "Vertical"}</button>

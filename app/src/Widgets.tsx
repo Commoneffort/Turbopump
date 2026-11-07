@@ -2,6 +2,7 @@
 // in this browser (localStorage "pv:widgets"). Everything here reads public accounts from the
 // shared copy (/api/state) or the site's execution report, so adding a widget costs no wallet
 // request.
+import LiquidationMap from "./LiqMap";
 import { ReactNode, useEffect, useRef, useState } from "react";
 import { useWallet } from "@solana/wallet-adapter-react";
 import * as C from "./chain";
@@ -167,7 +168,7 @@ const RANGES = [0.05, 0.1, 0.2, 0.5];
  *  their level and every liquidation in the report's window. */
 function Liquidations({ state, board, big }: { state: C.State; board?: S.Board; big?: boolean }) {
   const sym = state.vault.feed?.symbol ?? "";
-  const [tab, setTab] = useState<"map" | "history">("map");
+  const [tab, setTab] = useState<"map" | "heat" | "history">("map");
   const [range, setRange] = useState(big ? 0.2 : 0.1);
   const levels = liqLevels(state, board);
   if (!board) return <div className="quiet">Loading…</div>;
@@ -187,11 +188,16 @@ function Liquidations({ state, board, big }: { state: C.State; board?: S.Board; 
     <div className={`liqw${big ? " big" : ""}`}>
       {!big && (
         <div className="liqw-tabs">
-          <button className={tab === "map" ? "on" : ""} onClick={() => setTab("map")}>Heatmap</button>
+          <button className={tab === "map" ? "on" : ""} onClick={() => setTab("map")}>Map</button>
+          <button className={tab === "heat" ? "on" : ""} onClick={() => setTab("heat")}>Heatmap</button>
           <button className={tab === "history" ? "on" : ""} onClick={() => setTab("history")}>Happened</button>
         </div>
       )}
-      {(big || tab === "map") && <>
+      {!big && tab === "map" && <>
+        {head}
+        <div className="liqw-lmap"><LiquidationMap symbol={sym} price={p0} exact={levels.map(x => ({ price: x.liq, value: x.value }))} /></div>
+      </>}
+      {(big || tab === "heat") && <>
         {head}
         <div className="liqw-range">
           <span className="muted">Range</span>
@@ -199,10 +205,9 @@ function Liquidations({ state, board, big }: { state: C.State; board?: S.Board; 
         </div>
         <LiqChart levels={levels} price={p0} range={range} big={!!big} dp={dp} sym={sym} />
         {big && <h4 className="liqw-sub">Liquidations by price</h4>}
-        {big && <LiqMap levels={levels} price={p0} range={range} big dp={dp} sym={sym} />}
+        {big && <div className="liqw-lmap big"><LiquidationMap symbol={sym} price={p0} exact={levels.map(x => ({ price: x.liq, value: x.value }))} /></div>}
         {big && <p className="liqw-note muted">
-          {levels.length} open position{levels.length === 1 ? "" : "s"} on {sym}. Each bar is how much would be liquidated if the price reached that range
-          (estimated from each account's equity and positions now; profit, fees and other markets moving change it). Hover a bar for details.
+          {levels.length} open position{levels.length === 1 ? "" : "s"} on Turbopump's {sym} (the "Turbopump (exact)" view); "Market (est.)" estimates the whole market's. Each bar is how much would be liquidated in that price step; the lines add them up from the price outward. Hover a bar for details.
         </p>}
       </>}
       {big && <h4 className="liqw-sub">Nearest to their liquidation price</h4>}
@@ -211,67 +216,6 @@ function Liquidations({ state, board, big }: { state: C.State; board?: S.Board; 
         {big && <h4 className="liqw-sub">Liquidations that happened</h4>}
         <LiqHistory state={state} big={!!big} />
       </>}
-    </div>
-  );
-}
-
-/** The liquidation map: price ranges across the chosen band around the price, each bar the value
- *  liquidated if the price reached it; in the full view, the running total from the price outward. */
-function LiqMap({ levels, price, range, big, dp, sym }: { levels: LiqLevel[]; price: number; range: number; big: boolean; dp: number; sym: string }) {
-  const N = big ? 60 : 30;
-  const lo = price * (1 - range), hi = price * (1 + range), step = (hi - lo) / N;
-  const bars = Array.from({ length: N }, (_, i) => ({ from: lo + i * step, to: lo + (i + 1) * step, long: 0, short: 0, n: 0 }));
-  let outside = 0;
-  for (const x of levels) {
-    if (x.liq < lo || x.liq >= hi) { outside++; continue; }
-    const b = bars[Math.min(N - 1, Math.floor((x.liq - lo) / step))];
-    if (x.size > 0) b.long += x.value; else b.short += x.value;
-    b.n++;
-  }
-  const top = Math.max(1, ...bars.map(b => b.long + b.short));
-  const W = big ? 900 : 300, H = big ? 260 : 110, padB = 2;
-  const xAt = (p: number) => ((p - lo) / (hi - lo)) * W;
-  const yAt = (v: number) => (H - padB) - (v / top) * (H - padB - 8);
-  // Running totals outward from the price: longs below it, shorts above it.
-  const cumL: [number, number][] = [], cumS: [number, number][] = [];
-  if (big) {
-    let t = 0;
-    for (let i = N - 1; i >= 0; i--) { if (bars[i].to > price) continue; t += bars[i].long; cumL.push([xAt(bars[i].from), t]); }
-    t = 0;
-    for (let i = 0; i < N; i++) { if (bars[i].from < price) continue; t += bars[i].short; cumS.push([xAt(bars[i].to), t]); }
-  }
-  const cumTop = Math.max(1, ...cumL.map(c => c[1]), ...cumS.map(c => c[1]));
-  const cy = (v: number) => (H - padB) - (v / cumTop) * (H - padB - 8);
-  const line = (pts: [number, number][]) => pts.length ? `M${xAt(price)},${H - padB} ` + pts.map(([x, v]) => `L${x},${cy(v)}`).join(" ") : "";
-  const ticks = big ? [0, 0.25, 0.5, 0.75, 1] : [0, 0.5, 1];
-  return (
-    <div className="liqmap">
-      <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" role="img" aria-label={`Liquidation levels on ${sym} within ±${range * 100}% of the price`}>
-        {[0.25, 0.5, 0.75].map(f => <line key={f} x1="0" x2={W} y1={(H - padB) * f} y2={(H - padB) * f} className="liqmap-grid" />)}
-        {bars.map((b, i) => {
-          const x = xAt(b.from) + 0.5, w = Math.max(1, xAt(b.to) - xAt(b.from) - 1);
-          const yl = yAt(b.long), ys = yAt(b.long + b.short);
-          return (
-            <g key={i}>
-              <title>{`${fmt(b.from, dp)} – ${fmt(b.to, dp)}: ${b.long ? `longs ${money(b.long)}` : ""}${b.long && b.short ? ", " : ""}${b.short ? `shorts ${money(b.short)}` : ""}${!b.long && !b.short ? "nothing" : ` (${b.n} account${b.n === 1 ? "" : "s"})`}`}</title>
-              <rect x={x} y={0} width={w} height={H - padB} className="liqmap-hit" />
-              {b.long > 0 && <rect x={x} y={yl} width={w} height={(H - padB) - yl} className="liqmap-long" />}
-              {b.short > 0 && <rect x={x} y={ys} width={w} height={yl - ys} className="liqmap-short" />}
-            </g>
-          );
-        })}
-        {big && <path d={line(cumL)} className="liqmap-cum long" />}
-        {big && <path d={line(cumS)} className="liqmap-cum short" />}
-        <line x1={xAt(price)} x2={xAt(price)} y1="0" y2={H - padB} className="liqmap-now" />
-      </svg>
-      <div className="liqmap-ticks mono">{ticks.map(f => <span key={f} style={{ left: `${f * 100}%` }} className={f === 0 ? "first" : f === 1 ? "last" : ""}>{fmt(lo + (hi - lo) * f, dp)}</span>)}</div>
-      {big && <div className="liqmap-legend mono">
-        <span><i className="sw long" />longs liquidated</span>
-        <span><i className="sw now" />price {fmt(price, dp)}</span>
-        <span><i className="sw short" />shorts liquidated</span>
-        {big && <span className="muted">lines: running total from the price · largest bar {money(top)}</span>}
-        {outside > 0 && <span className="muted">{outside} level{outside === 1 ? "" : "s"} outside ±{range * 100}%</span>}
-      </div>}
     </div>
   );
 }
