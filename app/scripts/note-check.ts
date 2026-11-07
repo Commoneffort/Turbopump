@@ -1,6 +1,6 @@
 // Live check of trade notes (2026-11-07): a trading key's quoted trade carries a note signed by the
 // key, and the page's reader (S.loadNotes) finds it; a note a stranger attaches to the same trading
-// account is not counted.   QUOTE_URL=http://127.0.0.1:18301 NETWORK=x1-testnet npx tsx scripts/note-check.ts
+// account is not counted.   QUOTE_URL=http://127.0.0.1:18311 NETWORK=x1-testnet npx tsx scripts/note-check.ts
 import { ComputeBudgetProgram, Connection, Keypair, SystemProgram, Transaction, TransactionInstruction } from "@solana/web3.js";
 import { createAssociatedTokenAccountIdempotentInstruction, createMintToInstruction } from "@solana/spl-token";
 import * as fs from "fs";
@@ -22,8 +22,8 @@ async function send(ixs: TransactionInstruction[], signers: Keypair[], units = 1
 }
 (async () => {
   let w = Keypair.generate();
-  while (!C.placedMarket(w.publicKey).equals(C.MARKETS[1].key)) w = Keypair.generate();
-  C.setActiveMarket(C.MARKETS[1].key);
+  // (Every wallet trades on the original market since 2026-11-07.)
+  C.setActiveMarket(C.MARKET);
   await send([SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: w.publicKey, lamports: 300_000_000 }),
     createAssociatedTokenAccountIdempotentInstruction(payer.publicKey, C.ata(w.publicKey, C.MINT), w.publicKey, C.MINT),
     createMintToInstruction(C.MINT, C.ata(w.publicKey, C.MINT), faucet.publicKey, 500n * BigInt(C.USDC))], [payer, faucet]);
