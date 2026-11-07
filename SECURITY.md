@@ -136,3 +136,32 @@ Accepted, for now:
   rule is in the docs' Path to mainnet (sponsored gas as a debt repaid at withdrawal).
 - The engine program fills its X1 account to within 240 bytes: the next engine change needs the
   account extended first (`upgrade-program.sh` does it when a build is larger).
+
+## Review of the wallet and isolated orders (2026-11-07, later)
+
+Checked: the test wallet (`app/src/burner.ts`), the trading key (`tradingKey.ts`, `OneClick.tsx`,
+router `session.rs`), standing orders on isolated accounts (`Desk.tsx` `isoPrep`), the page's
+headers, and the repository for keys or secrets (none: `keys/` is ignored, no key in the built page).
+
+Fixed:
+- The page sent no security headers. It now sends a policy that runs scripts from the site only
+  (the one inline script moved to `public/early.js`), refuses to be framed (`frame-ancestors
+  'none'`, `X-Frame-Options: DENY`: a framed page could have been clicked into trades signed by
+  the test wallet without a popup), `nosniff`, a referrer policy and a permissions policy
+  (`app/vercel.json`). The page loads under it in Chromium with nothing blocked.
+- "Start a new test wallet" deleted the old, locked wallet. It is now kept aside in the browser,
+  still locked, under its address.
+- `sendOrders` passed any non-router instruction into the trading key's transaction; one that
+  needs the wallet's signature now sends the whole transaction by the wallet.
+
+Holds as designed:
+- The test wallet signs without a popup (that is its purpose): anything running in the page
+  could use it. Test networks only; the page offers no mainnet network.
+- A key stored under a PIN can be guessed offline by whoever copies the browser's storage
+  (600,000 PBKDF2 rounds a guess); a passphrase or a passkey is stronger. The dialog says so.
+- The trading key cannot withdraw, deposit or move money; an order it places counts once toward
+  its size, trade and daily limits and expires with its approval. A grid level keeps flipping
+  until then, so its later fills are not counted toward the daily total (bounded by the level's
+  size and the approval's end).
+- Isolated orders move margin into the wallet's own isolated account only; the margin of an order
+  that never fills stays there and the wallet withdraws it as usual.

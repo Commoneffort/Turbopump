@@ -21,6 +21,7 @@ import bs58 from "bs58";
 
 const PLAIN_KEY = "percolator-vaults:devnet-burner";
 const LOCKED_KEY = "percolator-vaults:burner-locked";
+const OLD_PREFIX = "percolator-vaults:burner-old:";
 export const BurnerName = "Devnet Burner" as WalletName<"Devnet Burner">;
 const ROUNDS = 600_000;
 
@@ -145,7 +146,7 @@ function askProtect(kp: Keypair, existing: boolean): Promise<Locked | null> {
   });
 }
 
-/** Unlocks a protected key; "start over" makes a new, empty test wallet (the old one is lost). */
+/** Unlocks a protected key; "start over" makes a new, empty test wallet (the old one is kept aside, still locked). */
 function askUnlock(l: Locked): Promise<Keypair | "new"> {
   return dialog((box, done) => {
     box.append(el("b", {}, "Unlock your test wallet"));
@@ -165,8 +166,8 @@ function askUnlock(l: Locked): Promise<Keypair | "new"> {
       box.append(pin, go);
       setTimeout(() => pin.focus(), 50);
     }
-    const anew = el("button", { style: BTN + ";opacity:.75;font-size:12px" }, "Start a new test wallet (this one is lost)");
-    anew.onclick = () => { if (window.confirm("Make a new, empty test wallet? This one and its test funds cannot be opened again.")) done("new"); };
+    const anew = el("button", { style: BTN + ";opacity:.75;font-size:12px" }, "Start a new test wallet (this one is put aside)");
+    anew.onclick = () => { if (window.confirm("Make a new, empty test wallet? This one stays locked in this browser, set aside: the site will not open it again by itself.")) done("new"); };
     box.append(msg, anew);
   });
 }
@@ -176,6 +177,10 @@ async function loadKeypair(): Promise<Keypair> {
   if (raw) {
     const got = await askUnlock(JSON.parse(raw) as Locked);
     if (got !== "new") return got;
+    // Kept, not deleted: the old wallet (still locked) stays in this browser under its address,
+    // so remembering its PIN or finding its passkey later can still open it.
+    const old = JSON.parse(raw) as Locked;
+    store.set(`${OLD_PREFIX}${old.pub}`, raw);
     store.del(LOCKED_KEY);
   }
   const plain = store.get(PLAIN_KEY);
