@@ -17,6 +17,7 @@ import {
   WalletReadyState,
 } from "@solana/wallet-adapter-base";
 import { Keypair, PublicKey, Transaction, VersionedTransaction } from "@solana/web3.js";
+import bs58 from "bs58";
 
 const PLAIN_KEY = "percolator-vaults:devnet-burner";
 const LOCKED_KEY = "percolator-vaults:burner-locked";
@@ -221,4 +222,33 @@ export class DevnetBurnerAdapter extends BaseSignerWalletAdapter {
   async signAllTransactions<T extends Transaction | VersionedTransaction>(txs: T[]): Promise<T[]> {
     return Promise.all(txs.map(t => this.signTransaction(t)));
   }
+}
+
+/** Shows the test wallet's private key, on request only (2026-11-07): it asks for the wallet's
+ *  passkey or PIN again first, even while the wallet is unlocked, so a page left open cannot be
+ *  read by someone passing by. The key is shown in a box with a copy button and never stored
+ *  anywhere else. Anyone who has it controls the wallet. */
+export async function revealTestWalletKey(): Promise<void> {
+  const raw = store.get(LOCKED_KEY), plain = store.get(PLAIN_KEY);
+  let kp: Keypair;
+  if (raw) {
+    const got = await askUnlock(JSON.parse(raw) as Locked);
+    if (got === "new") return;
+    kp = got;
+  } else if (plain) {
+    if (!window.confirm("Show this test wallet's private key? Anyone who has it controls the wallet.")) return;
+    kp = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(plain)));
+  } else return;
+  const secret = bs58.encode(kp.secretKey);
+  await dialog((box, done) => {
+    box.append(el("b", {}, "Your test wallet's private key"));
+    box.append(el("div", { style: "font-size:13px;color:#e15a48" }, "Anyone who has this key controls the wallet and everything in it. Paste it only into a wallet app you trust (Backpack, or an X1 wallet: \"import private key\"). Never into a website."));
+    box.append(el("div", { style: "opacity:.8;font-size:12px;word-break:break-all" }, `Address: ${kp.publicKey.toBase58()}`));
+    const t = el("textarea", { readOnly: true, value: secret, style: INPUT + ";height:84px;font:12px ui-monospace,monospace;word-break:break-all;resize:none" });
+    const copy = el("button", { style: MAIN }, "Copy");
+    copy.onclick = async () => { try { await navigator.clipboard.writeText(secret); copy.textContent = "Copied"; } catch { t.select(); } };
+    const close = el("button", { style: BTN }, "Close");
+    close.onclick = () => done(null);
+    box.append(t, copy, close);
+  });
 }

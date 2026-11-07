@@ -7,9 +7,9 @@
 import { CSSProperties, Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
-import { ComputeBudgetProgram, Connection, PublicKey, TransactionInstruction } from "@solana/web3.js";
+import { ComputeBudgetProgram, Connection, PublicKey, SystemProgram, TransactionInstruction } from "@solana/web3.js";
 import { OneClickPanel, SetupCard, sendOrders, useTradingKey } from "./OneClick";
-import { createAssociatedTokenAccountIdempotentInstruction } from "@solana/spl-token";
+import { createAssociatedTokenAccountIdempotentInstruction, createTransferCheckedInstruction } from "@solana/spl-token";
 import * as C from "./chain";
 import { readDirect } from "./view";
 import { T } from "./theme";
@@ -20,7 +20,7 @@ import { Liquidations, PULSE, PULSE_BOARD_MS, Whale, marketFills, useVolume } fr
 import { WidgetPanel, liqLevels } from "./Widgets";
 import { CloseSlider } from "./PositionTools";
 import { AcctView, Card, Faucet, Fill, Icon, LiquidityPanel, OpenerPanel, Send, ago, capUnits, entryPrice, explorer, fmt, num, priceDp, px, realizedPnl, short, units, usd, useAccounts, useActivity, useCards, useDeepFills, useFillsBySub, useVault, useWalletFills } from "./shared";
-import { BurnerName } from "./burner";
+import { BurnerName, revealTestWalletKey } from "./burner";
 
 const UP = T.green, DOWN = T.red;
 const pct = (x: number, dp = 2) => `${x >= 0 ? "+" : "−"}${fmt(Math.abs(x) * 100, dp)}%`;
@@ -1074,9 +1074,79 @@ function Account({ state, send, busy, held, row, vaults, accounts }: { state: C.
               {owed > 0n && state.openPositions === 0 && <div className="fine">A withdrawal first pays the {usd(owed)} owed to the vaults, out of your margin.</div>}
             </>
           )}
+          <TestWalletOut state={state} send={send} busy={busy} withdrawAll={() => {
+            // Everything in the trading account back to the wallet (its profit turned into
+            // capital and what it owes the vaults paid), as the Withdraw button does.
+            const all = (p?.capital ?? 0n) + profit - owed;
+            return all > 0n && !locked && state.openPositions === 0 && publicKey
+              ? [ata(publicKey), ...(profit > 0n ? [C.crank(publicKey, C.routerPortfolio(publicKey, sub), [state.vault.assetIndex]), C.routerConvertPnl(publicKey, sub)] : []), ...payAll(publicKey), C.routerWithdraw(publicKey, all, sub)]
+              : [];
+          }} />
         </div>
       )}
     </>
+  );
+}
+
+/** The test wallet (the burner: no wallet app, so nothing else can move its funds): send USDC or
+ *  XNT to any address, "All" emptying the trading account into it first when nothing is open;
+ *  and its private key, shown only on request after a fresh unlock (burner.revealTestWalletKey). */
+function TestWalletOut({ state, send, busy, withdrawAll }: { state: C.State; send: Send; busy?: string; withdrawAll: () => TransactionInstruction[] }) {
+  const { publicKey, wallet } = useWallet();
+  const { connection } = useConnection();
+  const [open, setOpen] = useState(false);
+  const [coin, setCoin] = useState<"USDC" | "XNT">("USDC");
+  const [to, setTo] = useState("");
+  const [amount, setAmount] = useState("");
+  const [note, setNote] = useState<string>();
+  if (!publicKey || wallet?.adapter?.name !== BurnerName) return null;
+  let dest: PublicKey | undefined;
+  try { dest = to.trim() ? new PublicKey(to.trim()) : undefined; } catch { dest = undefined; }
+  const XNT_KEEP = 2_000_000; // what a send of all XNT leaves for its own fee
+  const go = async (all: boolean) => {
+    if (!dest || dest.equals(publicKey)) return;
+    setNote(undefined);
+    if (coin === "USDC") {
+      // "All": the trading account's money first, then everything the wallet holds.
+      if (all) { const w = withdrawAll(); if (w.length && !(await send("Withdraw everything to the wallet", w))) return; }
+      const bal = all ? BigInt((await connection.getTokenAccountBalance(C.ata(publicKey, C.MINT)).catch(() => null))?.value.amount ?? "0") : BigInt(Math.floor(Number(amount || 0) * C.USDC));
+      if (bal <= 0n) { setNote("Nothing to send."); return; }
+      await send(`Send ${Number(bal) / C.USDC} USDC`, [createAssociatedTokenAccountIdempotentInstruction(publicKey, C.ata(dest, C.MINT), dest, C.MINT),
+        createTransferCheckedInstruction(C.ata(publicKey, C.MINT), C.MINT, C.ata(dest, C.MINT), publicKey, bal, 6)]);
+    } else {
+      const have = await connection.getBalance(publicKey);
+      const lamports = all ? have - XNT_KEEP : Math.floor(Number(amount || 0) * 1e9);
+      if (lamports <= 0 || lamports > have - XNT_KEEP + (all ? 0 : 1)) { setNote(`Not enough ${C.COIN}.`); return; }
+      await send(`Send ${(lamports / 1e9).toFixed(4)} ${C.COIN}`, [SystemProgram.transfer({ fromPubkey: publicKey, toPubkey: dest, lamports })]);
+    }
+  };
+  return (
+    <div className="oneclick">
+      {!open ? (
+        <div className="oneclick-b">
+          <button className="btn tiny" onClick={() => setOpen(true)} title="Move test funds out of the test wallet to any address">Send from test wallet</button>
+          <button className="btn tiny" onClick={() => revealTestWalletKey().catch(() => {})} title="Shows the private key, after you unlock with your passkey or PIN again">Export key</button>
+        </div>
+      ) : (
+        <>
+          <div className="oneclick-h"><b>Send from the test wallet</b></div>
+          <div className="oneclick-opts">
+            <label><select value={coin} onChange={e => setCoin(e.target.value as "USDC" | "XNT")}><option value="USDC">USDC</option><option value="XNT">{C.COIN}</option></select></label>
+          </div>
+          <label className="inp small"><span>To</span><input value={to} onChange={e => setTo(e.target.value)} placeholder="address" spellCheck={false} /></label>
+          <label className="inp small"><span>Amount</span><input value={amount} onChange={e => setAmount(e.target.value.replace(/[^0-9.]/g, ""))} inputMode="decimal" /></label>
+          <div className="oneclick-b">
+            <button className="btn white" disabled={!!busy || !dest || !Number(amount)} onClick={() => go(false)}>Send</button>
+            <button className="btn" disabled={!!busy || !dest} onClick={() => go(true)} title={coin === "USDC" ? "Withdraws everything from your trading account first (when no position is open), then sends all the wallet's USDC" : `Sends all but ${XNT_KEEP / 1e9} ${C.COIN} (the fee)`}>Send all</button>
+            <button className="btn" onClick={() => setOpen(false)}>Cancel</button>
+          </div>
+          {to.trim() && !dest && <div className="fine down">That is not an address.</div>}
+          {dest?.equals(publicKey) && <div className="fine">That is this wallet.</div>}
+          {coin === "USDC" && state.openPositions > 0 && <div className="fine">With a position open, "Send all" sends only what is in the wallet ({usd(state.userCollateral)}): close positions to free the margin.</div>}
+          {note && <div className="fine">{note}</div>}
+        </>
+      )}
+    </div>
   );
 }
 
