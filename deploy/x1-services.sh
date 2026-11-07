@@ -78,7 +78,9 @@ case "$1" in
     # The markets added by the split (deploy/x1-testnet.m<N>.json): each one its own executor
     # (checking every 1 s, not 0.15: the public RPC limits this server), keeper and maker
     # renewal. The original market's services are the ones above.
-    for MF in deploy/x1-testnet.m[0-9].json; do
+    # (Off since 2026-11-07: X1 runs on the original market only, the four of the split cost
+    # ~10 XNT an hour to keep current. X1_EXTRA_MARKETS=1 starts them again.)
+    for MF in $([ -n "$X1_EXTRA_MARKETS" ] && echo deploy/x1-testnet.m[0-9].json); do
       [ -f "$MF" ] && grep -q '"market"' "$MF" || continue
       N=$(basename "$MF" .json | sed 's/.*\.m//'); MJ=$(cat "$MF")
       if ! running x1-executor-m$N; then

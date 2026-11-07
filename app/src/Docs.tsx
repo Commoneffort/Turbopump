@@ -173,7 +173,7 @@ export default function Docs() {
           <tbody>
             <tr><td>1. Empty markets</td><td>Every market has a shared vault that takes the other side of every queued trade, so a new market can trade as soon as anyone deposits{X1 ? "; on X1 makers take trades too" : ""}.</td><td>A vault with no deposits takes nothing.</td></tr>
             <tr><td>2. The lister's keys</td><td>The vault program's governor address holds the market's authority and only uses it to retire idle markets; the vault holds each asset's admin, insurance and oracle keys and never uses them otherwise{X1 ? " (checked on chain for all five X1 markets)" : ""}.</td><td>We still hold the programs' upgrade keys (to be burned before mainnet){X1 ? ", and on X1 our reporter and witness keys post the prices" : ""}.</td></tr>
-            <tr><td>3. Fragmented liquidity</td><td>One vault per feed on a market: a second SOL vault on the same market cannot exist.</td><td>{X1 ? "On X1 we split trading over five markets for more room per block, so SOL, BTC and ETH each have five vaults. A trade only sees the vault of its wallet's market." : "None on devnet (one market)."}</td></tr>
+            <tr><td>3. Fragmented liquidity</td><td>One vault per feed on a market: a second SOL vault on the same market cannot exist.</td><td>{X1 ? "None today: X1 trades on one market. (From 6 to 7 November 2026 it ran five, for more room per block, which split each asset's liquidity five ways; the four extra markets are closed.)" : "None on devnet (one market)."}</td></tr>
             <tr><td>4. No spread to earn</td><td>The vault earns fees and what traders lose instead, and depositors get 85% of what is harvested.</td><td>{X1 ? "Solved for makers on X1: a maker's quote is the price paid (our engine fork settles its difference from Percolator's price between the two accounts), so a maker earns its spread." : "Still true on devnet: trades settle at the mark."}</td></tr>
             <tr><td>5. Front-running</td><td>Queued trades fill at a price posted after they land, so nobody can trade against the vault at a price they know.</td><td>{X1 ? "A quoted trade fills at once at the maker's price, which the maker set from the exchanges: nobody can trade it at a price they already know better than the maker did, except within the quote's two seconds, which is the maker's own risk and why quotes are short and size-limited." : "None for queued trades."}</td></tr>
           </tbody>
@@ -262,15 +262,14 @@ export default function Docs() {
           click. Quoted trades count in your track record like any other fill.
         </p>}
         {X1 && <p>
-          <b>Five markets.</b> A chain limits how much computing can write one account in a block, and every trade writes its
-          market's account. On X1 that is about 22 to 44 trades a block for one market, so X1 runs five Percolator markets, each
-          listing SOL, BTC and ETH, with its own vaults, maker and executor. Each wallet trades on one of them, so its margin is
-          still shared across its positions: the market where it already has an account (accounts from before November 6
-          stay on the original market), otherwise the one its address picks. The page finds it for you. You can copy a trader on
-          any market: the copy follows the trader's positions on the assets both markets list (SOL, BTC and ETH). Earn spreads a
-          deposit over the asset's vaults on all five markets, so each is deeper, and claims and withdraws on all of them at
-          once. On the original market the SOL, BTC and ETH quotes come from makers that each hold one asset, which keeps a
-          quoted trade's compute well under the limit.
+          <b>One market, for now.</b> A chain limits how much computing can write one account in a block, and every trade
+          writes its market's account: on X1 about 22 to 44 trades a block for one market. On 6 November 2026 X1 was split into
+          five markets for more room; on 7 November the four extra ones were closed again, since keeping five markets current
+          costs about five times as much (each market has to be brought forward every few slots, traded or not) and today's
+          volume fits one. Every wallet trades on the original market; accounts opened on the four others can still be read.
+          The router keeps what the split needed (copying across markets, Earn over several markets), so the split can come back
+          when the volume needs it. The SOL, BTC and ETH quotes come from makers that each hold one asset, which keeps a quoted
+          trade's compute well under the limit.
         </p>}
         <p>The router has no admin: no pause, no allow or block list, and its upgrade authority is to be burned before mainnet.</p>
 
@@ -547,7 +546,7 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
           <li><b>Smart contracts.</b> Unaudited code. The programs are upgradeable on both test networks (we hold the keys); a mainnet deployment must burn that authority.</li>
           {X1 && <li><b>Maker quotes.</b> A quoted trade fills against the maker's own account at the quoted price, within 1% of Percolator's (a trading key's within its own band). The difference from Percolator's price moves between the two accounts' capital in our engine fork, which is unaudited. If no maker quotes, or a quote is too small, the order goes through the queue.</li>}
           {X1 && <li><b>Trading keys.</b> A trading key can trade your account within the limits you set, until it expires. Malware in your browser could ask the page's key to sign trades (it cannot copy the key out where the browser supports that, and it can never withdraw). Turn one-click trading off on a computer you do not trust; turning it off ends the key on chain.</li>}
-          {X1 && <li><b>Five markets on X1.</b> Each wallet trades on one market, against that market's vaults and maker only, so each pool is smaller than one shared pool would be (Earn can spread a deposit over all five).</li>}
+          {X1 && <li><b>Accounts on the closed markets.</b> Four markets X1 ran on 6 and 7 November 2026 are closed: nothing keeps them current, so positions there cannot be traded or closed. Only test funds are affected.</li>}
           <li><b>Keepers.</b> Anyone can run a keeper or an executor, and each one is paid for its work (see Keepers and executors), but someone has to. If nobody does, epochs don't roll and prices don't update. On X1 only our reporter key can post prices, so X1 trades also wait on it.</li>
           <li><b>Margin stays in while you hold a position.</b> Percolator pays margin out only from an account with no open position on any market, so a trader closes everything before withdrawing. A queued trade must leave enough margin to open at the asset's level; a trade that only reduces a position is always accepted.</li>
           <li><b>Spot swaps go through xDEX.</b> The router checks what reaches your wallet, but the pool's price and its own fee are xDEX's. A thin pool moves a lot on a large swap; the ticket shows the price impact before you sign.</li>
@@ -811,7 +810,7 @@ deposit:     shares = assets × (S' + 1000) / (NAV_high' + 1)       (rounded dow
             <tr><td>Settlement on a fill</td><td>Every account on the market re-valued first</td><td>Only the trader and the vault, while that is safe (lazy settlement, our engine fork)</td></tr>
             <tr><td>Instant trades (maker quotes)</td><td>No</td><td>Yes, about 0.8 s from click to confirmed</td></tr>
             <tr><td>One-click trading</td><td>No</td><td>Yes</td></tr>
-            <tr><td>Markets</td><td>One</td><td>Five (each wallet trades on one)</td></tr>
+            <tr><td>Markets</td><td>One</td><td>One (five on 6–7 November 2026)</td></tr>
           </tbody>
         </table>
 

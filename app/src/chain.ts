@@ -98,8 +98,12 @@ let ACTIVE = MARKET;
 export const activeMarket = () => ACTIVE;
 export const setActiveMarket = (m: PublicKey) => { ACTIVE = isOurMarket(m) ? m : MARKET; };
 /** The markets added by the split: a new wallet is placed on one of them by its address, the
- *  same one every time (a wallet with an account on the original market stays there). */
-export const NEW_MARKETS = MARKETS.slice(1);
+ *  same one every time (a wallet with an account on the original market stays there). Closed
+ *  since 2026-11-07 (`split_open` in the network's file): X1 trades on the original market only,
+ *  as keeping five markets current cost ~10 XNT an hour. The four stay in MARKETS, so what is
+ *  held there can still be read; nothing places a wallet or a deposit there. */
+export const SPLIT_OPEN = !!(M as any).split_open;
+export const NEW_MARKETS = SPLIT_OPEN ? MARKETS.slice(1) : [];
 /** The market `wallet` lives on: the first market where it has a main trading account (the
  *  original market first), else the one it is placed on. One read. */
 export async function homeMarket(conn: Connection, wallet: PublicKey): Promise<PublicKey> {

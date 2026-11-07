@@ -503,7 +503,7 @@ function useSiblings(state: C.State, user: PublicKey | null, tick: number) {
   const [rows, setRows] = useState<C.State[]>([]);
   const feed = state.vault.feedHex, me = user?.toBase58();
   useEffect(() => {
-    if (C.MARKETS.length < 2) { setRows([]); return; }
+    if (!C.NEW_MARKETS.length) { setRows([]); return; }
     let live = true;
     (async () => {
       const all = (await C.listVaults(connection, true)).filter(v => v.canonical && v.feedHex === feed && v.status === 1);
