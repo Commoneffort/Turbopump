@@ -225,7 +225,8 @@ export function sendOrders(send: Send, ok: OneClickState, wallet: PublicKey, lab
   if (!key || ok.lamports < budget + 0.05 * XNT) return send(label, ixs);
   const market = C.marketOfVault(vault), session = C.sessionAddress(wallet, market);
   const mapped = ixs.map(ix => {
-    if (!ix.programId.equals(C.ROUTER)) return ix;
+    // (Anything else the wallet has to sign, such as opening an account or moving margin, goes by the wallet.)
+    if (!ix.programId.equals(C.ROUTER)) return ix.keys.some(k => k.isSigner && k.pubkey.equals(wallet)) ? null : ix;
     if (ix.data[0] === 12) return C.byKey(ix, key.publicKey, wallet, market);
     if (ix.data[0] === 13) return new TransactionInstruction({ programId: C.ROUTER, data: ix.data, keys: [
       { pubkey: key.publicKey, isSigner: true, isWritable: true }, { pubkey: ix.keys[1].pubkey, isSigner: false, isWritable: true },

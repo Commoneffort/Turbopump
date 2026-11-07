@@ -118,6 +118,34 @@ const abs = (q: bigint) => (q < 0n ? -q : q);
 const e6 = (x: number) => BigInt(Math.round(x * 1e6));
 const ORDER_NAME = ["Stop loss", "Take profit", "Trailing stop", "Limit", "TWAP", "Grid level", "Cross trigger", "Pair (ratio)", "Liquidation trigger"];
 /** The first of the wallet's order slots on this market that is free (or as many as asked). */
+/** Standing orders on an isolated account (sub != 0, 2026-11-07): the first one opens the account,
+ *  and each opening order brings from the wallet the margin its fill needs: at `lev`x (or the
+ *  router's minimum, if more), plus 1% and the fee, counting the account's position and its other
+ *  opening orders on the same side, less what the account holds. On the cross account: nothing. */
+function isoPrep(state: C.State, wallet: PublicKey | null, lev: number, add: bigint, price = state.asset.price): { ixs: TransactionInstruction[]; topUp: bigint } {
+  if (!wallet || state.sub === 0) return { ixs: [], topUp: 0n };
+  const open = !state.trader ? [C.openTradingAccount(wallet, state.sub), C.openLedger(wallet, wallet, state.sub)] : [];
+  const held = state.portfolio?.position ?? 0n;
+  const waiting = state.orders.filter(o => !o.reduceOnly && o.size !== 0n && (o.size > 0n) === (add > 0n)).reduce((a, o) => a + o.size, 0n);
+  const after = add === 0n ? 0n : held + waiting + add;
+  let topUp = 0n;
+  if (after !== 0n && state.marketData && abs(after) > abs(held)) {
+    const px = price > state.asset.price ? price : state.asset.price;
+    const byLev = abs(after) * px / C.UNIT / BigInt(Math.max(1, lev));
+    const byRule = C.isolatedNeed(state.marketData, state.vault.assetIndex, after);
+    const fee = abs(add + waiting) * px / C.UNIT * BigInt(C.TRADE_FEE_BPS) / 10_000n;
+    const target = (byLev > byRule ? byLev : byRule) * 101n / 100n + fee;
+    const has = state.health?.equity ?? 0n;
+    if (target > has) topUp = ((target - has + 9_999n) / 10_000n) * 10_000n;
+  }
+  const fund = topUp > 0n ? [createAssociatedTokenAccountIdempotentInstruction(wallet, C.ata(wallet, C.MINT), wallet, C.MINT), C.routerDeposit(wallet, topUp, state.sub)] : [];
+  return { ixs: [...open, ...fund], topUp };
+}
+/** The line and the check that go with `isoPrep` in an order form. */
+const isoLine = (state: C.State, topUp: bigint, lev: number) => state.sub === 0 ? null
+  : <div title={`Isolated: what this order's fill needs at ${lev}x, less what the account already holds, moves from your wallet when you place it. A loss can take only this account's margin.`}><span>Margin moved from wallet ({lev}×)</span><b className="mono">{money(num(topUp, 1e6))}</b></div>;
+const isoShort = (state: C.State, topUp: bigint) => state.sub !== 0 && topUp > state.userCollateral ? `This order moves ${money(num(topUp, 1e6))} of margin from your wallet, which has ${money(num(state.userCollateral, 1e6))} of test USDC` : undefined;
+
 const freeSlots = (state: C.State, n = 1) => Array.from({ length: C.MAX_ORDERS }, (_, i) => i).filter(i => !state.orders.some(o => o.index === i)).slice(0, n);
 
 /** Cross or isolated margin, chosen per market and kept in this browser. Cross: the wallet's main
@@ -779,7 +807,7 @@ function Ticket({ state, send, busy, copying, margin, setMargin, vaults }: { sta
           <button className={side < 0n ? "on down" : ""} onClick={() => setSide(-1n)}>{mode === "market" ? "Short" : "Sell"}</button>
         </div>
       )}
-      {mode === "strategy" ? <StrategyForm side={side} state={state} send={send} busy={busy} vaults={vaults} /> : mode !== "market" ? <StandingForm mode={mode} side={side} state={state} send={send} busy={busy} /> : <>
+      {mode === "strategy" ? <StrategyForm side={side} state={state} send={send} busy={busy} vaults={vaults} lev={lev} /> : mode !== "market" ? <StandingForm mode={mode} side={side} state={state} send={send} busy={busy} lev={lev} /> : <>
       <CurrentPosition held={held} sym={sym} />
 
       <label className="inp">
@@ -895,7 +923,7 @@ function KeeperLine({ lamports }: { lamports: number }) {
  *  carries out later, when their condition holds. */
 /** Strategy orders (router 2026-11-07), placed from one form and carried out on chain by anyone,
  *  like every standing order: a grid, a ladder, a trigger on another asset, a pair trade. */
-function StrategyForm({ side, state, send: wsend, busy, vaults }: { side: 1n | -1n; state: C.State; send: Send; busy?: string; vaults: C.Vault[] }) {
+function StrategyForm({ side, state, send: wsend, busy, vaults, lev }: { side: 1n | -1n; state: C.State; send: Send; busy?: string; vaults: C.Vault[]; lev: number }) {
   const { publicKey } = useWallet();
   const { connection } = useConnection();
   const ok = useTradingKey(busy ? 1 : 0);
@@ -913,7 +941,10 @@ function StrategyForm({ side, state, send: wsend, busy, vaults }: { side: 1n | -
   const n = (t: string) => { const x = Number(t); return Number.isFinite(x) && x > 0 ? x : 0; };
   const digits = (set: (t: string) => void) => (e: { target: { value: string } }) => set(e.target.value.replace(/[^0-9.]/g, ""));
   const free = freeSlots(state, C.MAX_ORDERS);
-  const need = !publicKey ? "Connect a wallet first" : !state.trader ? "Create a trading account first (Market tab)" : undefined;
+  const iso = state.sub !== 0;
+  const need = !publicKey ? "Connect a wallet first" : !state.trader && !iso ? "Create a trading account first (Market tab)" : undefined;
+  // (Isolated: the position the strategy can build, in units signed, for the margin it brings.)
+  let adds = 0n, addPrice = state.asset.price;
   const send: Send = (label, ixs) => publicKey && Array.isArray(ixs) ? sendOrders(wsend, ok, publicKey, label, ixs, v.key, ixs.reduce((a, ix) => a + (ix.programId.equals(C.ROUTER) && ix.data[0] === 12 && ix.data.length > 48 ? Number(ix.data.readBigUInt64LE(48)) : 0), 0)) : wsend(label, ixs);
   const tabs = <div className="seg strat-kinds">{([["grid", "Grid"], ["ladder", "Ladder"], ["cross", "Cross trigger"], ["pair", "Pair trade"], ["liq", "Liquidations"]] as const).map(([k, l]) => <button key={k} className={kind === k ? "on" : ""} onClick={() => setKind(k)}>{l}</button>)}</div>;
   let body: ReactNode = null, why: string | undefined = need, label = "", build: (() => Promise<TransactionInstruction[]>) | undefined;
@@ -922,6 +953,7 @@ function StrategyForm({ side, state, send: wsend, busy, vaults }: { side: 1n | -
     const lo = n(lower), hi = n(upper), k = Math.min(Math.floor(n(levels)), free.length), q = n(size);
     const step = k > 1 ? (hi - lo) / (k - 1) : 0;
     const prices = k > 1 && hi > lo ? Array.from({ length: k }, (_, i) => lo + i * step) : [];
+    { const buys = prices.filter(p => p < priceN).length, sells = prices.length - buys; adds = e6(q) * BigInt(Math.max(buys, sells)) * (buys >= sells ? 1n : -1n); addPrice = e6(hi); }
     why ??= !lo || !hi || hi <= lo ? "Enter a lower and an upper price" : k < 2 ? (free.length < 2 ? "Free at least two order slots first" : "At least 2 levels") : !q ? "Enter a size per level" : undefined;
     body = <>
       <label className="inp"><span>Lower price</span><input value={lower} onChange={digits(setLower)} placeholder={fmt(priceN * 0.95, dp)} inputMode="decimal" /></label>
@@ -939,6 +971,7 @@ function StrategyForm({ side, state, send: wsend, busy, vaults }: { side: 1n | -
   } else if (kind === "ladder") {
     const s0 = n(start) || priceN, pct = n(stepPct) / 100, k = Math.min(Math.floor(n(levels)), free.length), q = n(size);
     const prices = k > 0 && pct > 0 ? Array.from({ length: k }, (_, i) => s0 * (side > 0n ? 1 - pct * i : 1 + pct * i)) : [];
+    adds = e6(q) * BigInt(prices.length) * side; addPrice = e6(s0);
     why ??= !k ? (free.length ? "At least 1 step" : "All order slots are in use") : !q ? "Enter a size per step" : !pct ? "Enter the distance between steps" : undefined;
     body = <>
       <label className="inp"><span>First price</span><input value={start} onChange={digits(setStart)} placeholder={fmt(priceN, dp)} inputMode="decimal" /></label>
@@ -952,6 +985,7 @@ function StrategyForm({ side, state, send: wsend, busy, vaults }: { side: 1n | -
     build = async () => prices.map((p, i) => C.placeOrder(publicKey!, v.key, { index: free[i], kind: C.ORDER.LIMIT, size: e6(q) * side, trigger: e6(p) }, state.sub));
   } else if (kind === "liq") {
     const total = n(liqUsd), mins = n(liqMin), usd = n(notional);
+    adds = priceN ? e6(usd / priceN) * side : 0n;
     why ??= !total ? "Enter how much has to be liquidated" : !(mins >= 0.2 && mins <= 1440) ? "A window from 12 seconds to a day" : !usd ? "Enter an amount in dollars" : !free.length ? "All order slots are in use" : undefined;
     body = <>
       <div className="seg">{([[1, "Longs liquidated"], [-1, "Shorts liquidated"]] as const).map(([k, l]) => <button key={k} className={liqSide === k ? "on" : ""} onClick={() => setLiqSide(k)}>{l}</button>)}</div>
@@ -966,6 +1000,9 @@ function StrategyForm({ side, state, send: wsend, busy, vaults }: { side: 1n | -
   } else {
     const lv = n(level), usd = n(notional);
     const ratioNow = otherPrice > 0 ? priceN / otherPrice : 0;
+    adds = priceN ? e6(usd / priceN) * side : 0n;
+    // An isolated account holds one asset: a pair needs two.
+    if (kind === "pair" && iso) why ??= "A pair trade holds two assets: use the cross account for it";
     why ??= !ov ? "No other asset on this market" : !lv ? (kind === "cross" ? `Enter the ${other} price` : "Enter the ratio") : !usd ? "Enter an amount in dollars" : !free.length ? "All order slots are in use" : undefined;
     body = <>
       <label className="inp"><span>Watch</span><select value={other} onChange={e => setOther(e.target.value)}>{others.map(x => <option key={x.key.toBase58()} value={x.feed!.symbol}>{x.feed!.symbol}</option>)}</select><em>{kind === "cross" ? fmt(otherPrice, priceDp(otherPrice)) : `${sym}/${other} ${ratioNow.toFixed(5)}`}</em></label>
@@ -996,11 +1033,14 @@ function StrategyForm({ side, state, send: wsend, busy, vaults }: { side: 1n | -
       };
     }
   }
+  const prep = isoPrep(state, publicKey, lev, adds, addPrice);
+  why ??= isoShort(state, prep.topUp);
   return (
     <div className="sform">
       {tabs}
       {body}
-      <button className={`submit ${side > 0n ? "up" : "down"}`} disabled={!!why || !!busy} onClick={async () => { if (!build) return; try { const ixs = await build(); await send(label, ixs); } catch (e: any) { window.alert(String(e?.message ?? e)); } }}>
+      {iso && <div className="sum">{isoLine(state, prep.topUp, lev)}</div>}
+      <button className={`submit ${side > 0n ? "up" : "down"}`} disabled={!!why || !!busy} onClick={async () => { if (!build) return; try { const ixs = await build(); await send(label, [...prep.ixs, ...ixs]); } catch (e: any) { window.alert(String(e?.message ?? e)); } }}>
         {busy ? `${busy}…` : kind === "grid" ? "Place grid" : kind === "ladder" ? "Place ladder" : kind === "cross" || kind === "liq" ? "Place trigger" : "Place pair trade"}
       </button>
       {why && <div className="why">{why}</div>}
@@ -1008,7 +1048,7 @@ function StrategyForm({ side, state, send: wsend, busy, vaults }: { side: 1n | -
   );
 }
 
-function StandingForm({ mode, side, state, send: wsend, busy }: { mode: "limit" | "protect" | "twap"; side: 1n | -1n; state: C.State; send: Send; busy?: string }) {
+function StandingForm({ mode, side, state, send: wsend, busy, lev }: { mode: "limit" | "protect" | "twap"; side: 1n | -1n; state: C.State; send: Send; busy?: string; lev: number }) {
   const { publicKey } = useWallet();
   // With one-click trading on, orders are placed by the trading key (no popup), when it holds their keeper budget.
   const ok = useTradingKey(busy ? 1 : 0);
@@ -1026,15 +1066,18 @@ function StandingForm({ mode, side, state, send: wsend, busy }: { mode: "limit" 
   const [minutes, setMinutes] = useState("30");
   const n = (t: string) => { const x = Number(t); return Number.isFinite(x) && x > 0 ? x : 0; };
   const digits = (set: (t: string) => void) => (e: { target: { value: string } }) => set(e.target.value.replace(/[^0-9.]/g, ""));
-  const ready = !!publicKey && !!state.trader;
-  const need = !publicKey ? "Connect a wallet first" : !state.trader ? "Create a trading account first (Market tab)" : undefined;
+  // An isolated account is opened by its first order (TP / SL need a position, so an account).
+  const iso = state.sub !== 0;
+  const ready = !!publicKey && (!!state.trader || (iso && mode !== "protect"));
+  const need = !publicKey ? "Connect a wallet first" : !state.trader ? (iso ? (mode === "protect" ? "Open a position on this isolated account first" : undefined) : "Create a trading account first (Market tab)") : undefined;
   const free = freeSlots(state, 3);
 
   if (mode === "limit") {
     const q = e6(n(size)) * side, px = n(limit);
     // A limit on the wrong side of the price is carried out at once, like a market order.
     const marketable = px > 0 && (side > 0n ? px >= priceN : px <= priceN);
-    const why = need ?? (!free.length ? "All 8 order slots on this market are in use: cancel one first" : !n(size) ? "Enter a size" : !px ? "Enter a limit price" : undefined);
+    const prep = isoPrep(state, publicKey, lev, reduce ? 0n : q, px ? e6(px) : state.asset.price);
+    const why = need ?? (!free.length ? "All 8 order slots on this market are in use: cancel one first" : !n(size) ? "Enter a size" : !px ? "Enter a limit price" : reduce && !state.trader ? "Nothing to reduce: this isolated account holds no position" : isoShort(state, prep.topUp));
     return (
       <div className="sform">
         <CurrentPosition held={held} sym={sym} />
@@ -1044,9 +1087,10 @@ function StandingForm({ mode, side, state, send: wsend, busy }: { mode: "limit" 
         <div className="sum">
           <div><span>Order value</span><b className="mono">{money(n(size) * (px || priceN))}</b></div>
           <div><span>Carried out when the price is</span><b className="mono">{px ? `${side > 0n ? "≤" : "≥"} ${fmt(px, dp)}` : "—"}</b></div>
+          {isoLine(state, prep.topUp, lev)}
           <KeeperLine lamports={C.keeperBudget(C.ORDER.LIMIT)} />
         </div>
-        <button className={`submit ${side > 0n ? "up" : "down"}`} disabled={!!why || !!busy || !ready} onClick={() => publicKey && send(`Limit ${side > 0n ? "buy" : "sell"} ${size} ${sym} at ${limit}`, [C.placeOrder(publicKey, v.key, { index: free[0], kind: C.ORDER.LIMIT, reduceOnly: reduce, size: q, trigger: e6(px) }, state.sub)])}>
+        <button className={`submit ${side > 0n ? "up" : "down"}`} disabled={!!why || !!busy || !ready} onClick={() => publicKey && send(`Limit ${side > 0n ? "buy" : "sell"} ${size} ${sym} at ${limit}`, [...prep.ixs, C.placeOrder(publicKey, v.key, { index: free[0], kind: C.ORDER.LIMIT, reduceOnly: reduce, size: q, trigger: e6(px) }, state.sub)])}>
           {busy ? `${busy}…` : `Place limit ${side > 0n ? "buy" : "sell"}`}
         </button>
         {why && why !== "Enter a size" && <div className="why">{why}</div>}
@@ -1086,8 +1130,9 @@ function StandingForm({ mode, side, state, send: wsend, busy }: { mode: "limit" 
   }
 
   const total = n(size), k = Math.floor(n(slices)), mins = n(minutes);
+  const prep = isoPrep(state, publicKey, lev, reduce ? 0n : e6(total) * side);
   const interval = k > 0 ? Math.round(mins * 60 / k) : 0;
-  const why = need ?? (!free.length ? "All 8 order slots on this market are in use: cancel one first" : !total ? "Enter a size" : k < 2 || k > 500 ? "Between 2 and 500 slices" : interval < 10 ? "Slices must be at least 10 seconds apart: use fewer slices or a longer time" : undefined);
+  const why = need ?? (!free.length ? "All 8 order slots on this market are in use: cancel one first" : !total ? "Enter a size" : k < 2 || k > 500 ? "Between 2 and 500 slices" : interval < 10 ? "Slices must be at least 10 seconds apart: use fewer slices or a longer time" : reduce && !state.trader ? "Nothing to reduce: this isolated account holds no position" : isoShort(state, prep.topUp));
   return (
     <div className="sform">
       <label className="inp"><span>Total size</span><input value={size} onChange={digits(setSize)} placeholder="0.00" inputMode="decimal" /><em>{sym}</em></label>
@@ -1100,9 +1145,10 @@ function StandingForm({ mode, side, state, send: wsend, busy }: { mode: "limit" 
         <div><span>Each slice</span><b className="mono">{k >= 2 && total ? `${fmt(total / k, 4).replace(/\.?0+$/, "")} ${sym} (${money(total / k * priceN)})` : "—"}</b></div>
         <div><span>One slice every</span><b className="mono">{interval ? (interval >= 120 ? `${fmt(interval / 60, 1)} min` : `${interval} s`) : "—"}</b></div>
         <div><span>Total value</span><b className="mono">{money(total * priceN)}</b></div>
+        {isoLine(state, prep.topUp, lev)}
         {k >= 2 && <KeeperLine lamports={C.keeperBudget(C.ORDER.TWAP, k)} />}
       </div>
-      <button className={`submit ${side > 0n ? "up" : "down"}`} disabled={!!why || !!busy || !ready} onClick={() => { if (!publicKey) return; const at = free[0], q = e6(total) * side; send(`TWAP ${side > 0n ? "buy" : "sell"} ${size} ${sym}`, [C.placeOrder(publicKey, v.key, { index: at, kind: C.ORDER.TWAP, reduceOnly: reduce, size: q, trigger: 0n, interval, slices: k }, state.sub)]).then(sig => sig && keepTwapPlan(C.orderAddress(v.key, C.accountOwner(publicKey, state.sub), at), { total: q, slices: k, sig })); }}>
+      <button className={`submit ${side > 0n ? "up" : "down"}`} disabled={!!why || !!busy || !ready} onClick={() => { if (!publicKey) return; const at = free[0], q = e6(total) * side; send(`TWAP ${side > 0n ? "buy" : "sell"} ${size} ${sym}`, [...prep.ixs, C.placeOrder(publicKey, v.key, { index: at, kind: C.ORDER.TWAP, reduceOnly: reduce, size: q, trigger: 0n, interval, slices: k }, state.sub)]).then(sig => sig && keepTwapPlan(C.orderAddress(v.key, C.accountOwner(publicKey, state.sub), at), { total: q, slices: k, sig })); }}>
         {busy ? `${busy}…` : `Start TWAP ${side > 0n ? "buy" : "sell"}`}
       </button>
       {why && why !== "Enter a size" && <div className="why">{why}</div>}
