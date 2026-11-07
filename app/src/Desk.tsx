@@ -14,6 +14,7 @@ import * as C from "./chain";
 import { readDirect } from "./view";
 import { T } from "./theme";
 import Chart, { DayStats, HeatLevel, Trade, useDayStats } from "./Chart";
+import LiqMap from "./LiqMap";
 import * as S from "./social";
 import { Mark, marksFor, useBoard, useMe, useNotes, usePictures } from "./Traders";
 import { Liquidations, PULSE, PULSE_BOARD_MS, Whale, marketFills, useVolume } from "./Pulse";
@@ -309,9 +310,14 @@ function Charts({ sym, price, lines, linesOf, compare, marks, mine, whales, heat
     try { localStorage.setItem("pv:chart-panes", JSON.stringify(next)); } catch { /* storage unavailable */ }
   };
   const picker = <LayoutPick layout={layout} choose={choose} />;
+  // The liquidation map in place of the main chart (LiqMap), on a button of its bar.
+  const [map, setMap] = useState(() => { try { return localStorage.getItem("pv:liqmap-on") === "1"; } catch { return false; } });
+  const showMap = (on: boolean) => { setMap(on); try { localStorage.setItem("pv:liqmap-on", on ? "1" : "0"); } catch { /* none */ } };
+  const mapBtn = <button className="btn tiny liqmap-open" onClick={() => showMap(true)} title="How much would be liquidated at each price: longs below, shorts above">Liq map</button>;
   return (
     <div className={`charts l-${layout}`}>
-      <Chart symbol={sym} price={price} lines={lines} compare={compare} marks={marks} mine={mine} whales={whales} heat={heat} dense={n > 1} head={<>{picker}{n > 1 && <div className="pane-sym main"><b>{sym}</b></div>}</>} />
+      {map ? <LiqMap symbol={sym} price={price} exact={heat} back={() => showMap(false)} />
+        : <Chart symbol={sym} price={price} lines={lines} compare={compare} marks={marks} mine={mine} whales={whales} heat={heat} dense={n > 1} head={<>{picker}{mapBtn}{n > 1 && <div className="pane-sym main"><b>{sym}</b></div>}</>} />}
       {Array.from({ length: n - 1 }, (_, k) => {
         const i = k + 1, s = paneSym(i);
         return (

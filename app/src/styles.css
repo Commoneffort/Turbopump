@@ -1302,3 +1302,25 @@ h3 { margin: 0 0 12px; font-size: 15px; font-weight: 600; }
 .oneclick-b { display: flex; gap: 8px; flex-wrap: wrap; }
 .setup .check { display: flex; gap: 8px; align-items: flex-start; font-size: 12px; color: var(--muted); line-height: 1.4; }
 .setup .check input { margin-top: 2px; }
+
+/* ---------------------------------------------------------------- liquidation map (LiqMap.tsx) */
+.lmap { display: flex; flex-direction: column; min-height: 0; min-width: 0; align-self: stretch; background: var(--panel); }
+.desk-chart .charts > .lmap { min-height: 420px; }
+.lmap-bar { flex-wrap: wrap; gap: 8px 12px; flex: none; }
+.lmap-title { font-size: 12.5px; }
+.lmap-body { flex: 1; min-height: 260px; position: relative; overflow: hidden; }
+/* (Drawn over the whole body, so its size follows the panel rather than setting it.) */
+.lmap-body > svg { position: absolute; inset: 0; }
+.lmap-body .quiet { padding: 24px; }
+.lmap-foot { flex: none; padding: 6px 12px 8px; font-size: 11px; color: var(--muted); border-top: 1px solid var(--line); }
+.liqmap-open { margin-left: 4px; }
+.lm-grid { stroke: var(--line); stroke-width: 1; }
+.lm-tick { fill: var(--muted); font: 10.5px var(--mono); }
+.lm-sub { font-size: 9.5px; opacity: .7; }
+.lm-now { stroke: var(--text); stroke-width: 1.2; stroke-dasharray: 4 3; }
+.lm-now-box { fill: var(--text); }
+.lm-now-t { fill: var(--panel); font: 600 11.5px var(--mono); }
+.lm-cum { opacity: .95; }
+.lm-tip { fill: var(--raised, #1f2228); stroke: var(--line-2); }
+.lm-tip-h { fill: var(--text); font: 600 11.5px var(--mono); }
+.lm-tip-t { fill: var(--muted); font: 11px var(--sans, inherit); }
