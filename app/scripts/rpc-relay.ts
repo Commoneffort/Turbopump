@@ -95,8 +95,11 @@ function retry(job: Job, wait: number, why: string) {
 const server = http.createServer((req, res) => {
   if (req.method !== "POST") return res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ relay: UP, queued: queue.length, ...used(), caps: { SHORT_MAX, HEAVY_MAX }, ...stats }));
   const chunks: Buffer[] = [];
-  req.on("data", c => chunks.push(c));
+  let size = 0;
+  // (Only local processes reach the relay; still, a body is never more than 2 MB.)
+  req.on("data", c => { size += c.length; if (size > 2_000_000) { res.writeHead(413).end(); req.destroy(); } else chunks.push(c); });
   req.on("end", () => {
+    if (size > 2_000_000) return;
     const body = Buffer.concat(chunks);
     let calls: any[] = [];
     try { const j = JSON.parse(body.toString()); calls = Array.isArray(j) ? j : [j]; } catch { /* forwarded as is */ }

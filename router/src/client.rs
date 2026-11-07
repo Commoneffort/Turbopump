@@ -907,8 +907,8 @@ pub fn trigger_copy_across(payer: &Pubkey, t: &TraderKeys, leader: &Pubkey, lead
 
 /// Opens or renews `wallet`'s liquidation shield on `market` (see `shield`): `step` collateral
 /// atoms at a time, at most `max_total`, acting within `trigger_bps` of the liquidation floor.
-/// The wallet also approves the router's authority as delegate of its token account
-/// (`spl_token::instruction::approve`) for up to `max_total`.
+/// The wallet also approves the shield's own address (`shield_address`) as delegate of its token
+/// account (`spl_token::instruction::approve`) for up to `max_total`.
 pub fn set_shield(wallet: &Pubkey, market: &Pubkey, step: u64, max_total: u64, trigger_bps: u16) -> Instruction {
     let mut data = vec![crate::TAG_SET_SHIELD];
     data.extend_from_slice(&step.to_le_bytes());

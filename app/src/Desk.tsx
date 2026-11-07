@@ -1223,7 +1223,8 @@ function Account({ state, send, busy, held, row, vaults, accounts }: { state: C.
 
 /** Liquidation shield (router `shield`): margin added from the wallet, in steps, when the main
  *  account gets near liquidation, instead of being liquidated. The wallet approves the router as
- *  delegate of its USDC account for the total (its own approval, revoked when it is turned off). */
+ *  delegate of its USDC account for the total: the delegate is the shield's own address, which
+ *  signs for nothing else (its own approval, revoked when it is turned off). */
 const SHIELD_DIST = [[1_000, "10%"], [2_500, "25%"], [5_000, "50%"]] as const;
 function ShieldPanel({ send, busy }: { send: Send; busy?: string }) {
   const { publicKey } = useWallet();
@@ -1266,7 +1267,7 @@ function ShieldPanel({ send, busy }: { send: Send; busy?: string }) {
         <div className="oneclick-b">
           <button className="btn white" disabled={!!busy || bad} onClick={() => send("Turn on the liquidation shield", [
             createAssociatedTokenAccountIdempotentInstruction(publicKey, C.ata(publicKey, C.MINT), publicKey, C.MINT),
-            createApproveInstruction(C.ata(publicKey, C.MINT), C.routerAuthority(), publicKey, BigInt(Math.round(to * C.USDC))),
+            createApproveInstruction(C.ata(publicKey, C.MINT), C.shieldAddress(publicKey), publicKey, BigInt(Math.round(to * C.USDC))),
             C.setShield(publicKey, BigInt(Math.round(st * C.USDC)), BigInt(Math.round(to * C.USDC)), dist),
           ]).then(() => { setOpen(false); setN(x => x + 1); })}>Approve in wallet</button>
           <button className="btn" onClick={() => setOpen(false)}>Cancel</button>

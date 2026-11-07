@@ -92,3 +92,47 @@ Release process: `deploy/release-check.sh` builds each binary twice from a commi
 - **Reported prices.** The reporter key (compiled into the router) can post a price for any feed. On Solana the router lets such a price move a mark only for a queued request that has waited 20 seconds past its target without a Pyth price, and only as the first price at or after that target as the reporter states it. Within that window the reporter chooses the price those requests fill at, and its publish times are its own word. To use it, it has to keep Pyth's price for that target off the chain for 20 seconds, which any other executor defeats by posting it. In an X1 build there is no Pyth and the reporter is the oracle for every mark, fill, settlement and listing: that deployment is only as trustworthy as the reporter key and the price service behind it. The witness key must confirm each reported price, but today both keys and both price services run on the same server, so whoever controls that server controls X1's prices; the witness belongs on a separate machine with its own provider.
 - **No funding; a holding fee instead.** Funding is built but switched off (it blocked fills: see the Docs, Funding). Since 2026-10-29 the router charges the crowded side a holding fee for the vault instead (up to 0.01%/h at the vault's limit), collected when the trader withdraws. A trader who loses everything never pays it (the vault already has their loss), and it is booked only when the account next trades on that asset. The vault's exposure is still bounded by its limit (2× NAV on BTC and ETH, 1× elsewhere).
 - **An unwind closes the market out.** `Unwind` deleverages the traders on the other side of the vault, pro rata, at the mark, and Percolator then takes no new position on that market until every position on it is closed. Anyone can queue a close-out for any trader there (`RequestClose`); it executes at the first Pyth price after its target, so it gives nobody a price they know. A trader who holds a position through an unwind therefore has it closed at a Pyth price within a few minutes, without choosing to. The trigger needs a deposit or withdrawal to have waited a full extra epoch while the vault could not get flat.
+
+## Review of the 2026-11-06/07 work (2026-11-07)
+
+Read with an attacker's view after maker quotes at the quoted price, trading keys v2, standing
+orders by key, strategy orders, the liquidation tape and trigger, the liquidation shield, copy
+across markets, the fee sponsor, the locked test wallet and the Strategies page. Fixed before release:
+- **Any matcher could set a trade's price (engine fork, critical).** Our fork's `FLAG_AT_PRICE`
+  moves `size × (price − effective)` between the two accounts, and any LP's matcher can return it,
+  not only our vault's makers. A taker calling Percolator directly against an unknown LP could have
+  been charged far from the market. The engine now refuses a price more than 1%
+  (`AT_PRICE_BAND_BPS`) from its own effective price, whoever calls (`fork_trade_at_price_is_bounded_*`).
+- **A key's orders outlived the key.** Standing orders placed by a trading key (a grid level turns
+  around forever) kept trading after the key's approval ended and outside its daily caps. An order
+  a key places now expires with the key's approval (`session::key_expiry`).
+- **The shield's approval named the router's general authority.** That address also signs the
+  router's calls into the vault program. The delegate is now the shield account itself, which the
+  router signs for only in `TriggerShield`: the approval is useless anywhere else.
+- **Published strategies were used as written.** A recipe is someone else's data, and the test
+  wallet signs without asking. Recipes are now checked and clamped (ticker names, at most 8 levels,
+  $100,000 a level, sane percentages), invalid ones dropped, and "use" shows what it places and asks.
+- **The fee sponsor topped up keys of wallets with no trading account.** It now requires the
+  wallet's main trading account on the approval's market.
+- Smaller: the local RPC relay caps a request body at 2 MB.
+
+Checked and found sound: a trading key cannot withdraw, deposit, copy, set a shield, or trade for
+another wallet or market (every path goes through `session::authorize`, which needs the session the
+key is named in); cancelling by key returns rent only to the wallet; a stranger cannot place or
+cancel orders on someone's account; the shield moves only from a token account the wallet owns into
+its own main account, only near liquidation, never past the total, the approval or the balance, and
+books the deposit in the track record (so it cannot pass for profit); the liquidation tape is
+written only by the router at liquidating fills and read by address and owner; trade notes count
+only when signed by the trader or its approved key in the same transaction as the trade; the test
+wallet's key is encrypted at rest and exported only after a fresh unlock; the fee sponsor signs only
+a transfer it builds itself, to an approved key under 0.02 XNT, 3 times a day.
+
+Accepted, for now:
+- Someone can liquidate small accounts of their own to push a market's liquidation tape over the
+  level of others' liquidation triggers. It costs them the liquidations; triggers are a signal,
+  not a guarantee.
+- An executor that leaves the tape out of a liquidating fill records nothing (ours includes it).
+- Faucet and fee sponsor limits are per server instance and fit a test network only; the mainnet
+  rule is in the docs' Path to mainnet (sponsored gas as a debt repaid at withdrawal).
+- The engine program fills its X1 account to within 240 bytes: the next engine change needs the
+  account extended first (`upgrade-program.sh` does it when a build is larger).

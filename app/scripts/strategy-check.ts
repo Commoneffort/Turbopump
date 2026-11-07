@@ -56,7 +56,7 @@ async function send(ixs: TransactionInstruction[], signers: Keypair[], units = 6
   await send([SystemProgram.transfer({ fromPubkey: w.publicKey, toPubkey: BOARD, lamports: 0 }), new TI({ programId: MEMO, keys: [{ pubkey: w.publicKey, isSigner: true, isWritable: false }], data: Buffer.from("tps:" + JSON.stringify(spec), "utf8") })], [w]);
   say("ok   published", JSON.stringify(spec.name));
   // A shield: 5 USDC a step, 20 in all, within 25% of liquidation. Healthy now: refused.
-  await send([createApproveInstruction(C.ata(w.publicKey, C.MINT), C.routerAuthority(), w.publicKey, 20n * BigInt(C.USDC)), C.setShield(w.publicKey, 5n * BigInt(C.USDC), 20n * BigInt(C.USDC), 2_500)], [w]);
+  await send([createApproveInstruction(C.ata(w.publicKey, C.MINT), C.shieldAddress(w.publicKey), w.publicKey, 20n * BigInt(C.USDC)), C.setShield(w.publicKey, 5n * BigInt(C.USDC), 20n * BigInt(C.USDC), 2_500)], [w]);
   const sh = C.decodeShield(C.shieldAddress(w.publicKey), new Uint8Array((await conn.getAccountInfo(C.shieldAddress(w.publicKey)))!.data));
   say("ok   shield on chain:", Number(sh.step) / 1e6, "USDC a step,", Number(sh.maxTotal) / 1e6, "in all, within", sh.triggerBps / 100, "%");
   try { await send([C.triggerShield(payer.publicKey, w.publicKey)], [payer]); say("FAIL shield triggered on a healthy account"); }

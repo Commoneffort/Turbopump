@@ -2,8 +2,9 @@
 //! account to its own main trading account when that account gets close to liquidation, in steps,
 //! instead of being liquidated.
 //!
-//! The wallet approves the router's authority as a delegate of its USDC account for at most a
-//! total (an SPL token approval, which only the wallet can give and can revoke at any time), and
+//! The wallet approves its shield account (a router address of its own, which signs nothing but
+//! `TriggerShield`) as delegate of its USDC account for at most a total (an SPL token approval,
+//! which only the wallet can give and can revoke at any time), and
 //! opens a shield here naming the step, the total and how close to liquidation it acts. From then
 //! on anyone (the executors do) may send `TriggerShield`, which moves one step:
 //!   - only from a token account the wallet owns, and only into that wallet's main trading account
@@ -11,7 +12,8 @@
 //!   - only while the account's equity is under its liquidation floor plus `trigger_bps` (the same
 //!     figures the router liquidates on, fees owed included);
 //!   - never more than the step, what is left of the total, the approval or the balance.
-//! Nothing else can use the approval: the router signs as delegate in this instruction only.
+//! Nothing else can use the approval: the delegate is the shield's own address, which the router
+//! signs for in this instruction only (not the router's general authority).
 use bytemuck::{Pod, Zeroable};
 use solana_program::{account_info::AccountInfo, clock::Clock, entrypoint::ProgramResult, msg, program::invoke_signed, program_pack::Pack, pubkey::Pubkey, system_program, sysvar::Sysvar};
 
@@ -115,9 +117,9 @@ fn near_liquidation(market: &[u8], portfolio: &[u8], tiers: Option<&state::Tiers
 /// TriggerShield (anyone): moves one step of margin from the wallet's token account into its
 /// main trading account, when it is near liquidation.
 ///
-/// Accounts: 0 payer [s], 1 shield [w], 2 trader, 3 wallet's token account [w], 4 collateral [w],
-/// 5 portfolio [w], 6 market [w], 7 Percolator collateral vault [w], 8 router authority, 9 token
-/// program, 10 Percolator program; then optionally the trader's fee ledger, the market's tiers and
+/// Accounts: 0 payer [s], 1 shield [w] (the delegate), 2 trader, 3 wallet's token account [w],
+/// 4 collateral [w], 5 portfolio [w], 6 market [w], 7 Percolator collateral vault [w], 8 (unused,
+/// kept for the layout: the router authority), 9 token program, 10 Percolator program; then optionally the trader's fee ledger, the market's tiers and
 /// the wallet's track record [w] (a deposit is booked in it).
 pub fn trigger_shield(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let (payer, shield_ai, trader_ai, source, collateral) = (acc(accounts, 0)?, acc(accounts, 1)?, acc(accounts, 2)?, acc(accounts, 3)?, acc(accounts, 4)?);
@@ -126,9 +128,10 @@ pub fn trigger_shield(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramR
     writable(shield_ai)?;
     key_is(token, &spl_token::ID)?;
     key_is(percolator, &PERCOLATOR_PROGRAM_ID)?;
-    let (ak, abump) = authority_address(program_id);
-    key_is(authority, &ak)?;
+    let _ = authority;
     let mut s: Shield = load(shield_ai, program_id, SHIELD_MAGIC)?;
+    let (sk, sbump) = shield_address(program_id, &s.market, &s.wallet);
+    key_is(shield_ai, &sk)?;
     // The wallet's main account on the shield's market, and a token account of the wallet's.
     let t = load_trader(program_id, trader_ai, &s.wallet)?;
     if t.sub != 0 {
@@ -144,7 +147,7 @@ pub fn trigger_shield(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramR
         return Err(RouterError::BadAccount.into());
     }
     // (The token program clears an approval once it is used up; the wallet may also revoke it.)
-    if src.delegate != solana_program::program_option::COption::Some(ak) {
+    if src.delegate != solana_program::program_option::COption::Some(sk) {
         return Err(RouterError::ShieldSpent.into());
     }
     let debt = carry::ledger_in(program_id, accounts, trader_ai.key).map_or(0, carry::total_owed);
@@ -156,9 +159,9 @@ pub fn trigger_shield(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramR
         return Err(RouterError::ShieldSpent.into());
     }
     invoke_signed(
-        &spl_token::instruction::transfer(&spl_token::ID, source.key, collateral.key, &ak, &[], amount)?,
-        &[source.clone(), collateral.clone(), authority.clone(), token.clone()],
-        &[&[SEED_AUTHORITY, &[abump]]],
+        &spl_token::instruction::transfer(&spl_token::ID, source.key, collateral.key, &sk, &[], amount)?,
+        &[source.clone(), collateral.clone(), shield_ai.clone(), token.clone()],
+        &[&[SEED_SHIELD, s.market.as_ref(), s.wallet.as_ref(), &[sbump]]],
     )?;
     let view = perc::read_portfolio(portfolio, market.key, trader_ai.key)?;
     invoke_signed(

@@ -1566,6 +1566,11 @@ fn place_order(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         _ => return Err(RouterError::BadOrder.into()),
     }
     session::authorize(program_id, accounts, wallet, &owner, market.key, session::notional(size, b.mark_price), o.reduce_only == 1)?;
+    // An order a trading key places expires with the key's approval (a grid level, for one,
+    // would otherwise go on trading after it).
+    if let Some(until) = session::key_expiry(program_id, accounts, wallet.key, &owner, market.key) {
+        o.expiry = if o.expiry == 0 { until } else { o.expiry.min(until) };
+    }
     create_pda(wallet, order_ai, system, program_id, ORDER_LEN, budget, &[SEED_ORDER, vault_ai.key.as_ref(), at.as_ref(), &[index], &[bump]])?;
     store(order_ai, &o)
 }

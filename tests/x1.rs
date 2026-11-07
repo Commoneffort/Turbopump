@@ -945,6 +945,7 @@ fn a_trading_key_places_and_cancels_orders() {
     let ok = percolator_router::state::order_address(&percolator_router::id(), &w.vault, &wallet, 1).0;
     let o: percolator_router::state::Order = bytemuck::pod_read_unaligned(&w.env.svm.get_account(&ok).unwrap().data);
     assert_eq!(o.wallet, wallet);
+    assert_eq!({ o.expiry }, now + 3600, "a key's order expires with the key's approval");
     // The key cancels it; the rent goes to the wallet, not the key.
     let before = w.env.svm.get_balance(&wallet).unwrap();
     w.send(vec![cancel_order_by_key(&key.pubkey(), &market, &wallet, &w.vault, 1)], &[&key]).expect("the key cancels");

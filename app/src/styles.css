@@ -1353,3 +1353,9 @@ h3 { margin: 0 0 12px; font-size: 15px; font-weight: 600; }
 .strat-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .strat-item { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
 .strat-head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+
+/* Dropdown lists: the browser draws them itself, and a transparent select left them white with
+   white text. Every option gets the panel's colours. */
+select { color-scheme: dark; }
+select option, select optgroup { background: var(--panel); color: var(--text); }
+.strat-fields .inp select, .strat-build .inp select { background: var(--panel); }

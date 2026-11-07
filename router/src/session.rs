@@ -211,3 +211,15 @@ pub(crate) fn authorize(program_id: &Pubkey, accounts: &[AccountInfo], actor: &A
 pub(crate) fn notional(size: i128, price: u64) -> u128 {
     size.unsigned_abs().saturating_mul(price as u128) / 1_000_000
 }
+
+/// When the trading key `actor` stops being approved for `wallet` on `market` (None when the
+/// wallet signs itself, or without a session). An order a key places expires by then: its orders
+/// do not outlive its approval.
+pub(crate) fn key_expiry(program_id: &Pubkey, accounts: &[AccountInfo], actor: &Pubkey, wallet: &Pubkey, market: &Pubkey) -> Option<i64> {
+    if actor == wallet {
+        return None;
+    }
+    let sk = session_address(program_id, market, wallet).0;
+    let ai = accounts.iter().find(|a| *a.key == sk)?;
+    load_session(ai, program_id).ok().map(|s| s.expires)
+}

@@ -35,6 +35,32 @@ const DEFAULTS: Record<Kind, Spec["p"]> = {
 };
 const num = (x: number | string | undefined, d = 0) => { const v = Number(x); return Number.isFinite(v) ? v : d; };
 
+/** A strategy as it may be used: every value checked and kept within sane bounds, symbols plain
+ *  ticker names. A published recipe is someone else's data: one that does not pass is dropped,
+ *  and nothing in it can make "use" place more than these bounds allow. */
+const SYM = /^[A-Z0-9]{1,12}$/;
+const clamp = (x: unknown, lo: number, hi: number, d: number) => { const v = Number(x); return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : d; };
+export function sanitize(x: any): Spec | null {
+  if (!x || x.v !== 1 || !(x.kind in KIND_NAME) || typeof x.sym !== "string" || !SYM.test(x.sym)) return null;
+  const kind = x.kind as Kind, p = x.p ?? {}, side = x.side === -1 ? -1 : 1;
+  const usd = clamp(p.usd, 1, 100_000, DEFAULTS[kind].usd as number);
+  const q: Spec["p"] =
+    kind === "grid" ? { rangePct: clamp(p.rangePct, 0.2, 50, 5), levels: Math.round(clamp(p.levels, 2, 8, 6)), usd }
+    : kind === "ladder" ? { steps: Math.round(clamp(p.steps, 1, 8, 4)), apartPct: clamp(p.apartPct, 0.1, 20, 1.5), usd, tpPct: clamp(p.tpPct, 0.1, 100, 3) }
+    : kind === "cross" ? { watch: typeof p.watch === "string" && SYM.test(p.watch) ? p.watch : "", movePct: clamp(p.movePct, -50, 50, -3), usd, tpPct: clamp(p.tpPct, 0.1, 100, 4), slPct: clamp(p.slPct, 0.1, 100, 3) }
+    : { other: typeof p.other === "string" && SYM.test(p.other) ? p.other : "", gapPct: clamp(p.gapPct, 0.1, 50, 2), usd };
+  if ((kind === "cross" && (!q.watch || q.watch === x.sym || !q.movePct)) || (kind === "pair" && (!q.other || q.other === x.sym))) return null;
+  return { v: 1, name: String(x.name ?? "").slice(0, 60), note: String(x.note ?? "").slice(0, 200), sym: x.sym, kind, side, p: q };
+}
+/** In words, what using `s` places: for the confirmation before anything is signed. */
+function describe(s: Spec): string {
+  const usd = num(s.p.usd);
+  if (s.kind === "grid") return `${num(s.p.levels)} grid levels on ${s.sym} across ±${num(s.p.rangePct)}% of today's price, $${usd} each (up to $${usd * num(s.p.levels)} in all)`;
+  if (s.kind === "ladder") return `${num(s.p.steps)} limit ${s.side > 0 ? "buys" : "sells"} on ${s.sym}, ${num(s.p.apartPct)}% apart, $${usd} each (up to $${usd * num(s.p.steps)} in all)`;
+  if (s.kind === "cross") return `one order: ${s.side > 0 ? "buy" : "sell"} $${usd} of ${s.sym} once ${s.p.watch} has moved ${num(s.p.movePct)}% from today's price`;
+  return `two orders: ${s.side > 0 ? "buy" : "sell"} $${usd} of ${s.sym} and ${s.side > 0 ? "sell" : "buy"} $${usd} of ${s.p.other} once ${s.sym}/${s.p.other} is ${num(s.p.gapPct)}% ${s.side > 0 ? "below" : "above"} today's ratio`;
+}
+
 async function candles(sym: string): Promise<Candle[]> {
   const h = await fetchCandles(sym, 3600, 720);
   return (h.candles as any[]).map(k => ({ t: k[0], o: k[1], h: k[2], l: k[3], c: k[4] }));
@@ -181,8 +207,8 @@ async function readPublished(conn: Connection): Promise<Published[]> {
     const k = seen.get(s.signature);
     if (!k) continue;
     try {
-      const spec = JSON.parse(s.memo!.slice(s.memo!.indexOf(PREFIX) + PREFIX.length)) as Spec;
-      if (spec?.v === 1 && DEFAULTS[spec.kind] && typeof spec.sym === "string") out.push({ ...k, spec: { ...spec, name: String(spec.name ?? "").slice(0, 60), note: String(spec.note ?? "").slice(0, 200) } });
+      const spec = sanitize(JSON.parse(s.memo!.slice(s.memo!.indexOf(PREFIX) + PREFIX.length)));
+      if (spec) out.push({ ...k, spec });
     } catch { /* not a strategy */ }
   }
   return out;
@@ -223,8 +249,11 @@ export default function StrategiesPage({ send, busy, go }: { send: Send; busy?: 
   const setP = (k: string, v: string) => setSpec(s => ({ ...s, p: { ...s.p, [k]: /^[A-Z]+$/.test(v) ? v : Number(v) } }));
   const field = (k: string, label: string, unit = "") => <label className="inp small" key={k}><span>{label}</span><input value={String(spec.p[k] ?? "")} onChange={e => setP(k, e.target.value.replace(/[^0-9.\-]/g, ""))} inputMode="decimal" />{unit && <em>{unit}</em>}</label>;
   const pick = (k: string, label: string) => <label className="inp small" key={k}><span>{label}</span><select value={String(spec.p[k])} onChange={e => setP(k, e.target.value)}>{syms.filter(x => x !== spec.sym).map(x => <option key={x}>{x}</option>)}</select></label>;
-  const apply = async (s: Spec) => {
+  const apply = async (raw: Spec) => {
+    const s = sanitize(raw);
     if (!publicKey) return;
+    if (!s) { window.alert("This strategy's settings are not valid."); return; }
+    if (!window.confirm(`Place on your account: ${describe(s)}.\n\nThey run on chain until filled, cancelled or expired. Continue?`)) return;
     const m = await connection.getAccountInfo(C.activeMarket());
     try {
       const ixs = await ordersFor(connection, s, publicKey, vaults, new Uint8Array(m!.data));
@@ -232,8 +261,9 @@ export default function StrategiesPage({ send, busy, go }: { send: Send; busy?: 
     } catch (e: any) { window.alert(String(e?.message ?? e)); }
   };
   const publish = async () => {
-    if (!publicKey || !spec.name.trim()) return;
-    const text = PREFIX + JSON.stringify({ ...spec, name: spec.name.trim().slice(0, 60), note: spec.note.trim().slice(0, 200) });
+    const clean = sanitize({ ...spec, name: spec.name.trim(), note: spec.note.trim() });
+    if (!publicKey || !clean || !clean.name) return;
+    const text = PREFIX + JSON.stringify(clean);
     const sig = await send(`Publish "${spec.name.trim()}"`, [SystemProgram.transfer({ fromPubkey: publicKey, toPubkey: BOARD, lamports: 0 }), new TransactionInstruction({ programId: MEMO, keys: [{ pubkey: publicKey, isSigner: true, isWritable: false }], data: Buffer.from(text, "utf8") })]);
     if (sig) setTimeout(() => setN(x => x + 1), 1500);
   };

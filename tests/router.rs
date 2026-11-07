@@ -1081,9 +1081,10 @@ fn a_shield_adds_margin_from_the_wallet_near_liquidation_and_only_then() {
     let (u, t) = (w.traders[&7].0.kp.insecure_clone(), w.traders[&7].1);
     let source = w.traders[&7].0.collateral;
     let k = w.keys.clone().unwrap();
-    let authority = rstate::authority_address(&percolator_router::id()).0;
+    // The delegate is the shield's own address: it signs for nothing but TriggerShield.
+    let delegate = percolator_router::shield::shield_address(&percolator_router::id(), &t.market, &u.pubkey()).0;
     // 2 USDC a step, 3 in all, acting within 50% above the liquidation floor.
-    let approve = spl_token::instruction::approve(&spl_token::ID, &source, &authority, &u.pubkey(), &[], 3_000_000).unwrap();
+    let approve = spl_token::instruction::approve(&spl_token::ID, &source, &delegate, &u.pubkey(), &[], 3_000_000).unwrap();
     w.send(vec![approve, rclient::set_shield(&u.pubkey(), &t.market, 2_000_000, 3_000_000, 5_000)], &[&u]).expect("open a shield");
     let trigger = |w: &mut World| { let ix = rclient::trigger_shield(&w.payer.pubkey(), &t, &source, &k.percolator_vault); w.send(vec![ix], &[]) };
     // Healthy (25% of notional against an 11% floor): nothing moves.

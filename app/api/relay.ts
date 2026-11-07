@@ -8,7 +8,8 @@
 //
 // The sponsor signs nothing but a transfer it builds itself, of TOPUP lamports to the key, and
 // only when:
-//   - the session account of (market, wallet) names that key, and has not expired;
+//   - the session account of (market, wallet) names that key, and has not expired, and the wallet
+//     has its main trading account on that market;
 //   - the key holds less than LOW lamports;
 //   - the key has had fewer than PER_DAY top-ups in the last day (per instance), and the sponsor
 //     fewer than GLOBAL_PER_MIN a minute, and the sponsor itself holds at least FLOOR.
@@ -52,14 +53,19 @@ export default async function handler(req: any, res: any) {
     // The key's approval on any of the network's markets (X1 runs five).
     const markets = x1 ? X1_MARKETS : [MARKET];
     const sessions = markets.map(m => PublicKey.findProgramAddressSync([Buffer.from("session"), new PublicKey(m).toBuffer(), wallet.toBuffer()], router)[0]);
-    const accs = await conn.getMultipleAccountsInfo([...sessions, key, sponsor.publicKey], "confirmed");
-    const approved = accs.slice(0, sessions.length).some(a => {
+    // The wallet's main trading account on each market: a key is topped up only for a wallet
+    // that has one on the market its approval is for.
+    const traders = markets.map(m => PublicKey.findProgramAddressSync([Buffer.from("trader"), new PublicKey(m).toBuffer(), wallet.toBuffer()], router)[0]);
+    const accs = await conn.getMultipleAccountsInfo([...sessions, ...traders, key, sponsor.publicKey], "confirmed");
+    const n = sessions.length;
+    const approved = accs.slice(0, n).some((a, i) => {
       if (!a || !a.owner.equals(router) || !SESSION_LENS.has(a.data.length)) return false;
-      const d = a.data;
-      return new PublicKey(d.subarray(40, 72)).equals(wallet) && new PublicKey(d.subarray(72, 104)).equals(key) && Number(d.readBigInt64LE(104)) > now / 1000 + 60;
+      const d = a.data, t = accs[n + i];
+      return new PublicKey(d.subarray(40, 72)).equals(wallet) && new PublicKey(d.subarray(72, 104)).equals(key) && Number(d.readBigInt64LE(104)) > now / 1000 + 60
+        && !!t && t.owner.equals(router);
     });
-    if (!approved) return refuse("no trading key of this wallet's is approved now");
-    const held = accs[sessions.length]?.lamports ?? 0, have = accs[sessions.length + 1]?.lamports ?? 0;
+    if (!approved) return refuse("no trading key of this wallet's is approved now, on a market where it has a trading account");
+    const held = accs[2 * n]?.lamports ?? 0, have = accs[2 * n + 1]?.lamports ?? 0;
     if (held >= LOW) return refuse("the key still has XNT for its fees", 409);
     if (have < FLOOR + TOPUP) return refuse("the fee sponsor is out of funds", 503);
     const tx = new Transaction().add(SystemProgram.transfer({ fromPubkey: sponsor.publicKey, toPubkey: key, lamports: TOPUP }));
