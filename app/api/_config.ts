@@ -36,6 +36,8 @@ export const NETWORKS = {
   devnet: { rpc: process.env.RPC_URL ?? "https://api.devnet.solana.com", market: MARKET, mint: "FT7B8rR8NN1ciyGPmTDT8AxUUWtF1PGc4NCmuisYVPkh", faucetSecret: "FAUCET_SECRET", coin: "SOL", drip: 0.3, lowWater: 0.2 },
   "x1-testnet": { rpc: process.env.X1_RPC_URL ?? "https://rpc.testnet.x1.xyz", market: "281YHBA8J4DyU8yiyjZJgWE7FaA5G1ax4F5iPeB3WSZn", mint: "7jpUVrakCqTm68aatnDHYe7qhSF7Zq39PWoSKM1u2Aaw", faucetSecret: "FAUCET_SECRET_X1", coin: "XNT", drip: 2, lowWater: 1 },
 };
+/** Every Percolator market of the X1 deployment (the original and the four of the split). */
+export const X1_MARKETS = ["281YHBA8J4DyU8yiyjZJgWE7FaA5G1ax4F5iPeB3WSZn", "5fBaKk5DzL7wz35n3LwwUM9Y1DnEXvYhjof5NyRYpFt1", "74jd4xa2KiSrT126d96NcQBGiAjm6JjZZQ5g5NXcfmZc", "EHurKZwocopwjYTJDjtBBWwZkKuwXrSj598NhX753VqT", "7a56g7R3NtdFQsHZcAZmydRjEzYRJkiv8qqhPoEDe1p1"];
 export const networkOf = (req: any) => (req?.query?.network === "x1-testnet" ? NETWORKS["x1-testnet"] : NETWORKS.devnet);
 
 /** Wallets that seeded demo activity (scripts/seed.ts). The site labels them. */

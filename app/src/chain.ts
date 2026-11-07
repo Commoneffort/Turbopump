@@ -714,22 +714,13 @@ export async function marketSnapshot(conn: Connection, commitment: Commitment = 
  *  can use several hundred thousand units, and the fee does not depend on the request. On X1 a
  *  transaction pays 10 lamports for every unit it asks for, used or not (0.014 XNT at the
  *  maximum), so it asks for what a simulation says it uses, plus `spare`. */
-/** The fee sponsor (api/relay) of this network, read once. */
-let sponsorKey: Promise<PublicKey | null> | undefined;
-export const feeSponsor = () => (sponsorKey ??= fetch(`/api/relay?network=${NETWORK}`).then(r => r.ok ? r.json() : null).then(j => j?.sponsor ? new PublicKey(j.sponsor) : null).catch(() => null));
-/** Sends a trade signed by a trading key with the fee sponsor as fee payer: the key signs, the
- *  relay checks and adds the sponsor's signature, and sends it. Returns the signature. */
-export async function sponsoredSend(key: { publicKey: PublicKey; sign: (m: Uint8Array) => Promise<Uint8Array> }, ixs: TransactionInstruction[], pre: TransactionInstruction[], conn: Connection, sign: (k: any, tx: Transaction) => Promise<Transaction>): Promise<string> {
-  const sponsor = await feeSponsor();
-  if (!sponsor) throw new Error(`the one-click trading key has no ${COIN} left for fees: add ${COIN} to it, below the ticket`);
-  const tx = new Transaction().add(...pre, ...ixs);
-  tx.recentBlockhash = await recentBlockhash(conn);
-  tx.feePayer = sponsor;
-  await sign(key, tx);
-  const r = await fetch(`/api/relay?network=${NETWORK}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tx: tx.serialize({ requireAllSignatures: false }).toString("base64") }) });
+/** Asks the fee sponsor (api/relay) to top up `key`, `wallet`'s approved trading key, when it has
+ *  run out of XNT for its fees: 0.1 XNT, up to 3 times a day per key. Resolves once it landed. */
+export async function sponsorTopUp(conn: Connection, wallet: PublicKey, key: PublicKey): Promise<void> {
+  const r = await fetch(`/api/relay?network=${NETWORK}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ wallet: wallet.toBase58(), key: key.toBase58() }) });
   const j = await r.json().catch(() => ({}));
-  if (!r.ok || !j.sig) throw new Error(`the one-click trading key has no ${COIN} left for fees (${j.error ?? "the fee sponsor did not take it"}): add ${COIN} to it, below the ticket`);
-  return j.sig;
+  if (!r.ok || !j.sig) throw new Error(`the one-click trading key has no ${COIN} left for fees (${j.error ?? "the fee sponsor did not top it up"}): add ${COIN} to it, below the ticket`);
+  await confirmFast(conn, j.sig);
 }
 
 /** Waits until `sig` is confirmed (up to 60 s); throws if it failed. The RPC pushes the result
@@ -1857,6 +1848,8 @@ export async function quotedTrade(conn: Connection, v: Vault, wallet: PublicKey,
   // (TakeQuote brings the maker's and the taker's accounts and the asset to the current slot
   // itself, cranking only what needs it: the transaction is the signature check and the trade.)
   const ixs = takeQuoteIxs(v, wallet, sub, q, [], actor);
+  // (The key pays, as it will: a second payer would make the transaction too large. A key with no
+  // XNT is topped up by the fee sponsor first: Desk `trade`, `C.sponsorTopUp`.)
   const sim = await conn.simulateTransaction(new VersionedTransaction(new TransactionMessage({ payerKey: actor ?? wallet, recentBlockhash: PublicKey.default.toBase58(), instructions: [ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }), ...ixs] }).compileToV0Message()), { sigVerify: false, replaceRecentBlockhash: true }).catch(() => null);
   if (!sim || sim.value.err) return null;
   // (More room than simulated: the transaction may land a slot later, with more to catch up.)

@@ -82,10 +82,11 @@ function useSend(onDone: () => void): [Send, string | undefined, Toast | undefin
               try {
                 sig = await connection.sendRawTransaction(tx.serialize());
               } catch (e: any) {
-                // The key has no XNT left for the fee: our fee sponsor pays it for a maker-quote
-                // trade (api/relay checks the key is approved and the sponsor's XNT pays nothing else).
+                // The key has no XNT left for its fee: our fee sponsor tops it up (api/relay: only
+                // an approved key, 0.1 XNT, 3 times a day), then the same transaction goes again.
                 if (!C.X1 || !/no record of a prior credit|insufficient (funds|lamports)/i.test(String(e?.message ?? e) + (e?.logs ?? []).join(" "))) throw e;
-                sig = await C.sponsoredSend(opts.key, ixs, sized ? [] : [await C.computeLimit(connection, opts.key.publicKey, ixs)], connection, signWithKey);
+                await C.sponsorTopUp(connection, wallet.publicKey, opts.key.publicKey);
+                sig = await connection.sendRawTransaction(tx.serialize());
               }
               if (C.X1) await C.confirmFast(connection, sig);
               else await connection.confirmTransaction(sig, "confirmed");

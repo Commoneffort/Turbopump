@@ -231,6 +231,11 @@ the key as the signer for that wallet's accounts on that market, and nothing els
   the wallet (less if the wallet can't spare it; about 140 quoted trades); an "Add XNT" button
   tops it up, and turning it off sends what is left back.
 
+Fee sponsor (`app/api/relay.ts`, 2026-11-07): an approved key that runs out of XNT gets 0.1 XNT from
+the sponsor (3 times a day per key; only to a key a live session names; the server builds the
+transfer itself). A first version co-signed trades as their fee payer, but the second signer makes
+a quoted trade 1,239 bytes, over the 1,232 limit. Live: `app/scripts/sponsor-check.ts`.
+
 Tests: `tests/x1.rs` `a_trading_key_trades_within_its_limits_and_nothing_else` (limits out of
 range, a trade by the key, the size limit, a queued trade by the key, a withdrawal by the key
 refused, the daily limit, a close beyond the limit allowed, replacing the key, expiry, the key

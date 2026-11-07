@@ -688,6 +688,9 @@ function Ticket({ state, send, busy, copying, margin, setMargin, vaults }: { sta
     if (!publicKey) return;
     const cb = (q: { units: number; ixs: TransactionInstruction[] }) => [ComputeBudgetProgram.setComputeUnitLimit({ units: q.units }), ...q.ixs];
     if (actor && keyOpts) {
+      // A key out of XNT for its fees is topped up by the fee sponsor first (api/relay), so the
+      // user never has to add XNT; if the sponsor cannot, the wallet takes the trade below.
+      if (C.X1 && ok.lamports < 20_000_000) await C.sponsorTopUp(connection, publicKey, actor).then(() => ok.reload()).catch(() => {});
       let first = C.QUOTES_ON ? await C.quotedTrade(connection, v, publicKey, sub, size, 6, 1_500, true, actor).catch(() => null) : null;
       const canQueue = ok.lamports >= queueCoins(size);
       if (first || canQueue) {

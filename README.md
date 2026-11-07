@@ -288,8 +288,8 @@ Live on X1 testnet since 2026-11-06 (details, measurements and the rollback tag 
   trades on one of them.
 - **One-click trading:** a random, non-extractable browser key approved on chain (tags 39/40)
   signs trades and standing orders with no wallet popup, within a size a trade, trades a day, a
-  total a day and a quote band; it ends itself after 2 hours idle; a fee sponsor (`api/relay`) pays
-  its quoted trades' fees when it has no XNT; setup in one approval; the key falls back to the
+  total a day and a quote band; it ends itself after 2 hours idle; a fee sponsor (`api/relay`) tops
+  an approved key up with 0.1 XNT when it runs out (3 a day); setup in one approval; the key falls back to the
   wallet when it cannot cover a queued order.
 - **Across markets:** copying a leader on another market (`TriggerCopy` with the leader's market
   and vault), Earn deposits spread over all five markets' vaults, per-asset makers on the original
