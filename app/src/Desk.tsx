@@ -7,7 +7,7 @@
 import { CSSProperties, Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
-import { ComputeBudgetProgram, Connection, PublicKey, SystemProgram, TransactionInstruction } from "@solana/web3.js";
+import { ComputeBudgetProgram, Connection, PublicKey, SystemProgram, Transaction, TransactionInstruction } from "@solana/web3.js";
 import { OneClickPanel, SetupCard, sendOrders, useTradingKey } from "./OneClick";
 import { createAssociatedTokenAccountIdempotentInstruction, createTransferCheckedInstruction } from "@solana/spl-token";
 import * as C from "./chain";
@@ -185,9 +185,12 @@ function DeskInner({ vaultKey, markets, day, send, busy, tick, go }: { vaultKey:
   const asset = state?.vault.assetIndex ?? -1;
   // (Badge pictures are checked and loaded a moment after the board arrives: the marks follow.)
   const pictures = usePictures();
-  const notes = useNotes(leaders, tick);
+  // Your own trades' notes too, on your own chart (only the trades that carry one are marked).
+  const self = publicKey?.toBase58();
+  const noteWallets = useMemo(() => (self && !leaders.includes(self) ? [...leaders, self] : leaders), [leaders.join(","), self]);
+  const notes = useNotes(noteWallets, tick);
   const copied = me.copy?.leader.toBase58();
-  const marks = useMemo(() => marksFor(board, leaders, asset, notes, copied), [board, leaders.join(","), asset, pictures, notes, copied]);
+  const marks = useMemo(() => [...marksFor(board, leaders, asset, notes, copied), ...(self && !leaders.includes(self) ? marksFor(board, [self], asset, notes).filter(m => m.note) : [])].sort((a, b) => a.time - b.time), [board, leaders.join(","), asset, pictures, notes, copied, self]);
   // Every fill on this market by anyone: the trades list, the queue's fills and the chart's whales.
   const marketTrades = useMemo(() => marketFills(board, asset), [board, asset]);
   // This wallet's own fills on this market (green and red dots on the chart): its track record's,
@@ -516,7 +519,13 @@ function Ticket({ state, send, busy, copying, margin, setMargin, vaults }: { sta
   const [text, setText] = useState("");
   // An optional note for the trader's followers, sent with the trade (see S.tradeNote).
   const [note, setNote] = useState("");
-  const withNote = (ixs: TransactionInstruction[]) => (publicKey && S.cleanNote(note) ? [...ixs, S.tradeNote(publicKey, note)] : ixs);
+  // A quoted trade's transaction is near the size limit: with a long note it may not fit, and the
+  // trade then goes through the queue (a far smaller transaction), keeping the note.
+  const fits = (ixs: TransactionInstruction[], payer: PublicKey) => {
+    try { return new Transaction({ feePayer: payer, recentBlockhash: PublicKey.default.toBase58() }).add(...ixs).serialize({ requireAllSignatures: false, verifySignatures: false }).length <= 1232; } catch { return false; }
+  };
+  // (Signed by whoever signs the trade: the wallet, or with one-click trading its key.)
+  const withNote = (ixs: TransactionInstruction[], by?: PublicKey) => (publicKey && S.cleanNote(note) ? [...ixs, S.tradeNote(by ?? publicKey, note)] : ixs);
   const sendNoted = async (l: string, ixs: TransactionInstruction[]) => { const r = await send(l, withNote(ixs)); if (r) setNote(""); return r; };
   const [unit, setUnit] = useState<"coin" | "usd">("coin");
   const [mode, setMode] = useState<"market" | "limit" | "protect" | "twap">("market");
@@ -694,20 +703,22 @@ function Ticket({ state, send, busy, copying, margin, setMargin, vaults }: { sta
       let first = C.QUOTES_ON ? await C.quotedTrade(connection, v, publicKey, sub, size, 6, 1_500, true, actor).catch(() => null) : null;
       const canQueue = ok.lamports >= queueCoins(size);
       if (first || canQueue) {
-        return send(label, async conn => {
+        const r = await send(label, async conn => {
           // (A try after a failure in passing gets a fresh quote.)
           const q = first ?? (C.QUOTES_ON ? await C.quotedTrade(conn, v, publicKey, sub, size, 6, 1_500, true, actor).catch(() => null) : null);
           first = null;
-          if (q) return cb(q);
+          if (q && fits(withNote(cb(q), actor), actor)) return withNote(cb(q), actor);
           if (!canQueue) throw new Error("no maker quote now, and the one-click key has too little coin to queue the order");
-          return [C.requestTrade(publicKey, v.key, size, { sub, closeOnly, actor })];
+          return withNote([C.requestTrade(publicKey, v.key, size, { sub, closeOnly, actor })], actor);
         }, keyOpts);
+        if (r) setNote("");
+        return r;
       }
     }
     const life = wallet?.adapter?.name === BurnerName ? 6 : 30;
     const r = await send(label, async conn => {
       const q = C.QUOTES_ON ? await C.quotedTrade(conn, v, publicKey, sub, size, life, 1_500).catch(() => null) : null;
-      return withNote(q ? cb(q) : [C.requestTrade(publicKey, v.key, size, { sub, closeOnly })]);
+      return q && fits(withNote(cb(q)), publicKey) ? withNote(cb(q)) : withNote([C.requestTrade(publicKey, v.key, size, { sub, closeOnly })]);
     });
     if (r) setNote("");
     return r;

@@ -398,34 +398,43 @@ export function noteOf(memo: string | null | undefined): string | undefined {
   }
   return undefined;
 }
-/** A wallet's recent trade notes, newest first: read from its trading account's transactions.
- *  Anyone can send a transaction that names someone else's trading account and carries a memo,
- *  so a note only counts when that wallet signed the transaction, the memo lists it as its
- *  signer, and the same transaction queues a trade with the router. */
+/** A wallet's recent trade notes, newest first: read from its trading accounts' transactions (on
+ *  every market of the site: a wallet trades on one of X1's five). Anyone can send a transaction
+ *  that names someone else's trading account and carries a memo, so a note only counts when the
+ *  same transaction trades for that wallet through the router (Request 4, RequestClose 8,
+ *  TakeQuote 38), signed by the wallet itself or by its approved trading key (the router checked
+ *  the key against the wallet's session, which the instruction names), and the memo is signed by
+ *  that same signer. */
 const verified = new Map<string, boolean>();
 export async function loadNotes(conn: Connection, wallet: PublicKey, limit = 60): Promise<Note[]> {
-  const sigs = await conn.getSignaturesForAddress(C.traderAddress(wallet), { limit }, "confirmed");
+  const traders = C.MARKETS.map(m => C.traderAddress(wallet, 0, m.key));
+  const live = (await conn.getMultipleAccountsInfo(traders, "confirmed")).map((a, i) => (a ? i : -1)).filter(i => i >= 0);
   const out: Note[] = [];
   const me = wallet.toBase58(), router = C.ROUTER.toBase58(), memo = MEMO_PROGRAM.toBase58();
-  for (const s of sigs) {
-    const text = !s.err && s.blockTime ? noteOf(s.memo) : undefined;
-    if (!text) continue;
-    let ok = verified.get(s.signature);
-    if (ok === undefined) {
-      const tx = await conn.getTransaction(s.signature, { maxSupportedTransactionVersion: 0, commitment: "confirmed" }).catch(() => null);
-      if (!tx) continue;
-      const m = tx.transaction.message, keys = m.staticAccountKeys.map(k => k.toBase58());
-      const signers = keys.slice(0, m.header.numRequiredSignatures);
-      const ixs = m.compiledInstructions;
-      ok = signers.includes(me)
-        && ixs.some(ix => keys[ix.programIdIndex] === memo && ix.accountKeyIndexes.some(i => keys[i] === me))
-        // Request (4) or close (8) from this wallet: account 0 (the wallet / payer) is this wallet.
-        && ixs.some(ix => keys[ix.programIdIndex] === router && (ix.data[0] === 4 || ix.data[0] === 8) && keys[ix.accountKeyIndexes[0]] === me);
-      verified.set(s.signature, ok);
+  for (const i of live) {
+    const session = C.sessionAddress(wallet, C.MARKETS[i].key).toBase58();
+    const sigs = await conn.getSignaturesForAddress(traders[i], { limit }, "confirmed");
+    for (const s of sigs) {
+      const text = !s.err && s.blockTime ? noteOf(s.memo) : undefined;
+      if (!text) continue;
+      let ok = verified.get(s.signature);
+      if (ok === undefined) {
+        const tx = await conn.getTransaction(s.signature, { maxSupportedTransactionVersion: 0, commitment: "confirmed" }).catch(() => null);
+        if (!tx) continue;
+        const m = tx.transaction.message, keys = m.staticAccountKeys.map(k => k.toBase58());
+        const signers = new Set(keys.slice(0, m.header.numRequiredSignatures));
+        const ixs = m.compiledInstructions;
+        // The trade: by the wallet, or by a key the router accepted for it (its session named).
+        const trade = ixs.find(ix => keys[ix.programIdIndex] === router && [4, 8, 38].includes(ix.data[0]) && signers.has(keys[ix.accountKeyIndexes[0]])
+          && (keys[ix.accountKeyIndexes[0]] === me || ix.accountKeyIndexes.some(k => keys[k] === session)));
+        const by = trade && keys[trade.accountKeyIndexes[0]];
+        ok = !!by && ixs.some(ix => keys[ix.programIdIndex] === memo && ix.accountKeyIndexes.some(k => keys[k] === by));
+        verified.set(s.signature, ok);
+      }
+      if (ok) out.push({ time: s.blockTime!, text, sig: s.signature });
     }
-    if (ok) out.push({ time: s.blockTime!, text, sig: s.signature });
   }
-  return out;
+  return out.sort((a, b) => b.time - a.time);
 }
 
 

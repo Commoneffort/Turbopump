@@ -976,7 +976,7 @@ async function adversaryRoutine(bot: Bot) {
   const orders = (await conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: C.ORDER_LEN }] })).map(a => C.decodeOrder(a.pubkey, new Uint8Array(a.account.data))).filter(o => !o.wallet.equals(me)).slice(0, 3);
   for (const o of orders) {
     const cancel = new TransactionInstruction({ programId: C.ROUTER, keys: [{ pubkey: me, isSigner: true, isWritable: true }, { pubkey: o.key, isSigner: false, isWritable: true }], data: Buffer.from([13]) });
-    expect(await wouldFail(kp, [cancel]), ["0x5701"], "cancelling someone else's order");
+    expect(await wouldFail(kp, [cancel]), ["0x5701", "0x5705"], "cancelling someone else's order"); // (0x5705 since 2026-11-07: the router checks for a queued request before who signs; refused either way)
   }
   // A healthy account cannot be forced closed, and nobody can withdraw more than they have.
   const snap = await C.marketSnapshot(conn);
