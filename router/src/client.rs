@@ -904,3 +904,49 @@ pub fn trigger_copy_across(payer: &Pubkey, t: &TraderKeys, leader: &Pubkey, lead
     ix.accounts.insert(13, ro(*leader_vault));
     ix
 }
+
+/// Opens or renews `wallet`'s liquidation shield on `market` (see `shield`): `step` collateral
+/// atoms at a time, at most `max_total`, acting within `trigger_bps` of the liquidation floor.
+/// The wallet also approves the router's authority as delegate of its token account
+/// (`spl_token::instruction::approve`) for up to `max_total`.
+pub fn set_shield(wallet: &Pubkey, market: &Pubkey, step: u64, max_total: u64, trigger_bps: u16) -> Instruction {
+    let mut data = vec![crate::TAG_SET_SHIELD];
+    data.extend_from_slice(&step.to_le_bytes());
+    data.extend_from_slice(&max_total.to_le_bytes());
+    data.extend_from_slice(&trigger_bps.to_le_bytes());
+    Instruction {
+        program_id: crate::id(),
+        accounts: vec![AccountMeta::new(*wallet, true), w(crate::shield::shield_address(&crate::id(), market, wallet).0), ro(*market), ro(solana_program::system_program::ID)],
+        data,
+    }
+}
+
+/// Ends `wallet`'s shield on `market` (the rent back to the wallet).
+pub fn remove_shield(wallet: &Pubkey, market: &Pubkey) -> Instruction {
+    Instruction { program_id: crate::id(), accounts: vec![AccountMeta::new(*wallet, true), w(crate::shield::shield_address(&crate::id(), market, wallet).0)], data: vec![crate::TAG_REMOVE_SHIELD] }
+}
+
+/// Moves one step of margin into `t` (a main account) from `source` (the wallet's token
+/// account), when it is near liquidation; anyone may send it.
+pub fn trigger_shield(payer: &Pubkey, t: &TraderKeys, source: &Pubkey, percolator_vault: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: crate::id(),
+        accounts: vec![
+            AccountMeta::new(*payer, true),
+            w(crate::shield::shield_address(&crate::id(), &t.market, &t.wallet).0),
+            ro(t.trader),
+            w(*source),
+            w(t.collateral),
+            w(t.portfolio),
+            w(t.market),
+            w(*percolator_vault),
+            ro(authority_address(&crate::id()).0),
+            ro(spl_token::ID),
+            ro(perc::PERCOLATOR_PROGRAM_ID),
+            w(ledger_address(&crate::id(), &t.trader).0),
+            ro(tiers_address(&crate::id(), &t.market).0),
+            w(stats_address(&crate::id(), &t.market, &t.wallet).0),
+        ],
+        data: vec![crate::TAG_TRIGGER_SHIELD],
+    }
+}

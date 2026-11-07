@@ -239,6 +239,20 @@ pub const ORDER_TRAIL: u8 = 2;
 pub const ORDER_LIMIT: u8 = 3;
 /// Trades `size` in slices of `slice`, one every `interval` seconds.
 pub const ORDER_TWAP: u8 = 4;
+/// Strategy orders (2026-11-07), carried out by anyone like the others and filled like any trade:
+///
+/// A grid level: a limit order (`size`, `trigger`) that, once filled, turns into the opposite
+/// order one step away (a buy filled at P becomes a sell at P + `slice`, and back), `peak` the
+/// size of a level, `next_time` how many turns are left (0: until it expires). A grid is several
+/// of them placed together, one per level.
+pub const ORDER_GRID: u8 = 5;
+/// A cross trigger: trades `size` on this vault once another asset of the same market (`slice`,
+/// its asset index) has a price at or above `trigger` (`side` +1) or at or below it (`side` -1).
+pub const ORDER_CROSS: u8 = 6;
+/// A ratio trigger: trades `size` once this asset's price divided by another's (`slice`, an asset
+/// of the same market), as e6, is at or above `trigger` (`side` +1) or at or below it (`side` -1).
+/// A pair trade is two of them, one on each asset.
+pub const ORDER_RATIO: u8 = 7;
 
 /// A standing order: an instruction the wallet signed once, which anyone may carry out when its
 /// condition holds. Carrying it out only queues an ordinary request, so it fills like any trade:

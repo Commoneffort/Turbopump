@@ -1070,3 +1070,44 @@ fn the_fill_that_liquidates_an_account_pays_its_executor_the_reward() {
     assert_eq!(position(&w, 7), 15 * UNIT as i128, "a liquidation, not the unit asked for");
     assert_eq!(before - (w.env.svm.get_balance(&t.trader).unwrap() - trader_rent), LIQ_REWARD);
 }
+
+/// Liquidation shield (2026-11-07): the wallet approves the router as delegate of its token
+/// account and opens a shield; once its account is near liquidation anyone adds a step of margin
+/// from that account, never more than the total, and never while the account is healthy.
+#[test]
+fn a_shield_adds_margin_from_the_wallet_near_liquidation_and_only_then() {
+    let mut w = live();
+    leveraged_long(&mut w);
+    let (u, t) = (w.traders[&7].0.kp.insecure_clone(), w.traders[&7].1);
+    let source = w.traders[&7].0.collateral;
+    let k = w.keys.clone().unwrap();
+    let authority = rstate::authority_address(&percolator_router::id()).0;
+    // 2 USDC a step, 3 in all, acting within 50% above the liquidation floor.
+    let approve = spl_token::instruction::approve(&spl_token::ID, &source, &authority, &u.pubkey(), &[], 3_000_000).unwrap();
+    w.send(vec![approve, rclient::set_shield(&u.pubkey(), &t.market, 2_000_000, 3_000_000, 5_000)], &[&u]).expect("open a shield");
+    let trigger = |w: &mut World| { let ix = rclient::trigger_shield(&w.payer.pubkey(), &t, &source, &k.percolator_vault); w.send(vec![ix], &[]) };
+    // Healthy (25% of notional against an 11% floor): nothing moves.
+    expect(trigger(&mut w), router_code(RouterError::ShieldNotNeeded));
+    // At 0.85 the account holds 2 USDC against 17 of notional, 11.8%: under 16.5% (the floor plus half).
+    w.move_price(20, 850_000);
+    let e0 = equity(&w, 7);
+    trigger(&mut w).expect("a first step");
+    assert_eq!(equity(&w, 7) - e0, 2_000_000, "two USDC from the wallet into the account");
+    // That made it healthy again (4 USDC against 17, 23.5%): nothing more moves.
+    expect(trigger(&mut w), router_code(RouterError::ShieldNotNeeded));
+    // At 0.75 it is near again (2 against 15, 13.3%): the second step is what is left of the total.
+    w.move_price(40, 750_000);
+    let e1 = equity(&w, 7);
+    trigger(&mut w).expect("a second step");
+    assert_eq!(equity(&w, 7) - e1, 1_000_000, "the last USDC of the total");
+    // At 0.70 it is near once more, and the shield is spent.
+    w.move_price(40, 700_000);
+    expect(trigger(&mut w), router_code(RouterError::ShieldSpent));
+    // Another account's token account cannot be named in its place.
+    let other = w.new_user(10_000_000);
+    let ix = rclient::trigger_shield(&w.payer.pubkey(), &t, &other.collateral, &k.percolator_vault);
+    assert!(w.send(vec![ix], &[]).is_err(), "someone else's token account");
+    // The wallet removes it (and its rent comes back).
+    w.send(vec![rclient::remove_shield(&u.pubkey(), &t.market)], &[&u]).expect("remove the shield");
+    assert!(w.env.svm.get_account(&percolator_router::shield::shield_address(&percolator_router::id(), &t.market, &u.pubkey()).0).map_or(true, |a| a.lamports == 0));
+}

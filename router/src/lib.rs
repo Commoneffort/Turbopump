@@ -339,6 +339,10 @@ pub const TAG_TAKE_QUOTE: u8 = 38;
 /// Trading keys (`session`): the wallet approves a key to sign its trades, or ends it.
 pub const TAG_OPEN_SESSION: u8 = 39;
 pub const TAG_CLOSE_SESSION: u8 = 40;
+/// Liquidation shield (`shield`): the wallet sets it, anyone triggers it, the wallet removes it.
+pub const TAG_SET_SHIELD: u8 = 41;
+pub const TAG_TRIGGER_SHIELD: u8 = 42;
+pub const TAG_REMOVE_SHIELD: u8 = 43;
 /// Widest trail, in basis points.
 pub const MAX_TRAIL_BPS: u64 = 5_000;
 /// Shortest time between two slices of a TWAP order, and the most slices one can have.
@@ -490,6 +494,10 @@ pub enum RouterError {
     SessionExpired,
     /// Beyond the trading key's limits (trade size, trades a day), or limits out of range.
     SessionLimit,
+    /// The shielded account is not near liquidation (`shield`).
+    ShieldNotNeeded,
+    /// The shield's total, the token approval or the wallet's balance is used up.
+    ShieldSpent,
 }
 
 impl From<RouterError> for ProgramError {
@@ -550,6 +558,9 @@ pub fn process_instruction(program_id: &Pubkey, accounts: &[AccountInfo], data: 
         TAG_TAKE_QUOTE => quote::take_quote(program_id, accounts, rest),
         TAG_OPEN_SESSION => session::open_session(program_id, accounts, rest),
         TAG_CLOSE_SESSION => session::close_session(program_id, accounts),
+        TAG_SET_SHIELD => shield::set_shield(program_id, accounts, rest),
+        TAG_TRIGGER_SHIELD => shield::trigger_shield(program_id, accounts),
+        TAG_REMOVE_SHIELD => shield::remove_shield(program_id, accounts),
         #[cfg(not(feature = "devnet"))]
         quote::TEST_SIGNATURE_STANDIN => Ok(()),
         TAG_OPEN_LEDGER => carry::open_ledger(program_id, accounts),
@@ -664,6 +675,7 @@ macro_rules! trader_seeds {
 // (After `trader_seeds`, which it uses.)
 pub mod quote;
 pub mod session;
+pub mod shield;
 
 // ---- accounts ----
 
@@ -1507,6 +1519,28 @@ fn place_order(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
                 return Err(RouterError::BadOrder.into());
             }
         }
+        ORDER_GRID => {
+            // `interval`: the step between levels (price e6); `slices`: turns allowed (0 = any).
+            if size == 0 || trigger == 0 || reduce_only != 0 || interval <= 0 || interval as u64 >= trigger || size.unsigned_abs() > u64::MAX as u128 {
+                return Err(RouterError::BadOrder.into());
+            }
+            o.slice = interval as u64;
+            o.peak = size.unsigned_abs() as u64;
+            o.next_time = slices as i64;
+        }
+        ORDER_CROSS | ORDER_RATIO => {
+            // `interval`: the other asset (on this market); `slices`: 1 = at or above, 2 = at or below.
+            let other = u16::try_from(interval).map_err(|_| RouterError::BadOrder)?;
+            if size == 0 || trigger == 0 || other == v.asset_index || !(1..=2).contains(&slices) {
+                return Err(RouterError::BadOrder.into());
+            }
+            let (_, p, _) = perc::asset_price(&market.try_borrow_data()?, other)?;
+            if p == 0 {
+                return Err(RouterError::BadOrder.into());
+            }
+            o.slice = other as u64;
+            o.side = if slices == 1 { 1 } else { -1 };
+        }
         ORDER_TWAP => {
             let slice = size.unsigned_abs() / (slices.max(1) as u128);
             if size == 0 || !(2..=MAX_TWAP_SLICES).contains(&slices) || interval < MIN_TWAP_INTERVAL_SECS || slice == 0 || slice > u64::MAX as u128 {
@@ -1634,8 +1668,23 @@ fn trigger_order(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
             }
             closing(held, o.size)
         }
-        ORDER_LIMIT => {
+        ORDER_LIMIT | ORDER_GRID => {
             if if o.size > 0 { mark > o.trigger } else { mark < o.trigger } {
+                return Err(RouterError::NotTriggered.into());
+            }
+            o.size
+        }
+        ORDER_CROSS | ORDER_RATIO => {
+            let md = market.try_borrow_data()?;
+            let (_, other, _) = perc::asset_price(&md, o.slice as u16)?;
+            let value = if o.kind == ORDER_CROSS {
+                other as u128
+            } else {
+                let (_, own, _) = perc::asset_price(&md, v.asset_index)?;
+                if other == 0 { return Err(RouterError::NotTriggered.into()); }
+                (own as u128).saturating_mul(1_000_000) / other as u128
+            };
+            if if o.side > 0 { value < o.trigger as u128 } else { value > o.trigger as u128 } {
                 return Err(RouterError::NotTriggered.into());
             }
             o.size
@@ -1682,7 +1731,7 @@ fn trigger_order(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult
     // An order that can open a position fills in the account's keeper deposit first, when it
     // lacks one (the wallet may have had it refunded while flat): out of the order's budget,
     // which the page sizes to hold it, and only when the keeper's share is still there after.
-    if matches!(o.kind, ORDER_LIMIT | ORDER_TWAP) && o.reduce_only == 0 {
+    if matches!(o.kind, ORDER_LIMIT | ORDER_TWAP | ORDER_GRID | ORDER_CROSS | ORDER_RATIO) && o.reduce_only == 0 {
         let short = deposit_short(trader_ai)?;
         if short > 0 && spare(order_ai, ORDER_LEN)? >= short.saturating_add(cost + KEEPER_FEE) {
             pay(order_ai, trader_ai, short)?;
@@ -1722,6 +1771,20 @@ fn settle_order(order_ai: &AccountInfo, mut o: Order, traded: i128, wallet: &Acc
             o.size == 0
         }
     };
+    // A grid level that filled turns into the opposite order one step away, while it has turns
+    // left (`next_time`, 0 = until it expires).
+    if done && o.kind == ORDER_GRID && o.next_time != 1 {
+        let bought = traded > 0;
+        o.size = if bought { -(o.peak as i128) } else { o.peak as i128 };
+        o.trigger = if bought { o.trigger.saturating_add(o.slice) } else { o.trigger.saturating_sub(o.slice) };
+        if o.next_time > 1 {
+            o.next_time -= 1;
+        }
+        if o.trigger == 0 {
+            return close(order_ai, 0, wallet, wallet);
+        }
+        return store(order_ai, &o);
+    }
     if done { close(order_ai, 0, wallet, wallet) } else { store(order_ai, &o) }
 }
 
@@ -2040,7 +2103,7 @@ fn fill(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
                 size = before.checked_neg().ok_or(RouterError::Overflow)?;
             }
         }
-        if o.kind == ORDER_LIMIT && ((size > 0 && effective > o.trigger) || (size < 0 && effective < o.trigger)) {
+        if matches!(o.kind, ORDER_LIMIT | ORDER_GRID) && ((size > 0 && effective > o.trigger) || (size < 0 && effective < o.trigger)) {
             size = 0;
         }
     }

@@ -1324,3 +1324,7 @@ h3 { margin: 0 0 12px; font-size: 15px; font-weight: 600; }
 .lm-tip { fill: var(--raised, #1f2228); stroke: var(--line-2); }
 .lm-tip-h { fill: var(--text); font: 600 11.5px var(--mono); }
 .lm-tip-t { fill: var(--muted); font: 11px var(--sans, inherit); }
+
+/* Strategy and shield forms */
+.strat-kinds { flex-wrap: wrap; }
+.oneclick-opts input.mini { width: 56px; padding: 3px 6px; background: var(--raised); color: var(--text); border: 1px solid var(--line-2); border-radius: 4px; font: inherit; }

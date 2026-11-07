@@ -1174,7 +1174,8 @@ export const KEEPER_DEPOSIT = REQUEST_RENT + ROUTER_BOND_LAMPORTS + ROUTER_BOND_
  *  What is not used goes back to the wallet with the order's rent. */
 /** A limit or TWAP order can open a position, so it also carries a keeper deposit: its first
  *  execution moves it into the trading account if that has none (router `TriggerOrder`). */
-export const keeperBudget = (kind: number, slices = 0) => (kind === ORDER.TWAP ? Math.max(1, slices) : 1) * (ROUTER_BOND_LAMPORTS + KEEPER_FEE) + REQUEST_RENT + (kind === ORDER.LIMIT || kind === ORDER.TWAP ? KEEPER_DEPOSIT : 0);
+/** A grid level is carried out once per turn: its budget covers `slices` turns (10 when unlimited). */
+export const keeperBudget = (kind: number, slices = 0) => (kind === ORDER.TWAP ? Math.max(1, slices) : kind === ORDER.GRID ? (slices || 10) : 1) * (ROUTER_BOND_LAMPORTS + KEEPER_FEE) + REQUEST_RENT + (kind === ORDER.LIMIT || kind === ORDER.TWAP || kind === ORDER.GRID || kind === ORDER.CROSS || kind === ORDER.RATIO ? KEEPER_DEPOSIT : 0);
 /** The deposit (lamports) a trader's own request carries on top of the bond: a share of its
  *  notional, in the chain's coin at a fixed rate. It comes back when the request fills, and is
  *  kept only if the request expires after its price had arrived. */
@@ -1302,7 +1303,10 @@ export const REQUEST_LEN: number = R.request_len;
 // The wallet signs an order once. Anyone (an executor) may carry it out when its condition
 // holds against the vault's mark; that queues an ordinary request, which fills like any trade
 // at the first oracle price at or after its target time.
-export const ORDER = { STOP: 0, TAKE: 1, TRAIL: 2, LIMIT: 3, TWAP: 4 } as const;
+/** Router order kinds; GRID, CROSS and RATIO are the strategy orders (2026-11-07): a grid level
+ *  that turns around after each fill, a trigger on another asset's price, and one on the ratio of
+ *  this asset's price to another's (see the router's `state.rs`). */
+export const ORDER = { STOP: 0, TAKE: 1, TRAIL: 2, LIMIT: 3, TWAP: 4, GRID: 5, CROSS: 6, RATIO: 7 } as const;
 export const ORDER_LEN: number = R.order_len;
 export const MAX_ORDERS: number = R.max_orders;
 export const orderAddress = (vault: PublicKey, wallet: PublicKey, index: number) => rpda(Buffer.from("order"), vault.toBuffer(), wallet.toBuffer(), Buffer.from([index]));
@@ -1357,7 +1361,8 @@ export const triggerOrder = (payer: PublicKey, o: StandingOrder) => new Transact
 /** What an order would do at mark price `mark` with the wallet's position `held`, as the router
  *  decides it: "fire" (queue its trade), "record" (a trail noting a better mark), "void" (it can
  *  do nothing any more and is removed), or "wait". */
-export function orderAction(o: StandingOrder, mark: bigint, held: bigint, now: number): "fire" | "record" | "void" | "wait" {
+/** `market` (its account data): needed for a cross or ratio order, which watch another asset. */
+export function orderAction(o: StandingOrder, mark: bigint, held: bigint, now: number, market?: Uint8Array, ownAsset?: number): "fire" | "record" | "void" | "wait" {
   if (o.queued) return "wait";
   const protective = o.kind <= ORDER.TRAIL;
   if ((o.expiry !== 0 && now > o.expiry) || (protective && (held === 0n || (held > 0n) !== (o.side > 0)))) return "void";
@@ -1372,7 +1377,15 @@ export function orderAction(o: StandingOrder, mark: bigint, held: bigint, now: n
     return (long ? mark * 10_000n <= o.peak * (10_000n - o.trigger) : mark * 10_000n >= o.peak * (10_000n + o.trigger)) ? "fire" : "wait";
   }
   if (!protective && o.reduceOnly && (held === 0n || (held > 0n) === (o.size > 0n))) return "void";
-  if (o.kind === ORDER.LIMIT) return (o.size > 0n ? mark <= o.trigger : mark >= o.trigger) ? "fire" : "wait";
+  if (o.kind === ORDER.LIMIT || o.kind === ORDER.GRID) return (o.size > 0n ? mark <= o.trigger : mark >= o.trigger) ? "fire" : "wait";
+  if (o.kind === ORDER.CROSS || o.kind === ORDER.RATIO) {
+    if (!market) return "wait";
+    // (The router reads Percolator's own prices of the two assets, as here.)
+    const other = decodeAsset(market, Number(o.slice)).price;
+    const value = o.kind === ORDER.CROSS ? other : other > 0n && ownAsset !== undefined ? decodeAsset(market, ownAsset).price * 1_000_000n / other : 0n;
+    if (value === 0n) return "wait";
+    return (o.side > 0 ? value >= o.trigger : value <= o.trigger) ? "fire" : "wait";
+  }
   return now >= o.nextTime ? "fire" : "wait";
 }
 /** `sub`: 0 for the wallet's main account, 1..255 for an isolated one. */
@@ -1889,4 +1902,37 @@ export async function recentBlockhash(conn: Connection): Promise<string> {
   const hash = (await conn.getLatestBlockhash("confirmed")).blockhash;
   hashKept = { hash, at: Date.now(), conn };
   return hash;
+}
+
+// ---- liquidation shield (router `shield`, 2026-11-07) ----
+// The wallet approves the router's authority as delegate of its USDC account (up to a total) and
+// opens a shield: when its main account gets within `triggerBps` of its liquidation floor, anyone
+// (the executor) moves `step` from that USDC account into the account, until the total is used.
+export const SHIELD_LEN = 120;
+export const shieldAddress = (wallet: PublicKey, market = activeMarket()) => rpda(Buffer.from("shield"), market.toBuffer(), wallet.toBuffer());
+export type Shield = { key: PublicKey; market: PublicKey; wallet: PublicKey; step: bigint; maxTotal: bigint; used: bigint; triggerBps: number; last: number };
+export const decodeShield = (k: PublicKey, d: Uint8Array): Shield => ({
+  key: k, market: key(d, 8), wallet: key(d, 40), step: u64(d, 72), maxTotal: u64(d, 80), used: u64(d, 88), triggerBps: d[96] | (d[97] << 8), last: Number(i64(d, 104)),
+});
+export const setShield = (wallet: PublicKey, step: bigint, maxTotal: bigint, triggerBps: number, market = activeMarket()) => new TransactionInstruction({
+  programId: ROUTER,
+  keys: [rw(wallet, true), rw(shieldAddress(wallet, market)), ro(market), ro(SystemProgram.programId)],
+  data: new W().u8(41).u64(step).u64(maxTotal).u16(triggerBps).done(),
+});
+export const removeShield = (wallet: PublicKey, market = activeMarket()) => new TransactionInstruction({
+  programId: ROUTER, keys: [rw(wallet, true), rw(shieldAddress(wallet, market))], data: new W().u8(43).done(),
+});
+export const triggerShield = (payer: PublicKey, wallet: PublicKey, market = activeMarket()) => new TransactionInstruction({
+  programId: ROUTER,
+  keys: [rw(payer, true), rw(shieldAddress(wallet, market)), ro(traderAddress(wallet, 0, market)), rw(ata(wallet, MINT)), rw(routerCollateral(wallet, 0, market)), rw(routerPortfolio(wallet, 0, market)), rw(market), rw(marketInfo(market).percVault), ro(routerAuthority()), ro(TOKEN_PROGRAM_ID), ro(PERCOLATOR),
+    rw(ledgerAddress(wallet, 0, market)), ro(tiersAddress(market)), rw(statsAddress(wallet, market))],
+  data: new W().u8(42).done(),
+});
+/** Whether the shield acts now: the account's equity (what it owes the vaults taken off) is under
+ *  its liquidation floor plus `triggerBps` of it, as the router counts it. */
+export function shieldDue(s: Shield, market: Uint8Array, portfolio: Uint8Array, owed = 0n): boolean {
+  if (s.used >= s.maxTotal) return false;
+  const h = accountHealth(market, portfolio, owed);
+  if (h.notional === 0n || h.floor === 0n) return false;
+  return h.equity * 10_000n < h.floor * BigInt(10_000 + s.triggerBps);
 }

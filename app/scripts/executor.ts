@@ -1513,7 +1513,7 @@ async function serviceOrders(vaults: C.Vault[], books: Map<string, C.Book>, mark
     const pf = accs[2 * i], tr = accs[2 * i + 1];
     if (!pf || !tr) continue;
     const held = C.decodePortfolio(new Uint8Array(pf.data), v.assetIndex, market).position;
-    const what = C.orderAction(o, b.markPrice, held, now);
+    const what = C.orderAction(o, b.markPrice, held, now, market, v.assetIndex);
     if (what === "wait" || !overdue(`${what} order ${o.key.toBase58()}`)) continue;
     // A trail's record is only worth a transaction once the mark is clearly better.
     if (what === "record" && (o.peak === 0n || (b.markPrice > o.peak ? b.markPrice - o.peak : o.peak - b.markPrice) * 1000n < o.peak)) continue;
@@ -1527,10 +1527,36 @@ async function serviceOrders(vaults: C.Vault[], books: Map<string, C.Book>, mark
       const closes = held !== 0n && (held > 0n) !== buys && size <= (held > 0n ? held : -held);
       if (!closes && (buys ? v.inventory <= 0n : v.inventory >= 0n)) { orderRetry.set(o.key.toBase58(), Date.now() + 30_000); continue; }
     }
-    const name = ["stop", "take-profit", "trailing stop", "limit", "TWAP"][o.kind] ?? "order";
+    const name = ["stop", "take-profit", "trailing stop", "limit", "TWAP", "grid level", "cross trigger", "ratio trigger"][o.kind] ?? "order";
     const ok = await send(`${what === "fire" ? "carry out" : what === "record" ? "record a better mark for" : "remove"} ${name} of ${o.wallet.toBase58().slice(0, 6)} on ${v.feed?.symbol} (mark ${Number(b.markPrice) / 1e6})`, [C.triggerOrder(payer.publicKey, o)], true);
     // Refused (not enough margin, the mark moved back): leave it a while. Done: read the orders again.
     if (ok) { ordersAt = 0; orderFails.delete(o.key.toBase58()); if (what === "fire") queuedNow.add(acctKey(o)); } else orderRetry.set(o.key.toBase58(), Date.now() + orderBackoff(o.key.toBase58()));
+  }
+}
+
+// ---- liquidation shields (router `shield`, 2026-11-07) ----
+let shieldsAt = 0;
+let shieldCache: C.Shield[] = [];
+const shieldRetry = new Map<string, number>();
+/** Adds margin from the wallet to every shielded account near liquidation (router `TriggerShield`:
+ *  anyone may; the router checks it is near, and moves only from the wallet into its own account). */
+async function serviceShields(market: Uint8Array) {
+  enter("serviceShields");
+  if (Date.now() - shieldsAt > 10_000) {
+    const accs = await conn.getProgramAccounts(C.ROUTER, { filters: [{ dataSize: C.SHIELD_LEN }, { memcmp: { offset: 8, bytes: C.MARKET.toBase58() } }] });
+    shieldCache = accs.map(a => C.decodeShield(a.pubkey, new Uint8Array(a.account.data))).filter(x => x.used < x.maxTotal);
+    shieldsAt = Date.now();
+  }
+  const due = shieldCache.filter(x => (shieldRetry.get(x.key.toBase58()) ?? 0) <= Date.now());
+  if (!due.length) return;
+  const accs = await conn.getMultipleAccountsInfo(due.flatMap(x => [C.routerPortfolio(x.wallet), C.ledgerAddress(x.wallet)]));
+  for (const [i, x] of due.entries()) {
+    const pf = accs[2 * i], led = accs[2 * i + 1];
+    if (!pf) continue;
+    const owed = led ? C.totalOwed(C.decodeLedger(new Uint8Array(led.data))) : 0n;
+    if (!C.shieldDue(x, market, new Uint8Array(pf.data), owed)) continue;
+    const ok = await send(`shield: add ${Number(x.step) / 1e6} USDC to ${x.wallet.toBase58().slice(0, 6)}, near liquidation`, [C.triggerShield(payer.publicKey, x.wallet)], true);
+    if (ok) shieldsAt = 0; else shieldRetry.set(x.key.toBase58(), Date.now() + 30_000);
   }
 }
 
@@ -1903,6 +1929,7 @@ setInterval(() => {
       if (can("maintenance")) {
         await serviceOrders(vaults, books, market, now, slot).catch(e => log("error", "orders", String(e?.message ?? e).slice(0, 140)));
         await serviceCopies(vaults, books, market).catch(e => log("error", "copies", String(e?.message ?? e).slice(0, 140)));
+        await serviceShields(market).catch(e => log("error", "shields", String(e?.message ?? e).slice(0, 140)));
       }
       if (maintOn && Date.now() - slowAt >= SLOW_JOBS_MS) {
         slowAt = Date.now();

@@ -4,12 +4,12 @@
 // There is no order book to show: every order fills against the market's vault at the first
 // oracle price published a few seconds after the request. What stands in its place is the vault's
 // capacity: how much it can take on each side right now.
-import { CSSProperties, Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { CSSProperties, Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
 import { ComputeBudgetProgram, Connection, PublicKey, SystemProgram, Transaction, TransactionInstruction } from "@solana/web3.js";
 import { OneClickPanel, SetupCard, sendOrders, useTradingKey } from "./OneClick";
-import { createAssociatedTokenAccountIdempotentInstruction, createTransferCheckedInstruction } from "@solana/spl-token";
+import { createApproveInstruction, createAssociatedTokenAccountIdempotentInstruction, createRevokeInstruction, createTransferCheckedInstruction } from "@solana/spl-token";
 import * as C from "./chain";
 import { readDirect } from "./view";
 import { T } from "./theme";
@@ -116,7 +116,7 @@ export async function returnMargin(conn: Connection, wallet: PublicKey, sub: num
 }
 const abs = (q: bigint) => (q < 0n ? -q : q);
 const e6 = (x: number) => BigInt(Math.round(x * 1e6));
-const ORDER_NAME = ["Stop loss", "Take profit", "Trailing stop", "Limit", "TWAP"];
+const ORDER_NAME = ["Stop loss", "Take profit", "Trailing stop", "Limit", "TWAP", "Grid level", "Cross trigger", "Pair (ratio)"];
 /** The first of the wallet's order slots on this market that is free (or as many as asked). */
 const freeSlots = (state: C.State, n = 1) => Array.from({ length: C.MAX_ORDERS }, (_, i) => i).filter(i => !state.orders.some(o => o.index === i)).slice(0, n);
 
@@ -534,7 +534,7 @@ function Ticket({ state, send, busy, copying, margin, setMargin, vaults }: { sta
   const withNote = (ixs: TransactionInstruction[], by?: PublicKey) => (publicKey && S.cleanNote(note) ? [...ixs, S.tradeNote(by ?? publicKey, note)] : ixs);
   const sendNoted = async (l: string, ixs: TransactionInstruction[]) => { const r = await send(l, withNote(ixs)); if (r) setNote(""); return r; };
   const [unit, setUnit] = useState<"coin" | "usd">("coin");
-  const [mode, setMode] = useState<"market" | "limit" | "protect" | "twap">("market");
+  const [mode, setMode] = useState<"market" | "limit" | "protect" | "twap" | "strategy">("market");
   // Whether what is shown includes this wallet's own accounts yet (the market itself shows first).
   const v = state.vault, p = state.portfolio, sym = v.feed?.symbol ?? "";
   const sub = state.sub;
@@ -769,7 +769,7 @@ function Ticket({ state, send, busy, copying, margin, setMargin, vaults }: { sta
         <button className={margin === "isolated" ? "on" : ""} onClick={() => setMargin("isolated")} title={`Isolated margin: a separate account for ${sym} alone, holding only the margin you deposit into it. If this position goes wrong it can lose that margin and nothing else; your other positions cannot be touched, and it cannot use their money either. It holds one market at a time and has its own orders and queue place. Like your main account, only the router can trade it and withdrawals only go back to this wallet. Opening it costs about 0.07 test ${C.COIN} of rent. Copy trading and the leaderboard count your main account only.`}>Isolated</button>
       </div>
       <div className="otabs">
-        {([["market", "Market"], ["limit", "Limit"], ["protect", "TP / SL"], ["twap", "TWAP"]] as const).map(([m, label]) => (
+        {([["market", "Market"], ["limit", "Limit"], ["protect", "TP / SL"], ["twap", "TWAP"], ["strategy", "Strategy"]] as const).map(([m, label]) => (
           <button key={m} className={mode === m ? "on" : ""} onClick={() => setMode(m)}>{label}</button>
         ))}
       </div>
@@ -779,7 +779,7 @@ function Ticket({ state, send, busy, copying, margin, setMargin, vaults }: { sta
           <button className={side < 0n ? "on down" : ""} onClick={() => setSide(-1n)}>{mode === "market" ? "Short" : "Sell"}</button>
         </div>
       )}
-      {mode !== "market" ? <StandingForm mode={mode} side={side} state={state} send={send} busy={busy} /> : <>
+      {mode === "strategy" ? <StrategyForm side={side} state={state} send={send} busy={busy} vaults={vaults} /> : mode !== "market" ? <StandingForm mode={mode} side={side} state={state} send={send} busy={busy} /> : <>
       <CurrentPosition held={held} sym={sym} />
 
       <label className="inp">
@@ -893,6 +893,107 @@ function KeeperLine({ lamports }: { lamports: number }) {
 
 /** Limit, TP / SL / trailing stop, and TWAP: orders the wallet signs once and the executor
  *  carries out later, when their condition holds. */
+/** Strategy orders (router 2026-11-07), placed from one form and carried out on chain by anyone,
+ *  like every standing order: a grid, a ladder, a trigger on another asset, a pair trade. */
+function StrategyForm({ side, state, send: wsend, busy, vaults }: { side: 1n | -1n; state: C.State; send: Send; busy?: string; vaults: C.Vault[] }) {
+  const { publicKey } = useWallet();
+  const { connection } = useConnection();
+  const ok = useTradingKey(busy ? 1 : 0);
+  const v = state.vault, sym = v.feed?.symbol ?? "";
+  const priceN = num(state.asset.price, 1e6), dp = priceDp(priceN);
+  const [kind, setKind] = useState<"grid" | "ladder" | "cross" | "pair">("grid");
+  const [lower, setLower] = useState(""), [upper, setUpper] = useState(""), [levels, setLevels] = useState("6"), [size, setSize] = useState("");
+  const [start, setStart] = useState(""), [stepPct, setStepPct] = useState("1");
+  const others = vaults.filter(x => x.canonical && !x.key.equals(v.key) && x.feed);
+  const [other, setOther] = useState(others[0]?.feed?.symbol ?? "");
+  const [cond, setCond] = useState<"le" | "ge">("le"), [level, setLevel] = useState(""), [notional, setNotional] = useState("");
+  const ov = others.find(x => x.feed?.symbol === other);
+  const otherPrice = ov ? num(C.decodeAsset(state.marketData, ov.assetIndex).price, 1e6) : 0;
+  const n = (t: string) => { const x = Number(t); return Number.isFinite(x) && x > 0 ? x : 0; };
+  const digits = (set: (t: string) => void) => (e: { target: { value: string } }) => set(e.target.value.replace(/[^0-9.]/g, ""));
+  const free = freeSlots(state, C.MAX_ORDERS);
+  const need = !publicKey ? "Connect a wallet first" : !state.trader ? "Create a trading account first (Market tab)" : undefined;
+  const send: Send = (label, ixs) => publicKey && Array.isArray(ixs) ? sendOrders(wsend, ok, publicKey, label, ixs, v.key, ixs.reduce((a, ix) => a + (ix.programId.equals(C.ROUTER) && ix.data[0] === 12 && ix.data.length > 48 ? Number(ix.data.readBigUInt64LE(48)) : 0), 0)) : wsend(label, ixs);
+  const tabs = <div className="seg strat-kinds">{([["grid", "Grid"], ["ladder", "Ladder"], ["cross", "Cross trigger"], ["pair", "Pair trade"]] as const).map(([k, l]) => <button key={k} className={kind === k ? "on" : ""} onClick={() => setKind(k)}>{l}</button>)}</div>;
+  let body: ReactNode = null, why: string | undefined = need, label = "", build: (() => Promise<TransactionInstruction[]>) | undefined;
+
+  if (kind === "grid") {
+    const lo = n(lower), hi = n(upper), k = Math.min(Math.floor(n(levels)), free.length), q = n(size);
+    const step = k > 1 ? (hi - lo) / (k - 1) : 0;
+    const prices = k > 1 && hi > lo ? Array.from({ length: k }, (_, i) => lo + i * step) : [];
+    why ??= !lo || !hi || hi <= lo ? "Enter a lower and an upper price" : k < 2 ? (free.length < 2 ? "Free at least two order slots first" : "At least 2 levels") : !q ? "Enter a size per level" : undefined;
+    body = <>
+      <label className="inp"><span>Lower price</span><input value={lower} onChange={digits(setLower)} placeholder={fmt(priceN * 0.95, dp)} inputMode="decimal" /></label>
+      <label className="inp"><span>Upper price</span><input value={upper} onChange={digits(setUpper)} placeholder={fmt(priceN * 1.05, dp)} inputMode="decimal" /></label>
+      <label className="inp"><span>Levels</span><input value={levels} onChange={digits(setLevels)} inputMode="numeric" /><em>max {free.length}</em></label>
+      <label className="inp"><span>Size a level</span><input value={size} onChange={digits(setSize)} placeholder="0.00" inputMode="decimal" /><em>{sym}</em></label>
+      <div className="sum">
+        <div><span>Levels</span><b className="mono">{prices.map(p => fmt(p, dp)).join(" · ") || "—"}</b></div>
+        <div><span>Below {fmt(priceN, dp)}: buys, above: sells</span><b className="mono">{step ? `step ${fmt(step, dp)}` : "—"}</b></div>
+      </div>
+      <div className="fine">Each level is an order on chain. A buy that fills becomes a sell one step up, and a sell that fills becomes a buy one step down, again and again, with nothing to keep running on your side.</div>
+    </>;
+    label = `Grid of ${k} levels on ${sym}`;
+    build = async () => prices.map((p, i) => C.placeOrder(publicKey!, v.key, { index: free[i], kind: C.ORDER.GRID, size: e6(q) * (p < priceN ? 1n : -1n), trigger: e6(p), interval: Number(e6(step)), slices: 0 }, state.sub));
+  } else if (kind === "ladder") {
+    const s0 = n(start) || priceN, pct = n(stepPct) / 100, k = Math.min(Math.floor(n(levels)), free.length), q = n(size);
+    const prices = k > 0 && pct > 0 ? Array.from({ length: k }, (_, i) => s0 * (side > 0n ? 1 - pct * i : 1 + pct * i)) : [];
+    why ??= !k ? (free.length ? "At least 1 step" : "All order slots are in use") : !q ? "Enter a size per step" : !pct ? "Enter the distance between steps" : undefined;
+    body = <>
+      <label className="inp"><span>First price</span><input value={start} onChange={digits(setStart)} placeholder={fmt(priceN, dp)} inputMode="decimal" /></label>
+      <label className="inp"><span>Steps</span><input value={levels} onChange={digits(setLevels)} inputMode="numeric" /><em>max {free.length}</em></label>
+      <label className="inp"><span>Apart</span><input value={stepPct} onChange={digits(setStepPct)} inputMode="decimal" /><em>%</em></label>
+      <label className="inp"><span>Size a step</span><input value={size} onChange={digits(setSize)} placeholder="0.00" inputMode="decimal" /><em>{sym}</em></label>
+      <div className="sum"><div><span>{side > 0n ? "Buys" : "Sells"} at</span><b className="mono">{prices.map(p => fmt(p, dp)).join(" · ") || "—"}</b></div></div>
+      <div className="fine">Scales {side > 0n ? "into a long as the price falls" : "into a short as the price rises"}, one limit order a step. Add a stop for the whole position from the TP / SL tab once the first step has filled.</div>
+    </>;
+    label = `Ladder of ${k} ${side > 0n ? "buys" : "sells"} on ${sym}`;
+    build = async () => prices.map((p, i) => C.placeOrder(publicKey!, v.key, { index: free[i], kind: C.ORDER.LIMIT, size: e6(q) * side, trigger: e6(p) }, state.sub));
+  } else {
+    const lv = n(level), usd = n(notional);
+    const ratioNow = otherPrice > 0 ? priceN / otherPrice : 0;
+    why ??= !ov ? "No other asset on this market" : !lv ? (kind === "cross" ? `Enter the ${other} price` : "Enter the ratio") : !usd ? "Enter an amount in dollars" : !free.length ? "All order slots are in use" : undefined;
+    body = <>
+      <label className="inp"><span>Watch</span><select value={other} onChange={e => setOther(e.target.value)}>{others.map(x => <option key={x.key.toBase58()} value={x.feed!.symbol}>{x.feed!.symbol}</option>)}</select><em>{kind === "cross" ? fmt(otherPrice, priceDp(otherPrice)) : `${sym}/${other} ${ratioNow.toFixed(5)}`}</em></label>
+      <div className="seg">{(["le", "ge"] as const).map(c => <button key={c} className={cond === c ? "on" : ""} onClick={() => setCond(c)}>{c === "le" ? "At or below" : "At or above"}</button>)}</div>
+      <label className="inp"><span>{kind === "cross" ? `${other} price` : `${sym}/${other}`}</span><input value={level} onChange={digits(setLevel)} placeholder={kind === "cross" ? fmt(otherPrice, priceDp(otherPrice)) : ratioNow.toFixed(5)} inputMode="decimal" /></label>
+      <label className="inp"><span>Amount</span><input value={notional} onChange={digits(setNotional)} placeholder="0" inputMode="decimal" /><em>USD</em></label>
+      <div className="sum">{kind === "cross"
+        ? <div><span>Then</span><b className="mono">{side > 0n ? "buy" : "sell"} {usd && priceN ? fmt(usd / priceN, 4) : "—"} {sym}</b></div>
+        : <div><span>Then</span><b className="mono">{side > 0n ? "buy" : "sell"} {usd && priceN ? fmt(usd / priceN, 4) : "—"} {sym}, {side > 0n ? "sell" : "buy"} {usd && otherPrice ? fmt(usd / otherPrice, 4) : "—"} {other}</b></div>}</div>
+      <div className="fine">{kind === "cross" ? `Carried out on chain once ${other}'s price is ${cond === "le" ? "at or below" : "at or above"} your level, at the next oracle price, like any order.` : `Two orders on chain, one on each asset, both carried out once ${sym}/${other} is ${cond === "le" ? "at or below" : "at or above"} your ratio.`}</div>
+    </>;
+    if (kind === "cross") {
+      label = `If ${other} ${cond === "le" ? "≤" : "≥"} ${lv}: ${side > 0n ? "buy" : "sell"} ${sym}`;
+      build = async () => [C.placeOrder(publicKey!, v.key, { index: free[0], kind: C.ORDER.CROSS, size: e6(usd / priceN) * side, trigger: e6(lv), interval: ov!.assetIndex, slices: cond === "ge" ? 1 : 2 }, state.sub)];
+    } else {
+      label = `Pair: ${side > 0n ? "long" : "short"} ${sym} / ${side > 0n ? "short" : "long"} ${other} at ${sym}/${other} ${cond === "le" ? "≤" : "≥"} ${lv}`;
+      build = async () => {
+        // The other leg is an order on the other asset's vault: its own free slot there, and the
+        // same condition seen from its side (other/this = 1/ratio, the direction turned around).
+        const owner = C.accountOwner(publicKey!, state.sub, v.market);
+        const there = await connection.getMultipleAccountsInfo(Array.from({ length: C.MAX_ORDERS }, (_, i) => C.orderAddress(ov!.key, owner, i)));
+        const slot = there.findIndex(a => !a);
+        if (slot < 0) throw new Error(`all order slots on ${other} are in use`);
+        return [
+          C.placeOrder(publicKey!, v.key, { index: free[0], kind: C.ORDER.RATIO, size: e6(usd / priceN) * side, trigger: e6(lv), interval: ov!.assetIndex, slices: cond === "ge" ? 1 : 2 }, state.sub),
+          C.placeOrder(publicKey!, ov!.key, { index: slot, kind: C.ORDER.RATIO, size: e6(usd / otherPrice) * -side, trigger: BigInt(Math.round(1e12 / lv)), interval: v.assetIndex, slices: cond === "ge" ? 2 : 1 }, state.sub),
+        ];
+      };
+    }
+  }
+  return (
+    <div className="sform">
+      {tabs}
+      {body}
+      <button className={`submit ${side > 0n ? "up" : "down"}`} disabled={!!why || !!busy} onClick={async () => { if (!build) return; try { const ixs = await build(); await send(label, ixs); } catch (e: any) { window.alert(String(e?.message ?? e)); } }}>
+        {busy ? `${busy}…` : kind === "grid" ? "Place grid" : kind === "ladder" ? "Place ladder" : kind === "cross" ? "Place trigger" : "Place pair trade"}
+      </button>
+      {why && <div className="why">{why}</div>}
+    </div>
+  );
+}
+
 function StandingForm({ mode, side, state, send: wsend, busy }: { mode: "limit" | "protect" | "twap"; side: 1n | -1n; state: C.State; send: Send; busy?: string }) {
   const { publicKey } = useWallet();
   // With one-click trading on, orders are placed by the trading key (no popup), when it holds their keeper budget.
@@ -1091,6 +1192,7 @@ function Account({ state, send, busy, held, row, vaults, accounts }: { state: C.
               {owed > 0n && state.openPositions === 0 && <div className="fine">A withdrawal first pays the {usd(owed)} owed to the vaults, out of your margin.</div>}
             </>
           )}
+          {state.trader && !sub && <ShieldPanel send={send} busy={busy} />}
           <TestWalletOut state={state} send={send} busy={busy} withdrawAll={() => {
             // Everything in the trading account back to the wallet (its profit turned into
             // capital and what it owes the vaults paid), as the Withdraw button does.
@@ -1102,6 +1204,61 @@ function Account({ state, send, busy, held, row, vaults, accounts }: { state: C.
         </div>
       )}
     </>
+  );
+}
+
+/** Liquidation shield (router `shield`): margin added from the wallet, in steps, when the main
+ *  account gets near liquidation, instead of being liquidated. The wallet approves the router as
+ *  delegate of its USDC account for the total (its own approval, revoked when it is turned off). */
+const SHIELD_DIST = [[1_000, "10%"], [2_500, "25%"], [5_000, "50%"]] as const;
+function ShieldPanel({ send, busy }: { send: Send; busy?: string }) {
+  const { publicKey } = useWallet();
+  const { connection } = useConnection();
+  const [sh, setSh] = useState<C.Shield | null>();
+  const [n, setN] = useState(0);
+  const [open, setOpen] = useState(false);
+  const [step, setStep] = useState("10"), [total, setTotal] = useState("50");
+  const [dist, setDist] = useState<number>(2_500);
+  useEffect(() => {
+    if (!publicKey) return;
+    let live = true;
+    connection.getAccountInfo(C.shieldAddress(publicKey), "confirmed").then(a => live && setSh(a ? C.decodeShield(C.shieldAddress(publicKey), new Uint8Array(a.data)) : null)).catch(() => {});
+    return () => { live = false; };
+  }, [publicKey?.toBase58(), n, busy]);
+  if (!publicKey || sh === undefined) return null;
+  const usdc = (x: bigint) => `$${fmt(num(x, C.USDC), 2)}`;
+  if (sh) {
+    const left = sh.maxTotal - sh.used;
+    return (
+      <div className="oneclick on">
+        <div className="oneclick-h"><b>Liquidation shield on</b><span className="mono">{usdc(sh.used)} of {usdc(sh.maxTotal)} used</span></div>
+        <div className="fine">When your account gets within {sh.triggerBps / 100}% of its liquidation level, {usdc(sh.step)} is moved from your wallet's USDC into it, again while it stays that close, up to {usdc(left)} more. It only ever moves into your own account.</div>
+        <div className="oneclick-b"><button className="btn tiny" disabled={!!busy} onClick={() => send("Turn off the liquidation shield", [C.removeShield(publicKey), createRevokeInstruction(C.ata(publicKey, C.MINT), publicKey)]).then(() => setN(x => x + 1))}>Turn off</button></div>
+      </div>
+    );
+  }
+  const st = Number(step), to = Number(total);
+  const bad = !(st > 0) || !(to >= st);
+  return (
+    <div className="oneclick">
+      {!open ? <button className="btn wide" disabled={!!busy} onClick={() => setOpen(true)} title="Add margin from your wallet instead of being liquidated">Liquidation shield</button> : <>
+        <div className="oneclick-h"><b>Liquidation shield</b></div>
+        <div className="fine">Instead of being liquidated, add margin from your wallet's USDC in steps, automatically, when your account gets close to its liquidation level. You allow the router to move up to the total from your USDC, only into your own trading account; turning it off takes the permission back.</div>
+        <div className="oneclick-opts">
+          <label>Add <input className="mini" value={step} onChange={e => setStep(e.target.value.replace(/[^0-9.]/g, ""))} inputMode="decimal" /> USDC a step</label>
+          <label>up to <input className="mini" value={total} onChange={e => setTotal(e.target.value.replace(/[^0-9.]/g, ""))} inputMode="decimal" /> USDC</label>
+          <label>when within <select value={dist} onChange={e => setDist(Number(e.target.value))}>{SHIELD_DIST.map(([b, l]) => <option key={b} value={b}>{l}</option>)}</select> of liquidation</label>
+        </div>
+        <div className="oneclick-b">
+          <button className="btn white" disabled={!!busy || bad} onClick={() => send("Turn on the liquidation shield", [
+            createAssociatedTokenAccountIdempotentInstruction(publicKey, C.ata(publicKey, C.MINT), publicKey, C.MINT),
+            createApproveInstruction(C.ata(publicKey, C.MINT), C.routerAuthority(), publicKey, BigInt(Math.round(to * C.USDC))),
+            C.setShield(publicKey, BigInt(Math.round(st * C.USDC)), BigInt(Math.round(to * C.USDC)), dist),
+          ]).then(() => { setOpen(false); setN(x => x + 1); })}>Approve in wallet</button>
+          <button className="btn" onClick={() => setOpen(false)}>Cancel</button>
+        </div>
+      </>}
+    </div>
   );
 }
 
@@ -1269,6 +1426,8 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go, tick, accoun
   const { publicKey } = useWallet();
   const { connection } = useConnection();
   const ok = useTradingKey(busy ? 1 : 0);
+  // The asset a cross or ratio order watches, by its number on the market.
+  const vaultSym = (a: number) => markets.find(c => c.v.assetIndex === a)?.v.feed?.symbol ?? `#${a}`;
   const [tab, setTab] = useState<"positions" | "orders" | "twap" | "history" | "vault" | "market">("positions");
   const [rowPct, setRowPct] = useState<Map<string, number>>(new Map());
   const rk = (x: { sub: number; asset: number }) => `${x.sub}:${x.asset}`;
@@ -1376,6 +1535,8 @@ function Bottom({ state, markets, fills, held, liq, send, busy, go, tick, accoun
                 const mark = num(state.asset.price, 1e6), dpp = priceDp(mark);
                 const trig = o.kind === C.ORDER.TRAIL ? `${fmt(Number(o.trigger) / 100, 2)}% from ${fmt(num(o.peak, 1e6), dpp)}`
                   : o.kind === C.ORDER.TWAP ? `${units(o.slice)} every ${o.interval >= 120 ? `${fmt(o.interval / 60, 1)} min` : `${o.interval} s`}`
+                  : o.kind === C.ORDER.GRID ? `${buys ? "≤ " : "≥ "}${fmt(num(o.trigger, 1e6), dpp)}, then ${buys ? "sell" : "buy"} ${fmt(num(o.slice, 1e6), dpp)} ${buys ? "up" : "down"}`
+                  : o.kind === C.ORDER.CROSS || o.kind === C.ORDER.RATIO ? (() => { const other = state.vault && vaultSym(Number(o.slice)); return o.kind === C.ORDER.CROSS ? `${other} ${o.side > 0 ? "≥" : "≤"} ${fmt(num(o.trigger, 1e6), 2)}` : `${sym}/${other} ${o.side > 0 ? "≥" : "≤"} ${(Number(o.trigger) / 1e6).toFixed(5)}`; })()
                   : `${o.kind === C.ORDER.LIMIT ? (buys ? "≤ " : "≥ ") : ""}${fmt(num(o.trigger, 1e6), dpp)}`;
                 return (
                   <tr key={o.index}>

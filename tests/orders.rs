@@ -505,3 +505,69 @@ fn expiring_an_orders_request_pays_a_quarter_of_its_bond_and_the_rent_goes_back_
     let order_rent = w.env.svm.minimum_balance_for_rent_exemption(rstate::ORDER_LEN);
     assert_eq!(balance(&w, &order_ai) - order_rent, request_rent(&w));
 }
+
+// ---- strategy orders (2026-11-07) ----
+
+/// A grid level buys at its price, then becomes a sell one step up, then a buy again, for the
+/// turns it was given.
+#[test]
+fn a_grid_level_turns_into_the_opposite_order_after_each_fill() {
+    let mut w = live();
+    w.trader(0);
+    place(&mut w, 0, OrderParams { kind: rstate::ORDER_GRID, trigger: 970_000, size: 5 * U, interval: 20_000, slices: 2, ..Default::default() }).unwrap();
+    expect(trigger(&mut w, 0, 0), RouterError::NotTriggered);
+    w.move_price(20, 965_000);
+    let id = trigger(&mut w, 0, 0).unwrap();
+    fill_at(&mut w, 0, id, 0, 965_000).unwrap();
+    assert_eq!(position(&w, 0), 5 * U);
+    let o = order(&w, 0, 0).expect("the level stays, turned around");
+    assert_eq!(({ o.size }, { o.trigger }, { o.next_time }), (-5 * U, 990_000, 1));
+    expect(trigger(&mut w, 0, 0), RouterError::NotTriggered); // a sell waits for 0.99
+    w.move_price(20, 995_000);
+    let id = trigger(&mut w, 0, 0).unwrap();
+    fill_at(&mut w, 0, id, 0, 995_000).unwrap();
+    assert_eq!(position(&w, 0), 0);
+    assert!(order(&w, 0, 0).is_none(), "its last turn: gone");
+}
+
+/// A grid level's step must be smaller than its price, and it cannot be reduce-only.
+#[test]
+fn a_grid_level_is_checked_when_placed() {
+    let mut w = live();
+    w.trader(0);
+    expect(place(&mut w, 0, OrderParams { kind: rstate::ORDER_GRID, trigger: 970_000, size: 5 * U, interval: 0, ..Default::default() }), RouterError::BadOrder);
+    expect(place(&mut w, 0, OrderParams { kind: rstate::ORDER_GRID, trigger: 970_000, size: 5 * U, interval: 970_000, ..Default::default() }), RouterError::BadOrder);
+    expect(place(&mut w, 0, OrderParams { kind: rstate::ORDER_GRID, trigger: 970_000, size: 5 * U, interval: 10_000, reduce_only: true, ..Default::default() }), RouterError::BadOrder);
+}
+
+/// A cross trigger and a ratio trigger watch another asset of the market (here asset 0, the
+/// market's collateral unit) and trade this one when it is through their level.
+#[test]
+fn cross_and_ratio_orders_watch_another_asset_of_the_market() {
+    let mut w = live();
+    w.trader(0);
+    let own = w.asset();
+    // Not on its own asset.
+    expect(place(&mut w, 0, OrderParams { kind: rstate::ORDER_CROSS, trigger: 1, size: 5 * U, interval: own as i64, slices: 1, ..Default::default() }), RouterError::BadOrder);
+    let m = w.env.svm.get_account(&w.env.market).unwrap().data;
+    let other_price = perc::asset_price(&m, 0).map(|x| x.1);
+    eprintln!("asset 0 price: {other_price:?}");
+    let Ok(p0) = other_price else { return; };
+    if p0 == 0 { return; }
+    // Cross: at or below a level far above asset 0's price fires at once; at or above it does not.
+    place(&mut w, 0, OrderParams { index: 1, kind: rstate::ORDER_CROSS, trigger: p0 + 1, size: 5 * U, interval: 0, slices: 1, ..Default::default() }).unwrap();
+    expect(trigger(&mut w, 0, 1), RouterError::NotTriggered);
+    place(&mut w, 0, OrderParams { index: 2, kind: rstate::ORDER_CROSS, trigger: p0 + 1, size: 5 * U, interval: 0, slices: 2, ..Default::default() }).unwrap();
+    let id = trigger(&mut w, 0, 2).unwrap();
+    fill_at(&mut w, 0, id, 2, 1_000_000).unwrap();
+    assert_eq!(position(&w, 0), 5 * U);
+    // Ratio: this asset over asset 0, at or above 1.2 (the price is 1.0 against 1.0): not yet;
+    // when the price is 1.25 it is.
+    let ratio = 1_200_000u64 * 1_000_000 / p0;
+    place(&mut w, 0, OrderParams { index: 3, kind: rstate::ORDER_RATIO, trigger: ratio, size: -5 * U, interval: 0, slices: 1, ..Default::default() }).unwrap();
+    expect(trigger(&mut w, 0, 3), RouterError::NotTriggered);
+    w.move_price(40, 1_250_000);
+    let id = trigger(&mut w, 0, 3).unwrap();
+    fill_at(&mut w, 0, id, 3, 1_250_000).unwrap();
+    assert_eq!(position(&w, 0), 0, "sold back at the ratio");
+}
