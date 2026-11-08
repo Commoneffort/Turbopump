@@ -6,7 +6,7 @@ A vault pools deposits, lists its own perpetual market on Percolator, acts as th
 
 **Status:** live on Solana devnet and X1 testnet, unaudited. Do not use with real funds.
 
-> **Speed work (branch `speed/2026-11`), live on X1 testnet since 2026-11-06; Solana devnet still runs the version before it.** It forks our Percolator engine away from upstream's settlement rules. The last version before it is tagged `pre-speed-fork-2026-11-05`; see [docs/SPEED-FORK.md](docs/SPEED-FORK.md) for what changes and how to roll back.
+> **This branch includes the speed work** (built on branch `speed/2026-11`, merged into `master` on 2026-11-08), live on X1 testnet since 2026-11-06; Solana devnet still runs the version before it. It needs our fork of the Percolator engine, which leaves upstream's settlement rules (see Tests for the repositories to check out). The last version before it is tagged `pre-speed-fork-2026-11-05`; see [docs/SPEED-FORK.md](docs/SPEED-FORK.md) for what changes and how to roll back.
 
 ## Percolator and Turbopump
 
@@ -53,7 +53,7 @@ Before this change the vault filled every trade immediately at Percolator's mark
 
 ### How the router removes it
 
-1. **A trade is a request first.** It lands on chain and gets a target time: the later of the chain clock and the vault's current mark time, plus 4 seconds, rounded up to the next multiple of 2 seconds (`BATCH_SECS`). Rounding only adds wait; it means every request sent in the same 2-second window, on every market, fills at one price, so the executor re-values the accounts once for all of them instead of once per trade.
+1. **A trade is a request first.** It lands on chain and gets a target time: the later of the chain clock and the vault's current mark time, plus 4 seconds, rounded up to the next multiple of 2 seconds (`BATCH_SECS`). Rounding only adds wait; it means every request sent in the same 2-second window, on every market, fills at one price, so the executor re-values the accounts once for all of them instead of once per trade. On X1 (since 2026-11-05) the wait is counted in slots instead: 3 slots (about a second) after the request lands, rounded up to an even slot, and doubled for each step of the risk dial (`DELAY_SLOTS`, `BATCH_SLOTS`, `request_delay` in `router/src/lib.rs`).
 2. **It fills at exactly one price:** the first Pyth price published at or after the target. Pyth's signed update carries its own publish time and the previous one, so the router accepts only the update with `previous publish time < target <= publish time`. Nobody chooses a price: whoever executes the fill, and whenever, the price is the same, and nobody could have known it when the request landed.
 3. **The vault's mark only moves through the router, and only forward.** The vault lists its market in Percolator's authority-mark mode with itself as the oracle authority, and it moves the mark only when the router asks, to a fully verified Pyth price that is newer than the current one. The router never moves it past a pending request's target before that request has filled or expired.
 4. **There is no other way to trade.** The vault's matcher refuses every fill the router did not arm for that exact slot and size, so a trader calling Percolator directly gets nothing.
@@ -62,7 +62,7 @@ Before this change the vault filled every trade immediately at Percolator's mark
 
 Maker quotes (X1, router tag 38) are the exception: they fill at once, against the maker's own Percolator account, never the vault's, at the quoted price (within 1% of Percolator's). Percolator itself only uses a trade's price for its fee; our engine fork settles the difference from its price between the two accounts (matcher flag `FLAG_AT_PRICE`, since 2026-11-07), so the taker pays the quote and the maker earns its spread. The maker carries the risk of the exchanges moving during the quote's life (about 2 s).
 
-What is left: the design assumes the chain clock does not run more than a few seconds behind real time (the 4-second delay is the margin), and a request that cannot fill (for example after the account can no longer afford it at the new price) holds the mark at most 90 seconds before it expires, at the cost of its bond.
+What is left: on Solana the design assumes the chain clock does not run more than a few seconds behind real time (the 4-second delay is the margin); on X1, where the wait is counted in slots, it assumes the price reaches the chain within about a slot of the exchanges. A request that cannot fill (for example after the account can no longer afford it at the new price) holds the mark at most 90 seconds before it expires, at the cost of its bond.
 
 ## Why this exists
 
@@ -82,8 +82,8 @@ So the natural liquidity provider on Percolator is the operator of a market, not
 5. **Settle in epochs, without stopping trading.** Deposits and withdrawals are queued, then priced together at one net asset value when the epoch ends. A flat vault's value does not depend on the price, so anyone can roll it. A vault holding a position is settled through the router instead: anyone queues the settlement, and it executes at the first Pyth price published after its target time, like a trade, so nobody can choose the price it is valued at. Capital stays in Percolator and is counted at Percolator's figure; withdrawals are paid from cash, of which the vault keeps 30% of its value outside Percolator (`RESERVE_BPS`; 10% made vaults go closing-only about once an hour). `TopUpMargin` (anyone) moves that cash into the vault's Percolator margin when the margin is under 40% of its value, back up to 60%.
 6. **Keep exits open.** If an epoch's withdrawals are larger than the vault's cash, they can only be paid once its position is closed (Percolator pays out only from a flat account). Anyone can then switch the vault to closing-only (`RequireFlat`): it only accepts trades that shrink its position. Those withdrawals pay a 0.5% exit fee (`EXIT_FEE_BPS`) that stays with the depositors who remain. If a trader keeps a position open on purpose, anyone can call `Unwind` six epochs later (`UNWIND_GRACE_EPOCHS`: ordinary order flow gets that long to bring the vault flat first), and the vault closes its own position through Percolator's unilateral `RebalanceReduce`. That deleverages the traders on the other side, and Percolator then takes no new position on the market until every position on it is closed. The vault cannot take the other side of a close there, so the router closes the remaining positions out (`RequestClose`: anyone can queue it for any trader, and it executes at the first Pyth price after its target like any request); the market then resets and reopens.
 7. **Liquidate before Percolator has to.** A trader whose equity falls below their positions' liquidation level (3.5% of notional on BTC and ETH, 12% on stocks, 6% elsewhere, always at least 1 point above Percolator's own) can be liquidated through the router by anyone: the request executes at the first Pyth price after its target and, if the account is still below that level at that price, closes against the vault as much of the position as brings the account back to its opening margin plus 0.5% (at least a quarter of it; all of it if under a tenth would be left; `liquidation_size`). Ordinary trades stop at 80% of the vault's limit, so a liquidation always has room. Percolator's own liquidation (at its maintenance margin, on any crank) remains the backstop; it reduces the position unilaterally, which makes the market close-only until it is closed out as above. Since 2026-11-04 the executor works out each account's value at the current price, booked or not (`accountHealth().estimate` in `app/src/chain.ts`: the profit or loss since the account was last re-valued, from Percolator's K index, exactly as Percolator books it), and re-values an account at once when that puts it below its level or within 25% of it, so its router liquidation is queued within a scan (about 6 s) instead of after the routine re-valuing (up to 30 s). Percolator's own liquidation then waits up to 15 s, counted from the first router liquidation queued for the account, while the account still has money left.
-7. **Retire dead markets.** When a market has had no liquidity providers for three epochs, holds no position and has no trade queued, anyone can call `RetireMarket`: its leftover insurance (trading fees nobody else owns) goes to the opener, Percolator retires the asset, and its slot is reused by the next market opened. The same feed can be opened again later.
-8. **Wind down.** If the market is resolved, `SettleResolved` (anyone can call it) closes the portfolio through Percolator's resolved path. Queued deposits are refunded and shares redeem pro rata.
+8. **Retire dead markets.** When a market has had no liquidity providers for three epochs, holds no position and has no trade queued, anyone can call `RetireMarket`: its leftover insurance (trading fees nobody else owns) goes to the opener, Percolator retires the asset, and its slot is reused by the next market opened. The same feed can be opened again later.
+9. **Wind down.** If the market is resolved, `SettleResolved` (anyone can call it) closes the portfolio through Percolator's resolved path. Queued deposits are refunded and shares redeem pro rata.
 
 ## Instructions
 
@@ -167,14 +167,16 @@ So the natural liquidity provider on Percolator is the operator of a market, not
 
 ## Tests
 
-`./test.sh` builds both on-chain programs and runs 145 tests. The tests need Percolator's program crate checked out next to this repo (`../percolator-prog`, branch `merge/2026-10-28` of `Commoneffort/percolator-prog`, which fetches its engine from `Commoneffort/percolator` by commit) with its SBF binary built:
+`./test.sh` builds both on-chain programs (the Solana build and the X1 build) and runs 193 tests. The tests need Percolator's program crate checked out next to this repo (`../percolator-prog`, branch `speed/2026-11` of `Commoneffort/percolator-prog`). That branch fetches the engine fork from `Commoneffort/percolator` by commit (branch `speed/2026-11` there: fills that settle only the trader and the vault, and trades at a maker's quoted price), so it does not need to be cloned. Build the program's SBF binary first:
 
 ```bash
 git clone https://github.com/Commoneffort/Turbopump percolator-vault
-git clone -b merge/2026-10-28 https://github.com/Commoneffort/percolator-prog
-(cd percolator-prog && cargo build-sbf --tools-version v1.52)
+git clone -b speed/2026-11 https://github.com/Commoneffort/percolator-prog
+(cd percolator-prog && cargo build-sbf --tools-version v1.53)
 cd percolator-vault && ./test.sh
 ```
+
+The version before the speed work builds the same way from tag `pre-speed-fork-2026-11-05` in both repositories.
 
 The deployed programs' keys are not in the repository (`keys/` is ignored); the tests do not need them. The integration tests load the **production Percolator SBF binary** into LiteSVM and build markets with Percolator's own test harness; every trade in them goes through the router.
 
@@ -195,7 +197,7 @@ The deployed programs' keys are not in the repository (`keys/` is ignored); the 
 |---|---|
 | Vault program | `BSync6F8gtJs3Wj4w8L6H3ZtS397w2XoCYGEAJGmeYX` |
 | Router program | `DkK9TSMpVXLq26HeqxTXLysXyRKDYHTKU94SLFDWgjw3` |
-| Percolator program (integration branch, program 729a5538 on engine 460944c: upstream's engine of 2026-10-27 plus our fixes not merged upstream yet; the tested build) | `8o3uV87X2CvPYfPwM1sxeaYYE7sGWsTUiEy7SskEMM3P` |
+| Percolator program (devnet still runs the build before the speed work: program 729a5538 on engine 460944c, upstream's engine of 2026-10-27 plus our fixes not merged upstream yet) | `8o3uV87X2CvPYfPwM1sxeaYYE7sGWsTUiEy7SskEMM3P` |
 | Market (test USDC collateral) | `8ZMjDzhAgcV7zidvkRXM257Dp2HmzeNz7jpbTFvRE1Ls` |
 | Market authority (vault program governor address) | `78Hr1UZdw5zPX393dDNK1WnBBmjYWfe4WN3ZurvCnAkR` |
 | SOL-PERP vault | `GJ5JgntYZrsW4S2GpAL53ixg5gPviFThQjk9NtwmgAat` |
@@ -264,15 +266,18 @@ used or not. Everything that sends there therefore asks for what a simulation sa
 (`computeLimit` in chain.ts, `PERCOLATOR_FIT_COMPUTE` in the tool); asking for the maximum, as on
 Solana, costs 0.014 XNT a transaction. What remains is Percolator's own design: every market has
 to be cranked forward 10 slots at a time, traded or not, at about 26,000 compute units per
-market per crank. Measured on X1 testnet with 19 markets: **about 270 XNT a day**, nearly all of
-it cranks (about 14 XNT per market per day). A fill costs the executor about 0.013 XNT (two
+market per crank. Measured on X1 testnet with 19 markets in October 2026, before the speed work:
+**about 270 XNT a day**, nearly all of it cranks (about 14 XNT per market per day); sending one
+fill version first instead of all of them at once (2026-10-28) brought it to about 220 XNT a day. A fill costs the executor about 0.013 XNT (two
 versions are sent, one fails), more than the 0.002 XNT bond it earns. Fewer markets, or a market
 created with a longer accrual step (`max_accrual_dt_slots`, a risk parameter: prices then move
 toward the mark more slowly), are the ways to lower it.
 
 Checked: the X1 build's price rules in LiteSVM (`tests/x1.rs`, 9 tests, run by `./test.sh`); the
 whole sequence on a local validator; and on X1 testnet itself, all 19 markets opened and trades
-on SOL, BTC, ETH and TSLA filled in 7 to 14 seconds.
+on SOL, BTC, ETH and TSLA filled in 7 to 14 seconds (October 2026; with the speed work below,
+measured on X1 in November, a queued trade fills about 1.8 s after it is queued and a quoted one
+0.6 to 1.0 s after the quote is asked for).
 
 ### X1 speed work (November 2026)
 
@@ -309,11 +314,14 @@ Live on X1 testnet since 2026-11-06 (details, measurements and the rollback tag 
 
 ```
 src/            the vault program (processor, matcher, share math, state, Pyth reader, Percolator bindings, client builders)
-router/         the router program (requests, marks, fills) and its client builders
-tests/          LiteSVM tests against the production Percolator binary
+router/         the router program (requests, marks, fills, maker quotes, trading keys) and its client builders
+tests/          LiteSVM tests against the production Percolator binary, and the X1 fill replay data
 examples/       devnet deployment and keeper
-app/            web app (Vite + React + wallet adapter), the devnet faucet API, and scripts (executor, seed)
+app/            web app (Vite + React + wallet adapter); app/api: the site's server functions (faucet, maker quotes, fee sponsor, charts data); app/scripts: executor, maker, price service, witness, watchdog, seed and test bots
+deploy/         deployment manifests (devnet, X1 and its four extra markets), release gate, upgrade and service scripts
 pusher/         standalone Pyth price pusher for shared feed accounts (needs a Pyth API key)
+demo/           demo and pitch video sources
+docs/           speed work, hackathon write-up, demo script, proposals
 ```
 
 See [SECURITY.md](SECURITY.md) for the threat model and known limits, the live [docs page](https://turbopumpx.vercel.app/#/docs) for the full protocol description, [docs/SUBMISSION.md](docs/SUBMISSION.md) for the hackathon write-up and [docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md) for the demo.

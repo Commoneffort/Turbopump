@@ -8,8 +8,8 @@ app/dist/
 app/*.tsbuildinfo
 .vercel/
 demo/build/
-hedging/node_modules/
-hedging/state/
+# The operator's hedging tools stay on their machine only
+hedging/
 deploy/x1-tool
 deploy/indexer/
 demo/pitch/build/
