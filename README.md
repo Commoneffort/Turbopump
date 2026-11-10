@@ -9,7 +9,9 @@ A vault pools deposits, lists its own perpetual market on Percolator, acts as th
 | **X1 testnet** (speed work, since 2026-11-06) | Fills at once at the price a maker signed for it: about 0.6 to 0.7 s from click to filled, signed by a trading key the wallet approved once, with no wallet popup | Fills 3 slots after it lands (X1 slots are 0.36 s), about 2 to 3 s from sending to filled |
 | **Solana devnet** (version before the speed work) | Not available | Fills 4 seconds after it lands, on the next 2-second mark, so trades sent close together share a price |
 
-See [docs/SPEED-FORK.md](docs/SPEED-FORK.md) for how the X1 numbers were measured. Nobody holds a key over any of it: every parameter is fixed when a vault is created, and every maintenance step can be run by anyone.
+See [docs/SPEED-FORK.md](docs/SPEED-FORK.md) for how the X1 numbers were measured.
+
+Nobody holds a key over any of it: every parameter is fixed when a vault is created, and every maintenance step can be run by anyone.
 
 **Status:** live on Solana devnet and X1 testnet, unaudited. Do not use with real funds.
 
