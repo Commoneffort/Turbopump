@@ -2,7 +2,14 @@
 
 Turbopump is permissionless, adminless liquidity vaults for [Percolator](https://github.com/aeyakovenko/percolator), Anatoly Yakovenko's perpetual-futures risk engine on Solana, with trading that cannot be front-run.
 
-A vault pools deposits, lists its own perpetual market on Percolator, acts as the counterparty to every queued trade on it, and pays the market's trading fees to its depositors. Every trade goes through a router. A queued trade fills at the first oracle price published after a short wait, a price nobody could know when they traded: on X1 three slots after the trade landed (about a second; counted in slots since November 2026, see docs/SPEED-FORK.md), on Solana four seconds (on the next 2-second mark, so trades sent close together share a price). On X1 a market order can instead fill at once at the price a maker signed for it, signed by a trading key the wallet approved once, with no wallet popup. Nobody holds a key over any of it: every parameter is fixed when a vault is created, and every maintenance step can be run by anyone.
+A vault pools deposits, lists its own perpetual market on Percolator, acts as the counterparty to every queued trade on it, and pays the market's trading fees to its depositors. Every trade goes through a router. A queued trade fills at the first oracle price published after a short wait, a price nobody could know when they traded.
+
+| Network | Market order at a maker's quote | Queued trade |
+| --- | --- | --- |
+| **X1 testnet** (speed work, since 2026-11-06) | Fills at once at the price a maker signed for it: about 0.6 to 0.7 s from click to filled, signed by a trading key the wallet approved once, with no wallet popup | Fills 3 slots after it lands (X1 slots are 0.36 s), about 2 to 3 s from sending to filled |
+| **Solana devnet** (version before the speed work) | Not available | Fills 4 seconds after it lands, on the next 2-second mark, so trades sent close together share a price |
+
+See [docs/SPEED-FORK.md](docs/SPEED-FORK.md) for how the X1 numbers were measured. Nobody holds a key over any of it: every parameter is fixed when a vault is created, and every maintenance step can be run by anyone.
 
 **Status:** live on Solana devnet and X1 testnet, unaudited. Do not use with real funds.
 
@@ -16,7 +23,7 @@ Two different things, by two different authors. **Percolator** is the risk engin
 |---|---|---|
 | Liquidity | None of its own: a trade needs a counterparty | One shared vault per asset on each market, the counterparty to every queued trade; on X1 makers too |
 | Market keys | Whoever lists a market holds its admin, insurance and oracle keys | The vault's own address holds them; no instruction uses them |
-| Price a trade gets | The market's mark at that moment | Queued: the first oracle price published after a short wait (on X1 3 slots, about a second; on Solana 4 to 5 seconds). Quoted (X1): the maker's signed price, at once |
+| Price a trade gets | The market's mark at that moment | Quoted (X1): the maker's signed price, at once. Queued: the first oracle price published after a short wait (on X1 3 slots, about a second; on Solana devnet 4 to 5 seconds) |
 | Order types | An immediate trade between two accounts | Market, limit, stop loss, take profit, trailing stop, TWAP |
 | Who earns the fees | The asset's insurance operator | Depositors 85%, the market's opener 5%, the platform 10% |
 
@@ -53,7 +60,7 @@ Before this change the vault filled every trade immediately at Percolator's mark
 
 ### How the router removes it
 
-1. **A trade is a request first.** It lands on chain and gets a target time: the later of the chain clock and the vault's current mark time, plus 4 seconds, rounded up to the next multiple of 2 seconds (`BATCH_SECS`). Rounding only adds wait; it means every request sent in the same 2-second window, on every market, fills at one price, so the executor re-values the accounts once for all of them instead of once per trade. On X1 (since 2026-11-05) the wait is counted in slots instead: 3 slots (about a second) after the request lands, rounded up to an even slot, and doubled for each step of the risk dial (`DELAY_SLOTS`, `BATCH_SLOTS`, `request_delay` in `router/src/lib.rs`).
+1. **A trade is a request first.** It lands on chain and gets a target. On X1 (since 2026-11-05) the target is counted in slots: 3 slots (about a second) after the request lands, rounded up to an even slot, and doubled for each step of the risk dial (`DELAY_SLOTS`, `BATCH_SLOTS`, `request_delay` in `router/src/lib.rs`). On Solana devnet, which still runs the version before the speed work, it is a time: the later of the chain clock and the vault's current mark time, plus 4 seconds, rounded up to the next multiple of 2 seconds (`BATCH_SECS`). Rounding only adds wait; it means every request sent in the same window, on every market, fills at one price, so the executor re-values the accounts once for all of them instead of once per trade.
 2. **It fills at exactly one price:** the first Pyth price published at or after the target. Pyth's signed update carries its own publish time and the previous one, so the router accepts only the update with `previous publish time < target <= publish time`. Nobody chooses a price: whoever executes the fill, and whenever, the price is the same, and nobody could have known it when the request landed.
 3. **The vault's mark only moves through the router, and only forward.** The vault lists its market in Percolator's authority-mark mode with itself as the oracle authority, and it moves the mark only when the router asks, to a fully verified Pyth price that is newer than the current one. The router never moves it past a pending request's target before that request has filled or expired.
 4. **There is no other way to trade.** The vault's matcher refuses every fill the router did not arm for that exact slot and size, so a trader calling Percolator directly gets nothing.
@@ -288,17 +295,21 @@ Live on X1 testnet since 2026-11-06 (details, measurements and the rollback tag 
 - **Maker quotes:** a market order fills against a maker who signed a quote for it, in its own
   transaction, at the quoted price (engine fork `FLAG_AT_PRICE`; about 0.8 s from click to confirmed on X1), quotes fetched while the order is typed. Our maker runs
   as `api/quote` on the site and `app/scripts/maker.ts`.
-- **Five markets:** four more Percolator markets (`deploy/x1-testnet.m1.json` to `m4.json`), each
-  with SOL, BTC and ETH, its vaults, maker and executor (`deploy/x1-services.sh`); each wallet
-  trades on one of them.
+- **Extra markets (switched off):** four more Percolator markets (`deploy/x1-testnet.m1.json` to
+  `m4.json`), each with SOL, BTC and ETH, its vaults, maker and executor. Opened 2026-11-06 and
+  switched off on 2026-11-07, because keeping them current cost about 10 XNT an hour; X1 runs
+  on the original market. `X1_EXTRA_MARKETS=1 deploy/x1-services.sh` starts them again.
 - **One-click trading:** a random, non-extractable browser key approved on chain (tags 39/40)
   signs trades and standing orders with no wallet popup, within a size a trade, trades a day, a
   total a day and a quote band; it ends itself after 2 hours idle; a fee sponsor (`api/relay`) tops
   an approved key up with 0.1 XNT when it runs out (3 a day); setup in one approval; the key falls back to the
   wallet when it cannot cover a queued order.
 - **Across markets:** copying a leader on another market (`TriggerCopy` with the leader's market
-  and vault), Earn deposits spread over all five markets' vaults, per-asset makers on the original
+  and vault), Earn deposits spread over every open market's vaults, per-asset makers on the original
   market (`MAKER_ASSETS_X1`).
+- **Measured live (X1, 2026-11-10):** quotes fill 0.6 to 0.7 s after the click; queued trades
+  about 2 to 3 s; about 2,100 fills a day; one market handled about 50 fills a second in the
+  November load drill.
 
 ## Credits
 
