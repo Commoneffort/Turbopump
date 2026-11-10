@@ -20,12 +20,16 @@ export const explorer = (what: "address" | "tx", id: string) =>
 export const capUnits = (nav: bigint, bps: number, priceE6: bigint) => (priceE6 > 0n ? (nav * BigInt(bps) / 10_000n) * C.UNIT / priceE6 : 0n);
 export const ago = (sec: number) => (sec < 60 ? `${Math.max(1, Math.round(sec))}s ago` : sec < 3600 ? `${Math.round(sec / 60)}m ago` : `${Math.round(sec / 3600)}h ago`);
 
-export type Toast = { ok: boolean; text: string; sig?: string };
+/** `pending`: a quoted fill shown before the chain confirmed it (a maker's quote is the price
+ *  paid, so the fill is known once the trade is sent); the confirmed or failed toast replaces it. */
+export type Toast = { ok: boolean; text: string; sig?: string; pending?: boolean };
 /** `ixs` may be a function: it is called right before the wallet signs, so what it reads from the
  *  chain (a market's next request id) is as fresh as it can be. */
 /** `opts.key`: sign with the wallet's approved trading key (tradingKey.ts) instead of the wallet:
- *  the key pays the fee and is the only signer, so the wallet shows nothing. */
-export type Send = (label: string, ixs: TransactionInstruction[] | ((conn: Connection) => Promise<TransactionInstruction[]>), opts?: { key?: import("./tradingKey").TradingKey }) => Promise<string | undefined>;
+ *  the key pays the fee and is the only signer, so the wallet shows nothing.
+ *  `opts.preview`: read once the transaction is sent; a text (the quoted fill) is shown at once,
+ *  before the chain confirms it. */
+export type Send = (label: string, ixs: TransactionInstruction[] | ((conn: Connection) => Promise<TransactionInstruction[]>), opts?: { key?: import("./tradingKey").TradingKey; preview?: () => string | undefined }) => Promise<string | undefined>;
 
 export function Stat({ label, value, sub }: { label: string; value: string; sub?: string }) {
   return (

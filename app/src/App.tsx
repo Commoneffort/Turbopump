@@ -89,10 +89,12 @@ function useSend(onDone: () => void): [Send, string | undefined, Toast | undefin
                 await C.sponsorTopUp(connection, wallet.publicKey, opts.key.publicKey);
                 sig = await connection.sendRawTransaction(tx.serialize());
               }
+              const shown = opts.preview?.();
+              if (shown) setToast({ ok: true, pending: true, text: `${shown}: filled, confirming on chain…`, sig });
               if (C.X1) await C.confirmFast(connection, sig);
               else await connection.confirmTransaction(sig, "confirmed");
               readDirect();
-              setToast({ ok: true, text: `${label}: confirmed${attempt > 1 ? ` (try ${attempt})` : ""}`, sig });
+              setToast({ ok: true, text: `${shown ?? label}: confirmed${attempt > 1 ? ` (try ${attempt})` : ""}`, sig });
               onDone();
               return sig;
             } catch (e: any) {
@@ -125,10 +127,12 @@ function useSend(onDone: () => void): [Send, string | undefined, Toast | undefin
         } else sig = await wallet.sendTransaction(tx, connection);
         // (On X1 the status is asked for every 0.25 s: the subscription the library waits on
         // can take seconds longer to report it.)
+        const shown = opts?.preview?.();
+        if (shown) setToast({ ok: true, pending: true, text: `${shown}: filled, confirming on chain…`, sig });
         if (C.X1) await C.confirmFast(connection, sig);
         else await connection.confirmTransaction(sig, "confirmed");
         readDirect(); // what this changed is not in the shared copy yet
-        setToast({ ok: true, text: `${label}: confirmed`, sig });
+        setToast({ ok: true, text: `${shown ?? label}: confirmed`, sig });
         onDone();
         return sig;
       } catch (e: any) {
@@ -266,7 +270,7 @@ export default function App() {
 
       <TraderModalHost send={send} busy={busy} tick={tick} go={go} />
       {toast && (
-        <div className={toast.ok ? "toast ok" : "toast err"} onClick={clearToast}>
+        <div className={toast.pending ? "toast pending" : toast.ok ? "toast ok" : "toast err"} onClick={clearToast}>
           {toast.text}
           {toast.sig && <a href={explorer("tx", toast.sig)} target="_blank" rel="noreferrer"> · view</a>}
         </div>

@@ -26,6 +26,9 @@ import { BurnerName, revealTestWalletKey } from "./burner";
 const UP = T.green, DOWN = T.red;
 const pct = (x: number, dp = 2) => `${x >= 0 ? "+" : "−"}${fmt(Math.abs(x) * 100, dp)}%`;
 const money = (x: number, dp = 2) => `$${fmt(x, dp)}`;
+/** What a quoted trade shows once sent: the quote is the price paid, so the fill is known before
+ *  the chain confirms it (shown at once, then "confirmed"). */
+const quotedText = (label: string, q: C.Quote) => { const px = Number(q.price) / 1e6; return `${label} at ${money(px, px < 10 ? 4 : 2)}`; };
 const compact = (x: number) => (x >= 1e9 ? `$${fmt(x / 1e9, 2)}B` : x >= 1e6 ? `$${fmt(x / 1e6, 2)}M` : x >= 1e3 ? `$${fmt(x / 1e3, 1)}k` : `$${fmt(x, 0)}`);
 const signedMoney = (x: number) => `${x >= 0 ? "+" : "−"}$${fmt(Math.abs(x))}`;
 /** An up or down arrow for a gain or a loss. */
@@ -737,23 +740,28 @@ function Ticket({ state, send, busy, copying, margin, setMargin, vaults }: { sta
       let first = C.QUOTES_ON ? await C.quotedTrade(connection, v, publicKey, sub, size, 6, 1_500, true, actor).catch(() => null) : null;
       const canQueue = ok.lamports >= queueCoins(size);
       if (first || canQueue) {
+        let shown: string | undefined;
         const r = await send(label, async conn => {
           // (A try after a failure in passing gets a fresh quote.)
           const q = first ?? (C.QUOTES_ON ? await C.quotedTrade(conn, v, publicKey, sub, size, 6, 1_500, true, actor).catch(() => null) : null);
           first = null;
-          if (q && fits(withNote(cb(q), actor), actor)) return withNote(cb(q), actor);
+          shown = undefined;
+          if (q && fits(withNote(cb(q), actor), actor)) { shown = quotedText(label, q.quote); return withNote(cb(q), actor); }
           if (!canQueue) throw new Error("no maker quote now, and the one-click key has too little coin to queue the order");
           return withNote([C.requestTrade(publicKey, v.key, size, { sub, closeOnly, actor })], actor);
-        }, keyOpts);
+        }, { ...keyOpts, preview: () => shown });
         if (r) setNote("");
         return r;
       }
     }
     const life = wallet?.adapter?.name === BurnerName ? 6 : 30;
+    let shown: string | undefined;
     const r = await send(label, async conn => {
       const q = C.QUOTES_ON ? await C.quotedTrade(conn, v, publicKey, sub, size, life, 1_500).catch(() => null) : null;
-      return q && fits(withNote(cb(q)), publicKey) ? withNote(cb(q)) : withNote([C.requestTrade(publicKey, v.key, size, { sub, closeOnly })]);
-    });
+      const quoted = !!q && fits(withNote(cb(q)), publicKey);
+      shown = q && quoted ? quotedText(label, q.quote) : undefined;
+      return q && quoted ? withNote(cb(q)) : withNote([C.requestTrade(publicKey, v.key, size, { sub, closeOnly })]);
+    }, { preview: () => shown });
     if (r) setNote("");
     return r;
   };

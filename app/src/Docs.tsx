@@ -258,8 +258,11 @@ export default function Docs() {
         {X1 && <p>
           <b>Quotes fetched ahead.</b> While you type an order, the ticket already asks for a quote for it and keeps one fresh,
           so a click signs at once instead of asking first: 0.2 to 0.4 seconds from click to a signed trade, before your wallet.
-          With one-click trading (below) there is no wallet step, and a quoted trade is confirmed about 0.8 seconds after the
-          click. Quoted trades count in your track record like any other fill.
+          With one-click trading (below) there is no wallet step, and a quoted trade is confirmed about 0.4 to 0.8 seconds
+          after the click. A quote is the price you pay, so the page shows the fill (&quot;Long 0.05 SOL at $84.38: filled,
+          confirming on chain&quot;) as soon as the trade is sent, about 0.1 seconds after the click, and then
+          &quot;confirmed&quot; when the chain has it; if the chain refused it, that message says so instead. Quoted trades count in
+          your track record like any other fill.
         </p>}
         {X1 && <p>
           <b>One market, for now.</b> A chain limits how much computing can write one account in a block, and every trade
