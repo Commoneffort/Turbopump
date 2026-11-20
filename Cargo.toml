@@ -27,7 +27,7 @@ bytemuck = { version = "1.14", features = ["derive", "min_const_generics"] }
 [dev-dependencies]
 percolator-router = { path = "router", features = ["no-entrypoint"] }
 percolator_prog = { package = "percolator-prog", path = "../percolator-prog", default-features = false, features = ["no-entrypoint"] }
-percolator = { git = "https://github.com/Commoneffort/percolator", rev = "84fabf9ca054a95c274cefd1a7e533bdbf53c9b8" }
+percolator = { git = "https://github.com/Commoneffort/percolator", rev = "def5b7686a10d06f99ee6f6d2686dd0aa3295c21" }
 litesvm = "0.1"
 solana-sdk = "1.18"
 solana-client = "1.18"
@@ -45,8 +45,3 @@ unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(target_os, values("solana"))',
     'cfg(feature, values("custom-heap", "custom-panic"))',
 ] }
-
-# Speed work (docs/SPEED-FORK.md): the engine fork's branch, from the local worktree until its
-# commit is pinned (here and in percolator-prog).
-[patch."https://github.com/Commoneffort/percolator"]
-percolator = { path = "../_wt_speed" }
