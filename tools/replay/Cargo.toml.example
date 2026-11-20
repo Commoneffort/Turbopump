@@ -1,0 +1,13 @@
+# Scratch crate for the replay tools: copy this folder somewhere, rename this file to Cargo.toml,
+# put replay_*.rs under tests/, and keep percolator-prog checked out at the path below.
+[package]
+name = "replay"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+[dev-dependencies]
+percolator_prog = { package = "percolator-prog", path = "../percolator-prog", default-features = false, features = ["no-entrypoint"] }
+litesvm = "0.1"
+solana-sdk = "1.18"
+serde_json = "1"
+bincode = "1"
