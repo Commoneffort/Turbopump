@@ -27,7 +27,7 @@ bytemuck = { version = "1.14", features = ["derive", "min_const_generics"] }
 [dev-dependencies]
 percolator-router = { path = "router", features = ["no-entrypoint"] }
 percolator_prog = { package = "percolator-prog", path = "../percolator-prog", default-features = false, features = ["no-entrypoint"] }
-percolator = { git = "https://github.com/Commoneffort/percolator", rev = "def5b7686a10d06f99ee6f6d2686dd0aa3295c21" }
+percolator = { git = "https://github.com/Commoneffort/percolator", rev = "e026541a64a5f05d984e26046e8b9dbcf2093b3e" }
 litesvm = "0.1"
 solana-sdk = "1.18"
 solana-client = "1.18"

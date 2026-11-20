@@ -34,28 +34,71 @@ pub const MARKET_COLLATERAL_MINT_OFF: usize = HEADER_LEN + 32;
 
 /// Per-asset slots follow the wrapper config and the market-group header.
 pub const MARKET_SLOTS_OFF: usize = 464 + 726;
-pub const MARKET_ASSET_SLOT_LEN: usize = 1813;
+/// Asset-slot length since Percolator's engine c030aa4 (upstream #247 provider principal and
+/// #449 raw-basis sums): 64 bytes more than before (`MARKET_ASSET_SLOT_LEN_V1`).
+pub const MARKET_ASSET_SLOT_LEN: usize = 1877;
+/// Asset-slot length before engine c030aa4. A market account keeps it until Percolator's
+/// one-shot migration (tag 73) rewrites it; until then both layouts are read.
+pub const MARKET_ASSET_SLOT_LEN_V1: usize = 1813;
+/// In the current layout every asset-state field from `stored_pos_count_long` on sits 32
+/// bytes later than in v1 (the raw-basis sums were inserted before it), as do the slot's
+/// fields after the asset state (insurance budgets, ...). Offsets in this file are v1 offsets
+/// relative to the slot's engine part; `engine_field` moves them.
+const V1_RAW_BASIS_INSERT: usize = 321;
+const LAYOUT_SHIFT: usize = 32;
 const SLOT_ENGINE: usize = 512;
-const SLOT_MARKET_ID: usize = SLOT_ENGINE;
-const SLOT_INS_BUDGET_LONG: usize = SLOT_ENGINE + 515;
-const SLOT_INS_BUDGET_SHORT: usize = SLOT_ENGINE + 531;
-const SLOT_INS_SPENT_LONG: usize = SLOT_ENGINE + 547;
-const SLOT_INS_SPENT_SHORT: usize = SLOT_ENGINE + 563;
+const ENGINE_MARKET_ID: usize = 0;
+pub const ENGINE_INS_BUDGET_LONG: usize = 515;
+pub const ENGINE_INS_BUDGET_SHORT: usize = 531;
+pub const ENGINE_INS_SPENT_LONG: usize = 547;
+pub const ENGINE_INS_SPENT_SHORT: usize = 563;
 
-pub fn market_account_len_for_slots(slots: usize) -> usize {
-    MARKET_SLOTS_OFF + slots * MARKET_ASSET_SLOT_LEN
+/// The asset-slot length of a market account's layout, from the account's length.
+pub fn market_slot_len(market_len: usize) -> Result<usize, ProgramError> {
+    let slots = market_len.checked_sub(MARKET_SLOTS_OFF).ok_or(VaultError::BadPercolatorAccount)?;
+    if slots % MARKET_ASSET_SLOT_LEN == 0 {
+        Ok(MARKET_ASSET_SLOT_LEN)
+    } else if slots % MARKET_ASSET_SLOT_LEN_V1 == 0 {
+        Ok(MARKET_ASSET_SLOT_LEN_V1)
+    } else {
+        Err(VaultError::BadPercolatorAccount.into())
+    }
+}
+
+/// Where an asset's slot starts in a market account (either layout).
+fn slot_base(d: &[u8], asset_index: u16) -> Result<usize, ProgramError> {
+    Ok(MARKET_SLOTS_OFF + asset_index as usize * market_slot_len(d.len())?)
+}
+
+/// Where a field at v1 offset `v1_off` (relative to a slot's engine part) is in the current
+/// layout.
+pub fn current_engine_offset(v1_off: usize) -> usize {
+    if v1_off >= V1_RAW_BASIS_INSERT { v1_off + LAYOUT_SHIFT } else { v1_off }
+}
+
+/// Absolute offset of an engine field of an asset, given its v1 offset relative to the slot's
+/// engine part (`ASSET_*`, `ENGINE_*`).
+fn engine_field(d: &[u8], asset_index: u16, v1_off: usize) -> Result<usize, ProgramError> {
+    let len = market_slot_len(d.len())?;
+    let off = if len == MARKET_ASSET_SLOT_LEN { current_engine_offset(v1_off) } else { v1_off };
+    Ok(MARKET_SLOTS_OFF + asset_index as usize * len + SLOT_ENGINE + off)
+}
+
+/// A market account's length with `slots` asset slots, in the layout of its current length.
+pub fn market_account_len_for_slots(market_len: usize, slots: usize) -> Result<usize, ProgramError> {
+    Ok(MARKET_SLOTS_OFF + slots * market_slot_len(market_len)?)
 }
 
 /// Generation and remaining insurance budget (long + short) of one asset.
 pub fn asset_insurance(ai: &AccountInfo, asset_index: u16) -> Result<(u64, u128), ProgramError> {
     expect_market(ai)?;
     let d = ai.try_borrow_data()?;
-    let base = MARKET_SLOTS_OFF + asset_index as usize * MARKET_ASSET_SLOT_LEN;
-    let market_id = rd_u64(&d, base + SLOT_MARKET_ID)?;
-    let long = rd_u128(&d, base + SLOT_INS_BUDGET_LONG)?
-        .saturating_sub(rd_u128(&d, base + SLOT_INS_SPENT_LONG)?);
-    let short = rd_u128(&d, base + SLOT_INS_BUDGET_SHORT)?
-        .saturating_sub(rd_u128(&d, base + SLOT_INS_SPENT_SHORT)?);
+    let f = |off| engine_field(&d, asset_index, off);
+    let market_id = rd_u64(&d, f(ENGINE_MARKET_ID)?)?;
+    let long = rd_u128(&d, f(ENGINE_INS_BUDGET_LONG)?)?
+        .saturating_sub(rd_u128(&d, f(ENGINE_INS_SPENT_LONG)?)?);
+    let short = rd_u128(&d, f(ENGINE_INS_BUDGET_SHORT)?)?
+        .saturating_sub(rd_u128(&d, f(ENGINE_INS_SPENT_SHORT)?)?);
     Ok((market_id, long.saturating_add(short)))
 }
 
@@ -190,25 +233,25 @@ pub fn max_trading_fee_bps(d: &[u8]) -> Result<u64, ProgramError> {
 
 /// An asset's generation (`market_id`), effective price (e6) and last accrual slot.
 pub fn asset_price(d: &[u8], asset_index: u16) -> Result<(u64, u64, u64), ProgramError> {
-    let e = MARKET_SLOTS_OFF + asset_index as usize * MARKET_ASSET_SLOT_LEN + SLOT_ENGINE;
-    Ok((rd_u64(d, e)?, rd_u64(d, e + ASSET_EFFECTIVE_PRICE)?, rd_u64(d, e + ASSET_SLOT_LAST)?))
+    let f = |off| engine_field(d, asset_index, off);
+    Ok((rd_u64(d, f(ENGINE_MARKET_ID)?)?, rd_u64(d, f(ASSET_EFFECTIVE_PRICE)?)?, rd_u64(d, f(ASSET_SLOT_LAST)?)?))
 }
 
 /// How many accounts on an asset are not yet re-valued at its latest price move (both sides),
 /// and its funding (F) and social-loss (B) indices of each side: the router's lazy settlement
 /// (`router/src/lazy.rs`) only lets a fill skip re-valuing the others while those have not moved.
 pub fn asset_cohort(d: &[u8], asset_index: u16) -> Result<(u64, [u128; 4]), ProgramError> {
-    let e = MARKET_SLOTS_OFF + asset_index as usize * MARKET_ASSET_SLOT_LEN + SLOT_ENGINE;
-    let stale = rd_u64(d, e + ASSET_STALE_LONG)?.saturating_add(rd_u64(d, e + ASSET_STALE_SHORT)?);
-    Ok((stale, [rd_u128(d, e + ASSET_F_LONG)?, rd_u128(d, e + ASSET_F_SHORT)?, rd_u128(d, e + ASSET_B_LONG)?, rd_u128(d, e + ASSET_B_SHORT)?]))
+    let f = |off| engine_field(d, asset_index, off);
+    let stale = rd_u64(d, f(ASSET_STALE_LONG)?)?.saturating_add(rd_u64(d, f(ASSET_STALE_SHORT)?)?);
+    Ok((stale, [rd_u128(d, f(ASSET_F_LONG)?)?, rd_u128(d, f(ASSET_F_SHORT)?)?, rd_u128(d, f(ASSET_B_LONG)?)?, rd_u128(d, f(ASSET_B_SHORT)?)?]))
 }
 
 /// True while an asset is close-only: a position on it was reduced unilaterally (the vault's
 /// `Unwind`, a liquidation), which deleverages the other side, and Percolator then refuses every
 /// risk-increasing trade on the asset until all positions on it are closed and its sides reset.
 pub fn asset_close_only(d: &[u8], asset_index: u16) -> Result<bool, ProgramError> {
-    let e = MARKET_SLOTS_OFF + asset_index as usize * MARKET_ASSET_SLOT_LEN + SLOT_ENGINE;
-    Ok(rd_u128(d, e + ASSET_A_LONG)? != ADL_ONE || rd_u128(d, e + ASSET_A_SHORT)? != ADL_ONE)
+    Ok(rd_u128(d, engine_field(d, asset_index, ASSET_A_LONG)?)? != ADL_ONE
+        || rd_u128(d, engine_field(d, asset_index, ASSET_A_SHORT)?)? != ADL_ONE)
 }
 
 /// A portfolio's capital, PnL and active legs as (asset, signed position: positive is long).
@@ -252,7 +295,6 @@ pub fn positions(market: &[u8], portfolio: &[u8]) -> Result<Vec<Position>, Progr
         }
         let asset = u32::from_le_bytes(portfolio[l + LEG_ASSET_INDEX..l + LEG_ASSET_INDEX + 4].try_into().unwrap());
         let asset = u16::try_from(asset).map_err(|_| VaultError::BadPercolatorAccount)?;
-        let e = MARKET_SLOTS_OFF + asset as usize * MARKET_ASSET_SLOT_LEN + SLOT_ENGINE;
         let long = portfolio[l + LEG_SIDE] == 0;
         let (a_off, epoch_off, kf_off) = if long {
             (ASSET_A_LONG, ASSET_EPOCH_LONG, ASSET_KF_EPOCH_LONG)
@@ -261,18 +303,18 @@ pub fn positions(market: &[u8], portfolio: &[u8]) -> Result<Vec<Position>, Progr
         };
         let basis = rd_i128(portfolio, l + LEG_BASIS_POS_Q)?.unsigned_abs();
         let a_basis = rd_u128(portfolio, l + LEG_A_BASIS)?;
-        let abs = if rd_u64(portfolio, l + LEG_EPOCH_SNAP)? != rd_u64(market, e + epoch_off)? || a_basis == 0 {
+        let abs = if rd_u64(portfolio, l + LEG_EPOCH_SNAP)? != rd_u64(market, engine_field(market, asset, epoch_off)?)? || a_basis == 0 {
             0
         } else {
             // ceil(basis * a_now / a_basis), as the engine rounds it
-            let num = basis.checked_mul(rd_u128(market, e + a_off)?).ok_or(VaultError::Overflow)?;
+            let num = basis.checked_mul(rd_u128(market, engine_field(market, asset, a_off)?)?).ok_or(VaultError::Overflow)?;
             num.div_ceil(a_basis)
         };
         let abs = i128::try_from(abs).map_err(|_| VaultError::Overflow)?;
         out.push(Position {
             asset,
             size: if long { abs } else { -abs },
-            settled: rd_u64(portfolio, l + LEG_KF_EPOCH_SNAP)? >= rd_u64(market, e + kf_off)?,
+            settled: rd_u64(portfolio, l + LEG_KF_EPOCH_SNAP)? >= rd_u64(market, engine_field(market, asset, kf_off)?)?,
         });
     }
     Ok(out)
@@ -752,6 +794,18 @@ pub fn update_funding_cap(authority: &Pubkey, market: &Pubkey, cap_e9: u64, sequ
     }
 }
 
+/// Percolator tag 73 (our fork): the market authority moves a market account from the
+/// pre-c030aa4 layout to the current one. Percolator refuses it unless the market is exactly in
+/// the old layout and the move is exact, and needs the account to hold rent for its new length.
+pub const TAG_MIGRATE_MARKET_LAYOUT_V2: u8 = 73;
+pub fn migrate_market_layout_v2(authority: &Pubkey, market: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: PERCOLATOR_PROGRAM_ID,
+        accounts: vec![AccountMeta::new_readonly(*authority, true), AccountMeta::new(*market, false)],
+        data: vec![TAG_MIGRATE_MARKET_LAYOUT_V2],
+    }
+}
+
 /// The market's bound on funding rates (e9 per slot); 0 = no funding.
 pub fn max_abs_funding_e9(d: &[u8]) -> Result<u64, ProgramError> {
     rd_u64(d, MARKET_CONFIG_OFF + CONFIG_MAX_ABS_FUNDING_E9)
@@ -762,17 +816,17 @@ pub fn max_abs_funding_e9(d: &[u8]) -> Result<u64, ProgramError> {
 /// then on assets >= 1 the funding rate (i64 bits), its generation and its slot (see Percolator's
 /// `authority_funding_rate_view`).
 const SLOT_SEQUENCES: usize = 424;
-fn sequences_base(asset_index: u16) -> usize {
-    MARKET_SLOTS_OFF + asset_index as usize * MARKET_ASSET_SLOT_LEN + SLOT_SEQUENCES
+fn sequences_base(d: &[u8], asset_index: u16) -> Result<usize, ProgramError> {
+    Ok(slot_base(d, asset_index)? + SLOT_SEQUENCES)
 }
 /// An asset's (current oracle observation sequence, authority epoch).
 pub fn asset_sequences(d: &[u8], asset_index: u16) -> Result<(u64, u64), ProgramError> {
-    let b = sequences_base(asset_index);
+    let b = sequences_base(d, asset_index)?;
     Ok((rd_u64(d, b)?, rd_u64(d, b + 16)?))
 }
 /// Asset 0's trade-fee policy sequence (shared with the funding cap update).
 pub fn policy_sequence(d: &[u8]) -> Result<u64, ProgramError> {
-    rd_u64(d, sequences_base(0) + 24)
+    rd_u64(d, sequences_base(d, 0)? + 24)
 }
 /// An asset's funding as its authority set it: (rate e9 per slot, slot it was set at). Zero rate
 /// when never set or set for another generation of the asset slot.
@@ -780,8 +834,8 @@ pub fn authority_funding(d: &[u8], asset_index: u16) -> Result<(i64, u64), Progr
     if asset_index == 0 {
         return Ok((0, 0));
     }
-    let b = sequences_base(asset_index);
-    let generation = rd_u64(d, MARKET_SLOTS_OFF + asset_index as usize * MARKET_ASSET_SLOT_LEN + SLOT_MARKET_ID)?;
+    let b = sequences_base(d, asset_index)?;
+    let generation = rd_u64(d, engine_field(d, asset_index, ENGINE_MARKET_ID)?)?;
     if rd_u64(d, b + 32)? != generation || generation == 0 {
         return Ok((0, 0));
     }
@@ -886,9 +940,10 @@ pub fn crank_work(market: &[u8], portfolio: &[u8], also: u16, now: u64) -> Resul
         }
         let asset = u32::from_le_bytes(portfolio[l + LEG_ASSET_INDEX..l + LEG_ASSET_INDEX + 4].try_into().unwrap());
         let asset = u16::try_from(asset).map_err(|_| VaultError::BadPercolatorAccount)?;
-        let e = MARKET_SLOTS_OFF + asset as usize * MARKET_ASSET_SLOT_LEN + SLOT_ENGINE;
         let (epoch_off, kf_off) = if portfolio[l + LEG_SIDE] == 0 { (ASSET_EPOCH_LONG, ASSET_KF_EPOCH_LONG) } else { (ASSET_EPOCH_SHORT, ASSET_KF_EPOCH_SHORT) };
-        if rd_u64(portfolio, l + LEG_KF_EPOCH_SNAP)? < rd_u64(market, e + kf_off)? || rd_u64(portfolio, l + LEG_EPOCH_SNAP)? != rd_u64(market, e + epoch_off)? {
+        if rd_u64(portfolio, l + LEG_KF_EPOCH_SNAP)? < rd_u64(market, engine_field(market, asset, kf_off)?)?
+            || rd_u64(portfolio, l + LEG_EPOCH_SNAP)? != rd_u64(market, engine_field(market, asset, epoch_off)?)?
+        {
             work = true;
         }
         if asset != also && !assets.contains(&asset) {
@@ -897,8 +952,7 @@ pub fn crank_work(market: &[u8], portfolio: &[u8], also: u16, now: u64) -> Resul
     }
     assets.push(also);
     for a in &assets {
-        let e = MARKET_SLOTS_OFF + *a as usize * MARKET_ASSET_SLOT_LEN + SLOT_ENGINE;
-        if rd_u64(market, e + ASSET_SLOT_LAST)? < now {
+        if rd_u64(market, engine_field(market, *a, ASSET_SLOT_LAST)?)? < now {
             work = true;
         }
     }

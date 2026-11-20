@@ -215,7 +215,7 @@ fn a_provider_who_leaves_is_paid_its_part_of_uncollected_fees() {
         let data = w.env.market_data(false);
         let base = perc::MARKET_SLOTS_OFF + asset * perc::MARKET_ASSET_SLOT_LEN + 512;
         let rd = |o: usize| u128::from_le_bytes(data[base + o..base + o + 16].try_into().unwrap());
-        (rd(515) + rd(531) - rd(547) - rd(563)) as u64 - 10_000
+        (rd(perc::current_engine_offset(perc::ENGINE_INS_BUDGET_LONG)) + rd(perc::current_engine_offset(perc::ENGINE_INS_BUDGET_SHORT)) - rd(perc::current_engine_offset(perc::ENGINE_INS_SPENT_LONG)) - rd(perc::current_engine_offset(perc::ENGINE_INS_SPENT_SHORT))) as u64 - 10_000
     };
     println!("uncollected {uncollected}");
     let providers_part = uncollected - uncollected / 20 - uncollected / 10; // the opener's twentieth and the platform's tenth are not theirs
@@ -333,7 +333,7 @@ fn e2e_operate_mode_lists_asset_and_harvests_fees() {
         let data = w.env.market_data(false);
         let base = perc::MARKET_SLOTS_OFF + asset * perc::MARKET_ASSET_SLOT_LEN + 512;
         let rd = |o: usize| u128::from_le_bytes(data[base + o..base + o + 16].try_into().unwrap());
-        (0, rd(515) + rd(531) - rd(547) - rd(563))
+        (0, rd(perc::current_engine_offset(perc::ENGINE_INS_BUDGET_LONG)) + rd(perc::current_engine_offset(perc::ENGINE_INS_BUDGET_SHORT)) - rd(perc::current_engine_offset(perc::ENGINE_INS_SPENT_LONG)) - rd(perc::current_engine_offset(perc::ENGINE_INS_SPENT_SHORT)))
     };
     println!("asset insurance after trades: {insurance}");
     assert!(insurance > 10_000, "fees accrued to the vault's asset insurance");
@@ -401,14 +401,18 @@ fn market_offsets_match_engine() {
     assert_eq!(perc::MARKET_ASSET_SLOT_LEN, c::MARKET_ASSET_SLOT_LEN);
     assert_eq!(offset_of!(percolator::Market<[u8; 512]>, engine), 512);
     assert_eq!(offset_of!(S, asset) + offset_of!(percolator::AssetStateV16Account, market_id), 0);
-    assert_eq!(offset_of!(S, insurance_domain_budget_long), 515);
-    assert_eq!(offset_of!(S, insurance_domain_budget_short), 531);
-    assert_eq!(offset_of!(S, insurance_domain_spent_long), 547);
-    assert_eq!(offset_of!(S, insurance_domain_spent_short), 563);
-    assert_eq!(
-        perc::market_account_len_for_slots(4),
-        percolator_prog::state::market_account_len_for_capacity(4).unwrap()
-    );
+    // `perc` keeps v1 (pre-c030aa4) offsets and maps them with `current_engine_offset`; the v1
+    // values themselves are pinned by tests/layout_dual.rs against migrated live markets.
+    let cur = perc::current_engine_offset;
+    assert_eq!(perc::MARKET_ASSET_SLOT_LEN_V1 + 64, c::MARKET_ASSET_SLOT_LEN);
+    assert_eq!(offset_of!(S, insurance_domain_budget_long), cur(perc::ENGINE_INS_BUDGET_LONG));
+    assert_eq!(offset_of!(S, insurance_domain_budget_short), cur(perc::ENGINE_INS_BUDGET_SHORT));
+    assert_eq!(offset_of!(S, insurance_domain_spent_long), cur(perc::ENGINE_INS_SPENT_LONG));
+    assert_eq!(offset_of!(S, insurance_domain_spent_short), cur(perc::ENGINE_INS_SPENT_SHORT));
+    let current_len = percolator_prog::state::market_account_len_for_capacity(4).unwrap();
+    assert_eq!(perc::market_account_len_for_slots(current_len, 4).unwrap(), current_len);
+    let v1_len = perc::MARKET_SLOTS_OFF + 4 * perc::MARKET_ASSET_SLOT_LEN_V1;
+    assert_eq!(perc::market_account_len_for_slots(v1_len, 5).unwrap(), v1_len + perc::MARKET_ASSET_SLOT_LEN_V1);
     // Offsets the router's margin check and fill reads.
     use percolator::{AssetStateV16Account as A, PortfolioAccountV16Account as P, PortfolioLegV16Account as L, V16ConfigAccount as C};
     assert_eq!(perc::MARKET_CONFIG_OFF, c::MARKET_GROUP_OFF + offset_of!(percolator::MarketGroupV16HeaderAccount, config));
@@ -417,10 +421,10 @@ fn market_offsets_match_engine() {
     assert_eq!(perc::CONFIG_MIN_NONZERO_IM_REQ, offset_of!(C, min_nonzero_im_req));
     assert_eq!(perc::CONFIG_MAX_TRADING_FEE_BPS, offset_of!(C, max_trading_fee_bps));
     assert_eq!(perc::WRAPPER_TRADE_FEE_BASE_BPS, c::HEADER_LEN + offset_of!(percolator_prog::state::WrapperConfigV16, trade_fee_base_bps));
-    assert_eq!(perc::ASSET_EFFECTIVE_PRICE, offset_of!(A, effective_price));
-    assert_eq!(perc::ASSET_SLOT_LAST, offset_of!(A, slot_last));
-    assert_eq!(perc::ASSET_A_LONG, offset_of!(A, a_long));
-    assert_eq!(perc::ASSET_A_SHORT, offset_of!(A, a_short));
+    assert_eq!(cur(perc::ASSET_EFFECTIVE_PRICE), offset_of!(A, effective_price));
+    assert_eq!(cur(perc::ASSET_SLOT_LAST), offset_of!(A, slot_last));
+    assert_eq!(cur(perc::ASSET_A_LONG), offset_of!(A, a_long));
+    assert_eq!(cur(perc::ASSET_A_SHORT), offset_of!(A, a_short));
     assert_eq!(perc::ADL_ONE, percolator::ADL_ONE);
     assert_eq!(perc::PORTFOLIO_LEGS_OFF, c::HEADER_LEN + offset_of!(P, legs));
     assert_eq!(perc::PORTFOLIO_LEG_LEN, std::mem::size_of::<L>());
@@ -432,10 +436,16 @@ fn market_offsets_match_engine() {
     assert_eq!(perc::LEG_A_BASIS, offset_of!(L, a_basis));
     assert_eq!(perc::LEG_KF_EPOCH_SNAP, offset_of!(L, kf_epoch_snap));
     assert_eq!(perc::LEG_EPOCH_SNAP, offset_of!(L, epoch_snap));
-    assert_eq!(perc::ASSET_KF_EPOCH_LONG, offset_of!(A, kf_epoch_long));
-    assert_eq!(perc::ASSET_KF_EPOCH_SHORT, offset_of!(A, kf_epoch_short));
-    assert_eq!(perc::ASSET_EPOCH_LONG, offset_of!(A, epoch_long));
-    assert_eq!(perc::ASSET_EPOCH_SHORT, offset_of!(A, epoch_short));
+    assert_eq!(cur(perc::ASSET_KF_EPOCH_LONG), offset_of!(A, kf_epoch_long));
+    assert_eq!(cur(perc::ASSET_KF_EPOCH_SHORT), offset_of!(A, kf_epoch_short));
+    assert_eq!(cur(perc::ASSET_EPOCH_LONG), offset_of!(A, epoch_long));
+    assert_eq!(cur(perc::ASSET_EPOCH_SHORT), offset_of!(A, epoch_short));
+    assert_eq!(cur(perc::ASSET_STALE_LONG), offset_of!(A, stale_account_count_long));
+    assert_eq!(cur(perc::ASSET_STALE_SHORT), offset_of!(A, stale_account_count_short));
+    assert_eq!(cur(perc::ASSET_F_LONG), offset_of!(A, f_long_num));
+    assert_eq!(cur(perc::ASSET_F_SHORT), offset_of!(A, f_short_num));
+    assert_eq!(cur(perc::ASSET_B_LONG), offset_of!(A, b_long_num));
+    assert_eq!(cur(perc::ASSET_B_SHORT), offset_of!(A, b_short_num));
     // The vault reads the router book's pending count and trusts the router's authority address.
     assert_eq!(percolator_vault::ROUTER_BOOK_LEN_OFF, offset_of!(percolator_router::state::Book, len));
     assert_eq!(percolator_vault::ROUTER_PROGRAM_ID, percolator_router::id());
@@ -785,7 +795,14 @@ fn export_layout_for_frontend() {
             "stored_pos_count_short": offset_of!(percolator::AssetStateV16Account, stored_pos_count_short),
             "stale_account_count_long": offset_of!(percolator::AssetStateV16Account, stale_account_count_long),
             "stale_account_count_short": offset_of!(percolator::AssetStateV16Account, stale_account_count_short),
-            "ins_budget_long": 515, "ins_budget_short": 531, "ins_spent_long": 547, "ins_spent_short": 563,
+            "ins_budget_long": offset_of!(percolator::EngineAssetSlotV16Account, insurance_domain_budget_long),
+            "ins_budget_short": offset_of!(percolator::EngineAssetSlotV16Account, insurance_domain_budget_short),
+            "ins_spent_long": offset_of!(percolator::EngineAssetSlotV16Account, insurance_domain_spent_long),
+            "ins_spent_short": offset_of!(percolator::EngineAssetSlotV16Account, insurance_domain_spent_short),
+            "f_long": offset_of!(percolator::AssetStateV16Account, f_long_num),
+            "f_short": offset_of!(percolator::AssetStateV16Account, f_short_num),
+            "b_long": offset_of!(percolator::AssetStateV16Account, b_long_num),
+            "b_short": offset_of!(percolator::AssetStateV16Account, b_short_num),
             "control_sequences": percolator_prog::constants::ASSET_CONTROL_SEQUENCES_OFF,
             "oracle_observation": offset_of!(percolator_prog::state::AssetControlSequencesV16, oracle_observation),
             "authority_epoch": offset_of!(percolator_prog::state::AssetControlSequencesV16, authority_epoch) }
@@ -970,7 +987,7 @@ fn idle_market_is_retired_and_its_slot_reused() {
         let data = w.env.market_data(false);
         let base = perc::MARKET_SLOTS_OFF + asset as usize * perc::MARKET_ASSET_SLOT_LEN + 512;
         let rd = |o: usize| u128::from_le_bytes(data[base + o..base + o + 16].try_into().unwrap());
-        rd(515) + rd(531) - rd(547) - rd(563)
+        rd(perc::current_engine_offset(perc::ENGINE_INS_BUDGET_LONG)) + rd(perc::current_engine_offset(perc::ENGINE_INS_BUDGET_SHORT)) - rd(perc::current_engine_offset(perc::ENGINE_INS_SPENT_LONG)) - rd(perc::current_engine_offset(perc::ENGINE_INS_SPENT_SHORT))
     };
     assert!(insurance > 0, "trading fees sit in the asset's insurance");
     let owed_before = w.vault_state().opener_fees_owed;

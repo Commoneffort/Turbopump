@@ -176,11 +176,11 @@ So the natural liquidity provider on Percolator is the operator of a market, not
 
 ## Tests
 
-`./test.sh` builds both on-chain programs (the Solana build and the X1 build) and runs 193 tests. The tests need Percolator's program crate checked out next to this repo (`../percolator-prog`, branch `merge/2026-11-19` of `Commoneffort/percolator-prog`, the Percolator build live on X1 testnet and Solana devnet since 2026-11-20). That branch fetches the engine fork from `Commoneffort/percolator` by commit (branch `merge/2026-11-19` there: the speed fork, fills that settle only the trader and the vault and trades at a maker's quoted price, plus upstream's fixes up to 2026-11-19 that keep the stored account layout), so it does not need to be cloned. Build the program's SBF binary and the two test matchers first:
+`./test.sh` builds both on-chain programs (the Solana build and the X1 build) and runs 196 tests. The tests need Percolator's program crate checked out next to this repo (`../percolator-prog`, branch `merge/2026-11-20-layout` of `Commoneffort/percolator-prog`: upstream's program up to 2026-11-20 plus our trade paths, funding instructions and the one-shot market layout migration, tag 73). That branch fetches the engine fork from `Commoneffort/percolator` by commit (branch `merge/2026-11-20-layout` there: upstream's engine c030aa4, whose asset slots are 64 bytes longer, plus fills at a maker's quoted price, cohort-tolerant fills and the #172 crank-order fix), so it does not need to be cloned. The vault, router and app read market accounts in both layouts, so they keep working across the migration (`tests/layout_dual.rs`, `app/scripts/migrate-layout.ts`). Build the program's SBF binary and the two test matchers first:
 
 ```bash
 git clone https://github.com/Commoneffort/Turbopump percolator-vault
-git clone -b merge/2026-11-19 https://github.com/Commoneffort/percolator-prog
+git clone -b merge/2026-11-20-layout https://github.com/Commoneffort/percolator-prog
 (cd percolator-prog && cargo build-sbf --tools-version v1.53)
 # the two test matchers (tests/fixtures links to percolator-prog/tests/fixtures)
 for m in auth_matcher hostile_matcher; do (cd percolator-prog/tests/fixtures/$m && cargo build-sbf --tools-version v1.53); done

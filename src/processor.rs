@@ -199,6 +199,9 @@ pub const TAG_SET_FUNDING_CAP: u8 = 43;
 /// Makers (`maker`): register a portfolio as a maker; the router arms one signed quote.
 pub const TAG_OPEN_MAKER: u8 = 44;
 pub const TAG_ARM_QUOTE: u8 = 45;
+/// One-shot: a governed market moves to Percolator's current account layout (see
+/// `migrate_market_layout`).
+pub const TAG_MIGRATE_MARKET_LAYOUT: u8 = 46;
 
 /// The bound on every funding rate of a governed market (e9 per slot); 0 on a market means no
 /// funding at all, and `SetFundingCap` sets a governed market's cap to this.
@@ -662,6 +665,10 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         TAG_SET_FUNDING_CAP => {
             no_args(rest)?;
             set_funding_cap(program_id, accounts)
+        }
+        TAG_MIGRATE_MARKET_LAYOUT => {
+            no_args(rest)?;
+            migrate_market_layout(program_id, accounts)
         }
         _ => Err(VaultError::InvalidInstruction.into()),
     }
@@ -1791,7 +1798,7 @@ fn list_asset(program_id: &Pubkey, accounts: &[AccountInfo], a: ListArgs) -> Pro
     let price = update.price_e6().ok_or(VaultError::BadOracle)?;
 
     // Rent for the market account's new asset slot.
-    let new_len = perc::market_account_len_for_slots(a.asset_index as usize + 1);
+    let new_len = perc::market_account_len_for_slots(market.data_len(), a.asset_index as usize + 1)?;
     if new_len > market.data_len() {
         let need = Rent::get()?.minimum_balance(new_len);
         if market.lamports() < need {
@@ -1985,6 +1992,44 @@ fn set_funding_cap(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResu
     };
     invoke_signed(
         &perc::update_funding_cap(governor.key, market.key, CANON_MAX_FUNDING_E9, sequence.checked_add(1).ok_or(VaultError::Overflow)?, authority_epoch),
+        &[governor.clone(), market.clone(), percolator.clone()],
+        &[&[SEED_GOVERNOR, market.key.as_ref(), &[bump]]],
+    )
+}
+
+/// Moves a governed market from the account layout of Percolator's engine before c030aa4 to the
+/// current one (Percolator tag 73, signed by the market's governor). Anyone may send it, like
+/// `SetFundingCap`: Percolator refuses anything but an exact one-time move. The payer tops the
+/// market up to rent for its new length (64 bytes more per asset slot).
+///
+/// Accounts: 0 governor PDA, 1 market [w], 2 Percolator program, 3 payer [signer, w], 4 system program.
+fn migrate_market_layout(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let governor = acc(accounts, 0)?;
+    let market = acc(accounts, 1)?;
+    let percolator = acc(accounts, 2)?;
+    let payer = acc(accounts, 3)?;
+    let system = acc(accounts, 4)?;
+    writable(market)?;
+    key_is(percolator, &PERCOLATOR_PROGRAM_ID)?;
+    key_is(system, &system_program::ID)?;
+    signer(payer)?;
+    perc::expect_market(market)?;
+    let (expected, bump) = state::governor_address(program_id, market.key);
+    key_is(governor, &expected)?;
+    let len = market.data_len();
+    if perc::market_slot_len(len)? != perc::MARKET_ASSET_SLOT_LEN_V1 {
+        return Err(VaultError::InvalidInstruction.into());
+    }
+    let slots = (len - perc::MARKET_SLOTS_OFF) / perc::MARKET_ASSET_SLOT_LEN_V1;
+    let need = Rent::get()?.minimum_balance(perc::MARKET_SLOTS_OFF + slots * perc::MARKET_ASSET_SLOT_LEN);
+    if market.lamports() < need {
+        invoke(
+            &system_instruction::transfer(payer.key, market.key, need - market.lamports()),
+            &[payer.clone(), market.clone(), system.clone()],
+        )?;
+    }
+    invoke_signed(
+        &perc::migrate_market_layout_v2(governor.key, market.key),
         &[governor.clone(), market.clone(), percolator.clone()],
         &[&[SEED_GOVERNOR, market.key.as_ref(), &[bump]]],
     )

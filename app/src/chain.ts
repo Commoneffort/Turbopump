@@ -123,6 +123,18 @@ const marketOfData = new WeakMap<Uint8Array, string>();
 /** The market a copy of market data was read from (the original market when not noted). */
 export const marketKeyOf = (d: Uint8Array) => { const k = marketOfData.get(d); return k ? new PublicKey(k) : ACTIVE; };
 export const noteMarketData = (d: Uint8Array, market: PublicKey) => { marketOfData.set(d, market.toBase58()); return d; };
+/** Percolator's engine c030aa4 added 64 bytes to every asset slot: two raw-basis sums inside the
+ *  asset state (fields from `stored_pos_count_long` on moved 32 bytes, as did everything after the
+ *  asset state) and the provider principal at the slot's end. A market account keeps the older
+ *  layout until its one-shot migration (Percolator tag 73), so both are read: `L.market` is the
+ *  current layout, `MARKET_V1` the older one. Slot- and sequence-relative keys do not move. */
+type MarketLayout = typeof L.market;
+const MARKET_FIXED_KEYS = new Set(["slots", "slot_len", "engine", "control_sequences", "oracle_observation", "authority_epoch"]);
+const MARKET_V1: MarketLayout = Object.fromEntries(Object.entries(L.market).map(([k, v]) => [k,
+  k === "slot_len" ? (v as number) - 64
+  : !MARKET_FIXED_KEYS.has(k) && (v as number) >= L.market.stored_pos_count_long ? (v as number) - 32 : v])) as MarketLayout;
+/** The layout of a market account's data (`L.market` once migrated, else `MARKET_V1`). */
+export const marketLayout = (d: Uint8Array): MarketLayout => ((d.length - L.market.slots) % L.market.slot_len === 0 ? L.market : MARKET_V1);
 export const PUSH_ORACLE = new PublicKey("pythWSnswVUd12oZpeFP8e9CVaEqJg25g1Vtc2biRsT");
 export const USDC = 1_000_000;
 /** Epoch length of every canonical vault on devnet (the program's CANON_EPOCH_LEN_SLOTS). */
@@ -291,10 +303,10 @@ export function legPosition(market: Uint8Array, d: Uint8Array, base: number): bi
   const q = i128(d, base + L.leg.basis_pos_q);
   let abs = q < 0n ? -q : q;
   const long = d[base + L.leg.side] === 0;
-  const a = L.market.slots + u32(d, base + L.leg.asset_index) * L.market.slot_len + L.market.engine;
-  if (u64(d, base + L.leg.epoch_snap) !== u64(market, a + (long ? L.market.epoch_long : L.market.epoch_short))) abs = 0n;
+  const a = marketLayout(market).slots + u32(d, base + L.leg.asset_index) * marketLayout(market).slot_len + marketLayout(market).engine;
+  if (u64(d, base + L.leg.epoch_snap) !== u64(market, a + (long ? marketLayout(market).epoch_long : marketLayout(market).epoch_short))) abs = 0n;
   else {
-    const now = u128(market, a + (long ? L.market.a_long : L.market.a_short)), then = u128(d, base + L.leg.a_basis);
+    const now = u128(market, a + (long ? marketLayout(market).a_long : marketLayout(market).a_short)), then = u128(d, base + L.leg.a_basis);
     if (then > 0n && now !== then) abs = (abs * now + then - 1n) / then;
   }
   return long ? abs : -abs;
@@ -327,7 +339,7 @@ export function decodePortfolio(d: Uint8Array, asset: number, market?: Uint8Arra
 export type Asset = { marketId: bigint; price: bigint; slotLast: bigint; oiLong: bigint; oiShort: bigint; insurance: bigint };
 
 export function decodeAsset(market: Uint8Array, index: number): Asset {
-  const m = L.market;
+  const m = marketLayout(market);
   const e = m.slots + index * m.slot_len + m.engine;
   if (e + m.ins_spent_short + 16 > market.length) return { marketId: 0n, price: 0n, slotLast: 0n, oiLong: 0n, oiShort: 0n, insurance: 0n };
   return {
@@ -350,7 +362,7 @@ export const marketHeader = (d: Uint8Array) => {
   // first retired slot and only appends when none is.
   let listSlot = slots;
   for (let i = 1; i < slots; i++) {
-    if (d[L.market.slots + i * L.market.slot_len + L.market.engine + L.market.lifecycle] === LIFECYCLE_RETIRED) {
+    if (d[marketLayout(d).slots + i * marketLayout(d).slot_len + marketLayout(d).engine + marketLayout(d).lifecycle] === LIFECYCLE_RETIRED) {
       listSlot = i;
       break;
     }
@@ -554,9 +566,9 @@ export function fundingOf(market: Uint8Array, asset: number): { capE9: bigint; r
   const RR = L.router as any;
   const capE9 = RR.funding_cap_off ? u64(market, RR.funding_cap_off) : 0n;
   if (asset === 0 || RR.funding_seq_off_in_slot === undefined) return { capE9, rateE9: 0n, setSlot: 0n };
-  const slot = L.market.slots + asset * L.market.slot_len;
+  const slot = marketLayout(market).slots + asset * marketLayout(market).slot_len;
   const base = slot + RR.funding_seq_off_in_slot;
-  const generation = u64(market, slot + L.market.engine + L.market.market_id);
+  const generation = u64(market, slot + marketLayout(market).engine + marketLayout(market).market_id);
   if (base + 48 > market.length || u64(market, base + 32) !== generation || generation === 0n) return { capE9, rateE9: 0n, setSlot: 0n };
   return { capE9, rateE9: i64(market, base + 24), setSlot: u64(market, base + 40) };
 }
@@ -809,7 +821,7 @@ export type CrankPlan = { lag: number; lagCrank: TransactionInstruction; settle:
 
 /** `trader`, `sub`: the account a fill is for (its wallet, and which of its accounts). */
 export function crankPlan(s: MarketSnapshot, payer: PublicKey, vehicle: PublicKey, focus: number | undefined, trader?: PublicKey, assets: number[] = [], sub = 0): CrankPlan {
-  const at = (a: number) => L.market.slots + a * L.market.slot_len + L.market.engine;
+  const at = (a: number) => marketLayout(s.market).slots + a * marketLayout(s.market).slot_len + marketLayout(s.market).engine;
   const legs = (d: Uint8Array) => {
     const out: { asset: number; stale: boolean; losing: boolean }[] = [];
     for (let i = 0; i < 16; i++) {
@@ -818,11 +830,11 @@ export function crankPlan(s: MarketSnapshot, payer: PublicKey, vehicle: PublicKe
       const asset = u32(d, leg + L.leg.asset_index);
       const long = d[leg + L.leg.side] === 0;
       // Out of date after a price move, or left over from a side that was emptied and reset.
-      const stale = u64(d, leg + L.leg.kf_epoch_snap) < u64(s.market, at(asset) + (long ? L.market.kf_epoch_long : L.market.kf_epoch_short))
-        || u64(d, leg + L.leg.epoch_snap) !== u64(s.market, at(asset) + (long ? L.market.epoch_long : L.market.epoch_short));
+      const stale = u64(d, leg + L.leg.kf_epoch_snap) < u64(s.market, at(asset) + (long ? marketLayout(s.market).kf_epoch_long : marketLayout(s.market).kf_epoch_short))
+        || u64(d, leg + L.leg.epoch_snap) !== u64(s.market, at(asset) + (long ? marketLayout(s.market).epoch_long : marketLayout(s.market).epoch_short));
       // Whether settling this position books a loss: its side's price index is below the one
       // the position was last settled at.
-      const losing = i128(s.market, at(asset) + (long ? L.market.k_long : L.market.k_short)) < i128(d, leg + L.leg.k_snap);
+      const losing = i128(s.market, at(asset) + (long ? marketLayout(s.market).k_long : marketLayout(s.market).k_short)) < i128(d, leg + L.leg.k_snap);
       out.push({ asset, stale, losing });
     }
     return out;
@@ -853,11 +865,11 @@ export function crankPlan(s: MarketSnapshot, payer: PublicKey, vehicle: PublicKe
   const set = new Set<number>([...assets, ...holders.flatMap(p => p.legs.map(l => l.asset))]);
   if (focus !== undefined) { set.delete(focus); set.add(focus); }
   const all = [...set];
-  const moving = (a: number) => u64(s.market, at(a) + L.market.effective_price) !== u64(s.market, at(a) + L.market.raw_oracle_target_price);
+  const moving = (a: number) => u64(s.market, at(a) + marketLayout(s.market).effective_price) !== u64(s.market, at(a) + marketLayout(s.market).raw_oracle_target_price);
   // (Prototype, IDLE_JUMP=1: a market with no positions catches up in one crank, so only the
   // markets with positions decide how many cranks are needed.)
-  const counts = (a: number) => !IDLE_JUMP || u128(s.market, at(a) + L.market.oi_long) !== 0n || u128(s.market, at(a) + L.market.oi_short) !== 0n;
-  const oldest = all.filter(counts).reduce((m, a) => { const t = u64(s.market, at(a) + L.market.slot_last); return t < m ? t : m; }, BigInt(s.slot));
+  const counts = (a: number) => !IDLE_JUMP || u128(s.market, at(a) + marketLayout(s.market).oi_long) !== 0n || u128(s.market, at(a) + marketLayout(s.market).oi_short) !== 0n;
+  const oldest = all.filter(counts).reduce((m, a) => { const t = u64(s.market, at(a) + marketLayout(s.market).slot_last); return t < m ? t : m; }, BigInt(s.slot));
   const due = settleOrder.filter(p => p.legs.some(l => l.stale || moving(l.asset)));
   const own = (p: { legs: { asset: number }[] }) => {
     const as = [...new Set(p.legs.map(l => l.asset))];
@@ -876,10 +888,10 @@ export function crankPlan(s: MarketSnapshot, payer: PublicKey, vehicle: PublicKe
  *  pending") and refuses new positions on the asset until anyone finalizes the reset. Returns
  *  that instruction for each parked side that is ready (no stored or out-of-date positions). */
 export function finalizeResets(market: Uint8Array, assetIndex: number): TransactionInstruction[] {
-  const a = L.market.slots + assetIndex * L.market.slot_len + L.market.engine;
+  const a = marketLayout(market).slots + assetIndex * marketLayout(market).slot_len + marketLayout(market).engine;
   const sides = [
-    [L.market.mode_long, L.market.stored_pos_count_long, L.market.stale_account_count_long],
-    [L.market.mode_short, L.market.stored_pos_count_short, L.market.stale_account_count_short],
+    [marketLayout(market).mode_long, marketLayout(market).stored_pos_count_long, marketLayout(market).stale_account_count_long],
+    [marketLayout(market).mode_short, marketLayout(market).stored_pos_count_short, marketLayout(market).stale_account_count_short],
   ];
   return sides.flatMap(([mode, stored, stale], side) =>
     market[a + mode] === 2 && u64(market, a + stored) === 0n && u64(market, a + stale) === 0n
@@ -977,7 +989,7 @@ export const LIQUIDATION_BPS = BigInt(L.router.liquidation_bps);
  *  settled at that price (until it is, capital and PnL do not reflect the latest move). */
 export function accountHealth(market: Uint8Array, portfolio: Uint8Array, debt = 0n) {
   const P = L.portfolio;
-  const at = (a: number) => L.market.slots + a * L.market.slot_len + L.market.engine;
+  const at = (a: number) => marketLayout(market).slots + a * marketLayout(market).slot_len + marketLayout(market).engine;
   const positions: { asset: number; size: bigint; price: bigint; notional: bigint }[] = [];
   let settled = true, notional = 0n, unbooked = 0n;
   for (let i = 0; i < 16; i++) {
@@ -985,18 +997,18 @@ export function accountHealth(market: Uint8Array, portfolio: Uint8Array, debt = 
     if (portfolio[leg + L.leg.active] !== 1) continue;
     const asset = u32(portfolio, leg + L.leg.asset_index);
     const size = legPosition(market, portfolio, leg);
-    const price = u64(market, at(asset) + L.market.effective_price);
+    const price = u64(market, at(asset) + marketLayout(market).effective_price);
     const n = (size < 0n ? -size : size) * price / UNIT;
     const long = portfolio[leg + L.leg.side] === 0;
-    if (u64(portfolio, leg + L.leg.kf_epoch_snap) < u64(market, at(asset) + (long ? L.market.kf_epoch_long : L.market.kf_epoch_short))) settled = false;
+    if (u64(portfolio, leg + L.leg.kf_epoch_snap) < u64(market, at(asset) + (long ? marketLayout(market).kf_epoch_long : marketLayout(market).kf_epoch_short))) settled = false;
     // The profit or loss the price has made since the account was last re-valued, which its
     // capital and PnL do not show yet: |basis| x (K now - K then) / (A at the basis x POS_SCALE),
     // as Percolator books it when the account is next touched (funding is off, so F is left out).
-    const sameEpoch = u64(portfolio, leg + L.leg.epoch_snap) === u64(market, at(asset) + (long ? L.market.epoch_long : L.market.epoch_short));
+    const sameEpoch = u64(portfolio, leg + L.leg.epoch_snap) === u64(market, at(asset) + (long ? marketLayout(market).epoch_long : marketLayout(market).epoch_short));
     const aBasis = u128(portfolio, leg + L.leg.a_basis);
     if (sameEpoch && aBasis > 0n) {
       const q = i128(portfolio, leg + L.leg.basis_pos_q);
-      const kNow = i128(market, at(asset) + (long ? L.market.k_long : L.market.k_short));
+      const kNow = i128(market, at(asset) + (long ? marketLayout(market).k_long : marketLayout(market).k_short));
       const dk = kNow - i128(portfolio, leg + L.leg.k_snap);
       unbooked += ((q < 0n ? -q : q) * dk) / (aBasis * UNIT);
     }
@@ -1040,7 +1052,7 @@ export async function fetchTiers(conn: Connection, market = activeMarket()) { co
 export function levels(market: Uint8Array, asset: number, tiers: Uint8Array | null = tiersFor(market)) {
   const RR = L.router as any;
   const im = u64(market, RR.im_bps_off), mm = u64(market, RR.mm_bps_off);
-  const generation = u64(market, L.market.slots + asset * L.market.slot_len + L.market.engine + L.market.market_id);
+  const generation = u64(market, marketLayout(market).slots + asset * marketLayout(market).slot_len + marketLayout(market).engine + marketLayout(market).market_id);
   const known = tiers && asset < RR.tier_slots && u64(tiers, RR.tiers.generation + asset * 8) === generation ? tiers[RR.tiers.tier + asset] : undefined;
   const openTier = known ?? TIER_STOCK, liqTier = known ?? (tiers ? TIER_DEFAULT : TIER_MAJOR);
   const lv = (t: number) => ((RR.tier_levels[t] ?? RR.tier_levels[0]) as number[]).map(BigInt);
@@ -1056,8 +1068,8 @@ export const maxLeverage = (market: Uint8Array, asset: number) => Number(10_000n
  *  Unwind, a liquidation), which deleverages the other side, and Percolator then refuses every
  *  risk-increasing trade on it until all positions on it are closed and its sides reset. */
 export const closeOnly = (market: Uint8Array, asset: number) => {
-  const a = L.market.slots + asset * L.market.slot_len + L.market.engine;
-  return u128(market, a + L.market.a_long) !== ADL_ONE || u128(market, a + L.market.a_short) !== ADL_ONE;
+  const a = marketLayout(market).slots + asset * marketLayout(market).slot_len + marketLayout(market).engine;
+  return u128(market, a + marketLayout(market).a_long) !== ADL_ONE || u128(market, a + marketLayout(market).a_short) !== ADL_ONE;
 };
 const ADL_ONE = 1_000_000_000_000_000n;
 
@@ -1075,7 +1087,7 @@ export function openPositions(portfolio: Uint8Array): number {
  *  as a loss (the router's `margin_covers`). A trade that only shrinks a position is always accepted. */
 export function marginRoom(market: Uint8Array, portfolio: Uint8Array, asset: number, owed = 0n): bigint {
   const R = L.router, P = L.portfolio;
-  const price = (a: number) => u64(market, L.market.slots + a * L.market.slot_len + L.market.engine + L.market.effective_price);
+  const price = (a: number) => u64(market, marketLayout(market).slots + a * marketLayout(market).slot_len + marketLayout(market).engine + marketLayout(market).effective_price);
   const stress = BigInt(R.stress_bps), fee = marketRates(market).feeBps;
   // A position's need per unit of notional, scaled by 1e8.
   const perUnit = (a: number) => (10_000n + stress) * (levels(market, a).open + fee) + stress * 10_000n;
@@ -1099,7 +1111,7 @@ export function marginRoom(market: Uint8Array, portfolio: Uint8Array, asset: num
 export function isolatedNeed(market: Uint8Array, asset: number, size: bigint): bigint {
   const q = size < 0n ? -size : size;
   if (q === 0n) return 0n;
-  const p = u64(market, L.market.slots + asset * L.market.slot_len + L.market.engine + L.market.effective_price);
+  const p = u64(market, marketLayout(market).slots + asset * marketLayout(market).slot_len + marketLayout(market).engine + marketLayout(market).effective_price);
   const stress = BigInt(L.router.stress_bps), fee = marketRates(market).feeBps;
   const perUnit = (10_000n + stress) * (levels(market, asset).open + fee) + stress * 10_000n;
   return u128(market, L.router.min_im_off) + q * p / UNIT * perUnit / 100_000_000n;
@@ -1465,16 +1477,18 @@ export function portfolioAssets(d: Uint8Array): number[] {
 }
 /** How many positions are open on an asset (both sides). */
 export function assetPositionCount(market: Uint8Array, asset: number): number {
-  const e = L.market.slots + asset * L.market.slot_len + L.market.engine;
-  return Number(u64(market, e + 321) + u64(market, e + 329));
+  const e = marketLayout(market).slots + asset * marketLayout(market).slot_len + marketLayout(market).engine;
+  const M = marketLayout(market);
+  return Number(u64(market, e + M.stored_pos_count_long) + u64(market, e + M.stored_pos_count_short));
 }
 /** The router's `lazy::tolerant`: whether a fill now skips re-valuing the asset's other accounts
  *  (true only while some are out of date and the range allows it). */
 export function lazyReady(market: Uint8Array, asset: number, b: Book, r: PriceRange | null, requireStale = true): boolean {
   if (!r || !r.valid || r.low === 0n) return false;
-  const e = L.market.slots + asset * L.market.slot_len + L.market.engine;
-  const stale = u64(market, e + 337) + u64(market, e + 345);
-  const indices = [113, 129, 225, 241].map(o => u128(market, e + o));
+  const e = marketLayout(market).slots + asset * marketLayout(market).slot_len + marketLayout(market).engine;
+  const M = marketLayout(market);
+  const stale = u64(market, e + M.stale_account_count_long) + u64(market, e + M.stale_account_count_short);
+  const indices = [M.f_long, M.f_short, M.b_long, M.b_short].map(o => u128(market, e + o));
   // (Without `requireStale`: before the fill's own crank has accrued the asset to the new mark,
   // nobody is out of date yet.)
   if ((requireStale && stale === 0n) || r.markAt !== b.markPublish || indices.some((x, i) => x !== r.indices[i])) return false;
@@ -1523,8 +1537,8 @@ export const holdPctYear = (rateE12: bigint) => holdPctHour(rateE12) * 24 * 365;
 
 /** An asset's next oracle observation sequence and its authority epoch (Percolator checks both). */
 export function controlSequences(market: Uint8Array, asset: number) {
-  const base = L.market.slots + asset * L.market.slot_len + L.market.control_sequences;
-  return { nextObservation: u64(market, base + L.market.oracle_observation) + 1n, authorityEpoch: u64(market, base + L.market.authority_epoch) };
+  const base = marketLayout(market).slots + asset * marketLayout(market).slot_len + marketLayout(market).control_sequences;
+  return { nextObservation: u64(market, base + marketLayout(market).oracle_observation) + 1n, authorityEpoch: u64(market, base + marketLayout(market).authority_epoch) };
 }
 
 /** Opens the wallet's main trading account (`sub` 0) or one of its isolated ones. */
@@ -1701,6 +1715,14 @@ export const setFundingCap = (market = activeMarket()) => new TransactionInstruc
   programId: VAULT_PROGRAM,
   keys: [ro(PublicKey.findProgramAddressSync([Buffer.from("governor"), market.toBuffer()], VAULT_PROGRAM)[0]), rw(market), ro(PERCOLATOR)],
   data: Buffer.from([43]),
+});
+/** One-shot (vault `MigrateMarketLayout`, anyone): moves a governed market to Percolator's current
+ *  account layout (engine c030aa4: 64 bytes more per asset slot); `payer` adds the rent for it.
+ *  Percolator refuses it on a market that is already current or cannot be moved exactly. */
+export const migrateMarketLayout = (payer: PublicKey, market: PublicKey) => new TransactionInstruction({
+  programId: VAULT_PROGRAM,
+  keys: [ro(PublicKey.findProgramAddressSync([Buffer.from("governor"), market.toBuffer()], VAULT_PROGRAM)[0]), rw(market), ro(PERCOLATOR), rw(payer, true), ro(SystemProgram.programId)],
+  data: Buffer.from([46]),
 });
 /** One step of a market's funding rate toward its target (router `RefreshFunding`, anyone). It
  *  only acts when the asset is accrued to the current slot, so it goes right behind the cranks

@@ -6,6 +6,15 @@ import L from "./_layout.js";
 import bs58 from "bs58";
 import { FEED_SYMBOLS, PERCOLATOR, ROUTER, SEED_WALLETS, VAULT_PROGRAM, networkOf } from "./_config.js";
 
+/** Percolator's engine c030aa4 added 64 bytes to every asset slot (fields from
+ *  `stored_pos_count_long` on moved 32 bytes). A market not yet moved (Percolator tag 73) is read
+ *  with the older offsets; `L.market` is the current layout (as app/src/chain.ts `marketLayout`). */
+const MARKET_FIXED_KEYS = new Set(["slots", "slot_len", "engine", "control_sequences", "oracle_observation", "authority_epoch"]);
+const MARKET_V1 = Object.fromEntries(Object.entries(L.market).map(([k, v]) => [k,
+  k === "slot_len" ? (v as number) - 64
+  : !MARKET_FIXED_KEYS.has(k) && (v as number) >= L.market.stored_pos_count_long ? (v as number) - 32 : v])) as typeof L.market;
+const marketLayout = (d: Uint8Array) => ((d.length - L.market.slots) % L.market.slot_len === 0 ? L.market : MARKET_V1);
+
 const dv = (d: Uint8Array) => new DataView(d.buffer, d.byteOffset, d.byteLength);
 const u64 = (d: Uint8Array, o: number) => dv(d).getBigUint64(o, true);
 const u128 = (d: Uint8Array, o: number) => u64(d, o) + (u64(d, o + 8) << 64n);
@@ -78,8 +87,9 @@ async function build(rpc: string, MARKET: string) {
     if (sym) symbols.set(dv(d).getUint16(L.vault.asset_index, true), sym);
   }
   const m = new Uint8Array(market!.data);
+  const M = marketLayout(m);
   const priceOf = (asset: number) => {
-    const o = L.market.slots + asset * L.market.slot_len + L.market.engine + L.market.effective_price;
+    const o = M.slots + asset * M.slot_len + M.engine + M.effective_price;
     return o + 8 <= m.length ? u64(m, o) : 0n;
   };
 
@@ -101,11 +111,11 @@ async function build(rpc: string, MARKET: string) {
       const long = d[b + L.leg.side] === 0;
       // The position as Percolator counts it: scaled by any deleveraging of its side since it was
       // opened, and zero once that side was emptied and reset.
-      const e = L.market.slots + asset * L.market.slot_len + L.market.engine;
+      const e = M.slots + asset * M.slot_len + M.engine;
       let size = q < 0n ? -q : q;
-      if (u64(d, b + L.leg.epoch_snap) !== u64(m, e + (long ? L.market.epoch_long : L.market.epoch_short))) size = 0n;
+      if (u64(d, b + L.leg.epoch_snap) !== u64(m, e + (long ? M.epoch_long : M.epoch_short))) size = 0n;
       else {
-        const now = u128(m, e + (long ? L.market.a_long : L.market.a_short)), then = u128(d, b + L.leg.a_basis);
+        const now = u128(m, e + (long ? M.a_long : M.a_short)), then = u128(d, b + L.leg.a_basis);
         if (then > 0n && now !== then) size = (size * now + then - 1n) / then;
       }
       if (size === 0n) continue;
